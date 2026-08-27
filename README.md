@@ -47,15 +47,20 @@ local PostgreSQL instance for integration tests and the demo.
 - Bun (`curl -fsSL https://bun.sh/install | bash`)
 - A running PostgreSQL server with a `quarry_dev` database
 
-The Cloud Agent environment provisions PostgreSQL automatically and starts it on
-boot via `.cursor/start.sh`. By default the code connects to
-`postgres://quarry:quarry@127.0.0.1:5432/quarry_dev`; override it with the
-`DATABASE_URL` environment variable.
+The Cloud Agent environment is defined in `.cursor/environment.json`:
 
-To start PostgreSQL manually (outside a Cloud Agent):
+- `.cursor/install.sh` installs Bun and PostgreSQL, provisions the `quarry` role
+  and `quarry_dev` database, and runs `bun install`.
+- `.cursor/start.sh` brings the PostgreSQL cluster online on every boot.
+
+By default the code connects to `postgres://quarry:quarry@127.0.0.1:5432/quarry_dev`;
+override it with the `DATABASE_URL` environment variable.
+
+To provision and start PostgreSQL manually (outside a Cloud Agent):
 
 ```bash
-bash .cursor/start.sh
+bash .cursor/install.sh   # one-time: install toolchain + create the dev database
+bash .cursor/start.sh     # start PostgreSQL
 ```
 
 ### Commands
