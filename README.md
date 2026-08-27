@@ -48,9 +48,15 @@ local PostgreSQL instance for integration tests and the demo.
 - A running PostgreSQL server with a `quarry_dev` database
 
 The Cloud Agent environment provisions PostgreSQL automatically and starts it on
-boot (see `.cursor/environment.json` and `.cursor/start.sh`). By default the code
-connects to `postgres://quarry:quarry@127.0.0.1:5432/quarry_dev`; override it with
-the `DATABASE_URL` environment variable.
+boot via `.cursor/start.sh`. By default the code connects to
+`postgres://quarry:quarry@127.0.0.1:5432/quarry_dev`; override it with the
+`DATABASE_URL` environment variable.
+
+To start PostgreSQL manually (outside a Cloud Agent):
+
+```bash
+bash .cursor/start.sh
+```
 
 ### Commands
 

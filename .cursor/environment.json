@@ -1,6 +1,0 @@
-{
-  "name": "quarry",
-  "user": "ubuntu",
-  "install": "bun install",
-  "start": "bash .cursor/start.sh"
-}
