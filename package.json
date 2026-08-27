@@ -1,0 +1,25 @@
+{
+  "name": "quarry",
+  "version": "0.1.0",
+  "description": "A type-safe SQL query builder for PostgreSQL",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "test": "bun test",
+    "test:all": "bun test",
+    "start": "bun run examples/demo.ts"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/pg": "^8.11.10",
+    "typescript": "^5.7.2"
+  },
+  "trustedDependencies": ["@biomejs/biome"]
+}
