@@ -19,13 +19,15 @@
 	"scripts": {
 		"build": "tsdown && tsc -p tsconfig.build.json --emitDeclarationOnly",
 		"check:attw": "pnpm dlx @arethetypeswrong/cli quarry-*.tgz",
+		"check:format": "oxfmt --check .",
 		"check:publint": "pnpm dlx publint",
 		"clean": "git clean -dfX --exclude='!.env.*'",
 		"format": "oxfmt --write .",
-		"format:check": "oxfmt --check .",
 		"lint": "oxlint --type-aware",
-		"test": "vitest run",
-		"test:types": "vitest run --typecheck",
+		"test": "vitest run --typecheck",
+		"test:runtime": "vitest run",
+		"test:types": "vitest run --typecheck.only",
+		"test:watch": "vitest --typecheck",
 		"typecheck": "tsc --noEmit"
 	},
 	"devDependencies": {
