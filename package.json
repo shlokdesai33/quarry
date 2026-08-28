@@ -1,0 +1,55 @@
+{
+	"name": "quarry",
+	"version": "0.0.0",
+	"description": "A type-safe SQL query builder for PostgreSQL.",
+	"license": "MIT",
+	"files": [
+		"dist",
+		"src"
+	],
+	"type": "module",
+	"sideEffects": false,
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"scripts": {
+		"build": "tsdown && tsc -p tsconfig.build.json --emitDeclarationOnly",
+		"check:attw": "pnpm dlx @arethetypeswrong/cli quarry-*.tgz",
+		"check:publint": "pnpm dlx publint",
+		"clean": "git clean -dfX --exclude='!.env.*'",
+		"format": "oxfmt --write .",
+		"format:check": "oxfmt --check .",
+		"lint": "oxlint --type-aware",
+		"test": "vitest run",
+		"test:types": "vitest run --typecheck",
+		"typecheck": "tsc --noEmit"
+	},
+	"devDependencies": {
+		"@types/node": "^26.4.0",
+		"oxfmt": "^0.65.0",
+		"oxlint": "^1.80.0",
+		"oxlint-tsgolint": "^7.0.2001",
+		"tsdown": "^0.22.14",
+		"typescript": "^7.0.2",
+		"vitest": "^4.1.11"
+	},
+	"devEngines": {
+		"packageManager": {
+			"name": "pnpm",
+			"version": "^11.0.0",
+			"onFail": "error"
+		},
+		"runtime": {
+			"name": "node",
+			"version": "^24.11.0",
+			"onFail": "error"
+		}
+	},
+	"engines": {
+		"node": ">=22.12"
+	}
+}

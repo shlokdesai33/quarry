@@ -1,0 +1,25 @@
+{
+	"compilerOptions": {
+		// modules
+		"module": "nodenext",
+		"moduleResolution": "nodenext",
+		"verbatimModuleSyntax": true,
+		"isolatedModules": true,
+		"noUncheckedSideEffectImports": true,
+		"erasableSyntaxOnly": true,
+
+		// language level
+		"target": "es2024",
+		"lib": ["es2024"],
+
+		// type checking
+		"strict": true,
+		"noEmit": true,
+		"noUncheckedIndexedAccess": true,
+		"exactOptionalPropertyTypes": true,
+		"noImplicitOverride": true,
+		"noImplicitReturns": true,
+		"skipLibCheck": true
+	},
+	"include": ["src", "test", "vitest.config.ts", "tsdown.config.ts"]
+}
