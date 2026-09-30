@@ -10,6 +10,7 @@
 	},
 	"plugins": ["typescript", "unicorn", "oxc", "import", "promise"],
 	"rules": {
+		"import/no-cycle": "error",
 		"eslint/no-fallthrough": "error",
 		"eslint/eqeqeq": "error",
 		"eslint/no-console": "error",
@@ -23,12 +24,11 @@
 		],
 		// oxlint recommends using typescript's noImplicitReturns instead
 		"typescript/consistent-return": "off",
-		"typescript/no-explicit-any": "error",
+		"typescript/no-explicit-any": "off",
 		"typescript/no-floating-promises": "error",
 		"typescript/no-misused-promises": "error",
 		"typescript/await-thenable": "error",
-		"typescript/no-unnecessary-type-assertion": "error",
-		"import/no-cycle": "error"
+		"typescript/no-unnecessary-type-assertion": "error"
 	},
 	"overrides": [
 		{

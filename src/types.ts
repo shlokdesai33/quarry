@@ -1,4 +1,4 @@
-import type { AnyColumn } from './column.js';
+import type { AnyColumn } from './column/any-column.js';
 import type { AnyTable } from './table.js';
 
 /**
