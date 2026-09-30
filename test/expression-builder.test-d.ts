@@ -97,6 +97,10 @@ describe('comparison operators', () => {
 		eb('users.email', '=', null);
 		// @ts-expect-error `is` on a non-boolean column only takes null
 		eb('users.email', 'is', 'x');
+		// @ts-expect-error postgres takes only a keyword after `is`
+		eb('users.email', 'is', eb.val(null));
+		// @ts-expect-error postgres takes only a keyword after `is not`
+		eb('users.admin', 'is not', eb('users.admin', '=', true));
 	});
 
 	it('accepts an expression of the value type, nullable or not', () => {
@@ -166,12 +170,15 @@ describe('expressions on the left', () => {
 
 	it('type the value from the expression and operator', () => {
 		eb(lower, 'in', ['a', 'b']);
+		eb(lower, 'in', eb.ref('users.tags'));
 		eb(eb.ref('users.age'), '=', eb.ref('users.id'));
 
 		// @ts-expect-error wrong scalar type
 		eb(lower, '=', 1);
 		// @ts-expect-error `in` takes a list
 		eb(lower, 'in', 'a');
+		// @ts-expect-error `in` takes an array expression, not a scalar one
+		eb(lower, 'in', eb.ref('users.firstName'));
 		// @ts-expect-error reference is a string column
 		eb(eb.ref('users.age'), '=', eb.ref('users.firstName'));
 	});

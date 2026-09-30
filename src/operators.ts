@@ -196,4 +196,3 @@ export interface TsvectorOperators extends NullOperators {
 	// matches the given tsquery, e.g. `'fat & rat'`
 	'@@': string;
 }
- 

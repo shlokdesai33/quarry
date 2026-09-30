@@ -21,7 +21,7 @@ export class ArrayType<E extends DataType = DataType> extends DataType {
 
 	/**
 	 * Creates a new array type.
-	 * 
+	 *
 	 * @param element the type of the elements.
 	 */
 	constructor(element: E) {
@@ -31,7 +31,7 @@ export class ArrayType<E extends DataType = DataType> extends DataType {
 
 	/**
 	 * Encodes a value as a SQL array.
-	 * 
+	 *
 	 * @param value the value to encode.
 	 * @returns the encoded value.
 	 */
@@ -44,7 +44,7 @@ export class ArrayType<E extends DataType = DataType> extends DataType {
 	/**
 	 * Encodes an operand as a SQL array. For `= any` and `<> all` the operand
 	 * is a single element, so it's encoded by the element type instead.
-	 * 
+	 *
 	 * @param operator the operator to encode.
 	 * @param value the value to encode.
 	 * @returns the encoded value.

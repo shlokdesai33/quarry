@@ -52,7 +52,7 @@ export abstract class BaseColumn<D extends DataType, S, I, U> {
 	 * The type of the column when used in an insert clause.
 	 */
 	declare readonly $insert: I;
-	
+
 	/**
 	 * The type of the column when used in an update clause.
 	 */
@@ -72,7 +72,7 @@ export abstract class BaseColumn<D extends DataType, S, I, U> {
 
 	/**
 	 * Creates a new column.
-	 * 
+	 *
 	 * @param args the arguments for the column.
 	 */
 	constructor({ dataType, name }: ColumnArgs<D>) {

@@ -19,15 +19,31 @@ import type { OperationNode } from './node.js';
 import type { ComparableOperators, TextOperators } from './operators.js';
 import type { DataTypeOf, NullOf, Operand, Ref, Refs, TypeOf } from './refs.js';
 
-/** The constraint for text arguments: any SQL type with the text operators. */
+/** A result of SQL type `D`, nullable when `N` is `null`. */
+type Result<D extends DataType, N = never> = TypedExpression<
+	D['$native'] | N,
+	D
+>;
+
+/** Any SQL type with the text operators. */
 type Text = DataType & { readonly $operators: TextOperators<unknown> };
 
-/** The constraint for arguments that need an ordering. */
+/** Any SQL type with an ordering. */
 type Comparable = DataType & {
 	readonly $operators: ComparableOperators<unknown>;
 };
 
-/** The last element of a tuple. */
+/** An argument of any SQL type, including one postgres infers (`eb.val`). */
+type Part<R extends Refs> = Ref<R> | Expression<unknown>;
+
+/**
+ * A `coalesce` fallback: an operand of the first argument's SQL type, or any
+ * expression of its value type (so `eb.val` works).
+ */
+type Fallback<R extends Refs, First> =
+	| Operand<R, DataTypeOf<R, First>>
+	| Expression<TypeOf<R, First>>;
+
 type Last<T extends readonly unknown[]> = T extends readonly [
 	...unknown[],
 	infer L,
@@ -35,34 +51,8 @@ type Last<T extends readonly unknown[]> = T extends readonly [
 	? L
 	: never;
 
-/**
- * What may follow the first argument of `coalesce`: an operand of the same
- * SQL type, or any expression of the same value type (so `eb.val` works).
- */
-type Fallback<R extends Refs, First> =
-	| Operand<R, DataTypeOf<R, First>>
-	| Expression<TypeOf<R, First>>;
-
-/**
- * The types an expression can be cast to, keyed by SQL name.
- */
-interface CastTypes {
-	text: TextType;
-	integer: IntegerType;
-	bigint: BigIntType;
-	numeric: DecimalType;
-	real: RealType;
-	'double precision': DoublePrecisionType;
-	boolean: BooleanType;
-	uuid: UUIDType;
-	date: DateType;
-	timestamp: TimestampType;
-	timestamptz: TimestampTzType;
-}
-
-type CastType = keyof CastTypes;
-
-const CAST_TYPES: { readonly [T in CastType]: new () => CastTypes[T] } = {
+/** The targets of `cast`, keyed by SQL name. */
+const CAST_TYPES = {
 	text: TextType,
 	integer: IntegerType,
 	bigint: BigIntType,
@@ -74,53 +64,44 @@ const CAST_TYPES: { readonly [T in CastType]: new () => CastTypes[T] } = {
 	date: DateType,
 	timestamp: TimestampType,
 	timestamptz: TimestampTzType,
-};
+} satisfies Record<string, new () => DataType>;
+
+type CastType = keyof typeof CAST_TYPES;
+
+type CastTypes = { [T in CastType]: InstanceType<(typeof CAST_TYPES)[T]> };
 
 /**
- * The SQL functions available in scope `R`. Each declares the SQL type of its
- * arguments and result, so `lower` is only offered for text and its result can
- * go on the left of a comparison as text. Null propagates the way postgres
- * propagates it: most functions are null if any argument is; `concat`,
- * `count` and `now` never are.
- *
- * Arguments are references in scope or expressions; a plain value goes
- * through `eb.val`.
+ * The SQL functions available in scope `R`, typed by the SQL types of their
+ * arguments and results. Most are null if any argument is; `concat`, `count`
+ * and `now` never are. A plain value argument goes through `eb.val`.
  */
 export interface Functions<R extends Refs> {
-	/** `lower(text)`: the string in lower case. */
+	/** `lower(text)` */
 	lower<A extends Operand<R, Text>>(
 		text: A,
-	): TypedExpression<TextType['$native'] | NullOf<TypeOf<R, A>>, TextType>;
+	): Result<TextType, NullOf<TypeOf<R, A>>>;
 
-	/** `upper(text)`: the string in upper case. */
+	/** `upper(text)` */
 	upper<A extends Operand<R, Text>>(
 		text: A,
-	): TypedExpression<TextType['$native'] | NullOf<TypeOf<R, A>>, TextType>;
+	): Result<TextType, NullOf<TypeOf<R, A>>>;
 
 	/** `length(text)`: the number of characters. */
 	length<A extends Operand<R, Text>>(
 		text: A,
-	): TypedExpression<
-		IntegerType['$native'] | NullOf<TypeOf<R, A>>,
-		IntegerType
-	>;
+	): Result<IntegerType, NullOf<TypeOf<R, A>>>;
 
 	/**
-	 * `concat(a, b, ...)`: the arguments joined as text. Nulls are skipped, so
-	 * the result is never null.
+	 * `concat(a, b, ...)`. Nulls are skipped, so the result is never null.
 	 *
 	 * @example eb.fn.concat('users.firstName', eb.val(' '), 'users.lastName')
 	 */
-	concat(
-		...parts: readonly [Part<R>, ...Part<R>[]]
-	): TypedExpression<TextType['$native'], TextType>;
+	concat(...parts: readonly [Part<R>, ...Part<R>[]]): Result<TextType>;
 
 	/**
 	 * `coalesce(first, ...rest)`: the first non-null argument. All arguments
-	 * share the first's SQL type, and the result is nullable only if the last
-	 * argument is.
+	 * share the first's SQL type; the result is nullable only if the last is.
 	 *
-	 * @example eb.fn.coalesce('users.nickname', 'users.firstName')
 	 * @example eb.fn.coalesce('users.deletedAt', eb.fn.now())
 	 */
 	coalesce<
@@ -135,53 +116,37 @@ export interface Functions<R extends Refs> {
 		DataTypeOf<R, A>
 	>;
 
-	/**
-	 * `count(*)` or `count(value)`: the number of rows, or of rows where
-	 * `value` is not null. Postgres returns `bigint`, which arrives as a string.
-	 */
-	count(value?: Part<R>): TypedExpression<BigIntType['$native'], BigIntType>;
+	/** `count(*)` or `count(value)`. A `bigint`, so it arrives as a string. */
+	count(value?: Part<R>): Result<BigIntType>;
 
-	/** `min(value)`: the smallest value, or null over no rows. */
+	/** `min(value)`: null over no rows. */
 	min<A extends Operand<R, Comparable>>(
 		value: A,
 	): TypedExpression<TypeOf<R, A> | null, DataTypeOf<R, A>>;
 
-	/** `max(value)`: the largest value, or null over no rows. */
+	/** `max(value)`: null over no rows. */
 	max<A extends Operand<R, Comparable>>(
 		value: A,
 	): TypedExpression<TypeOf<R, A> | null, DataTypeOf<R, A>>;
 
 	/** `now()`: the transaction's start time. */
-	now(): TypedExpression<TimestampTzType['$native'], TimestampTzType>;
+	now(): Result<TimestampTzType>;
 
 	/**
-	 * `cast(value as type)`: the value converted to another SQL type. The
-	 * result's type and SQL type follow the target, and null is preserved.
-	 * This is the way to change an expression's type: it converts the value
-	 * rather than merely asserting a different type for it.
+	 * `cast(value as type)`: converts the value, so its type and SQL type
+	 * follow the target.
 	 *
 	 * @example eb.fn.cast(eb.fn.count(), 'integer')
 	 */
 	cast<A extends Operand<R>, T extends CastType>(
 		value: A,
 		type: T,
-	): TypedExpression<
-		CastTypes[T]['$native'] | NullOf<TypeOf<R, A>>,
-		CastTypes[T]
-	>;
+	): Result<CastTypes[T], NullOf<TypeOf<R, A>>>;
 }
-
-/**
- * An argument that may be of any SQL type, including one postgres infers
- * (`eb.val`), for the functions that accept anything.
- */
-type Part<R extends Refs> = Ref<R> | Expression<unknown>;
 
 /** How the function catalog resolves its arguments against the scope. */
 interface Scope<R extends Refs> {
-	/** The node for an argument. */
-	readonly node: (arg: Ref<R> | Expression<unknown>) => OperationNode;
-	/** The SQL type of an argument whose type is known. */
+	readonly node: (arg: Part<R>) => OperationNode;
 	readonly dataType: (
 		arg: Ref<R> | TypedExpression<unknown, DataType>,
 	) => DataType;
@@ -190,9 +155,9 @@ interface Scope<R extends Refs> {
 const STAR: OperationNode = { kind: 'raw', fragments: ['*'], nodes: [] };
 
 /**
- * At runtime a function call is a node and a data type; the result's
- * TypeScript types are supplied by the `Functions` signature. So this returns
- * the bottom expression, which satisfies every signature.
+ * At runtime a call is just a node and a data type; `Functions` supplies the
+ * TypeScript types, so this returns the bottom type, which fits every
+ * signature.
  */
 function result(
 	node: OperationNode,
@@ -206,9 +171,6 @@ function call(name: string, args: readonly OperationNode[], type: DataType) {
 	return result({ kind: 'function', name, args }, type);
 }
 
-/**
- * Creates the function catalog for a scope.
- */
 export function functions<R extends Refs>({
 	node,
 	dataType,

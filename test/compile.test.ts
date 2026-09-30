@@ -77,11 +77,41 @@ describe('comparisons', () => {
 		});
 	});
 
+	it('parenthesises a comparison on the right', () => {
+		expect(compiled(eb('users.admin', '=', eb('users.age', '>', 18)))).toEqual({
+			sql: '"users"."admin" = ("users"."age" > $1)',
+			params: [18],
+		});
+		expect(
+			compiled(eb('users.admin', '=', eb.and([eb('users.age', '>', 18)]))),
+		).toEqual({
+			sql: '"users"."admin" = ("users"."age" > $1)',
+			params: [18],
+		});
+	});
+
 	it('renders `in` as a parenthesised list', () => {
 		expect(compiled(eb('users.age', 'in', [1, 2, 3]))).toEqual({
 			sql: '"users"."age" in ($1, $2, $3)',
 			params: [1, 2, 3],
 		});
+	});
+
+	it('renders `in` against an array expression as `= any` / `<> all`', () => {
+		expect(compiled(eb('users.age', 'in', eb.val([1, 2])))).toEqual({
+			sql: '"users"."age" = any($1)',
+			params: [[1, 2]],
+		});
+		expect(compiled(eb('users.age', 'not in', eb.val([1, 2])))).toEqual({
+			sql: '"users"."age" <> all($1)',
+			params: [[1, 2]],
+		});
+		expect(compiled(eb('users.firstName', 'in', eb.ref('users.tags')))).toEqual(
+			{
+				sql: '"users"."first_name" = any("users"."tags")',
+				params: [],
+			},
+		);
 	});
 
 	it('collapses an empty `in` list', () => {
@@ -113,6 +143,18 @@ describe('comparisons', () => {
 		});
 	});
 
+	it('puts an expression on the left for `= any`', () => {
+		const name = eb.ref('users.firstName');
+		expect(compiled(eb('users.tags', '= any', name))).toEqual({
+			sql: '"users"."first_name" = any("users"."tags")',
+			params: [],
+		});
+		expect(compiled(eb('users.tags', '<> all', name))).toEqual({
+			sql: '"users"."first_name" <> all("users"."tags")',
+			params: [],
+		});
+	});
+
 	it('passes array operands as a single parameter', () => {
 		expect(compiled(eb('users.tags', '&&', ['a', 'b']))).toEqual({
 			sql: '"users"."tags" && $1',
@@ -134,7 +176,7 @@ describe('expressions on the left', () => {
 			params: [1, 2],
 		});
 		expect(compiled(eb(eb('users.age', '>', 18), 'is', false))).toEqual({
-			sql: '"users"."age" > $1 is false',
+			sql: '("users"."age" > $1) is false',
 			params: [18],
 		});
 	});

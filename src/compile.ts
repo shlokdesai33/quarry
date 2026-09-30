@@ -22,12 +22,12 @@ function render(node: OperationNode, params: unknown[]): string {
 		case 'value':
 			params.push(node.value);
 			return `$${params.length}`;
-		case 'valueList':
+		case 'value_list':
 			return `(${node.values.map((value) => render(value, params)).join(', ')})`;
 		case 'literal':
 			return String(node.value);
 		case 'binary':
-			return `${render(node.left, params)} ${node.operator} ${render(node.right, params)}`;
+			return `${renderOperand(node.left, params)} ${node.operator} ${renderOperand(node.right, params)}`;
 		case 'and':
 			return renderLogical(node.operands, 'and', 'true', params);
 		case 'or':
@@ -43,6 +43,21 @@ function render(node: OperationNode, params: unknown[]): string {
 				node.fragments[0] ?? '',
 			);
 	}
+}
+
+/** Nested comparisons are parenthesised so postgres precedence cannot regroup them. */
+function renderOperand(node: OperationNode, params: unknown[]): string {
+	const sql = render(node, params);
+	return rendersAsBinary(node) ? `(${sql})` : sql;
+}
+
+/** A single-operand `and` / `or` renders as its operand, unparenthesised. */
+function rendersAsBinary(node: OperationNode): boolean {
+	if (node.kind === 'and' || node.kind === 'or') {
+		const [only, ...rest] = node.operands;
+		return only !== undefined && rest.length === 0 && rendersAsBinary(only);
+	}
+	return node.kind === 'binary';
 }
 
 function renderLogical(
