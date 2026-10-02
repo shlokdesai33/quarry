@@ -17,7 +17,7 @@ export class GeneratedColumn<D extends DataType, S, I, U>
 	nullable() {
 		return new GeneratedColumn<D, S | null, I, U>({
 			dataType: this.dataType,
-			name: this.name,
+			columnName: this.columnName,
 		});
 	}
 
@@ -30,21 +30,28 @@ export class GeneratedColumn<D extends DataType, S, I, U>
 	generated() {
 		return new GeneratedColumn<D, S, never, never>({
 			dataType: this.dataType,
-			name: this.name,
+			columnName: this.columnName,
+		});
+	}
+
+	override name(columnName: string) {
+		return new GeneratedColumn<D, S, I, U>({
+			dataType: this.dataType,
+			columnName,
 		});
 	}
 
 	/**
-	 * Sets the TypeScript view of the column when selected (branded values,
+	 * Narrows the TypeScript view of the column when selected (branded values,
 	 * literal unions). Only the select type is given: a generated column is
 	 * never written, so its insert and update types stay `never`.
 	 *
 	 * @example text().generated().as<'active' | 'inactive'>()
 	 */
-	override as<X>() {
+	override as<X extends S>() {
 		return new GeneratedColumn<D, X, I, U>({
 			dataType: this.dataType,
-			name: this.name,
+			columnName: this.columnName,
 		});
 	}
 }

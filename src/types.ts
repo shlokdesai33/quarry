@@ -11,7 +11,7 @@ export type Schema = {
 /**
  * Collapses an intersection into a single object type for readable hovers.
  */
-type Prettify<T> = { [K in keyof T]: T[K] } & {};
+export type Prettify<T> = { [K in keyof T]: T[K] } & {};
 
 /**
  * Forces `T` to be resolved at this boundary. When a row type is used inside

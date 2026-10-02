@@ -1,6 +1,7 @@
 import type { AnyColumn } from './column/any-column.js';
-import type { DataType, OperatorsFor } from './data-type/data-type.js';
-import type { Expression, TypedExpression } from './expression.js';
+import type { DataType } from './data-type/data-type.js';
+import type { Expression, Param, TypedExpression } from './expression.js';
+import type { OperatorsByKind, ParamOperators } from './operators.js';
 import type { AnyTable } from './table.js';
 
 /**
@@ -71,12 +72,18 @@ export type NullOf<T> = Extract<T, null>;
 
 /**
  * The operators an operand admits: those of its SQL type, at its non-null
- * value type.
+ * value type. A parameter has no SQL type, so it only admits `any` / `all`
+ * of an array on the right.
  */
 export type OperatorsOf<R extends Refs, A> = [A] extends [
 	infer K extends Ref<R>,
 ]
-	? OperatorsFor<R[K]['dataType'], NonNullable<R[K]['$select']>>
+	? OperatorsByKind<
+			NonNullable<R[K]['$select']>,
+			R[K]['dataType']
+		>[R[K]['dataType']['$kind']]
 	: A extends TypedExpression<infer T, infer D extends DataType>
-		? OperatorsFor<D, NonNullable<T>>
-		: never;
+		? OperatorsByKind<NonNullable<T>, D>[D['$kind']]
+		: A extends Param<unknown>
+			? ParamOperators
+			: never;

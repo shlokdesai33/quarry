@@ -1,67 +1,66 @@
+import type { Kind } from '../operators.js';
+
 /**
- * A SQL type: the operators a value of the type admits, and how such values
- * are encoded for the driver. Columns and expressions of the type share it,
- * so a value is encoded the same way whether it is compared against a column
- * or against a computed expression.
+ * How a user-defined data type encodes values, where that differs from
+ * passing them to the driver as they are.
+ */
+type Options = {
+	/**
+	 * The postgres input syntax of a non-null value of the type, for types the
+	 * driver would send wrongly. `null` is always SQL `NULL`, so it never
+	 * reaches this.
+	 */
+	readonly serialize?: (value: unknown) => string;
+};
+
+/**
+ * A SQL type of kind `K`: how values of the type are encoded for the driver,
+ * and, through `OperatorsByKind`, the operators they admit. Columns and
+ * expressions of the type share it, so a value is encoded the same way
+ * whether it is compared against a column or against a computed expression.
  *
- * It is not generic over the TypeScript type of its values, which lives on
+ * It says nothing about the TypeScript type of its values, which lives on
  * the column or expression instead: `text`, `text null` and `text` narrowed
- * to a union of literals are all the same SQL type. It only records the
- * type's native representation, `$native`, which those narrow. The operators
- * still depend on the value type (`=` takes one), so they are declared in
- * terms of `this['$value']`, which `OperatorsFor` fills in.
+ * to a union of literals are all the same SQL type.
+ *
+ * A user-defined type gives its encoding as an option; the built-in types
+ * that need one override `serialize`, leaving `null` as SQL `NULL`.
  *
  * Instances are immutable.
  */
-export abstract class DataType {
+export class DataType<K extends Kind = Kind> {
 	/**
-	 * A phantom slot for the value type, filled in by `OperatorsFor`. Never
-	 * set.
+	 * The name of the SQL type, which keys its operators in `OperatorsByKind`.
+	 * It also keeps types that admit the same operators, such as `integer`
+	 * and `real`, distinct.
 	 */
-	declare readonly $value: unknown;
+	readonly $kind: K;
 
 	/**
-	 * A phantom tag naming the SQL type. It keeps types that admit the same
-	 * operators, such as `integer` and `real`, distinct.
+	 * How values are encoded, where they aren't sent as is.
 	 */
-	declare abstract readonly $kind: string;
+	readonly #options: Options;
 
 	/**
-	 * A phantom property holding the TypeScript type a non-null value of this
-	 * type is represented as, both when read and when written: `number` for
-	 * `real`, `string` for `bigint` (whose range exceeds a number's).
-	 * Columns and expressions of the type narrow it, e.g. to a union of
-	 * literals.
+	 * Creates a data type of the given kind.
+	 *
+	 * @param kind the name of the SQL type.
+	 * @param options how values are encoded, where they aren't sent as is.
 	 */
-	declare abstract readonly $native: unknown;
-
-	/**
-	 * A phantom property holding the operators usable when a value of this
-	 * type is on the left, in terms of `this['$value']`.
-	 */
-	declare abstract readonly $operators: object;
-
-	/**
-	 * Converts a value of this type into what the driver should send.
-	 * Identity by default: the driver already serialises strings, numbers,
-	 * booleans, dates, byte arrays and plain arrays. Overridden where the
-	 * JavaScript representation differs from the postgres input syntax.
-	 */
-	encode(value: unknown): unknown {
-		return value;
+	constructor(kind: K, options: Options = {}) {
+		this.$kind = kind;
+		this.#options = options;
 	}
 
 	/**
-	 * Converts the right-hand side of a comparison. Defaults to `encode`, since
-	 * most operators compare against a value of the type itself; overridden
-	 * where an operator takes something else.
+	 * Converts a value of this type into what the driver should send: the
+	 * `serialize` option's text, or the value as is, since the driver already
+	 * serialises strings, numbers, booleans, dates, byte arrays and plain
+	 * arrays. `null` is SQL `NULL`.
 	 */
-	encodeOperand(_operator: string, value: unknown): unknown {
-		return this.encode(value);
+	serialize(value: unknown): unknown {
+		return this.#options.serialize && value !== null
+			? this.#options.serialize(value)
+			: value;
 	}
 }
-
-/** The operators of the data type `D` for non-null values of type `S`. */
-export type OperatorsFor<D extends DataType, S> = (D & {
-	readonly $value: S;
-})['$operators'];

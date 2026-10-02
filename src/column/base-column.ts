@@ -10,7 +10,7 @@ export type ColumnArgs<D extends DataType> = {
 	 * The name of the column in the database, when it differs from the key it
 	 * is declared under.
 	 */
-	readonly name?: string | undefined;
+	readonly columnName?: string | undefined;
 };
 
 /**
@@ -28,19 +28,15 @@ export type ColumnArgs<D extends DataType> = {
  * and autocomplete never offers it. Repeating a modifier is a no-op, so it
  * stays available, and `nullable` excludes nothing but `identity`.
  *
- * - `Column` (what the factories return): `nullable` → `NullableColumn`,
- *   `default` → `DefaultColumn`, `generated` → `GeneratedColumn`,
- *   `array` → `ArrayColumn`
+ * - `Column` (what the factories and `array()` return): `nullable` →
+ *   `Column`, `default` → `DefaultColumn`, `generated` → `GeneratedColumn`
  * - `IntegerColumn`: as `Column`, plus `identity` → `IdentityColumn`
- * - `NullableColumn`: as `Column` (its `nullable` → `NullableColumn`),
- *   without `array`: elements are never nullable
- * - `ArrayColumn`: as `Column` (its `nullable` → `ArrayColumn`), without
- *   `array`
  * - `DefaultColumn`: `nullable`, `default` → `DefaultColumn`
  * - `GeneratedColumn`: `nullable`, `generated` → `GeneratedColumn`
  * - `IdentityColumn`: none
  *
- * `as()` is valid everywhere and keeps the state.
+ * The `array()` factory takes a `Column` of a non-array type as its element.
+ * `name()` and `as()` are valid everywhere and keep the state.
  */
 export abstract class BaseColumn<D extends DataType, S, I, U> {
 	/**
@@ -68,23 +64,33 @@ export abstract class BaseColumn<D extends DataType, S, I, U> {
 	 * The name of the column in the database, when it differs from the key it
 	 * is declared under.
 	 */
-	readonly name: string | undefined;
+	readonly columnName: string | undefined;
 
 	/**
 	 * Creates a new column.
 	 *
 	 * @param args the arguments for the column.
 	 */
-	constructor({ dataType, name }: ColumnArgs<D>) {
+	constructor({ dataType, columnName }: ColumnArgs<D>) {
 		this.dataType = dataType;
-		this.name = name;
+		this.columnName = columnName;
 	}
 
 	/**
-	 * Sets the TypeScript view of the column (branded ids, literal unions,
-	 * read-only columns, asymmetric nullability). The types are not checked
-	 * against the SQL type or each other: they must match what the driver
-	 * returns and what postgres accepts.
+	 * Sets the name of the column in the database, when it differs from the
+	 * key it is declared under. Valid in every state, which it keeps.
+	 *
+	 * @example firstName: text().name('first_name')
+	 */
+	abstract name(columnName: string): BaseColumn<D, S, I, U>;
+
+	/**
+	 * Narrows the TypeScript view of the column (branded ids, literal unions,
+	 * read-only columns, asymmetric nullability). Each type can only narrow
+	 * the column's current one, and what is written must also be selectable,
+	 * so the view never claims a value the driver doesn't return or postgres
+	 * wouldn't accept. A column with a default may still omit the value on
+	 * insert.
 	 *
 	 * @example text().as<string, never, never>()
 	 */

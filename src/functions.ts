@@ -1,37 +1,23 @@
-import { BooleanType } from './data-type/boolean.js';
-import { TextType } from './data-type/character.js';
-import type { DataType } from './data-type/data-type.js';
+import { ArrayType } from './data-type/array.js';
+import { DataType } from './data-type/data-type.js';
 import {
-	DateType,
-	TimestampType,
-	TimestampTzType,
-} from './data-type/datetime.js';
-import {
-	BigIntType,
-	DecimalType,
-	DoublePrecisionType,
-	IntegerType,
-	RealType,
-} from './data-type/numeric.js';
-import { UUIDType } from './data-type/uuid.js';
-import { type Expression, TypedExpression } from './expression.js';
+	Expression,
+	type Param,
+	Quantified,
+	TypedExpression,
+} from './expression.js';
 import type { OperationNode } from './node.js';
-import type { ComparableOperators, TextOperators } from './operators.js';
+import type { Kind, OrderedKind, TextKind } from './operators.js';
 import type { DataTypeOf, NullOf, Operand, Ref, Refs, TypeOf } from './refs.js';
 
-/** A result of SQL type `D`, nullable when `N` is `null`. */
-type Result<D extends DataType, N = never> = TypedExpression<
-	D['$native'] | N,
-	D
->;
+/** A result of SQL type `K` and TypeScript type `T`, nullable when `N` is `null`. */
+type Result<K extends Kind, T, N = never> = TypedExpression<T | N, DataType<K>>;
 
-/** Any SQL type with the text operators. */
-type Text = DataType & { readonly $operators: TextOperators<unknown> };
+/** Any character type. */
+type Text = DataType<TextKind>;
 
 /** Any SQL type with an ordering. */
-type Comparable = DataType & {
-	readonly $operators: ComparableOperators<unknown>;
-};
+type Comparable = DataType<OrderedKind>;
 
 /** An argument of any SQL type, including one postgres infers (`eb.val`). */
 type Part<R extends Refs> = Ref<R> | Expression<unknown>;
@@ -44,6 +30,31 @@ type Fallback<R extends Refs, First> =
 	| Operand<R, DataTypeOf<R, First>>
 	| Expression<TypeOf<R, First>>;
 
+/** What `any` and `all` take: values, an array parameter, or an array operand. */
+type Quantifiable<R extends Refs> =
+	| readonly unknown[]
+	| Param<readonly unknown[] | null>
+	| Operand<R, DataType<'array'>>;
+
+type Element<T> = T extends readonly (infer E)[] ? E : never;
+
+type ElementType<D> = D extends ArrayType<infer E> ? E : never;
+
+/**
+ * `any(A)` or `all(A)`: values and parameters have no SQL type of their own,
+ * an array operand has its element type. Null if the array or an element can
+ * be.
+ */
+type QuantifiedOf<R extends Refs, A> = A extends readonly (infer S)[]
+	? Quantified<S, never>
+	: A extends Param<infer T>
+		? Quantified<Element<NonNullable<T>>, never, NullOf<T>>
+		: Quantified<
+				NonNullable<Element<NonNullable<TypeOf<R, A>>>>,
+				ElementType<DataTypeOf<R, A>>,
+				NullOf<TypeOf<R, A> | Element<NonNullable<TypeOf<R, A>>>>
+			>;
+
 type Last<T extends readonly unknown[]> = T extends readonly [
 	...unknown[],
 	infer L,
@@ -51,24 +62,37 @@ type Last<T extends readonly unknown[]> = T extends readonly [
 	? L
 	: never;
 
-/** The targets of `cast`, keyed by SQL name. */
-const CAST_TYPES = {
-	text: TextType,
-	integer: IntegerType,
-	bigint: BigIntType,
-	numeric: DecimalType,
-	real: RealType,
-	'double precision': DoublePrecisionType,
-	boolean: BooleanType,
-	uuid: UUIDType,
-	date: DateType,
-	timestamp: TimestampType,
-	timestamptz: TimestampTzType,
-} satisfies Record<string, new () => DataType>;
+/** The TypeScript type a value cast to each target arrives as. */
+interface CastValues {
+	text: string;
+	integer: number;
+	bigint: string;
+	numeric: string;
+	real: number;
+	'double precision': number;
+	boolean: boolean;
+	uuid: string;
+	date: string;
+	timestamp: string;
+	timestamptz: Date;
+}
 
-type CastType = keyof typeof CAST_TYPES;
+type CastType = keyof CastValues;
 
-type CastTypes = { [T in CastType]: InstanceType<(typeof CAST_TYPES)[T]> };
+/** The kind of each target of `cast`, keyed by SQL name. */
+const CAST_KINDS = {
+	text: 'text',
+	integer: 'integer',
+	bigint: 'bigint',
+	numeric: 'decimal',
+	real: 'real',
+	'double precision': 'double precision',
+	boolean: 'boolean',
+	uuid: 'uuid',
+	date: 'date',
+	timestamp: 'timestamp',
+	timestamptz: 'timestamptz',
+} as const satisfies Record<CastType, Kind>;
 
 /**
  * The SQL functions available in scope `R`, typed by the SQL types of their
@@ -79,24 +103,24 @@ export interface Functions<R extends Refs> {
 	/** `lower(text)` */
 	lower<A extends Operand<R, Text>>(
 		text: A,
-	): Result<TextType, NullOf<TypeOf<R, A>>>;
+	): Result<'text', string, NullOf<TypeOf<R, A>>>;
 
 	/** `upper(text)` */
 	upper<A extends Operand<R, Text>>(
 		text: A,
-	): Result<TextType, NullOf<TypeOf<R, A>>>;
+	): Result<'text', string, NullOf<TypeOf<R, A>>>;
 
 	/** `length(text)`: the number of characters. */
 	length<A extends Operand<R, Text>>(
 		text: A,
-	): Result<IntegerType, NullOf<TypeOf<R, A>>>;
+	): Result<'integer', number, NullOf<TypeOf<R, A>>>;
 
 	/**
 	 * `concat(a, b, ...)`. Nulls are skipped, so the result is never null.
 	 *
 	 * @example eb.fn.concat('users.firstName', eb.val(' '), 'users.lastName')
 	 */
-	concat(...parts: readonly [Part<R>, ...Part<R>[]]): Result<TextType>;
+	concat(...parts: readonly [Part<R>, ...Part<R>[]]): Result<'text', string>;
 
 	/**
 	 * `coalesce(first, ...rest)`: the first non-null argument. All arguments
@@ -117,7 +141,7 @@ export interface Functions<R extends Refs> {
 	>;
 
 	/** `count(*)` or `count(value)`. A `bigint`, so it arrives as a string. */
-	count(value?: Part<R>): Result<BigIntType>;
+	count(value?: Part<R>): Result<'bigint', string>;
 
 	/** `min(value)`: null over no rows. */
 	min<A extends Operand<R, Comparable>>(
@@ -130,7 +154,7 @@ export interface Functions<R extends Refs> {
 	): TypedExpression<TypeOf<R, A> | null, DataTypeOf<R, A>>;
 
 	/** `now()`: the transaction's start time. */
-	now(): Result<TimestampTzType>;
+	now(): Result<'timestamptz', Date>;
 
 	/**
 	 * `cast(value as type)`: converts the value, so its type and SQL type
@@ -141,11 +165,31 @@ export interface Functions<R extends Refs> {
 	cast<A extends Operand<R>, T extends CastType>(
 		value: A,
 		type: T,
-	): Result<CastTypes[T], NullOf<TypeOf<R, A>>>;
+	): Result<(typeof CAST_KINDS)[T], CastValues[T], NullOf<TypeOf<R, A>>>;
+
+	/**
+	 * `any(array)`, the right-hand side of a comparison that holds if it does
+	 * for some element. Not a function in postgres, so it is accepted nowhere
+	 * else. Each value is encoded like an operand of the comparison. Of an
+	 * array column or expression, it also takes a parameter on the left.
+	 *
+	 * @example eb('users.email', 'like', eb.fn.any(['%@a.com', '%@b.com']))
+	 * @example eb('users.age', '>', eb.fn.any('users.limits'))
+	 * @example eb(eb.val('admin'), '=', eb.fn.any('users.tags'))
+	 */
+	any<const A extends Quantifiable<R>>(array: A): QuantifiedOf<R, A>;
+
+	/**
+	 * `all(array)`, the right-hand side of a comparison that holds if it does
+	 * for every element, so always for an empty array.
+	 *
+	 * @example eb('users.email', 'not like', eb.fn.all(['%@a.com', '%@b.com']))
+	 */
+	all<const A extends Quantifiable<R>>(array: A): QuantifiedOf<R, A>;
 }
 
 /** How the function catalog resolves its arguments against the scope. */
-interface Scope<R extends Refs> {
+export interface Scope<R extends Refs> {
 	readonly node: (arg: Part<R>) => OperationNode;
 	readonly dataType: (
 		arg: Ref<R> | TypedExpression<unknown, DataType>,
@@ -171,28 +215,51 @@ function call(name: string, args: readonly OperationNode[], type: DataType) {
 	return result({ kind: 'function', name, args }, type);
 }
 
+/** Like `result`: `Functions` supplies the element types. */
+function quantified(
+	quantifier: 'any' | 'all',
+	array: readonly unknown[] | Expression<unknown>,
+	element: DataType | undefined,
+): never {
+	// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the signature supplies the type
+	return new Quantified(quantifier, array, element) as never;
+}
+
 export function functions<R extends Refs>({
 	node,
 	dataType,
 }: Scope<R>): Functions<R> {
+	// values and parameters stay as they are, so the comparison can encode them
+	const quantify = (quantifier: 'any' | 'all') => (array: Quantifiable<R>) => {
+		if (typeof array !== 'string' && !(array instanceof TypedExpression)) {
+			return quantified(quantifier, array, undefined);
+		}
+		const type = dataType(array);
+		return quantified(
+			quantifier,
+			typeof array === 'string' ? new Expression(node(array)) : array,
+			type instanceof ArrayType ? type.element : undefined,
+		);
+	};
+
 	return {
-		lower: (text) => call('lower', [node(text)], new TextType()),
-		upper: (text) => call('upper', [node(text)], new TextType()),
-		length: (text) => call('length', [node(text)], new IntegerType()),
-		concat: (...parts) => call('concat', parts.map(node), new TextType()),
+		lower: (text) => call('lower', [node(text)], new DataType('text')),
+		upper: (text) => call('upper', [node(text)], new DataType('text')),
+		length: (text) => call('length', [node(text)], new DataType('integer')),
+		concat: (...parts) => call('concat', parts.map(node), new DataType('text')),
 		coalesce: (first, ...rest) =>
 			call('coalesce', [first, ...rest].map(node), dataType(first)),
 		count: (value) =>
 			call(
 				'count',
 				[value === undefined ? STAR : node(value)],
-				new BigIntType(),
+				new DataType('bigint'),
 			),
 		min: (value) => call('min', [node(value)], dataType(value)),
 		max: (value) => call('max', [node(value)], dataType(value)),
-		now: () => call('now', [], new TimestampTzType()),
+		now: () => call('now', [], new DataType('timestamptz')),
 		cast: (value, type) => {
-			if (!Object.hasOwn(CAST_TYPES, type)) {
+			if (!Object.hasOwn(CAST_KINDS, type)) {
 				throw new Error(`Unknown cast type "${type}"`);
 			}
 			return result(
@@ -201,8 +268,10 @@ export function functions<R extends Refs>({
 					fragments: ['cast(', ` as ${type})`],
 					nodes: [node(value)],
 				},
-				new CAST_TYPES[type](),
+				new DataType(CAST_KINDS[type]),
 			);
 		},
+		any: quantify('any'),
+		all: quantify('all'),
 	};
 }

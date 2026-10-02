@@ -9,17 +9,24 @@ export class IdentityColumn<D extends DataType, S, I, U>
 	//
 	extends BaseColumn<D, S, I, U>
 {
+	override name(columnName: string) {
+		return new IdentityColumn<D, S, I, U>({
+			dataType: this.dataType,
+			columnName,
+		});
+	}
+
 	/**
-	 * Sets the TypeScript view of the column when selected (branded ids,
+	 * Narrows the TypeScript view of the column when selected (branded ids,
 	 * literal unions). Only the select type is given: an identity is never
 	 * written, so its insert and update types stay `never`.
 	 *
 	 * @example integer().identity().as<UserId>()
 	 */
-	override as<X>() {
+	override as<X extends S>() {
 		return new IdentityColumn<D, X, I, U>({
 			dataType: this.dataType,
-			name: this.name,
+			columnName: this.columnName,
 		});
 	}
 }

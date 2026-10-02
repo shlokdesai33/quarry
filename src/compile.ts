@@ -25,7 +25,9 @@ function render(node: OperationNode, params: unknown[]): string {
 		case 'value_list':
 			return `(${node.values.map((value) => render(value, params)).join(', ')})`;
 		case 'literal':
-			return String(node.value);
+			return typeof node.value === 'string'
+				? stringLiteral(node.value)
+				: String(node.value);
 		case 'binary':
 			return `${renderOperand(node.left, params)} ${node.operator} ${renderOperand(node.right, params)}`;
 		case 'and':
@@ -75,4 +77,19 @@ function renderLogical(
 
 function identifier(name: string): string {
 	return `"${name.replaceAll('"', '""')}"`;
+}
+
+/**
+ * A quoted string literal, escaped as postgres's `quote_literal` does: quotes
+ * doubled, and backslashes doubled inside an `E'...'` literal, so it reads the
+ * same whatever `standard_conforming_strings` is.
+ */
+function stringLiteral(value: string): string {
+	if (value.includes('\0')) {
+		throw new Error('A string literal cannot contain a NUL character');
+	}
+	const quoted = value.replaceAll("'", "''");
+	return value.includes('\\')
+		? `E'${quoted.replaceAll('\\', '\\\\')}'`
+		: `'${quoted}'`;
 }

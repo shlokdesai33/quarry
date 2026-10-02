@@ -1,14 +1,11 @@
-import { ArrayType } from '../data-type/array.js';
 import type { DataType } from '../data-type/data-type.js';
-import { ArrayColumn } from './array-column.js';
 import { BaseColumn } from './base-column.js';
 import { DefaultColumn } from './default-column.js';
 import { GeneratedColumn } from './generated-column.js';
-import { NullableColumn } from './nullable-column.js';
 
 /**
- * A column as its factory returns it: no modifier applied yet, so it can
- * still become the element of an array.
+ * A column as the factories and `array()` return it, or made nullable. Unless
+ * it is itself an array, it can be the element of an `array()`.
  */
 export class Column<D extends DataType, S, I = S, U = I>
 	//
@@ -22,9 +19,9 @@ export class Column<D extends DataType, S, I = S, U = I>
 	 * @example text().nullable().as<string | null, string | null, string>()
 	 */
 	nullable() {
-		return new NullableColumn<D, S | null, I | null, U | null>({
+		return new Column<D, S | null, I | null, U | null>({
 			dataType: this.dataType,
-			name: this.name,
+			columnName: this.columnName,
 		});
 	}
 
@@ -37,7 +34,7 @@ export class Column<D extends DataType, S, I = S, U = I>
 	default() {
 		return new DefaultColumn<D, S, I | undefined, U>({
 			dataType: this.dataType,
-			name: this.name,
+			columnName: this.columnName,
 		});
 	}
 
@@ -50,39 +47,21 @@ export class Column<D extends DataType, S, I = S, U = I>
 	generated() {
 		return new GeneratedColumn<D, S, never, never>({
 			dataType: this.dataType,
-			name: this.name,
+			columnName: this.columnName,
 		});
 	}
 
-	/**
-	 * Makes the column an array of its type: `text().array()` is a `text[]`
-	 * column whose value is `string[]`. The name carries over, elements are
-	 * encoded by the element type, and modifiers after `array()` apply to the
-	 * array column.
-	 *
-	 * Elements are never typed as null, so `array()` isn't offered after
-	 * `nullable()`. Postgres doesn't enforce this: any array may hold nulls,
-	 * which a check like `array_position(col, null) is null` rules out.
-	 *
-	 * Only one dimension is modelled, so the result has no `array()` of its
-	 * own. Postgres treats `integer[][]` as the same type as `integer[]`, with
-	 * a rectangularity rule TypeScript cannot express, and operators like
-	 * `= any` compare against the base element rather than a row.
-	 *
-	 * @example tags: text().array()
-	 * @example labels: text().array().nullable()
-	 */
-	array() {
-		return new ArrayColumn<ArrayType<D>, S[]>({
-			dataType: new ArrayType(this.dataType),
-			name: this.name,
+	override name(columnName: string) {
+		return new Column<D, S, I, U>({
+			dataType: this.dataType,
+			columnName,
 		});
 	}
 
-	override as<X, Y, Z>() {
+	override as<X extends S, Y extends I & X, Z extends U & X>() {
 		return new Column<D, X, Y, Z>({
 			dataType: this.dataType,
-			name: this.name,
+			columnName: this.columnName,
 		});
 	}
 }

@@ -1,27 +1,54 @@
-import { Expression } from './expression.js';
+import { Expression, Param, Quantified } from './expression.js';
 import type { OperationNode } from './node.js';
 
-/** `value = any(col)` and `value <> all(col)`: the value goes on the left. */
+/** `x in arr` is `x = any(arr)`, and `x not in arr` is `x <> all(arr)`. */
 const QUANTIFIED = {
-	'= any': ['=', 'any'],
-	'<> all': ['<>', 'all'],
+	in: ['=', 'any'],
+	'not in': ['<>', 'all'],
 } as const;
 
 /**
  * Builds the node for `left operator value`. Operators whose right-hand side
  * is not a single value are lowered to generic nodes, so `compile` needs no
- * operator-specific rendering. Plain values go through `encode`.
+ * operator-specific rendering. Plain values and parameters go through
+ * `serialize`; other expressions are used as-is. An array of operands, as `in`
+ * against an array and `any` / `all` take, is one parameter whose items are
+ * each encoded.
  */
 export function comparison(
 	left: OperationNode,
 	operator: string,
 	value: unknown,
-	encode: (value: unknown) => unknown,
+	serialize: (value: unknown) => unknown,
 ): OperationNode {
-	const operand = (item: unknown): OperationNode =>
-		Expression.is(item)
+	const operand = (item: unknown): OperationNode => {
+		if (item instanceof Param) {
+			return { kind: 'value', value: serialize(item.value) };
+		}
+		return Expression.is(item)
 			? item.toNode()
-			: { kind: 'value', value: encode(item) };
+			: { kind: 'value', value: serialize(item) };
+	};
+
+	const array = (items: unknown): OperationNode => {
+		const values = items instanceof Param ? items.value : items;
+		return Array.isArray(values)
+			? { kind: 'value', value: values.map(serialize) }
+			: operand(items);
+	};
+
+	if (value instanceof Quantified) {
+		return {
+			kind: 'binary',
+			left,
+			operator,
+			right: {
+				kind: 'function',
+				name: value.quantifier,
+				args: [array(value.array)],
+			},
+		};
+	}
 
 	switch (operator) {
 		case 'is':
@@ -58,14 +85,13 @@ export function comparison(
 			}
 
 			// postgres's `in` only takes a list, so an array-valued expression
-			// uses the equivalent `x = any(arr)` / `x <> all(arr)`
-			const [op, fn] = QUANTIFIED[operator === 'in' ? '= any' : '<> all'];
-
+			// uses the equivalent quantified comparison
+			const [op, fn] = QUANTIFIED[operator];
 			return {
 				kind: 'binary',
 				left,
 				operator: op,
-				right: { kind: 'function', name: fn, args: [operand(value)] },
+				right: { kind: 'function', name: fn, args: [array(value)] },
 			};
 		}
 		case 'between':
@@ -83,16 +109,6 @@ export function comparison(
 				};
 			}
 			break;
-		}
-		case '= any':
-		case '<> all': {
-			const [op, fn] = QUANTIFIED[operator];
-			return {
-				kind: 'binary',
-				left: operand(value),
-				operator: op,
-				right: { kind: 'function', name: fn, args: [left] },
-			};
 		}
 	}
 

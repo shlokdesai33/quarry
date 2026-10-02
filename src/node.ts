@@ -41,13 +41,14 @@ export type ValueListNode = {
 };
 
 /**
- * A value merged into the SQL text rather than parameterised. Restricted to
- * types that cannot carry an injection, and needed where postgres refuses a
- * parameter (`is null`, `is true`).
+ * A value merged into the SQL text rather than parameterised: where postgres
+ * refuses a parameter (`is null`, `is true`), and for jsonb keys, which an
+ * expression index on `data->>'key'` only matches as written. Strings are
+ * quoted and escaped by `compile`; numbers must be finite.
  */
 export type LiteralNode = {
 	readonly kind: 'literal';
-	readonly value: boolean | number | null;
+	readonly value: boolean | number | string | null;
 };
 
 /**

@@ -16,5 +16,5 @@ export interface AnyColumn {
 	readonly $insert: unknown;
 	readonly $update: unknown;
 	readonly dataType: DataType;
-	readonly name: string | undefined;
+	readonly columnName: string | undefined;
 }

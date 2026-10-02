@@ -4,52 +4,65 @@ import type { DefaultColumn } from '../src/column/default-column.js';
 import type { GeneratedColumn } from '../src/column/generated-column.js';
 import type { IdentityColumn } from '../src/column/identity-column.js';
 import type { IntegerColumn } from '../src/column/integer-column.js';
-import type { NullableColumn } from '../src/column/nullable-column.js';
-import type { ArrayColumn } from '../src/column/array-column.js';
 import type { ArrayType } from '../src/data-type/array.js';
-import type { BooleanType } from '../src/data-type/boolean.js';
-import type { TextType } from '../src/data-type/character.js';
-import type { DataType, OperatorsFor } from '../src/data-type/data-type.js';
-import type { TimestampTzType } from '../src/data-type/datetime.js';
+import type { DataType } from '../src/data-type/data-type.js';
 import type { EnumType } from '../src/data-type/enum.js';
-import type { BigIntType, IntegerType } from '../src/data-type/numeric.js';
+import type { JsonbType } from '../src/data-type/jsonb.js';
+import type { TstzRangeType } from '../src/data-type/range.js';
+import type { VectorType } from '../src/data-type/vector.js';
 import {
+	array,
 	bigint,
 	boolean,
 	integer,
+	jsonb,
+	real,
 	text,
 	timestamptz,
+	tstzrange,
+	uuid,
+	varchar,
+	vector,
 } from '../src/column-factories.js';
 import { defineEnum } from '../src/define-enum.js';
 import { defineTable } from '../src/define-table.js';
 import type { Expression, TypedExpression } from '../src/expression.js';
 import { expressionBuilder } from '../src/expression-builder.js';
+import { selectFrom } from '../src/select-query-builder.js';
 import type {
 	ArrayOperators,
 	ComparableOperators,
+	NumberKind,
+	OperatorsByKind,
+	TextKind,
 	TextOperators,
 } from '../src/operators.js';
+
+type BigIntType = DataType<'bigint'>;
+type BooleanType = DataType<'boolean'>;
+type IntegerType = DataType<'integer'>;
+type TextType = DataType<'text'>;
 
 const status = defineEnum('status', ['active', 'inactive']);
 
 const users = defineTable('users', {
 	columns: {
 		id: integer().identity(),
-		firstName: text('first_name'),
+		firstName: text().name('first_name'),
 		email: text().nullable(),
 		admin: boolean(),
 		age: integer(),
 		score: integer().nullable(),
-		tags: text().array(),
+		tags: array(text()),
 		status: status(),
-		createdAt: timestamptz('created_at'),
+		createdAt: timestamptz().name('created_at'),
 	},
 });
 
 const posts = defineTable('posts', {
 	columns: {
 		id: integer().identity(),
-		authorId: integer('author_id'),
+		authorId: integer().name('author_id'),
 	},
 });
 
@@ -74,7 +87,6 @@ describe('comparison operators', () => {
 		eb('users.age', '=', 1);
 		eb('users.status', '=', 'active');
 		eb('users.status', 'in', ['active', 'inactive']);
-		eb('users.tags', '= any', 'a');
 
 		// @ts-expect-error wrong scalar type
 		eb('users.age', '=', '1');
@@ -84,8 +96,8 @@ describe('comparison operators', () => {
 		eb('users.age', 'in', 1);
 		// @ts-expect-error `between` takes a pair
 		eb('users.age', 'between', [1]);
-		// @ts-expect-error `= any` takes an element, not an array
-		eb('users.tags', '= any', ['a']);
+		// @ts-expect-error not an operator: `any` goes on the right
+		eb('users.tags', '= any', 'a');
 	});
 
 	it('only allows null through `is`', () => {
@@ -154,6 +166,211 @@ describe('comparison operators', () => {
 	});
 });
 
+describe('right-hand operands', () => {
+	const things = defineTable('things', {
+		columns: {
+			name: text(),
+			nickname: varchar(),
+			token: uuid(),
+			age: integer(),
+			minAge: integer(),
+			score: integer().nullable(),
+			ratio: real(),
+			tags: array(text()),
+			aliases: array(text()).nullable(),
+			labels: array(text().nullable()),
+			tokens: array(uuid()),
+			limits: array(integer()),
+			documents: array(jsonb()),
+			settings: jsonb(),
+			active: tstzrange(),
+			createdAt: timestamptz(),
+		},
+	});
+	const tb = expressionBuilder(things);
+
+	it('take expressions as list items and pair bounds', () => {
+		tb('things.age', 'in', [18, tb.ref('things.minAge')]);
+		tb('things.age', 'not in', [tb.ref('things.minAge')]);
+		tb('things.age', 'between', [tb.ref('things.minAge'), 65]);
+
+		// @ts-expect-error a list item is still checked
+		tb('things.age', 'in', [18, tb.ref('things.name')]);
+		// @ts-expect-error a bound is still checked
+		tb('things.age', 'between', [tb.ref('things.token'), 65]);
+	});
+
+	it('accept an expression of a SQL type postgres compares with', () => {
+		tb('things.name', '=', tb.ref('things.nickname'));
+		tb('things.nickname', '<', tb.ref('things.name'));
+		tb('things.age', '<', tb.ref('things.ratio'));
+		tb('things.name', 'like', tb.fn.concat('things.nickname', tb.val('%')));
+
+		// @ts-expect-error text = bigint, although both are strings
+		tb('things.name', '=', tb.fn.count());
+		// @ts-expect-error text = uuid, although both are strings
+		tb('things.name', '=', tb.ref('things.token'));
+		// @ts-expect-error a uuid is not a pattern
+		tb('things.name', 'like', tb.ref('things.token'));
+		// @ts-expect-error nor an item of a list of text
+		tb('things.name', 'in', ['a', tb.ref('things.token')]);
+	});
+
+	it('check array expressions by their element type', () => {
+		tb('things.tags', '&&', tb.ref('things.tags'));
+		tb('things.name', 'in', tb.ref('things.tags'));
+		tb('things.nickname', '=', tb.fn.any('things.tags'));
+
+		// @ts-expect-error text[] @> uuid[]
+		tb('things.tags', '@>', tb.ref('things.tokens'));
+		// @ts-expect-error text in uuid[]
+		tb('things.name', 'in', tb.ref('things.tokens'));
+		// @ts-expect-error a uuid is not an element of text[]
+		tb('things.token', '=', tb.fn.any('things.tags'));
+	});
+
+	it('compare a parameter with the elements of an array', () => {
+		tb(tb.val('a'), '=', tb.fn.any('things.tags'));
+		tb(tb.val('a'), '<>', tb.fn.all(tb.ref('things.aliases')));
+		tb(tb.val('a%'), 'like', tb.fn.any('things.tags'));
+		tb(tb.val(5), '<', tb.fn.all('things.limits'));
+		tb(tb.val({ a: 1 }), '@>', tb.fn.any('things.documents'));
+		tb(tb.val('a'), '=', tb.fn.any(tb.fn.coalesce('things.tags', tb.val([]))));
+
+		// the operator and the parameter's type are not checked against the
+		// elements yet
+		tb(tb.val(1), 'like', tb.fn.any('things.tags'));
+
+		// @ts-expect-error a plain value would read as a reference
+		tb('a', '=', tb.fn.any('things.tags'));
+		// @ts-expect-error a parameter needs `any` or `all` on the right
+		tb(tb.val('a'), '=', 'a');
+		// @ts-expect-error `in` takes a list, not `any` / `all`
+		tb(tb.val('a'), 'in', tb.fn.any('things.tags'));
+		// @ts-expect-error nor does an operator whose operand is an array
+		tb(tb.val('a'), '?|', tb.fn.any('things.tags'));
+	});
+
+	it('are nullable when the parameter, the array or an element is', () => {
+		expectTypeOf(
+			tb(tb.val('a'), '=', tb.fn.any('things.tags')).$type,
+		).toEqualTypeOf<boolean>();
+		expectTypeOf(
+			tb(tb.val('a'), '=', tb.fn.any('things.aliases')).$type,
+		).toEqualTypeOf<boolean | null>();
+		expectTypeOf(
+			tb(tb.val('a'), '=', tb.fn.any('things.labels')).$type,
+		).toEqualTypeOf<boolean | null>();
+		expectTypeOf(
+			tb(tb.val(null), '=', tb.fn.any('things.tags')).$type,
+		).toEqualTypeOf<boolean | null>();
+	});
+
+	it('take a parameter on the left in where clauses too', () => {
+		selectFrom(things).where(tb.val('a'), '=', tb.fn.any('things.tags'));
+		selectFrom(things).where((q) =>
+			q.where(q.val('a'), '<>', q.fn.all('things.tags')),
+		);
+		// @ts-expect-error a parameter needs `any` or `all` on the right
+		selectFrom(things).where(tb.val('a'), '=', 'a');
+	});
+
+	it('take the operand type of operators on other types', () => {
+		tb('things.active', '@>', tb.ref('things.createdAt'));
+	});
+
+	it('leave jsonb key and path tests to `eb.json`', () => {
+		tb('things.settings', '@>', { theme: 'dark' });
+		tb('things.settings', '<@', ['a']);
+
+		// @ts-expect-error `eb.json.hasKey`
+		tb('things.settings', '?', 'theme');
+		// @ts-expect-error `eb.json.hasAnyKey`
+		tb('things.settings', '?|', ['a']);
+		// @ts-expect-error `eb.json.pathExists`
+		tb('things.settings', '@?', '$.theme');
+		// @ts-expect-error null is SQL null, never contained
+		tb('things.settings', '@>', null);
+	});
+
+	it('take parameters wherever they take a value', () => {
+		tb('things.age', '=', tb.val(1));
+		tb('things.age', 'in', tb.val([1, 2]));
+		tb('things.age', 'in', [1, tb.val(2)]);
+		tb('things.age', 'between', [tb.val(1), 2]);
+
+		// @ts-expect-error a parameter of the wrong type
+		tb('things.age', '=', tb.val('1'));
+	});
+
+	it('take `any` / `all` wherever an operator takes one operand', () => {
+		tb('things.name', 'like', tb.fn.any(['a%', 'b%']));
+		tb('things.name', 'not ilike', tb.fn.all(['a%']));
+		tb('things.name', '=', tb.fn.any('things.tags'));
+		tb('things.name', '=', tb.fn.any(tb.ref('things.aliases')));
+		tb('things.age', '>', tb.fn.any(tb.val([1, 2])));
+		tb('things.age', '<=', tb.fn.all('things.limits'));
+		tb('things.settings', '@>', tb.fn.any([{ theme: 'dark' }]));
+		tb('things.active', '@>', tb.fn.any([new Date()]));
+		eb('users.status', '=', eb.fn.any(['active', 'inactive']));
+
+		// @ts-expect-error the elements are checked against the operand type
+		tb('things.age', '>', tb.fn.any(['1']));
+		// @ts-expect-error nor an element of a list of text
+		tb('things.name', '=', tb.fn.any('things.tokens'));
+		// @ts-expect-error not a member of the enum
+		eb('users.status', '=', eb.fn.any(['deleted']));
+		// @ts-expect-error a value is not null
+		tb('things.name', '=', tb.fn.any(['a', null]));
+		// @ts-expect-error `any` takes an array
+		tb('things.name', '=', tb.fn.any('things.name'));
+	});
+
+	it('take `any` / `all` only where postgres does', () => {
+		// @ts-expect-error not an operator
+		tb('things.name', 'is distinct from', tb.fn.any(['a']));
+		// @ts-expect-error `in` takes a list
+		tb('things.name', 'in', tb.fn.any(['a']));
+		// @ts-expect-error `between` takes a pair
+		tb('things.age', 'between', [tb.fn.any([1]), 2]);
+		// @ts-expect-error the operand is an array, and arrays hold no arrays
+		tb('things.tags', '@>', tb.fn.any([['a']]));
+		// @ts-expect-error nor for equality
+		tb('things.tags', '=', tb.fn.any([['a']]));
+		// @ts-expect-error nor for containment of jsonb arrays held in arrays
+		tb('things.documents', '@>', tb.fn.any([[{ a: 1 }]]));
+		// @ts-expect-error not an expression
+		tb.fn.lower(tb.fn.any(['a']));
+		// @ts-expect-error nor a predicate
+		tb.and([tb.fn.any([true])]);
+	});
+
+	it('are nullable when the array given to `any` / `all` or an element is', () => {
+		expectTypeOf(
+			tb('things.name', '=', tb.fn.any(['a'])).$type,
+		).toEqualTypeOf<boolean>();
+		expectTypeOf(
+			tb('things.name', '=', tb.fn.any('things.tags')).$type,
+		).toEqualTypeOf<boolean>();
+		expectTypeOf(
+			tb('things.name', '=', tb.fn.any('things.aliases')).$type,
+		).toEqualTypeOf<boolean | null>();
+		expectTypeOf(
+			tb('things.name', '=', tb.fn.all('things.labels')).$type,
+		).toEqualTypeOf<boolean | null>();
+	});
+
+	it('are nullable when an item of a list or pair is', () => {
+		expectTypeOf(tb('things.age', 'in', [1, 2]).$type).toEqualTypeOf<boolean>();
+		expectTypeOf(
+			tb('things.age', 'in', [1, tb.ref('things.score')]).$type,
+		).toEqualTypeOf<boolean | null>();
+		expectTypeOf(
+			tb('things.age', 'between', [tb.ref('things.score'), 2]).$type,
+		).toEqualTypeOf<boolean | null>();
+	});
+});
+
 describe('expressions on the left', () => {
 	const lower = eb.fn.lower('users.firstName');
 
@@ -186,6 +403,110 @@ describe('expressions on the left', () => {
 	it('reject expressions of unknown SQL type', () => {
 		// @ts-expect-error a parameter has no SQL type
 		eb(eb.val(1), '=', 1);
+	});
+});
+
+describe('jsonb functions', () => {
+	type Profile = {
+		address: { city: string; zip?: string };
+		tags: string[];
+	};
+	const docs = defineTable('docs', {
+		columns: {
+			name: text(),
+			token: uuid(),
+			keys: array(text()),
+			profile: jsonb<Profile>(),
+			extra: jsonb<Profile>().nullable(),
+			data: jsonb(),
+		},
+	});
+	const db = expressionBuilder(docs);
+
+	it('type a field or path from the column', () => {
+		expectTypeOf(db.json.get('docs.profile', 'address').$type).toEqualTypeOf<{
+			city: string;
+			zip?: string;
+		} | null>();
+		expectTypeOf(
+			db.json.get('docs.profile', 'address', 'zip').$type,
+		).toEqualTypeOf<string | null>();
+		expectTypeOf(db.json.get('docs.profile', 'tags', 0).$type).toEqualTypeOf<
+			string | null
+		>();
+		expectTypeOf(
+			db.json.text('docs.profile', 'address', 'city').$type,
+		).toEqualTypeOf<string | null>();
+		expectTypeOf(
+			db.json.get('docs.profile', 'tags').dataType,
+		).toEqualTypeOf<JsonbType>();
+		expectTypeOf(db.json.text('docs.profile', 'tags').dataType).toEqualTypeOf<
+			DataType<'text'>
+		>();
+	});
+
+	it('check each key against the value it indexes', () => {
+		// @ts-expect-error not a key of the profile
+		db.json.get('docs.profile', 'nope');
+		// @ts-expect-error nor of the address
+		db.json.text('docs.profile', 'address', 'street');
+		// @ts-expect-error an array takes an index
+		db.json.get('docs.profile', 'tags', 'first');
+		// @ts-expect-error a path has at least one key
+		db.json.get('docs.profile');
+		// @ts-expect-error only jsonb has fields
+		db.json.get('docs.name', 'a');
+	});
+
+	it('take any path into an untyped column', () => {
+		db.json.get('docs.data', 'a', 0, 'b');
+		db.json.text('docs.data', 'a');
+	});
+
+	it('compare a field by its SQL type', () => {
+		db(db.json.text('docs.profile', 'address', 'city'), 'ilike', 'os%');
+		db(db.json.get('docs.profile', 'address'), '@>', { city: 'Oslo' });
+		db(db.fn.cast(db.json.text('docs.data', 'age'), 'integer'), '>', 18);
+		db(db.json.length(db.json.get('docs.profile', 'tags')), '>', 2);
+
+		// @ts-expect-error text has no containment
+		db(db.json.text('docs.profile', 'address'), '@>', 'a');
+	});
+
+	it('test keys and jsonpaths as predicates', () => {
+		db.json.hasKey('docs.profile', 'tags');
+		db.json.hasKey('docs.profile', db.ref('docs.name'));
+		db.json.hasAnyKey('docs.profile', ['tags', 'address']);
+		db.json.hasAllKeys('docs.profile', db.ref('docs.keys'));
+		db.json.pathExists('docs.data', '$.tags[*]');
+		db.json.pathMatches('docs.data', db.val('$.n > 1'));
+		selectFrom(docs).where(db.json.hasKey('docs.profile', 'tags'));
+		selectFrom(docs).where((q) => q.where(q.json.hasKey('docs.data', 'a')));
+
+		// @ts-expect-error a key is text, not a uuid
+		db.json.hasKey('docs.profile', db.ref('docs.token'));
+		// @ts-expect-error a key list is text[]
+		db.json.hasAnyKey('docs.profile', 'tags');
+		// @ts-expect-error a jsonpath is a string
+		db.json.pathExists('docs.data', 1);
+	});
+
+	it('are nullable when the column, a key or the result can be', () => {
+		expectTypeOf(
+			db.json.hasKey('docs.profile', 'tags').$type,
+		).toEqualTypeOf<boolean>();
+		expectTypeOf(db.json.hasKey('docs.extra', 'tags').$type).toEqualTypeOf<
+			boolean | null
+		>();
+		expectTypeOf(
+			db.json.pathMatches('docs.data', '$.n > 1').$type,
+		).toEqualTypeOf<boolean | null>();
+		expectTypeOf(db.json.typeOf('docs.profile').$type).toEqualTypeOf<
+			'object' | 'array' | 'string' | 'number' | 'boolean' | 'null'
+		>();
+		expectTypeOf(db.json.length('docs.extra').$type).toEqualTypeOf<
+			number | null
+		>();
 	});
 });
 
@@ -387,29 +708,53 @@ describe('expression typing', () => {
 describe('columns and data types', () => {
 	it('keep the SQL type through nullability and narrowing', () => {
 		expectTypeOf(text().nullable()).toEqualTypeOf<
-			NullableColumn<TextType, string | null, string | null, string | null>
+			Column<TextType, string | null, string | null, string | null>
 		>();
 		expectTypeOf(text().as<'a' | 'b', 'a', never>()).toEqualTypeOf<
 			Column<TextType, 'a' | 'b', 'a', never>
 		>();
 	});
 
-	it('record the native representation of each SQL type', () => {
-		expectTypeOf<IntegerType['$native']>().toEqualTypeOf<number>();
-		expectTypeOf<BigIntType['$native']>().toEqualTypeOf<string>();
-		expectTypeOf<ArrayType<BigIntType>['$native']>().toEqualTypeOf<string[]>();
+	it('agree on how each SQL type is represented, wherever it is created', () => {
 		expectTypeOf(bigint()).toEqualTypeOf<IntegerColumn<BigIntType, string>>();
+		expectTypeOf(eb.fn.count().$type).toEqualTypeOf<string>();
+		expectTypeOf(
+			eb.fn.cast('users.age', 'bigint').$type,
+		).toEqualTypeOf<string>();
+
+		expectTypeOf(integer().$select).toEqualTypeOf<number>();
+		expectTypeOf(eb.fn.length('users.firstName').$type).toEqualTypeOf<number>();
+		expectTypeOf(
+			eb.fn.cast('users.firstName', 'integer').$type,
+		).toEqualTypeOf<number>();
+
+		expectTypeOf(text().$select).toEqualTypeOf<string>();
+		expectTypeOf(eb.fn.lower('users.firstName').$type).toEqualTypeOf<string>();
+		expectTypeOf(eb.fn.cast('users.age', 'text').$type).toEqualTypeOf<string>();
+
+		expectTypeOf(timestamptz().$select).toEqualTypeOf<Date>();
+		expectTypeOf(eb.fn.now().$type).toEqualTypeOf<Date>();
+		expectTypeOf(
+			eb.fn.cast('users.age', 'timestamptz').$type,
+		).toEqualTypeOf<Date>();
+
+		expectTypeOf(boolean().$select).toEqualTypeOf<boolean>();
+		expectTypeOf(eb('users.age', '=', 1).$type).toEqualTypeOf<boolean>();
+		expectTypeOf(
+			eb.fn.cast('users.age', 'boolean').$type,
+		).toEqualTypeOf<boolean>();
+
 		// @ts-expect-error a bigint column's values are strings
 		bigint<1n>();
 	});
 
 	it('derive operators from the SQL type at the value type', () => {
-		expectTypeOf<OperatorsFor<TextType, 'a' | 'b'>>().toEqualTypeOf<
-			TextOperators<'a' | 'b'>
+		expectTypeOf<OperatorsByKind<'a' | 'b', TextType>['text']>().toEqualTypeOf<
+			TextOperators<'a' | 'b', DataType<TextKind>>
 		>();
-		expectTypeOf<OperatorsFor<IntegerType, number>>().toEqualTypeOf<
-			ComparableOperators<number>
-		>();
+		expectTypeOf<
+			OperatorsByKind<number, IntegerType>['integer']
+		>().toEqualTypeOf<ComparableOperators<number, DataType<NumberKind>>>();
 	});
 
 	it('only allow integer identities', () => {
@@ -439,7 +784,7 @@ describe('columns and data types', () => {
 
 		// repeating a modifier is a no-op
 		expectTypeOf(text().nullable().nullable()).toEqualTypeOf<
-			NullableColumn<TextType, string | null, string | null, string | null>
+			Column<TextType, string | null, string | null, string | null>
 		>();
 		expectTypeOf(
 			text().default().nullable().default(),
@@ -462,7 +807,7 @@ describe('columns and data types', () => {
 			IdentityColumn<IntegerType, UserId, never, never>
 		>();
 		expectTypeOf(bigint().nullable()).toEqualTypeOf<
-			NullableColumn<BigIntType, string | null, string | null, string | null>
+			Column<BigIntType, string | null, string | null, string | null>
 		>();
 
 		// @ts-expect-error an identity is never null
@@ -477,6 +822,35 @@ describe('columns and data types', () => {
 		integer().identity().as<number>().default();
 	});
 
+	it('keep the state when named', () => {
+		expectTypeOf(text().name('a')).toEqualTypeOf<Column<TextType, string>>();
+		expectTypeOf(integer().name('a')).toEqualTypeOf<
+			IntegerColumn<IntegerType, number>
+		>();
+		expectTypeOf(text().nullable().name('a')).toEqualTypeOf<
+			Column<TextType, string | null, string | null, string | null>
+		>();
+		expectTypeOf(text().default().name('a')).toEqualTypeOf<
+			DefaultColumn<TextType, string, string | undefined, string>
+		>();
+		expectTypeOf(text().generated().name('a')).toEqualTypeOf<
+			GeneratedColumn<TextType, string, never, never>
+		>();
+		expectTypeOf(integer().name('a').identity()).toEqualTypeOf<
+			IdentityColumn<IntegerType, number, never, never>
+		>();
+		expectTypeOf(integer().identity().name('a')).toEqualTypeOf<
+			IdentityColumn<IntegerType, number, never, never>
+		>();
+		expectTypeOf(array(text()).name('a')).toEqualTypeOf<
+			Column<ArrayType<TextType>, string[]>
+		>();
+		// @ts-expect-error a default and a generated value exclude each other
+		text().generated().name('a').default();
+		// @ts-expect-error nothing applies after identity
+		integer().identity().name('a').nullable();
+	});
+
 	it('keep a default optional on insert when narrowed', () => {
 		type Email = string & { readonly brand: 'email' };
 		expectTypeOf(
@@ -484,24 +858,30 @@ describe('columns and data types', () => {
 		).toEqualTypeOf<Email | undefined>();
 	});
 
-	it('take any types with as(), in every state', () => {
-		expectTypeOf(text().as<number, number, number>()).toEqualTypeOf<
-			Column<TextType, number, number, number>
-		>();
-		expectTypeOf(integer().as<string, string, string>()).toEqualTypeOf<
-			IntegerColumn<IntegerType, string, string, string>
-		>();
-		expectTypeOf(timestamptz().as<Date, string, never>()).toEqualTypeOf<
-			Column<TimestampTzType, Date, string, never>
-		>();
+	it('only narrow with as(), in every state', () => {
+		type UserId = number & { readonly brand: 'user' };
 		expectTypeOf(
-			text()
-				.array()
-				.as<(string | null)[], (string | null)[], (string | null)[]>().$select,
-		).toEqualTypeOf<(string | null)[]>();
-		expectTypeOf(integer().identity().as<string>()).toEqualTypeOf<
-			IdentityColumn<IntegerType, string, never, never>
+			text().nullable().as<string | null, string | null, string>(),
+		).toEqualTypeOf<Column<TextType, string | null, string | null, string>>();
+		expectTypeOf(
+			text().default().as<'a', 'a', 'a'>().$insert,
+		).toEqualTypeOf<'a'>();
+		expectTypeOf(integer().identity().as<UserId>()).toEqualTypeOf<
+			IdentityColumn<IntegerType, UserId, never, never>
 		>();
+
+		// @ts-expect-error the select type can't change the SQL type's values
+		text().as<number, number, number>();
+		// @ts-expect-error nor in any state
+		integer().identity().as<string>();
+		// @ts-expect-error nor widen them
+		array(text()).as<readonly string[], string[], string[]>();
+		// @ts-expect-error a write must be a value of the column
+		timestamptz().as<Date, string, never>();
+		// @ts-expect-error and selectable once written
+		text().as<'a', string, string>();
+		// @ts-expect-error a column without a default can't be omitted
+		text().as<string, string | undefined, string>();
 		// @ts-expect-error a generated column takes only a select type
 		text().generated().as<string, string, never>();
 		// @ts-expect-error an identity takes only a select type
@@ -511,50 +891,59 @@ describe('columns and data types', () => {
 		>();
 	});
 
-	it('type arrays by their element', () => {
-		expectTypeOf(text().array()).toEqualTypeOf<
-			ArrayColumn<ArrayType<TextType>, string[]>
-		>();
-		expectTypeOf(text().array().nullable().$select).toEqualTypeOf<
-			string[] | null
-		>();
-		expectTypeOf(status().array().$select).toEqualTypeOf<
-			('active' | 'inactive')[]
-		>();
-		expectTypeOf(integer<1 | 2>().array().$select).toEqualTypeOf<(1 | 2)[]>();
-		expectTypeOf<OperatorsFor<ArrayType<TextType>, string[]>>().toEqualTypeOf<
-			ArrayOperators<string[]>
-		>();
+	it('give the types that encode values their own class', () => {
+		expectTypeOf(jsonb().dataType).toEqualTypeOf<JsonbType>();
+		expectTypeOf(tstzrange().dataType).toEqualTypeOf<TstzRangeType>();
+		expectTypeOf(vector().dataType).toEqualTypeOf<VectorType>();
+		// a plain jsonb data type would skip the JSON encoding
+		expectTypeOf<DataType<'jsonb'>>().not.toExtend<JsonbType>();
+		expectTypeOf<JsonbType>().toExtend<DataType<'jsonb'>>();
 	});
 
-	it('only offer array() where the column can still be an element', () => {
-		// @ts-expect-error postgres has no arrays of arrays
-		text().array().array();
-		expectTypeOf(text().array().nullable()).toEqualTypeOf<
-			ArrayColumn<
-				ArrayType<TextType>,
-				string[] | null,
-				string[] | null,
-				string[] | null
-			>
+	it('type arrays by their element', () => {
+		expectTypeOf(array(text())).toEqualTypeOf<
+			Column<ArrayType<TextType>, string[]>
 		>();
-		// @ts-expect-error nor after making the array nullable
-		text().array().nullable().array();
-		// @ts-expect-error elements are never nullable
-		text().nullable().array();
-		// @ts-expect-error nor after narrowing the nullable column
-		text().nullable().as<'a' | null, 'a' | null, 'a' | null>().array();
-		// @ts-expect-error a default belongs to the array column, after array()
-		text().default().array();
-		// @ts-expect-error a generated value belongs to the array column
-		text().generated().array();
-		// @ts-expect-error an identity is not an element
-		integer().identity().array();
-		// @ts-expect-error identity() is not offered on an array
-		integer().array().identity();
+		expectTypeOf(array(text()).nullable().$select).toEqualTypeOf<
+			string[] | null
+		>();
+		expectTypeOf(array(status()).$select).toEqualTypeOf<
+			('active' | 'inactive')[]
+		>();
+		expectTypeOf(array(integer<1 | 2>()).$select).toEqualTypeOf<(1 | 2)[]>();
+		expectTypeOf<
+			OperatorsByKind<string[], ArrayType<TextType>>['array']
+		>().toEqualTypeOf<ArrayOperators<string[], DataType<TextKind>>>();
+	});
 
-		text().array().default();
-		text().array().nullable().generated();
+	it('type elements as nullable only when the element column is', () => {
+		expectTypeOf(array(text().nullable())).toEqualTypeOf<
+			Column<ArrayType<TextType>, (string | null)[]>
+		>();
+		expectTypeOf(array(text().nullable()).nullable().$select).toEqualTypeOf<
+			(string | null)[] | null
+		>();
+		expectTypeOf(
+			array(text().nullable().as<'a' | null, 'a' | null, 'a' | null>()).$select,
+		).toEqualTypeOf<('a' | null)[]>();
+	});
+
+	it('only take a fresh or nullable column as the element', () => {
+		// @ts-expect-error postgres has no arrays of arrays
+		array(array(text()));
+		// @ts-expect-error nor of nullable arrays
+		array(array(text()).nullable());
+		// @ts-expect-error a default belongs to the array column
+		array(text().default());
+		// @ts-expect-error a generated value belongs to the array column
+		array(text().generated());
+		// @ts-expect-error an identity is not an element
+		array(integer().identity());
+		// @ts-expect-error identity() is not offered on an array
+		array(integer()).identity();
+
+		array(text()).default();
+		array(text()).nullable().generated();
 	});
 });
 

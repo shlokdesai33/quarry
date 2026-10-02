@@ -22,10 +22,9 @@ export function defineEnum<const T extends string>(
 	enumName: string,
 	values: readonly T[],
 ) {
-	return function $defineEnum<X extends T>(columnName?: string) {
+	return function $defineEnum<X extends T>() {
 		return new Column<EnumType, X>({
 			dataType: new EnumType(enumName, values),
-			name: columnName,
 		});
 	};
 }

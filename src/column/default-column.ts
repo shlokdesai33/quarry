@@ -17,7 +17,7 @@ export class DefaultColumn<D extends DataType, S, I, U>
 	nullable() {
 		return new DefaultColumn<D, S | null, I | null, U | null>({
 			dataType: this.dataType,
-			name: this.name,
+			columnName: this.columnName,
 		});
 	}
 
@@ -30,14 +30,21 @@ export class DefaultColumn<D extends DataType, S, I, U>
 	default() {
 		return new DefaultColumn<D, S, I | undefined, U>({
 			dataType: this.dataType,
-			name: this.name,
+			columnName: this.columnName,
 		});
 	}
 
-	override as<X, Y, Z>() {
+	override name(columnName: string) {
+		return new DefaultColumn<D, S, I, U>({
+			dataType: this.dataType,
+			columnName,
+		});
+	}
+
+	override as<X extends S, Y extends I & (X | undefined), Z extends U & X>() {
 		return new DefaultColumn<D, X, Y, Z>({
 			dataType: this.dataType,
-			name: this.name,
+			columnName: this.columnName,
 		});
 	}
 }

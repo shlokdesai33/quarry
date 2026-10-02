@@ -17,6 +17,8 @@
 		"./package.json": "./package.json"
 	},
 	"scripts": {
+		"bench:lsp": "node bench/types/lsp.ts",
+		"bench:types": "node bench/types/run.ts",
 		"build": "tsdown && tsc -p tsconfig.build.json --emitDeclarationOnly",
 		"check:attw": "pnpm dlx @arethetypeswrong/cli quarry-*.tgz",
 		"check:format": "oxfmt --check .",

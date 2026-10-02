@@ -1,4 +1,3 @@
-import type { ArrayOperators } from '../operators.js';
 import { DataType } from './data-type.js';
 
 /**
@@ -9,11 +8,7 @@ import { DataType } from './data-type.js';
  * `integer[]`, with the dimensions as metadata on the value. So `E` is never
  * itself an array type; `array()` enforces it.
  */
-export class ArrayType<E extends DataType = DataType> extends DataType {
-	declare readonly $kind: 'array';
-	declare readonly $native: E['$native'][];
-	declare readonly $operators: ArrayOperators<this['$value']>;
-
+export class ArrayType<E extends DataType> extends DataType<'array'> {
 	/**
 	 * The type of the elements.
 	 */
@@ -25,38 +20,13 @@ export class ArrayType<E extends DataType = DataType> extends DataType {
 	 * @param element the type of the elements.
 	 */
 	constructor(element: E) {
-		super();
+		super('array');
 		this.element = element;
 	}
 
-	/**
-	 * Encodes a value as a SQL array.
-	 *
-	 * @param value the value to encode.
-	 * @returns the encoded value.
-	 */
-	override encode(value: unknown) {
+	override serialize(value: unknown) {
 		return Array.isArray(value)
-			? value.map((item: unknown) => this.element.encode(item))
+			? value.map((item: unknown) => this.element.serialize(item))
 			: value;
-	}
-
-	/**
-	 * Encodes an operand as a SQL array. For `= any` and `<> all` the operand
-	 * is a single element, so it's encoded by the element type instead.
-	 *
-	 * @param operator the operator to encode.
-	 * @param value the value to encode.
-	 * @returns the encoded value.
-	 */
-	override encodeOperand(operator: string, value: unknown) {
-		switch (operator) {
-			case '= any':
-				return this.element.encodeOperand('=', value);
-			case '<> all':
-				return this.element.encodeOperand('<>', value);
-			default:
-				return this.encode(value);
-		}
 	}
 }

@@ -37,6 +37,18 @@
 				"typescript/no-explicit-any": "off",
 				"typescript/no-unnecessary-type-assertion": "off"
 			}
+		},
+		{
+			// benchmark scripts: they report to the console, run their steps in
+			// order, and parse untyped compiler output. No tsconfig includes them,
+			// so the strictness their assertions answer to is not visible here.
+			"files": ["bench/**"],
+			"rules": {
+				"eslint/no-console": "off",
+				"eslint/no-await-in-loop": "off",
+				"typescript/no-unsafe-type-assertion": "off",
+				"typescript/no-unnecessary-type-assertion": "off"
+			}
 		}
 	],
 	"ignorePatterns": ["dist"]

@@ -104,6 +104,74 @@ export class TypedExpression<T, D extends DataType> extends Expression<T> {
 }
 
 /**
+ * A parameter: a value sent alongside the query, whose SQL type postgres
+ * infers from where it is used, as `eb.val` creates. On the right-hand side
+ * of a comparison it is encoded by the other side's SQL type, exactly like a
+ * plain value; elsewhere it is sent as is.
+ *
+ * It has no SQL type of its own, so it is never a `TypedExpression`, and an
+ * operand that takes a parameter does not thereby take an expression of any
+ * SQL type.
+ */
+export class Param<T> extends Expression<T> {
+	/** The value sent to the driver. */
+	readonly value: T;
+
+	constructor(value: T) {
+		super({ kind: 'value', value });
+		this.value = value;
+	}
+}
+
+/**
+ * `any(array)` or `all(array)`, as `eb.fn.any` and `eb.fn.all` create: on
+ * the right of a comparison, it holds if the comparison holds for some, or
+ * for every, element. `S` is the type of the elements, `D` their SQL type
+ * (`never` for values, whose SQL type postgres infers), and `N` is `null`
+ * when the array or an element can be.
+ *
+ * Not an expression: postgres only allows it as the right-hand operand of an
+ * operator, so nothing else accepts it. When the array has a SQL type, a
+ * parameter can be the left-hand side, as in `eb(eb.val('a'), '=',
+ * eb.fn.any('users.tags'))`, and is encoded by the element type.
+ */
+export class Quantified<S, D extends DataType, N extends null = never> {
+	/** Phantom: the type of the elements. */
+	declare readonly $element: S;
+
+	/** Phantom: the SQL type of the elements. */
+	declare readonly $dataType: D;
+
+	/** Phantom: `null` when the array or an element can be. */
+	declare readonly $null: N;
+
+	/** Whether some or every element must satisfy the comparison. */
+	readonly quantifier: 'any' | 'all';
+
+	/**
+	 * The array: values or a parameter, which the comparison encodes item by
+	 * item, or an expression.
+	 */
+	readonly array: readonly unknown[] | Expression<unknown>;
+
+	/**
+	 * The SQL type of the elements, when the array is an expression of an
+	 * array type; `undefined` for values and parameters.
+	 */
+	readonly element: DataType | undefined;
+
+	constructor(
+		quantifier: 'any' | 'all',
+		array: readonly unknown[] | Expression<unknown>,
+		element: DataType | undefined,
+	) {
+		this.quantifier = quantifier;
+		this.array = array;
+		this.element = element;
+	}
+}
+
+/**
  * An expression paired with a name, for the positions that take one: select
  * list entries and derived tables. `A` becomes the key in the result row and
  * `T` its type.

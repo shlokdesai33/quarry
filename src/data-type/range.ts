@@ -1,29 +1,37 @@
-import type { RangeOperators } from '../operators.js';
-import { isRange, type Range, serializeRange } from '../range.js';
+import { isRange, serializeRange } from '../range.js';
 import { DataType } from './data-type.js';
 
-export class DateRangeType extends DataType {
-	declare readonly $kind: 'daterange';
-	declare readonly $native: Range<string>;
-	declare readonly $operators: RangeOperators<this['$value']>;
+/**
+ * `daterange`: a range becomes its literal. Bounds and points are date
+ * strings, already in postgres input syntax, so a single date (for `@>`) and
+ * `null` are sent as they are.
+ */
+export class DateRangeType extends DataType<'daterange'> {
+	constructor() {
+		super('daterange');
+	}
 
-	// a range becomes its literal; a single date (for `@>`) passes through.
-	override encode(value: unknown) {
+	override serialize(value: unknown) {
 		return isRange(value) ? serializeRange(value, String) : value;
 	}
 }
 
-export class TstzRangeType extends DataType {
-	declare readonly $kind: 'tstzrange';
-	declare readonly $native: Range<Date>;
-	declare readonly $operators: RangeOperators<this['$value']>;
+/** A timestamp bound or point in postgres input syntax. */
+function timestamp(value: unknown): string {
+	return value instanceof Date ? value.toISOString() : String(value);
+}
 
-	// a range becomes its literal; a single timestamp (for `@>`) passes through.
-	override encode(value: unknown) {
-		return isRange(value)
-			? serializeRange(value, (bound) =>
-					bound instanceof Date ? bound.toISOString() : String(bound),
-				)
-			: value;
+/**
+ * `tstzrange`: a range becomes its literal, and a single timestamp (for `@>`)
+ * its text. Bounds and points are `Date`s.
+ */
+export class TstzRangeType extends DataType<'tstzrange'> {
+	constructor() {
+		super('tstzrange');
+	}
+
+	override serialize(value: unknown) {
+		if (value === null) return value;
+		return isRange(value) ? serializeRange(value, timestamp) : timestamp(value);
 	}
 }
