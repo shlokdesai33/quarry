@@ -18,12 +18,12 @@ import { EnumType } from './data-type/enum.js';
  *   columns: { status: status<'suspended' | 'deleted'>() },
  * });
  */
-export function defineEnum<const T extends string>(
-	enumName: string,
+export function defineEnum<const N extends string, const T extends string>(
+	enumName: N,
 	values: readonly T[],
 ) {
 	return function $defineEnum<X extends T>() {
-		return new Column<EnumType, X>({
+		return new Column<EnumType<N>, X>({
 			dataType: new EnumType(enumName, values),
 		});
 	};

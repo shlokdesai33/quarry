@@ -48,48 +48,50 @@ const posts = defineTable('posts', {
 const eb = expressionBuilder(users);
 
 const compiled = (expression: Expression<unknown>) =>
-	compile(expression.toNode());
+	compile(expression._quarry.node);
 
 describe('comparisons', () => {
 	it('parameterises the value and maps the column name', () => {
-		expect(compiled(eb('users.firstName', '=', 'Ada'))).toEqual({
+		expect(compiled(eb.ref('users.firstName').eq('Ada'))).toEqual({
 			sql: '"users"."first_name" = $1',
 			params: ['Ada'],
 		});
 	});
 
 	it('keeps the key when the column has no explicit name', () => {
-		expect(compiled(eb('users.age', '>=', 18))).toEqual({
+		expect(compiled(eb.ref('users.age').gte(18))).toEqual({
 			sql: '"users"."age" >= $1',
 			params: [18],
 		});
 	});
 
 	it('accepts a reference on the right', () => {
-		expect(compiled(eb('users.age', '<', eb.ref('users.id')))).toEqual({
+		expect(compiled(eb.ref('users.age').lt(eb.ref('users.id')))).toEqual({
 			sql: '"users"."age" < "users"."id"',
 			params: [],
 		});
 	});
 
 	it('renders `is null` as a literal', () => {
-		expect(compiled(eb('users.email', 'is', null))).toEqual({
+		expect(compiled(eb.ref('users.email').isNull())).toEqual({
 			sql: '"users"."email" is null',
 			params: [],
 		});
-		expect(compiled(eb('users.admin', 'is not', true))).toEqual({
+		expect(compiled(eb.ref('users.admin').isNotTrue())).toEqual({
 			sql: '"users"."admin" is not true',
 			params: [],
 		});
 	});
 
 	it('parenthesises a comparison on the right', () => {
-		expect(compiled(eb('users.admin', '=', eb('users.age', '>', 18)))).toEqual({
+		expect(
+			compiled(eb.ref('users.admin').eq(eb.ref('users.age').gt(18))),
+		).toEqual({
 			sql: '"users"."admin" = ("users"."age" > $1)',
 			params: [18],
 		});
 		expect(
-			compiled(eb('users.admin', '=', eb.and([eb('users.age', '>', 18)]))),
+			compiled(eb.ref('users.admin').eq(eb.and([eb.ref('users.age').gt(18)]))),
 		).toEqual({
 			sql: '"users"."admin" = ("users"."age" > $1)',
 			params: [18],
@@ -97,54 +99,54 @@ describe('comparisons', () => {
 	});
 
 	it('renders `in` as a parenthesised list', () => {
-		expect(compiled(eb('users.age', 'in', [1, 2, 3]))).toEqual({
+		expect(compiled(eb.ref('users.age').in([1, 2, 3]))).toEqual({
 			sql: '"users"."age" in ($1, $2, $3)',
 			params: [1, 2, 3],
 		});
 	});
 
 	it('renders `in` against an array expression as `= any` / `<> all`', () => {
-		expect(compiled(eb('users.age', 'in', eb.val([1, 2])))).toEqual({
+		expect(compiled(eb.ref('users.age').in(eb.val([1, 2])))).toEqual({
 			sql: '"users"."age" = any($1)',
 			params: [[1, 2]],
 		});
-		expect(compiled(eb('users.age', 'not in', eb.val([1, 2])))).toEqual({
+		expect(compiled(eb.ref('users.age').notIn(eb.val([1, 2])))).toEqual({
 			sql: '"users"."age" <> all($1)',
 			params: [[1, 2]],
 		});
-		expect(compiled(eb('users.firstName', 'in', eb.ref('users.tags')))).toEqual(
-			{
-				sql: '"users"."first_name" = any("users"."tags")',
-				params: [],
-			},
-		);
+		expect(
+			compiled(eb.ref('users.firstName').in(eb.ref('users.tags'))),
+		).toEqual({
+			sql: '"users"."first_name" = any("users"."tags")',
+			params: [],
+		});
 	});
 
 	it('collapses an empty `in` list', () => {
-		expect(compiled(eb('users.age', 'in', []))).toEqual({
+		expect(compiled(eb.ref('users.age').in([]))).toEqual({
 			sql: 'false',
 			params: [],
 		});
-		expect(compiled(eb('users.age', 'not in', []))).toEqual({
+		expect(compiled(eb.ref('users.age').notIn([]))).toEqual({
 			sql: 'true',
 			params: [],
 		});
 	});
 
 	it('renders `between`', () => {
-		expect(compiled(eb('users.age', 'not between', [18, 65]))).toEqual({
+		expect(compiled(eb.ref('users.age').notBetween([18, 65]))).toEqual({
 			sql: '"users"."age" not between $1 and $2',
 			params: [18, 65],
 		});
 	});
 
 	it('takes expressions as items of a list and bounds of a pair', () => {
-		expect(compiled(eb('users.age', 'in', [18, eb.ref('users.id')]))).toEqual({
+		expect(compiled(eb.ref('users.age').in([18, eb.ref('users.id')]))).toEqual({
 			sql: '"users"."age" in ($1, "users"."id")',
 			params: [18],
 		});
 		expect(
-			compiled(eb('users.age', 'between', [eb.ref('users.id'), 65])),
+			compiled(eb.ref('users.age').between([eb.ref('users.id'), 65])),
 		).toEqual({
 			sql: '"users"."age" between "users"."id" and $1',
 			params: [65],
@@ -152,108 +154,84 @@ describe('comparisons', () => {
 	});
 
 	it('compares a parameter with the elements of an array column', () => {
-		expect(compiled(eb(eb.val('admin'), '=', eb.fn.any('users.tags')))).toEqual(
-			{
-				sql: '$1 = any("users"."tags")',
-				params: ['admin'],
-			},
-		);
-		expect(
-			compiled(eb(eb.val('admin'), '<>', eb.fn.all('users.tags'))),
-		).toEqual({
+		expect(compiled(eb.val('admin').eq(eb.fn.any('users.tags')))).toEqual({
+			sql: '$1 = any("users"."tags")',
+			params: ['admin'],
+		});
+		expect(compiled(eb.val('admin').ne(eb.fn.all('users.tags')))).toEqual({
 			sql: '$1 <> all("users"."tags")',
 			params: ['admin'],
 		});
-		expect(
-			compiled(eb(eb.val('ada'), 'like', eb.fn.any('users.tags'))),
-		).toEqual({
+		expect(compiled(eb.val('ada').like(eb.fn.any('users.tags')))).toEqual({
 			sql: '$1 like any("users"."tags")',
 			params: ['ada'],
 		});
 	});
 
+	it('numbers a parameter on the left before those on the right', () => {
+		const tags = eb.fn.coalesce('users.tags', eb.val<string[]>([]));
+		expect(compiled(eb.val('admin').eq(eb.fn.any(tags)))).toEqual({
+			sql: '$1 = any(coalesce("users"."tags", $2))',
+			params: ['admin', []],
+		});
+	});
+
+	it('renders an expression on the left in place of a column', () => {
+		expect(compiled(eb.fn.lower('users.firstName').like('a%'))).toEqual({
+			sql: 'lower("users"."first_name") like $1',
+			params: ['a%'],
+		});
+		expect(compiled(eb.ref('users.age').gt(18).isFalse())).toEqual({
+			sql: '("users"."age" > $1) is false',
+			params: [18],
+		});
+	});
+
 	it('needs an array of known SQL type to compare a parameter with', () => {
-		expect(() => eb(eb.val('admin'), '=', eb.fn.any(['admin']))).toThrow(
+		expect(() => eb.val('admin').eq(eb.fn.any(['admin']))).toThrow(
 			'any() or all() of an array column or expression',
 		);
 	});
 
 	it('renders `any` / `all` of values as one array parameter', () => {
 		expect(
-			compiled(eb('users.firstName', 'like', eb.fn.any(['a%', 'b%']))),
+			compiled(eb.ref('users.firstName').like(eb.fn.any(['a%', 'b%']))),
 		).toEqual({
 			sql: '"users"."first_name" like any($1)',
 			params: [['a%', 'b%']],
 		});
 		expect(
-			compiled(eb('users.firstName', 'not like', eb.fn.all(['a%', 'b%']))),
+			compiled(eb.ref('users.firstName').notLike(eb.fn.all(['a%', 'b%']))),
 		).toEqual({
 			sql: '"users"."first_name" not like all($1)',
 			params: [['a%', 'b%']],
 		});
-		expect(compiled(eb('users.age', '>', eb.fn.any(eb.val([1, 2]))))).toEqual({
-			sql: '"users"."age" > any($1)',
-			params: [[1, 2]],
-		});
+		expect(compiled(eb.ref('users.age').gt(eb.fn.any(eb.val([1, 2]))))).toEqual(
+			{
+				sql: '"users"."age" > any($1)',
+				params: [[1, 2]],
+			},
+		);
 	});
 
 	it('renders `any` / `all` of an array expression in place', () => {
 		expect(
-			compiled(eb('users.firstName', '=', eb.fn.any('users.tags'))),
+			compiled(eb.ref('users.firstName').eq(eb.fn.any('users.tags'))),
 		).toEqual({
 			sql: '"users"."first_name" = any("users"."tags")',
 			params: [],
 		});
 		const tags = eb.fn.coalesce('users.tags', eb.val<string[]>([]));
-		expect(compiled(eb('users.firstName', '<>', eb.fn.all(tags)))).toEqual({
+		expect(compiled(eb.ref('users.firstName').ne(eb.fn.all(tags)))).toEqual({
 			sql: '"users"."first_name" <> all(coalesce("users"."tags", $1))',
 			params: [[]],
 		});
 	});
 
 	it('passes array operands as a single parameter', () => {
-		expect(compiled(eb('users.tags', '&&', ['a', 'b']))).toEqual({
+		expect(compiled(eb.ref('users.tags').overlaps(['a', 'b']))).toEqual({
 			sql: '"users"."tags" && $1',
 			params: [['a', 'b']],
-		});
-	});
-});
-
-describe('expressions on the left', () => {
-	const lower = eb.fn.lower('users.firstName');
-
-	it('renders the expression in place of the column', () => {
-		expect(compiled(eb(lower, 'like', 'a%'))).toEqual({
-			sql: 'lower("users"."first_name") like $1',
-			params: ['a%'],
-		});
-		expect(compiled(eb(eb.ref('users.age'), 'in', [1, 2]))).toEqual({
-			sql: '"users"."age" in ($1, $2)',
-			params: [1, 2],
-		});
-		expect(compiled(eb(eb('users.age', '>', 18), 'is', false))).toEqual({
-			sql: '("users"."age" > $1) is false',
-			params: [18],
-		});
-	});
-
-	it('compares a parameter with the elements of an array expression', () => {
-		const tags = eb.fn.coalesce('users.tags', eb.val<string[]>([]));
-		expect(compiled(eb(eb.val('admin'), '=', eb.fn.any(tags)))).toEqual({
-			sql: '$1 = any(coalesce("users"."tags", $2))',
-			params: ['admin', []],
-		});
-	});
-
-	it('encodes values by the SQL type of the expression', () => {
-		const vacation = eb.fn.coalesce('users.vacation', eb.val(null));
-		expect(compiled(eb(vacation, '=', { empty: true }))).toEqual({
-			sql: 'coalesce("users"."vacation", $1) = $2',
-			params: [null, 'empty'],
-		});
-		expect(compiled(eb(eb.ref('users.settings'), '=', ['a', 'b']))).toEqual({
-			sql: '"users"."settings" = $1',
-			params: ['["a","b"]'],
 		});
 	});
 });
@@ -269,26 +247,26 @@ describe('value encoding', () => {
 	};
 
 	it('serialises a range operand as a range literal', () => {
-		expect(compiled(eb('users.active', '&&', january))).toEqual({
+		expect(compiled(eb.ref('users.active').overlaps(january))).toEqual({
 			sql: '"users"."active" && $1',
 			params: ['["2024-01-01T00:00:00.000Z","2024-02-01T00:00:00.000Z")'],
 		});
 	});
 
 	it('sends a point operand of a range as its text', () => {
-		expect(compiled(eb('users.active', '@>', jan))).toEqual({
+		expect(compiled(eb.ref('users.active').contains(jan))).toEqual({
 			sql: '"users"."active" @> $1',
 			params: ['2024-01-01T00:00:00.000Z'],
 		});
-		expect(compiled(eb('users.vacation', '@>', '2024-01-01')).params).toEqual([
-			'2024-01-01',
-		]);
+		expect(
+			compiled(eb.ref('users.vacation').contains('2024-01-01')).params,
+		).toEqual(['2024-01-01']);
 	});
 
 	it('serialises unbounded and empty ranges', () => {
 		expect(
 			compiled(
-				eb('users.vacation', '=', {
+				eb.ref('users.vacation').eq({
 					empty: false,
 					lower: null,
 					upper: '2024-02-01',
@@ -296,15 +274,15 @@ describe('value encoding', () => {
 				}),
 			).params,
 		).toEqual(['(,"2024-02-01"]']);
-		expect(compiled(eb('users.vacation', '=', { empty: true })).params).toEqual(
-			['empty'],
-		);
+		expect(
+			compiled(eb.ref('users.vacation').eq({ empty: true })).params,
+		).toEqual(['empty']);
 	});
 
 	it('escapes quotes and backslashes inside range bounds', () => {
 		expect(
 			compiled(
-				eb('users.vacation', '=', {
+				eb.ref('users.vacation').eq({
 					empty: false,
 					lower: 'a"b\\c',
 					upper: null,
@@ -316,19 +294,19 @@ describe('value encoding', () => {
 
 	it('serialises jsonb values, including top-level arrays', () => {
 		expect(
-			compiled(eb('users.settings', '=', { theme: 'dark' })).params,
+			compiled(eb.ref('users.settings').eq({ theme: 'dark' })).params,
 		).toEqual(['{"theme":"dark"}']);
-		expect(compiled(eb('users.settings', '=', ['a', 'b'])).params).toEqual([
+		expect(compiled(eb.ref('users.settings').eq(['a', 'b'])).params).toEqual([
 			'["a","b"]',
 		]);
 		expect(
-			compiled(eb('users.settings', '@>', { theme: 'dark' })).params,
+			compiled(eb.ref('users.settings').contains({ theme: 'dark' })).params,
 		).toEqual(['{"theme":"dark"}']);
 	});
 
 	it('encodes each element of an `in` list', () => {
 		expect(
-			compiled(eb('users.settings', 'in', [{ theme: 'dark' }, ['a']])),
+			compiled(eb.ref('users.settings').in([{ theme: 'dark' }, ['a']])),
 		).toEqual({
 			sql: '"users"."settings" in ($1, $2)',
 			params: ['{"theme":"dark"}', '["a"]'],
@@ -338,27 +316,26 @@ describe('value encoding', () => {
 	it('sends null as SQL null, not as JSON null', () => {
 		expect(new JsonbType().serialize(null)).toBeNull();
 		expect(
-			compiled(eb('users.settings', '@>', { theme: null })).params,
+			compiled(eb.ref('users.settings').contains({ theme: null })).params,
 		).toEqual(['{"theme":null}']);
+	});
+
+	it('encodes values by the SQL type of an expression, not only a column', () => {
+		const vacation = eb.fn.coalesce('users.vacation', eb.val(null));
+		expect(compiled(vacation.eq({ empty: true }))).toEqual({
+			sql: 'coalesce("users"."vacation", $1) = $2',
+			params: [null, 'empty'],
+		});
 	});
 
 	it('does not encode expressions', () => {
 		expect(
-			compiled(eb('users.settings', '=', eb.ref('users.settings'))).params,
+			compiled(eb.ref('users.settings').eq(eb.ref('users.settings'))).params,
 		).toEqual([]);
 	});
 
-	it('encodes a parameter like a plain value', () => {
-		expect(
-			compiled(eb('users.settings', '=', eb.val({ theme: 'dark' }))).params,
-		).toEqual(['{"theme":"dark"}']);
-		expect(compiled(eb('users.active', '&&', eb.val(january))).params).toEqual([
-			'["2024-01-01T00:00:00.000Z","2024-02-01T00:00:00.000Z")',
-		]);
-	});
-
 	it('encodes the items of an array parameter given to `in`', () => {
-		expect(compiled(eb('users.settings', 'in', eb.val([['a']])))).toEqual({
+		expect(compiled(eb.ref('users.settings').in(eb.val([['a']])))).toEqual({
 			sql: '"users"."settings" = any($1)',
 			params: [['["a"]']],
 		});
@@ -367,15 +344,18 @@ describe('value encoding', () => {
 	it('encodes each value given to `any` / `all` as an operand of the operator', () => {
 		expect(
 			compiled(
-				eb('users.settings', '@>', eb.fn.any([{ theme: 'dark' }, ['a']])),
+				eb
+					.ref('users.settings')
+					.contains(eb.fn.any([{ theme: 'dark' }, ['a']])),
 			).params,
 		).toEqual([['{"theme":"dark"}', '["a"]']]);
 		expect(
-			compiled(eb('users.active', '&&', eb.fn.any(eb.val([january])))).params,
+			compiled(eb.ref('users.active').overlaps(eb.fn.any(eb.val([january]))))
+				.params,
 		).toEqual([['["2024-01-01T00:00:00.000Z","2024-02-01T00:00:00.000Z")']]);
-		expect(compiled(eb('users.active', '@>', eb.fn.any([jan]))).params).toEqual(
-			[['2024-01-01T00:00:00.000Z']],
-		);
+		expect(
+			compiled(eb.ref('users.active').contains(eb.fn.any([jan]))).params,
+		).toEqual([['2024-01-01T00:00:00.000Z']]);
 	});
 
 	it('serializes a user-defined type by its option, never passing it null', () => {
@@ -388,61 +368,30 @@ describe('value encoding', () => {
 	});
 
 	it('serialises vectors in pgvector syntax', () => {
-		expect(vector().dataType.serialize([1, 2.5, 3])).toBe('[1,2.5,3]');
-	});
-
-	it('keeps a name through the modifiers around it', () => {
-		const named = defineTable('named', {
-			columns: {
-				id: integer().name('named_id').identity(),
-				note: text().nullable().name('note_text').default(),
-				slug: text().generated().name('slug_text').as<'a'>(),
-			},
-		});
-		const nb = expressionBuilder(named);
-		expect(compiled(nb.ref('named.id')).sql).toBe('"named"."named_id"');
-		expect(compiled(nb.ref('named.note')).sql).toBe('"named"."note_text"');
-		expect(compiled(nb.ref('named.slug')).sql).toBe('"named"."slug_text"');
-	});
-
-	it('names an array column by its own name, or else its element', () => {
-		const tagged = defineTable('tagged', {
-			columns: {
-				labels: array(text()).name('label_list'),
-				aliases: array(text().name('alias_list')),
-				topics: array(text().name('ignored')).name('topic_list'),
-			},
-		});
-		const tb = expressionBuilder(tagged);
-		expect(compiled(tb.ref('tagged.labels')).sql).toBe('"tagged"."label_list"');
-		expect(compiled(tb.ref('tagged.aliases')).sql).toBe(
-			'"tagged"."alias_list"',
-		);
-		expect(compiled(tb.ref('tagged.topics')).sql).toBe('"tagged"."topic_list"');
+		expect(vector()._quarry.dataType.serialize([1, 2.5, 3])).toBe('[1,2.5,3]');
 	});
 
 	it('encodes array elements by the element type', () => {
 		const literal = '["2024-01-01T00:00:00.000Z","2024-02-01T00:00:00.000Z")';
-		expect(compiled(eb('users.history', '@>', [january])).params).toEqual([
-			[literal],
-		]);
 		expect(
-			compiled(eb(eb.val(january), '=', eb.fn.any('users.history'))),
-		).toEqual({
+			compiled(eb.ref('users.history').contains([january])).params,
+		).toEqual([[literal]]);
+		expect(compiled(eb.val(january).eq(eb.fn.any('users.history')))).toEqual({
 			sql: '$1 = any("users"."history")',
 			params: [literal],
 		});
 		expect(
-			compiled(eb(eb.val({ id: 1 }), '=', eb.fn.any('users.documents'))).params,
+			compiled(eb.val({ id: 1 }).eq(eb.fn.any('users.documents'))).params,
 		).toEqual(['{"id":1}']);
 		expect(
-			compiled(eb('users.documents', '&&', [{ id: 1 }, { id: 2 }])).params,
+			compiled(eb.ref('users.documents').overlaps([{ id: 1 }, { id: 2 }]))
+				.params,
 		).toEqual([['{"id":1}', '{"id":2}']]);
 	});
 
 	it('sends null elements as SQL null, not as encoded values', () => {
 		expect(
-			compiled(eb('users.attachments', '@>', [null, { id: 1 }])).params,
+			compiled(eb.ref('users.attachments').contains([null, { id: 1 }])).params,
 		).toEqual([[null, '{"id":1}']]);
 	});
 });
@@ -486,20 +435,20 @@ describe('jsonb functions', () => {
 
 	it('compares a field by its SQL type', () => {
 		expect(
-			compiled(eb(eb.json.text('users.settings', 'theme'), '=', 'dark')),
+			compiled(eb.json.text('users.settings', 'theme').eq('dark')),
 		).toEqual({
 			sql: '("users"."settings" ->> \'theme\') = $1',
 			params: ['dark'],
 		});
-		expect(
-			compiled(eb(eb.json.get('users.settings', 'theme'), '=', 'dark')),
-		).toEqual({
-			sql: '("users"."settings" -> \'theme\') = $1',
-			params: ['"dark"'],
-		});
+		expect(compiled(eb.json.get('users.settings', 'theme').eq('dark'))).toEqual(
+			{
+				sql: '("users"."settings" -> \'theme\') = $1',
+				params: ['"dark"'],
+			},
+		);
 		expect(
 			compiled(
-				eb(eb.json.get('users.profile', 'address'), '@>', { city: 'Oslo' }),
+				eb.json.get('users.profile', 'address').contains({ city: 'Oslo' }),
 			).params,
 		).toEqual(['{"city":"Oslo"}']);
 	});
@@ -542,9 +491,7 @@ describe('jsonb functions', () => {
 			'jsonb_typeof("users"."data")',
 		);
 		expect(
-			compiled(
-				eb(eb.json.length(eb.json.get('users.profile', 'tags')), '>', 2),
-			),
+			compiled(eb.json.length(eb.json.get('users.profile', 'tags')).gt(2)),
 		).toEqual({
 			sql: 'jsonb_array_length("users"."profile" -> \'tags\') > $1',
 			params: [2],
@@ -555,8 +502,8 @@ describe('jsonb functions', () => {
 describe('logical operators', () => {
 	it('parenthesises and/or and numbers parameters in order', () => {
 		const expression = eb.or([
-			eb.and([eb('users.age', '>', 18), eb('users.admin', '=', false)]),
-			eb.not(eb('users.email', 'is', null)),
+			eb.and([eb.ref('users.age').gt(18), eb.ref('users.admin').eq(false)]),
+			eb.not(eb.ref('users.email').isNull()),
 		]);
 		expect(compiled(expression)).toEqual({
 			sql: '(("users"."age" > $1 and "users"."admin" = $2) or not ("users"."email" is null))',
@@ -565,7 +512,7 @@ describe('logical operators', () => {
 	});
 
 	it('unwraps a single operand', () => {
-		expect(compiled(eb.and([eb('users.age', '>', 18)]))).toEqual({
+		expect(compiled(eb.and([eb.ref('users.age').gt(18)]))).toEqual({
 			sql: '"users"."age" > $1',
 			params: [18],
 		});
@@ -611,7 +558,7 @@ describe('functions', () => {
 			sql: 'min("users"."age")',
 			params: [],
 		});
-		expect(compiled(eb(eb.fn.max('users.age'), '>', 18))).toEqual({
+		expect(compiled(eb.fn.max('users.age').gt(18))).toEqual({
 			sql: 'max("users"."age") > $1',
 			params: [18],
 		});
@@ -622,7 +569,7 @@ describe('functions', () => {
 	});
 
 	it('renders cast', () => {
-		expect(compiled(eb(eb.fn.cast(eb.fn.count(), 'integer'), '>', 5))).toEqual({
+		expect(compiled(eb.fn.cast(eb.fn.count(), 'integer').gt(5))).toEqual({
 			sql: 'cast(count(*) as integer) > $1',
 			params: [5],
 		});
@@ -636,7 +583,7 @@ describe('scope', () => {
 	it('resolves references across several tables', () => {
 		const scoped = expressionBuilder(users, posts);
 		expect(
-			compiled(scoped('posts.authorId', '=', scoped.ref('users.id'))),
+			compiled(scoped.ref('posts.authorId').eq(scoped.ref('users.id'))),
 		).toEqual({
 			sql: '"posts"."author_id" = "users"."id"',
 			params: [],
@@ -645,10 +592,40 @@ describe('scope', () => {
 
 	it('uses the alias of an aliased table', () => {
 		const scoped = expressionBuilder(users.as('u'));
-		expect(compiled(scoped('u.firstName', '=', 'Ada'))).toEqual({
+		expect(compiled(scoped.ref('u.firstName').eq('Ada'))).toEqual({
 			sql: '"u"."first_name" = $1',
 			params: ['Ada'],
 		});
+	});
+});
+
+describe('column names', () => {
+	it('keeps a name through the modifiers around it', () => {
+		const named = defineTable('named', {
+			columns: {
+				id: integer().name('named_id').identity(),
+				note: text().nullable().name('note_text').default(),
+				slug: text().generated().name('slug_text').typed<'a'>(),
+			},
+		});
+		const nb = expressionBuilder(named);
+		expect(compiled(nb.ref('named.id')).sql).toBe('"named"."named_id"');
+		expect(compiled(nb.ref('named.note')).sql).toBe('"named"."note_text"');
+		expect(compiled(nb.ref('named.slug')).sql).toBe('"named"."slug_text"');
+	});
+
+	it('names an array column by its own name, never its element', () => {
+		const tagged = defineTable('tagged', {
+			columns: {
+				labels: array(text()).name('label_list'),
+				aliases: array(text().name('ignored')),
+				topics: array(text().name('ignored')).name('topic_list'),
+			},
+		});
+		const tb = expressionBuilder(tagged);
+		expect(compiled(tb.ref('tagged.labels')).sql).toBe('"tagged"."label_list"');
+		expect(compiled(tb.ref('tagged.aliases')).sql).toBe('"tagged"."aliases"');
+		expect(compiled(tb.ref('tagged.topics')).sql).toBe('"tagged"."topic_list"');
 	});
 
 	it('escapes quotes in identifiers', () => {

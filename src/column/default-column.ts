@@ -15,10 +15,7 @@ export class DefaultColumn<D extends DataType, S, I, U>
 	 * @example text().default().nullable()
 	 */
 	nullable() {
-		return new DefaultColumn<D, S | null, I | null, U | null>({
-			dataType: this.dataType,
-			columnName: this.columnName,
-		});
+		return new DefaultColumn<D, S | null, I | null, U | null>(this._quarry);
 	}
 
 	/**
@@ -28,23 +25,14 @@ export class DefaultColumn<D extends DataType, S, I, U>
 	 * @example text().nullable().default()
 	 */
 	default() {
-		return new DefaultColumn<D, S, I | undefined, U>({
-			dataType: this.dataType,
-			columnName: this.columnName,
-		});
+		return new DefaultColumn<D, S, I | undefined, U>(this._quarry);
 	}
 
 	override name(columnName: string) {
-		return new DefaultColumn<D, S, I, U>({
-			dataType: this.dataType,
-			columnName,
-		});
+		return new DefaultColumn<D, S, I, U>({ ...this._quarry, columnName });
 	}
 
-	override as<X extends S, Y extends I & (X | undefined), Z extends U & X>() {
-		return new DefaultColumn<D, X, Y, Z>({
-			dataType: this.dataType,
-			columnName: this.columnName,
-		});
+	override typed<X extends S, Y extends I, Z extends U>() {
+		return new DefaultColumn<D, X, Y, Z>(this._quarry);
 	}
 }

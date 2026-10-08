@@ -1,10 +1,11 @@
 import type { ArrayType } from './data-type/array.js';
 import { DataType } from './data-type/data-type.js';
 import { JsonbType } from './data-type/jsonb.js';
-import { Expression, type Param, TypedExpression } from './expression.js';
+import { Expression, type Param, type TypedExpression } from './expression.js';
+import { typedExpression } from './expression-methods.js';
 import type { Scope } from './functions.js';
 import type { OperationNode } from './node.js';
-import type { JsonValue, TextKind } from './operators.js';
+import type { Expr, JsonValue, Predicate, TextKind } from './operators.js';
 import type { NullOf, Operand, Refs, TypeOf } from './refs.js';
 
 type Jsonb = DataType<'jsonb'>;
@@ -58,9 +59,6 @@ type JsonOf<R extends Refs, A> = NonNullable<TypeOf<R, A>>;
 /** `null` if an argument can be. */
 type NullIn<V> = V extends Expression<infer T> ? NullOf<T> : never;
 
-/** A boolean result, nullable when `N` is `null`. */
-type Predicate<N> = TypedExpression<boolean | N, DataType<'boolean'>>;
-
 /** What `jsonb_typeof` returns. */
 type JsonType = 'object' | 'array' | 'string' | 'number' | 'boolean' | 'null';
 
@@ -69,10 +67,12 @@ type JsonType = 'object' | 'array' | 'string' | 'number' | 'boolean' | 'null';
  * testing keys and jsonpaths. Each takes a jsonb column or expression first.
  *
  * Reading yields an expression, so it compares like any other: with `text`'s
- * operators, or with jsonb's, whose values are encoded as jsonb. The key and
+ * methods, or with jsonb's, whose values are encoded as jsonb. The key and
  * path tests are predicates, for `where(predicate)` and `eb.and`.
+ *
+ * `R` is invariant, as for `ExpressionBuilder`.
  */
-export interface JsonFunctions<R extends Refs> {
+export interface JsonFunctions<in out R extends Refs> {
 	/**
 	 * `json -> key -> ...`: the jsonb value at the path, null where it is
 	 * missing. Each key is an object key or an array index, checked against
@@ -80,24 +80,24 @@ export interface JsonFunctions<R extends Refs> {
 	 * on the same `->` chain applies.
 	 *
 	 * @example eb.json.get('users.settings', 'theme')
-	 * @example eb(eb.json.get('users.settings', 'prefs'), '@>', { beta: true })
+	 * @example eb.json.get('users.settings', 'prefs').contains({ beta: true })
 	 */
 	get<A extends Operand<R, Jsonb>, const P extends readonly [Key, ...Key[]]>(
 		json: A,
 		...path: P & PathIn<JsonOf<R, A>, P>
-	): TypedExpression<Exclude<At<JsonOf<R, A>, P>, undefined> | null, JsonbType>;
+	): Expr<Exclude<At<JsonOf<R, A>, P>, undefined> | null, JsonbType>;
 
 	/**
 	 * `json -> ... ->> key`: the value at the path as text, null where it is
 	 * missing (or is JSON `null`). Cast it to compare as a number or a date.
 	 *
-	 * @example eb(eb.json.text('users.settings', 'theme'), '=', 'dark')
+	 * @example eb.json.text('users.settings', 'theme').eq('dark')
 	 * @example eb.fn.cast(eb.json.text('users.settings', 'age'), 'integer')
 	 */
 	text<A extends Operand<R, Jsonb>, const P extends readonly [Key, ...Key[]]>(
 		json: A,
 		...path: P & PathIn<JsonOf<R, A>, P>
-	): TypedExpression<string | null, DataType<'text'>>;
+	): Expr<string | null, DataType<'text'>>;
 
 	/**
 	 * `json ? key`: the key is a top-level key (or, for an array, a string
@@ -157,12 +157,12 @@ export interface JsonFunctions<R extends Refs> {
 	/** `jsonb_typeof(json)`: the kind of JSON value. */
 	typeOf<A extends Operand<R, Jsonb>>(
 		json: A,
-	): TypedExpression<JsonType | NullOf<TypeOf<R, A>>, DataType<'text'>>;
+	): Expr<JsonType | NullOf<TypeOf<R, A>>, DataType<'text'>>;
 
 	/** `jsonb_array_length(json)`: the number of elements; an error unless an array. */
 	length<A extends Operand<R, Jsonb>>(
 		json: A,
-	): TypedExpression<number | NullOf<TypeOf<R, A>>, DataType<'integer'>>;
+	): Expr<number | NullOf<TypeOf<R, A>>, DataType<'integer'>>;
 }
 
 /** A list of keys: values, a parameter, or a text array expression. */
@@ -170,12 +170,6 @@ type Keys =
 	| readonly string[]
 	| Param<readonly string[]>
 	| TypedExpression<readonly string[] | null, ArrayType<Text>>;
-
-/** `JsonFunctions` supplies the types, so this returns the bottom type. */
-function result(node: OperationNode, dataType: DataType): never {
-	// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the signature supplies the type
-	return new TypedExpression(node, dataType) as never;
-}
 
 function key(value: Key): OperationNode {
 	if (typeof value === 'number' && !Number.isInteger(value)) {
@@ -186,7 +180,7 @@ function key(value: Key): OperationNode {
 
 /** A key or path operand: values and parameters are sent as is, as text. */
 function operand(value: unknown): OperationNode {
-	return Expression.is(value) ? value.toNode() : { kind: 'value', value };
+	return Expression.is(value) ? value._quarry.node : { kind: 'value', value };
 }
 
 export function jsonFunctions<R extends Refs>({
@@ -195,7 +189,7 @@ export function jsonFunctions<R extends Refs>({
 	const walk =
 		(last: '->' | '->>', type: DataType) =>
 		(json: Operand<R, Jsonb>, ...path: readonly Key[]) =>
-			result(
+			typedExpression(
 				path.reduce<OperationNode>(
 					(left, step, i) => ({
 						kind: 'binary',
@@ -210,13 +204,13 @@ export function jsonFunctions<R extends Refs>({
 
 	const test =
 		(operator: string) => (json: Operand<R, Jsonb>, right: unknown) =>
-			result(
+			typedExpression(
 				{ kind: 'binary', left: node(json), operator, right: operand(right) },
 				new DataType('boolean'),
 			);
 
 	const call = (name: string, type: DataType) => (json: Operand<R, Jsonb>) =>
-		result({ kind: 'function', name, args: [node(json)] }, type);
+		typedExpression({ kind: 'function', name, args: [node(json)] }, type);
 
 	return {
 		get: walk('->', new JsonbType()),

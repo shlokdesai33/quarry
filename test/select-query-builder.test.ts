@@ -34,19 +34,25 @@ describe('where', () => {
 		expect(selectFrom(users).toWhereNode()).toBeUndefined();
 	});
 
-	it('adds a comparison', () => {
-		expect(where(selectFrom(users).where('users.age', '>=', 18))).toEqual({
-			sql: '"users"."age" >= $1',
-			params: [18],
+	it('adds `column = value`', () => {
+		expect(where(selectFrom(users).where('users.role', 'admin'))).toEqual({
+			sql: '"users"."role" = $1',
+			params: ['admin'],
 		});
+	});
+
+	it('adds a condition built in a callback', () => {
+		expect(
+			where(selectFrom(users).where((eb) => eb.ref('users.age').gte(18))),
+		).toEqual({ sql: '"users"."age" >= $1', params: [18] });
 	});
 
 	it('joins conditions with and', () => {
 		expect(
 			where(
 				selectFrom(users)
-					.where('users.age', '>=', 18)
-					.where('users.role', '=', 'admin'),
+					.where((eb) => eb.ref('users.age').gte(18))
+					.where('users.role', 'admin'),
 			),
 		).toEqual({
 			sql: '("users"."age" >= $1 and "users"."role" = $2)',
@@ -56,84 +62,76 @@ describe('where', () => {
 
 	it('takes a predicate', () => {
 		const eb = expressionBuilder(users);
-		expect(where(selectFrom(users).where(eb('users.age', '>', 1)))).toEqual({
+		expect(where(selectFrom(users).where(eb.ref('users.age').gt(1)))).toEqual({
 			sql: '"users"."age" > $1',
 			params: [1],
 		});
 	});
 
-	it('compares columns through q.ref', () => {
-		expect(
-			where(
-				selectFrom(users).where((q) =>
-					q.where('users.age', '>', q.ref('users.id')),
-				),
-			),
-		).toEqual({ sql: '"users"."age" > "users"."id"', params: [] });
-	});
-
-	it('leaves the builder it was called on unchanged', () => {
-		const query = selectFrom(users);
-		query.where('users.age', '>=', 18);
-		expect(query.toWhereNode()).toBeUndefined();
-	});
-});
-
-describe('orWhere', () => {
-	it('binds looser than and, as in SQL', () => {
+	it('takes or as one condition, parenthesised among the others', () => {
 		expect(
 			where(
 				selectFrom(users)
-					.where('users.age', '>=', 18)
-					.orWhere('users.role', '=', 'admin')
-					.where('users.email', 'is', null),
-			),
-		).toEqual({
-			sql: '("users"."age" >= $1 or ("users"."role" = $2 and "users"."email" is null))',
-			params: [18, 'admin'],
-		});
-	});
-
-	it('acts like where when it comes first', () => {
-		expect(where(selectFrom(users).orWhere('users.age', '>=', 18))).toEqual({
-			sql: '"users"."age" >= $1',
-			params: [18],
-		});
-	});
-
-	it('parenthesises a group', () => {
-		expect(
-			where(
-				selectFrom(users)
-					.where((q) =>
-						q.where('users.age', '<', 13).orWhere('users.age', '>', 65),
+					.where((eb) =>
+						eb.ref('users.age').lt(13).or(eb.ref('users.age').gt(65)),
 					)
-					.where('users.role', '=', 'member'),
+					.where('users.role', 'member'),
 			),
 		).toEqual({
 			sql: '(("users"."age" < $1 or "users"."age" > $2) and "users"."role" = $3)',
 			params: [13, 65, 'member'],
 		});
-	});
-
-	it('skips an empty group', () => {
 		expect(
 			where(
-				selectFrom(users)
-					.where((q) => q)
-					.orWhere('users.age', '>=', 18),
+				selectFrom(users).where((eb) =>
+					eb.or([eb.ref('users.age').lt(13), eb.ref('users.email').isNull()]),
+				),
 			),
-		).toEqual({ sql: '"users"."age" >= $1', params: [18] });
+		).toEqual({
+			sql: '("users"."age" < $1 or "users"."email" is null)',
+			params: [13],
+		});
+	});
+
+	it('flattens chained and / or of the same kind', () => {
+		expect(
+			where(
+				selectFrom(users).where((eb) =>
+					eb
+						.ref('users.age')
+						.gt(1)
+						.and(eb.ref('users.age').lt(9))
+						.and(eb.ref('users.role').eq('admin')),
+				),
+			),
+		).toEqual({
+			sql: '("users"."age" > $1 and "users"."age" < $2 and "users"."role" = $3)',
+			params: [1, 9, 'admin'],
+		});
+	});
+
+	it('destructures the builder', () => {
+		expect(
+			where(
+				selectFrom(users).where(({ ref }) => ref('users.email').isNotNull()),
+			),
+		).toEqual({ sql: '"users"."email" is not null', params: [] });
+	});
+
+	it('leaves the builder it was called on unchanged', () => {
+		const query = selectFrom(users);
+		query.where('users.age', 18);
+		expect(query.toWhereNode()).toBeUndefined();
 	});
 });
 
 describe('innerJoin', () => {
 	it('puts the joined table in scope, keeping earlier conditions', () => {
 		const query = selectFrom(users)
-			.where('users.age', '>=', 18)
+			.where((eb) => eb.ref('users.age').gte(18))
 			.innerJoin(contacts)
-			.on((q) => q.where('contacts.userId', '=', q.ref('users.id')))
-			.where('contacts.email', 'like', '%@example.com');
+			.on((eb) => eb.ref('contacts.userId').eq(eb.ref('users.id')))
+			.where((eb) => eb.ref('contacts.email').like('%@example.com'));
 
 		expect(where(query)).toEqual({
 			sql: '("users"."age" >= $1 and "contacts"."email" like $2)',

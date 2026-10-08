@@ -16,41 +16,30 @@ import type { OperationNode } from './node.js';
  */
 export class Expression<T> {
 	/**
-	 * A phantom property that represents the type this expression evaluates to.
-	 * Declared, never assigned: it exists only so that `Expression<string>` is
-	 * not assignable to `Expression<number>`.
+	 * What the library reads: not part of the API.
 	 */
-	declare readonly $type: T;
-
-	/**
-	 * The node the expression compiles to.
-	 *
-	 * Private so that only expressions built by this copy of the library are
-	 * accepted: the node tree is an internal format that only the matching
-	 * `compile` understands, and a look-alike object or an expression from
-	 * another installed version could render wrong or bypass the invariants
-	 * `LiteralNode` and `RawNode` rely on. The private field makes the type
-	 * nominal and lets `is` check the brand at runtime.
-	 *
-	 * The drawback is that when two copies of quarry are installed, even of
-	 * the same version, their expressions are incompatible with each other,
-	 * both to the type checker and to `is`. The fix is to deduplicate the
-	 * dependency.
-	 */
-	readonly #node: OperationNode;
+	readonly _quarry: {
+		/**
+		 * Phantom: the type this expression evaluates to. Never set: it exists
+		 * only so that `Expression<string>` is not assignable to
+		 * `Expression<number>`, and is optional so that the object can be
+		 * built without it. Reading it gives `T | undefined`; `T` itself is
+		 * what `Expression<infer T>` infers.
+		 */
+		readonly $type?: T;
+		/**
+		 * The node the expression compiles to.
+		 */
+		readonly node: OperationNode;
+	};
 
 	/**
 	 * Creates a new expression.
 	 *
-	 * @param node the node the expression compiles to.
-	 *
-	 * @example new Expression(new ReferenceNode('users', 'email'))
-	 * @example new Expression(new ValueNode(1))
-	 * @example new Expression(new FunctionNode('now'))
-	 * @example new Expression(new RawNode('now()'))
+	 * @param node what the expression compiles to.
 	 */
 	constructor(node: OperationNode) {
-		this.#node = node;
+		this._quarry = { node };
 	}
 
 	/**
@@ -58,14 +47,7 @@ export class Expression<T> {
 	 * i.e. whether it is rendered as SQL rather than sent as a parameter.
 	 */
 	static is(value: unknown): value is Expression<unknown> {
-		return typeof value === 'object' && value !== null && #node in value;
-	}
-
-	/**
-	 * Converts the expression to a node.
-	 */
-	toNode(): OperationNode {
-		return this.#node;
+		return typeof value === 'object' && value !== null && '_quarry' in value;
 	}
 
 	/**
@@ -80,9 +62,9 @@ export class Expression<T> {
 
 /**
  * An expression whose SQL type `D` is known: a column reference, a function
- * call, a comparison. Only these can be the left-hand side of a comparison or
- * the argument of a function that needs a particular SQL type, and values
- * compared against them are encoded by `dataType`.
+ * call, a comparison. Only these have the comparison methods of a SQL type
+ * (see `Expr`) or can be the argument of a function that needs one, and
+ * values compared against them are encoded by its SQL type.
  *
  * An expression whose SQL type is whatever postgres infers, such as a bare
  * parameter, is only an `Expression`.
@@ -92,34 +74,63 @@ export class Expression<T> {
  */
 export class TypedExpression<T, D extends DataType> extends Expression<T> {
 	/**
-	 * The SQL type of the expression: its operators and how values compared
-	 * against it are encoded.
+	 * What the library reads: not part of the API. `dataType` is the SQL type
+	 * of the expression: its methods and how values compared against it are
+	 * encoded.
 	 */
-	readonly dataType: D;
+	declare readonly _quarry: {
+		/**
+		 * Phantom: the type this expression evaluates to.
+		 */
+		readonly $type?: T;
+		readonly node: OperationNode;
+		readonly dataType: D;
+	};
 
 	constructor(node: OperationNode, dataType: D) {
 		super(node);
-		this.dataType = dataType;
+		this._quarry = { node, dataType };
 	}
 }
 
 /**
  * A parameter: a value sent alongside the query, whose SQL type postgres
- * infers from where it is used, as `eb.val` creates. On the right-hand side
- * of a comparison it is encoded by the other side's SQL type, exactly like a
- * plain value; elsewhere it is sent as is.
+ * infers from where it is used, as `eb.val` creates. As the array of `in` or
+ * `any` / `all`, its items are encoded by the other side's SQL type, exactly
+ * like a plain array's; elsewhere it is sent as is.
  *
  * It has no SQL type of its own, so it is never a `TypedExpression`, and an
  * operand that takes a parameter does not thereby take an expression of any
  * SQL type.
  */
 export class Param<T> extends Expression<T> {
-	/** The value sent to the driver. */
-	readonly value: T;
+	/**
+	 * What the library reads: not part of the API. `value` is sent to the
+	 * driver.
+	 */
+	declare readonly _quarry: {
+		/**
+		 * Phantom: the type this expression evaluates to.
+		 */
+		readonly $type?: T;
+		/**
+		 * Phantom: the value sent to the driver.
+		 */
+		readonly $value?: T;
+		/**
+		 * Phantom: the node the expression compiles to.
+		 */
+		readonly node: OperationNode;
+		/**
+		 * The value sent to the driver.
+		 */
+		readonly value: T;
+	};
 
 	constructor(value: T) {
-		super({ kind: 'value', value });
-		this.value = value;
+		const node = { kind: 'value', value } as const;
+		super(node);
+		this._quarry = { node, value };
 	}
 }
 
@@ -128,46 +139,67 @@ export class Param<T> extends Expression<T> {
  * the right of a comparison, it holds if the comparison holds for some, or
  * for every, element. `S` is the type of the elements, `D` their SQL type
  * (`never` for values, whose SQL type postgres infers), and `N` is `null`
- * when the array or an element can be.
+ * when the array or an element can be. `Typed` is `true` for an array
+ * expression and `false` for values or a parameter: a comparison checks
+ * values by the other side's TypeScript type, and an array expression only by
+ * its SQL type.
  *
  * Not an expression: postgres only allows it as the right-hand operand of an
  * operator, so nothing else accepts it. When the array has a SQL type, a
- * parameter can be the left-hand side, as in `eb(eb.val('a'), '=',
- * eb.fn.any('users.tags'))`, and is encoded by the element type.
+ * parameter can be the left-hand side, as in
+ * `eb.val('a').eq(eb.fn.any('users.tags'))`, and is encoded by the element
+ * type.
  */
-export class Quantified<S, D extends DataType, N extends null = never> {
-	/** Phantom: the type of the elements. */
-	declare readonly $element: S;
-
-	/** Phantom: the SQL type of the elements. */
-	declare readonly $dataType: D;
-
-	/** Phantom: `null` when the array or an element can be. */
-	declare readonly $null: N;
-
-	/** Whether some or every element must satisfy the comparison. */
-	readonly quantifier: 'any' | 'all';
-
+export class Quantified<
+	S,
+	D extends DataType,
+	N extends null = never,
+	Typed extends boolean = boolean,
+> {
 	/**
-	 * The array: values or a parameter, which the comparison encodes item by
-	 * item, or an expression.
+	 * What the library reads: not part of the API. The `$` members are
+	 * phantoms, never set: optional so that the object can be built without
+	 * them, and still compared.
 	 */
-	readonly array: readonly unknown[] | Expression<unknown>;
-
-	/**
-	 * The SQL type of the elements, when the array is an expression of an
-	 * array type; `undefined` for values and parameters.
-	 */
-	readonly element: DataType | undefined;
+	readonly _quarry: {
+		/**
+		 * Phantom: the type of the elements.
+		 */
+		readonly $element?: S;
+		/**
+		 * Phantom: the SQL type of the elements.
+		 */
+		readonly $dataType?: D;
+		/**
+		 * Phantom: `null` when the array or an element can be.
+		 */
+		readonly $null?: N;
+		/**
+		 * Phantom: whether the elements have a known SQL type.
+		 */
+		readonly $typed?: Typed;
+		/**
+		 * Whether some or every element must satisfy the comparison.
+		 */
+		readonly quantifier: 'any' | 'all';
+		/**
+		 * The array: values or a parameter, which the comparison encodes item
+		 * by item, or an expression.
+		 */
+		readonly array: readonly unknown[] | Expression<unknown>;
+		/**
+		 * The SQL type of the elements, when the array is an expression of an
+		 * array type; `undefined` for values and parameters.
+		 */
+		readonly element: DataType | undefined;
+	};
 
 	constructor(
 		quantifier: 'any' | 'all',
 		array: readonly unknown[] | Expression<unknown>,
 		element: DataType | undefined,
 	) {
-		this.quantifier = quantifier;
-		this.array = array;
-		this.element = element;
+		this._quarry = { quantifier, array, element };
 	}
 }
 

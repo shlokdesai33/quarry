@@ -36,7 +36,7 @@ export type ColumnArgs<D extends DataType> = {
  * - `IdentityColumn`: none
  *
  * The `array()` factory takes a `Column` of a non-array type as its element.
- * `name()` and `as()` are valid everywhere and keep the state.
+ * `name()` and `typed()` are valid everywhere and keep the state.
  */
 export abstract class BaseColumn<D extends DataType, S, I, U> {
 	/**
@@ -55,16 +55,15 @@ export abstract class BaseColumn<D extends DataType, S, I, U> {
 	declare readonly $update: U;
 
 	/**
-	 * The SQL type of the column. Values compared against the column are
-	 * encoded by it.
+	 * What the library reads: not part of the API. `dataType` is the SQL type
+	 * of the column, which encodes values compared against it; `columnName`
+	 * its name in the database, when it differs from the key it is declared
+	 * under.
 	 */
-	readonly dataType: D;
-
-	/**
-	 * The name of the column in the database, when it differs from the key it
-	 * is declared under.
-	 */
-	readonly columnName: string | undefined;
+	readonly _quarry: {
+		readonly dataType: D;
+		readonly columnName: string | undefined;
+	};
 
 	/**
 	 * Creates a new column.
@@ -72,8 +71,7 @@ export abstract class BaseColumn<D extends DataType, S, I, U> {
 	 * @param args the arguments for the column.
 	 */
 	constructor({ dataType, columnName }: ColumnArgs<D>) {
-		this.dataType = dataType;
-		this.columnName = columnName;
+		this._quarry = { dataType, columnName };
 	}
 
 	/**
@@ -87,12 +85,10 @@ export abstract class BaseColumn<D extends DataType, S, I, U> {
 	/**
 	 * Narrows the TypeScript view of the column (branded ids, literal unions,
 	 * read-only columns, asymmetric nullability). Each type can only narrow
-	 * the column's current one, and what is written must also be selectable,
-	 * so the view never claims a value the driver doesn't return or postgres
-	 * wouldn't accept. A column with a default may still omit the value on
-	 * insert.
+	 * the column's current one, so the view never claims a value the driver
+	 * doesn't return or postgres wouldn't accept.
 	 *
-	 * @example text().as<string, never, never>()
+	 * @example text().typed<string, never, never>()
 	 */
-	abstract as(): BaseColumn<D, unknown, unknown, unknown>;
+	abstract typed(): BaseColumn<D, unknown, unknown, unknown>;
 }

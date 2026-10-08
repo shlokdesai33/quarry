@@ -1,56 +1,77 @@
+import type { DataType } from './data-type/data-type.js';
 import type { AliasedExpression, TypedExpression } from './expression.js';
 import {
 	type ExpressionBuilder,
 	expressionBuilder,
 } from './expression-builder.js';
 import type { OperationNode } from './node.js';
-import type { OperatorsOf, Ref, Refs, RefsOf } from './refs.js';
+import type { AnyPredicate, EqualsValue } from './operators.js';
+import type { Ref, Refs, RefsOf } from './refs.js';
 import type { AnyTable } from './table.js';
 import type { Prettify } from './types.js';
 import {
-	type AnyPredicate,
 	type Condition,
 	type ConditionArgs,
 	type Group,
+	type Unconstrained,
 	WhereBuilder,
 } from './where-builder.js';
 
-/**
- * The columns that can be the right-hand side `V` of a join condition: those
- * in scope `R` whose values the operator takes.
- */
-type JoinColumn<R extends Refs, V> = {
-	[K in Ref<R>]: TypedExpression<R[K]['$select'], R[K]['dataType']> extends V
-		? K
-		: never;
-}[Ref<R>];
+/** The expressions the operand `V` takes, one per SQL type it accepts. */
+type ExpressionsIn<V> = Extract<V, TypedExpression<unknown, DataType>>;
 
 /**
- * The operators of the joined column `L` that some column can be the
- * right-hand side of: not `is`, which takes a keyword, nor `between`, which
- * takes a pair.
- */
-type JoinOperator<R extends Refs, L> = {
-	[O in keyof OperatorsOf<R, L> & string]: [
-		JoinColumn<R, OperatorsOf<R, L>[O]>,
-	] extends [never]
-		? never
-		: O;
-}[keyof OperatorsOf<R, L> & string];
-
-/**
- * The forms `on` takes over scope `R`, where `JR` are the joined table's
- * references, returning `B`:
+ * The columns of the tables `T` that can be the operand `V`: those of a SQL
+ * type it takes.
  *
- * - `(joinedColumn, operator, column)`: compares two columns
- * - `(q => q.where(...).orWhere(...))`: any conditions
+ * Each column's SQL type is matched against the SQL types of the expressions
+ * `V` takes, rather than building an expression for every column and
+ * checking it against all of `V`, for type-checking speed.
+ */
+type JoinColumn<T extends readonly AnyTable[], V> =
+	ExpressionsIn<V> extends infer E
+		? E extends TypedExpression<unknown, infer D extends DataType>
+			? TableColumn<T[number], D>
+			: never
+		: never;
+
+/**
+ * The columns of the table `X` of SQL type `D`. Scanned per table rather than
+ * over the merged scope, so each join of a chain reuses the scans of the
+ * tables joined before it.
+ */
+type TableColumn<X, D> = X extends AnyTable
+	? {
+			[K in keyof X['$refs'] & string]: X['$refs'][K] extends {
+				readonly _quarry: { readonly dataType: D };
+			}
+				? K
+				: never;
+		}[keyof X['$refs'] & string]
+	: never;
+
+/**
+ * The forms `on` takes over scope `R`, where `PT` are the tables joined before
+ * and `JR` the joined table's references, returning `B`:
+ *
+ * - `(joinedColumn, earlierColumn)`: the two columns are equal
+ * - `(eb => condition)`: any condition
  * - `(predicate)`: any boolean expression
  */
-interface JoinCondition<R extends Refs, JR extends Refs, B> {
-	<L extends Ref<JR>, O extends keyof OperatorsOf<R, L> & JoinOperator<R, L>>(
+interface JoinCondition<
+	R extends Refs,
+	PT extends readonly AnyTable[],
+	JR extends Refs,
+	B,
+> {
+	<L extends Ref<JR>>(
 		left: L,
-		operator: O,
-		right: JoinColumn<R, OperatorsOf<R, L>[O]>,
+		right: Unconstrained<
+			JoinColumn<
+				PT,
+				EqualsValue<NonNullable<JR[L]['$select']>, JR[L]['_quarry']['dataType']>
+			>
+		>,
 	): B;
 	(group: Group<R>): B;
 	(predicate: AnyPredicate): B;
@@ -83,9 +104,9 @@ type Row<R extends Refs, S> = { [K in S as KeyOf<K>]: ValueOf<R, K> };
  * @example
  * selectFrom(users)
  *   .innerJoin(contacts)
- *   .on('contacts.userId', '=', 'users.id')
- *   .where('users.age', '>=', 18)
- *   .orWhere((q) => q.where('users.role', '=', 'admin'))
+ *   .on('contacts.userId', 'users.id')
+ *   .where('users.role', 'admin')
+ *   .where((eb) => eb.ref('users.age').gte(18).or(eb.ref('users.verified').isTrue()))
  *   .select(['users.id', 'contacts.email'])
  */
 export function selectFrom<T extends AnyTable>(
@@ -118,24 +139,16 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 	}
 
 	/**
-	 * Adds a condition to the `where` clause, joined by `and`.
+	 * Adds a condition to the `where` clause, joined to the others by `and`:
+	 * `column = value`, or any condition built in a callback.
 	 *
-	 * @example .where('users.age', '>=', 18)
-	 * @example .where((q) => q.where('users.age', '<', 13).orWhere('users.age', '>', 65))
+	 * @example .where('users.role', 'admin')
+	 * @example .where((eb) => eb.ref('users.age').gte(18))
+	 * @example .where((eb) => eb.or([eb.ref('users.age').lt(13), eb.ref('users.age').gt(65)]))
 	 */
 	readonly where: Condition<RefsOf<T>, SelectQueryBuilder<T, O>> = (
 		...args: ConditionArgs<RefsOf<T>>
-	) => new SelectQueryBuilder<T, O>(this.#tables, this.#where.add('and', args));
-
-	/**
-	 * Adds a condition to the `where` clause, joined by `or`. `and` binds
-	 * tighter, as in SQL: `.where(a).orWhere(b).where(c)` is `a or (b and c)`.
-	 *
-	 * @example .where('users.age', '>=', 18).orWhere('users.role', '=', 'admin')
-	 */
-	readonly orWhere: Condition<RefsOf<T>, SelectQueryBuilder<T, O>> = (
-		...args: ConditionArgs<RefsOf<T>>
-	) => new SelectQueryBuilder<T, O>(this.#tables, this.#where.add('or', args));
+	) => new SelectQueryBuilder<T, O>(this.#tables, this.#where.add(args));
 
 	/**
 	 * Joins `table`, whose columns are in scope from `on` onwards.
@@ -193,17 +206,19 @@ export class JoinBuilder<T extends readonly AnyTable[], J extends AnyTable, O> {
 	}
 
 	/**
-	 * The join condition. The shorthand compares a column of the joined table
-	 * with any column in scope, both checked against the operator; any other
-	 * condition (values, expressions, several conditions) goes in a callback.
+	 * The join condition. The shorthand is `joinedColumn = earlierColumn`: a
+	 * column of the joined table equal to a column of a table joined before,
+	 * of a SQL type its `=` takes. Any other condition (other operators,
+	 * values, expressions, several conditions) goes in a callback.
 	 *
 	 * Not implemented yet: the condition is checked but not recorded.
 	 *
-	 * @example .on('contacts.userId', '=', 'users.id')
-	 * @example .on((q) => q.where('contacts.userId', '=', q.ref('users.id')).where('contacts.kind', '=', 'primary'))
+	 * @example .on('contacts.userId', 'users.id')
+	 * @example .on((eb) => eb.ref('contacts.userId').eq(eb.ref('users.id')).and(eb.ref('contacts.kind').eq('primary')))
 	 */
 	readonly on: JoinCondition<
 		RefsOf<[...T, J]>,
+		T,
 		RefsOf<[J]>,
 		SelectQueryBuilder<[...T, J], O>
 	> = () => this.#query;

@@ -21,91 +21,112 @@ const contacts = defineTable('contacts', {
 });
 
 describe('where', () => {
-	it('types the value from the column and operator', () => {
-		selectFrom(users).where('users.age', '>=', 18);
-		selectFrom(users).where('users.role', 'in', ['admin', 'member']);
-		selectFrom(users).orWhere('users.email', 'is', null);
+	it('types `column = value` like `eq`', () => {
+		selectFrom(users).where('users.age', 18);
+		selectFrom(users).where('users.role', 'admin');
+		selectFrom(users).where('users.email', 'a@example.com');
 
 		// @ts-expect-error wrong value type
-		selectFrom(users).where('users.age', '=', '18');
+		selectFrom(users).where('users.age', '18');
 		// @ts-expect-error not one of the role's values
-		selectFrom(users).where('users.role', '=', 'owner');
-		// @ts-expect-error integers have no pattern operators
-		selectFrom(users).where('users.age', 'like', '1%');
+		selectFrom(users).where('users.role', 'owner');
+		// @ts-expect-error `= null` is never true: `isNull()` in a callback
+		selectFrom(users).where('users.email', null);
+		// @ts-expect-error the two-argument form is only `=`
+		selectFrom(users).where('users.age', '>=', 18);
 	});
 
-	it('gives a group the same scope', () => {
-		selectFrom(users).where((q) =>
-			q.where('users.age', '<', 13).orWhere('users.role', '=', 'admin'),
+	it('takes any condition in a callback', () => {
+		selectFrom(users).where((eb) => eb.ref('users.age').gte(18));
+		selectFrom(users).where((eb) =>
+			eb.ref('users.age').lt(13).or(eb.ref('users.role').eq('admin')),
 		);
-		selectFrom(users).where((q) =>
-			q.where('users.age', '>', q.ref('users.id')),
+		selectFrom(users).where((eb) =>
+			eb.or([eb.ref('users.age').lt(13), eb.ref('users.email').isNull()]),
+		);
+		selectFrom(users).where(({ ref }) =>
+			ref('users.email').like('%@example.com'),
 		);
 
-		selectFrom(users).where((q) =>
-			// @ts-expect-error a reference is still checked inside a group
-			q.where('users.age', '>', q.ref('users.email')),
-		);
+		// @ts-expect-error a callback returns a condition
+		selectFrom(users).where((eb) => eb.ref('users.age'));
+	});
+
+	it('has no orWhere: or is part of one condition', () => {
+		// @ts-expect-error `.where((eb) => a.or(b))`
+		selectFrom(users).orWhere('users.age', 18);
 	});
 
 	it('only sees joined tables', () => {
 		// @ts-expect-error contacts is not joined
-		selectFrom(users).where('contacts.email', '=', 'x');
+		selectFrom(users).where('contacts.email', 'x');
+		// @ts-expect-error nor in a callback
+		selectFrom(users).where((eb) => eb.ref('contacts.email').eq('x'));
 
 		selectFrom(users)
 			.innerJoin(contacts)
-			.on((q) => q.where('contacts.userId', '=', q.ref('users.id')))
-			.where('contacts.email', '=', 'x');
+			.on('contacts.userId', 'users.id')
+			.where('contacts.email', 'x');
 	});
 });
 
 describe('innerJoin', () => {
 	const joined = selectFrom(users).innerJoin(contacts);
 
-	it('compares a joined column with another table’s column', () => {
-		joined.on('contacts.userId', '=', 'users.id');
-		joined.on('contacts.userId', '<', 'users.age');
-		joined.on('contacts.email', '=', 'users.email');
+	it('equates a joined column with another table’s column', () => {
+		joined.on('contacts.userId', 'users.id');
+		joined.on('contacts.userId', 'users.age');
+		joined.on('contacts.email', 'users.email');
 	});
 
 	it('puts the joined table’s column on the left', () => {
 		// @ts-expect-error the left-hand side is a column of the joined table
-		joined.on('users.id', '=', 'contacts.userId');
+		joined.on('users.id', 'contacts.userId');
 	});
 
-	it('takes any column in scope on the right', () => {
-		joined.on('contacts.userId', '=', 'contacts.id');
-
+	it('takes a column of an earlier table on the right', () => {
+		// @ts-expect-error the right-hand side is a column of an earlier table
+		joined.on('contacts.userId', 'contacts.id');
 		// @ts-expect-error a value is not a column
-		joined.on('contacts.userId', '=', 1);
+		joined.on('contacts.userId', 1);
 		// @ts-expect-error not a column in scope
-		joined.on('contacts.userId', '=', 'users.nope');
+		joined.on('contacts.userId', 'users.nope');
 	});
 
-	it('checks the right-hand column against the operator', () => {
+	it('takes a column of any earlier table on the right', () => {
+		const second = joined
+			.on('contacts.userId', 'users.id')
+			.innerJoin(users.as('managers'));
+		second.on('managers.id', 'users.id');
+		second.on('managers.id', 'contacts.userId');
+		// @ts-expect-error the right-hand side is a column of an earlier table
+		second.on('managers.id', 'managers.age');
+	});
+
+	it('checks the right-hand column against the joined column’s `=`', () => {
 		// @ts-expect-error an integer column is not compared with a string one
-		joined.on('contacts.userId', '=', 'users.email');
-		// @ts-expect-error integers have no pattern operators
-		joined.on('contacts.userId', 'like', 'users.email');
-		// @ts-expect-error `is` takes a keyword, not a column
-		joined.on('contacts.userId', 'is', 'users.id');
-		// @ts-expect-error `between` takes a pair, not a column
-		joined.on('contacts.userId', 'between', 'users.id');
+		joined.on('contacts.userId', 'users.email');
 	});
 
 	it('joins a table to an alias of itself', () => {
 		selectFrom(users)
 			.innerJoin(users.as('managers'))
-			.on('managers.id', '=', 'users.id');
+			.on('managers.id', 'users.id');
 	});
 
 	it('takes any other condition in a callback', () => {
-		joined.on((q) =>
-			q
-				.where('contacts.userId', '=', q.ref('users.id'))
-				.where('contacts.email', 'like', '%@example.com'),
+		joined.on((eb) =>
+			eb
+				.ref('contacts.userId')
+				.eq(eb.ref('users.id'))
+				.and(eb.ref('contacts.email').like('%@example.com')),
 		);
-		joined.on((q) => q.where('users.age', '>=', 18));
+		joined.on((eb) => eb.ref('contacts.userId').lt(eb.ref('users.age')));
+		joined.on((eb) => eb.ref('users.age').gte(18));
+		// @ts-expect-error the shorthand takes no operator
+		joined.on('contacts.userId', '<', 'users.age');
+		// @ts-expect-error a callback condition is still checked
+		joined.on((eb) => eb.ref('contacts.userId').eq(eb.ref('users.email')));
 	});
 });
 
@@ -128,7 +149,7 @@ describe('select', () => {
 		expectTypeOf(
 			selectFrom(users)
 				.innerJoin(contacts)
-				.on((q) => q.where('contacts.userId', '=', q.ref('users.id')))
+				.on('contacts.userId', 'users.id')
 				.select(['users.id', 'contacts.email']).$output,
 		).toEqualTypeOf<{ id: number; email: string }>();
 	});

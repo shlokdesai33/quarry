@@ -22,6 +22,8 @@
 				"caughtErrorsIgnorePattern": "^_"
 			}
 		],
+		// the library's internals live under `_quarry`
+		"eslint/no-underscore-dangle": ["error", { "allow": ["_quarry"] }],
 		// oxlint recommends using typescript's noImplicitReturns instead
 		"typescript/consistent-return": "off",
 		"typescript/no-explicit-any": "off",

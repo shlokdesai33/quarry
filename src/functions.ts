@@ -6,12 +6,13 @@ import {
 	Quantified,
 	TypedExpression,
 } from './expression.js';
+import { typedExpression } from './expression-methods.js';
 import type { OperationNode } from './node.js';
-import type { Kind, OrderedKind, TextKind } from './operators.js';
+import type { Expr, Kind, OrderedKind, TextKind } from './operators.js';
 import type { DataTypeOf, NullOf, Operand, Ref, Refs, TypeOf } from './refs.js';
 
 /** A result of SQL type `K` and TypeScript type `T`, nullable when `N` is `null`. */
-type Result<K extends Kind, T, N = never> = TypedExpression<T | N, DataType<K>>;
+type Result<K extends Kind, T, N = never> = Expr<T | N, DataType<K>>;
 
 /** Any character type. */
 type Text = DataType<TextKind>;
@@ -46,14 +47,34 @@ type ElementType<D> = D extends ArrayType<infer E> ? E : never;
  * be.
  */
 type QuantifiedOf<R extends Refs, A> = A extends readonly (infer S)[]
-	? Quantified<S, never>
+	? Quantified<S, never, never, false>
 	: A extends Param<infer T>
-		? Quantified<Element<NonNullable<T>>, never, NullOf<T>>
+		? Quantified<Element<NonNullable<T>>, never, NullOf<T>, false>
 		: Quantified<
 				NonNullable<Element<NonNullable<TypeOf<R, A>>>>,
 				ElementType<DataTypeOf<R, A>>,
-				NullOf<TypeOf<R, A> | Element<NonNullable<TypeOf<R, A>>>>
+				NullOf<TypeOf<R, A> | Element<NonNullable<TypeOf<R, A>>>>,
+				true
 			>;
+
+/**
+ * What `coalesce(first, ...rest)` returns: of the first argument's SQL type,
+ * and null only if the last argument can be.
+ *
+ * Behind `extends infer`, so it waits until the arguments are inferred: built
+ * from both type parameters, `Expr` would otherwise be instantiated with them
+ * still generic while the call is resolved.
+ */
+type Coalesced<R extends Refs, A, Rest extends readonly unknown[]> = [
+	A,
+	Rest,
+] extends [infer F, infer L extends readonly unknown[]]
+	? Expr<
+			| NonNullable<TypeOf<R, F> | TypeOf<R, L[number]>>
+			| NullOf<TypeOf<R, Last<L>>>,
+			DataTypeOf<R, F>
+		>
+	: never;
 
 type Last<T extends readonly unknown[]> = T extends readonly [
 	...unknown[],
@@ -98,8 +119,10 @@ const CAST_KINDS = {
  * The SQL functions available in scope `R`, typed by the SQL types of their
  * arguments and results. Most are null if any argument is; `concat`, `count`
  * and `now` never are. A plain value argument goes through `eb.val`.
+ *
+ * `R` is invariant, as for `ExpressionBuilder`.
  */
-export interface Functions<R extends Refs> {
+export interface Functions<in out R extends Refs> {
 	/** `lower(text)` */
 	lower<A extends Operand<R, Text>>(
 		text: A,
@@ -134,11 +157,7 @@ export interface Functions<R extends Refs> {
 	>(
 		first: A,
 		...rest: Rest
-	): TypedExpression<
-		| NonNullable<TypeOf<R, A> | TypeOf<R, Rest[number]>>
-		| NullOf<TypeOf<R, Last<Rest>>>,
-		DataTypeOf<R, A>
-	>;
+	): Coalesced<R, A, Rest>;
 
 	/** `count(*)` or `count(value)`. A `bigint`, so it arrives as a string. */
 	count(value?: Part<R>): Result<'bigint', string>;
@@ -146,12 +165,12 @@ export interface Functions<R extends Refs> {
 	/** `min(value)`: null over no rows. */
 	min<A extends Operand<R, Comparable>>(
 		value: A,
-	): TypedExpression<TypeOf<R, A> | null, DataTypeOf<R, A>>;
+	): Expr<TypeOf<R, A> | null, DataTypeOf<R, A>>;
 
 	/** `max(value)`: null over no rows. */
 	max<A extends Operand<R, Comparable>>(
 		value: A,
-	): TypedExpression<TypeOf<R, A> | null, DataTypeOf<R, A>>;
+	): Expr<TypeOf<R, A> | null, DataTypeOf<R, A>>;
 
 	/** `now()`: the transaction's start time. */
 	now(): Result<'timestamptz', Date>;
@@ -173,9 +192,9 @@ export interface Functions<R extends Refs> {
 	 * else. Each value is encoded like an operand of the comparison. Of an
 	 * array column or expression, it also takes a parameter on the left.
 	 *
-	 * @example eb('users.email', 'like', eb.fn.any(['%@a.com', '%@b.com']))
-	 * @example eb('users.age', '>', eb.fn.any('users.limits'))
-	 * @example eb(eb.val('admin'), '=', eb.fn.any('users.tags'))
+	 * @example eb.ref('users.email').like(eb.fn.any(['%@a.com', '%@b.com']))
+	 * @example eb.ref('users.age').gt(eb.fn.any('users.limits'))
+	 * @example eb.val('admin').eq(eb.fn.any('users.tags'))
 	 */
 	any<const A extends Quantifiable<R>>(array: A): QuantifiedOf<R, A>;
 
@@ -183,7 +202,7 @@ export interface Functions<R extends Refs> {
 	 * `all(array)`, the right-hand side of a comparison that holds if it does
 	 * for every element, so always for an empty array.
 	 *
-	 * @example eb('users.email', 'not like', eb.fn.all(['%@a.com', '%@b.com']))
+	 * @example eb.ref('users.email').notLike(eb.fn.all(['%@a.com', '%@b.com']))
 	 */
 	all<const A extends Quantifiable<R>>(array: A): QuantifiedOf<R, A>;
 }
@@ -198,21 +217,8 @@ export interface Scope<R extends Refs> {
 
 const STAR: OperationNode = { kind: 'raw', fragments: ['*'], nodes: [] };
 
-/**
- * At runtime a call is just a node and a data type; `Functions` supplies the
- * TypeScript types, so this returns the bottom type, which fits every
- * signature.
- */
-function result(
-	node: OperationNode,
-	dataType: DataType,
-): TypedExpression<never, never> {
-	// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the signature supplies the type
-	return new TypedExpression(node, dataType as never);
-}
-
 function call(name: string, args: readonly OperationNode[], type: DataType) {
-	return result({ kind: 'function', name, args }, type);
+	return typedExpression({ kind: 'function', name, args }, type);
 }
 
 /** Like `result`: `Functions` supplies the element types. */
@@ -262,7 +268,7 @@ export function functions<R extends Refs>({
 			if (!Object.hasOwn(CAST_KINDS, type)) {
 				throw new Error(`Unknown cast type "${type}"`);
 			}
-			return result(
+			return typedExpression(
 				{
 					kind: 'raw',
 					fragments: ['cast(', ` as ${type})`],

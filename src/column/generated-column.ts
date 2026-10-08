@@ -15,10 +15,7 @@ export class GeneratedColumn<D extends DataType, S, I, U>
 	 * @example text().generated().nullable()
 	 */
 	nullable() {
-		return new GeneratedColumn<D, S | null, I, U>({
-			dataType: this.dataType,
-			columnName: this.columnName,
-		});
+		return new GeneratedColumn<D, S | null, I, U>(this._quarry);
 	}
 
 	/**
@@ -28,17 +25,11 @@ export class GeneratedColumn<D extends DataType, S, I, U>
 	 * @example text().nullable().generated()
 	 */
 	generated() {
-		return new GeneratedColumn<D, S, never, never>({
-			dataType: this.dataType,
-			columnName: this.columnName,
-		});
+		return new GeneratedColumn<D, S, never, never>(this._quarry);
 	}
 
 	override name(columnName: string) {
-		return new GeneratedColumn<D, S, I, U>({
-			dataType: this.dataType,
-			columnName,
-		});
+		return new GeneratedColumn<D, S, I, U>({ ...this._quarry, columnName });
 	}
 
 	/**
@@ -46,12 +37,9 @@ export class GeneratedColumn<D extends DataType, S, I, U>
 	 * literal unions). Only the select type is given: a generated column is
 	 * never written, so its insert and update types stay `never`.
 	 *
-	 * @example text().generated().as<'active' | 'inactive'>()
+	 * @example text().generated().typed<'active' | 'inactive'>()
 	 */
-	override as<X extends S>() {
-		return new GeneratedColumn<D, X, I, U>({
-			dataType: this.dataType,
-			columnName: this.columnName,
-		});
+	override typed<X extends S>() {
+		return new GeneratedColumn<D, X, I, U>(this._quarry);
 	}
 }

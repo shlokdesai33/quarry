@@ -15,7 +15,7 @@ type Options = {
 
 /**
  * A SQL type of kind `K`: how values of the type are encoded for the driver,
- * and, through `OperatorsByKind`, the operators they admit. Columns and
+ * and, through `MethodsByKind`, the comparisons they admit. Columns and
  * expressions of the type share it, so a value is encoded the same way
  * whether it is compared against a column or against a computed expression.
  *
@@ -30,11 +30,11 @@ type Options = {
  */
 export class DataType<K extends Kind = Kind> {
 	/**
-	 * The name of the SQL type, which keys its operators in `OperatorsByKind`.
-	 * It also keeps types that admit the same operators, such as `integer`
+	 * The name of the SQL type, which keys its methods in `MethodsByKind`.
+	 * It also keeps types that admit the same comparisons, such as `integer`
 	 * and `real`, distinct.
 	 */
-	readonly $kind: K;
+	readonly kind: K;
 
 	/**
 	 * How values are encoded, where they aren't sent as is.
@@ -48,7 +48,7 @@ export class DataType<K extends Kind = Kind> {
 	 * @param options how values are encoded, where they aren't sent as is.
 	 */
 	constructor(kind: K, options: Options = {}) {
-		this.$kind = kind;
+		this.kind = kind;
 		this.#options = options;
 	}
 

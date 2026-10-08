@@ -23,15 +23,15 @@ export function comparison(
 ): OperationNode {
 	const operand = (item: unknown): OperationNode => {
 		if (item instanceof Param) {
-			return { kind: 'value', value: serialize(item.value) };
+			return { kind: 'value', value: serialize(item._quarry.value) };
 		}
 		return Expression.is(item)
-			? item.toNode()
+			? item._quarry.node
 			: { kind: 'value', value: serialize(item) };
 	};
 
 	const array = (items: unknown): OperationNode => {
-		const values = items instanceof Param ? items.value : items;
+		const values = items instanceof Param ? items._quarry.value : items;
 		return Array.isArray(values)
 			? { kind: 'value', value: values.map(serialize) }
 			: operand(items);
@@ -44,8 +44,8 @@ export function comparison(
 			operator,
 			right: {
 				kind: 'function',
-				name: value.quantifier,
-				args: [array(value.array)],
+				name: value._quarry.quantifier,
+				args: [array(value._quarry.array)],
 			},
 		};
 	}

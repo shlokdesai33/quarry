@@ -1,34 +1,36 @@
-import { Expression, type Param } from './expression.js';
+import { Expression } from './expression.js';
 import type { ExpressionBuilder } from './expression-builder.js';
-import type { Functions } from './functions.js';
-import type { JsonFunctions } from './json.js';
+import { compare } from './expression-methods.js';
 import type { OperationNode } from './node.js';
-import type { Operand, OperatorsOf, Ref, Refs } from './refs.js';
+import type { AnyPredicate, EqualsValue } from './operators.js';
+import type { Ref, Refs } from './refs.js';
 
-/** A boolean expression, possibly null. */
-export type AnyPredicate = Expression<boolean | null>;
-
-/** A group callback: builds conditions that are parenthesised together. */
-export type Group<R extends Refs> = (
-	q: WhereBuilder<R>,
-) => WhereBuilder<R> | AnyPredicate;
+/** A condition callback: builds one condition from the expression builder. */
+export type Group<R extends Refs> = (eb: ExpressionBuilder<R>) => AnyPredicate;
 
 /**
- * The forms `where` and `orWhere` take, returning `B`:
+ * `T`, but with no constraint while `T` is generic, for type-checking speed.
+ * For a literal argument, the compiler asks whether the parameter type keeps
+ * literals before applying the call's inferred type arguments, so it resolves
+ * a generic parameter type through its constraint: for a column's value, the
+ * type for every reference in scope. The check is a no-op here; this makes it
+ * free. Once `T` is concrete, this is `T`, and errors print it as `T`.
+ */
+export type Unconstrained<T> = [T] extends [infer U] ? U : never;
+
+/**
+ * The forms `where` takes, returning `B`:
  *
- * - `(left, operator, value)`: a comparison, typed like `eb(...)`, including
- *   `(q.val(x), operator, q.fn.any(array))`
- * - `(q => q.where(...).orWhere(...))`: a parenthesised group
+ * - `(column, value)`: `column = value`, the value typed like `eq`'s
+ * - `(eb => condition)`: any condition, e.g. `eb.ref(column).gte(value)`
  * - `(predicate)`: any boolean expression
  */
 export interface Condition<R extends Refs, B> {
-	<
-		L extends Operand<R> | Param<unknown>,
-		O extends keyof OperatorsOf<R, L> & string,
-	>(
-		left: L,
-		operator: O,
-		value: OperatorsOf<R, L>[O],
+	<C extends Ref<R>>(
+		column: C,
+		value: Unconstrained<
+			EqualsValue<NonNullable<R[C]['$select']>, R[C]['_quarry']['dataType']>
+		>,
 	): B;
 	(group: Group<R>): B;
 	(predicate: AnyPredicate): B;
@@ -36,134 +38,57 @@ export interface Condition<R extends Refs, B> {
 
 /** The arguments of any form of `Condition`. */
 export type ConditionArgs<R extends Refs> =
-	| readonly [left: unknown, operator: string, value: unknown]
+	| readonly [column: string, value: unknown]
 	| readonly [group: Group<R>]
 	| readonly [predicate: AnyPredicate];
 
-/** How a condition joins the ones before it. */
-type Connector = 'and' | 'or';
-
-interface Entry {
-	readonly connector: Connector;
-	readonly node: OperationNode;
-}
-
 /**
  * Collects the conditions of a `where` clause over the references in scope
- * `R`, each joined to the ones before it by `and` (`where`) or `or`
- * (`orWhere`). They combine as written in SQL, where `and` binds tighter than
- * `or`: `a.where(b).orWhere(c).where(d)` is `(a and b) or (c and d)`. A group
- * callback is how to combine them otherwise.
+ * `R`, joined by `and`. Any other combination is one condition built with
+ * `and` / `or`.
  *
  * Immutable: every method returns a new builder.
- *
- * @example q.where('users.age', '>=', 18).orWhere('users.role', '=', 'admin')
- * @example q.where('posts.authorId', '=', q.ref('users.id'))
  */
 export class WhereBuilder<R extends Refs> {
 	readonly #eb: ExpressionBuilder<R>;
-	readonly #entries: readonly Entry[];
+	readonly #conditions: readonly OperationNode[];
 
-	/** The SQL functions. */
-	readonly fn: Functions<R>;
-
-	/** The jsonb functions. */
-	readonly json: JsonFunctions<R>;
-
-	constructor(eb: ExpressionBuilder<R>, entries: readonly Entry[] = []) {
+	constructor(
+		eb: ExpressionBuilder<R>,
+		conditions: readonly OperationNode[] = [],
+	) {
 		this.#eb = eb;
-		this.#entries = entries;
-		this.fn = eb.fn;
-		this.json = eb.json;
+		this.#conditions = conditions;
 	}
 
-	/**
-	 * A column reference, for comparing two columns.
-	 *
-	 * @example q.where('posts.authorId', '=', q.ref('users.id'))
-	 */
-	ref<C extends Ref<R>>(column: C) {
-		return this.#eb.ref(column);
-	}
-
-	/**
-	 * A parameter, for positions that take a reference by default.
-	 *
-	 * @example q.where('users.id', 'in', q.val(ids))
-	 */
-	val<T extends readonly unknown[]>(value: T): Param<T>;
-	val<const T>(value: T): Param<T>;
-	val(value: unknown) {
-		return this.#eb.val(value);
-	}
-
-	/** Adds a condition joined by `and`. */
-	readonly where: Condition<R, WhereBuilder<R>> = (...args: ConditionArgs<R>) =>
-		this.add('and', args);
-
-	/** Adds a condition joined by `or`. */
-	readonly orWhere: Condition<R, WhereBuilder<R>> = (
-		...args: ConditionArgs<R>
-	) => this.add('or', args);
-
-	/**
-	 * Adds a condition given in any form of `Condition`. An empty group adds
-	 * nothing.
-	 */
-	add(connector: Connector, args: ConditionArgs<R>): WhereBuilder<R> {
-		const node = this.#nodeOf(args);
-		return node === undefined
-			? this
-			: new WhereBuilder(this.#eb, [...this.#entries, { connector, node }]);
+	/** Adds a condition given in any form of `Condition`. */
+	add(args: ConditionArgs<R>): WhereBuilder<R> {
+		return new WhereBuilder(this.#eb, [
+			...this.#conditions,
+			this.#nodeOf(args),
+		]);
 	}
 
 	/** The same conditions over a wider scope, e.g. after a join. */
 	rescope<S extends Refs>(eb: ExpressionBuilder<S>): WhereBuilder<S> {
-		return new WhereBuilder(eb, this.#entries);
+		return new WhereBuilder(eb, this.#conditions);
 	}
 
-	/**
-	 * The conditions as one node, `undefined` when there are none. Runs of
-	 * `and` are grouped first, then joined by `or`.
-	 */
+	/** The conditions as one node, `undefined` when there are none. */
 	toNode(): OperationNode | undefined {
-		const groups: OperationNode[][] = [];
-		for (const { connector, node } of this.#entries) {
-			const last = groups.at(-1);
-			if (last === undefined || connector === 'or') {
-				groups.push([node]);
-			} else {
-				last.push(node);
-			}
-		}
-
-		const operands = groups.map((group): OperationNode =>
-			group.length === 1 && group[0] !== undefined
-				? group[0]
-				: { kind: 'and', operands: group },
-		);
-		if (operands.length <= 1) return operands[0];
-		return { kind: 'or', operands };
+		const [only, ...rest] = this.#conditions;
+		return rest.length === 0
+			? only
+			: { kind: 'and', operands: this.#conditions };
 	}
 
-	#nodeOf(args: ConditionArgs<R>): OperationNode | undefined {
-		if (args.length === 3) {
-			return this.#compare(...args).toNode();
+	#nodeOf(args: ConditionArgs<R>): OperationNode {
+		if (args.length === 2) {
+			return compare(this.#eb.ref(args[0]), '=', args[1])._quarry.node;
 		}
 		const [first] = args;
-		if (Expression.is(first)) {
-			return first.toNode();
-		}
-		return first(new WhereBuilder(this.#eb)).toNode();
-	}
-
-	#compare(left: unknown, operator: string, value: unknown): AnyPredicate {
-		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- `Condition` checks the arguments
-		const compare = this.#eb as unknown as (
-			left: unknown,
-			operator: string,
-			value: unknown,
-		) => AnyPredicate;
-		return compare(left, operator, value);
+		return Expression.is(first)
+			? first._quarry.node
+			: first(this.#eb)._quarry.node;
 	}
 }

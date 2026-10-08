@@ -20,23 +20,14 @@ export class IntegerColumn<D extends DataType, S, I = S, U = I>
 	 * @example integer<UserId>().identity()
 	 */
 	identity() {
-		return new IdentityColumn<D, S, never, never>({
-			dataType: this.dataType,
-			columnName: this.columnName,
-		});
+		return new IdentityColumn<D, S, never, never>(this._quarry);
 	}
 
 	override name(columnName: string) {
-		return new IntegerColumn<D, S, I, U>({
-			dataType: this.dataType,
-			columnName,
-		});
+		return new IntegerColumn<D, S, I, U>({ ...this._quarry, columnName });
 	}
 
-	override as<X extends S, Y extends I & X, Z extends U & X>() {
-		return new IntegerColumn<D, X, Y, Z>({
-			dataType: this.dataType,
-			columnName: this.columnName,
-		});
+	override typed<X extends S, Y extends I, Z extends U>() {
+		return new IntegerColumn<D, X, Y, Z>(this._quarry);
 	}
 }

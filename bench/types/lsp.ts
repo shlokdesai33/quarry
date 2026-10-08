@@ -166,15 +166,16 @@ const joinedText = `t1.c${columnOf(1, KINDS[0]!)}`;
 
 const PROBE = `
 export const probe = [
-	eb('t0.c0', '=', 'x'),
+	eb.ref('t0.c0').eq('x'),
 	eb.fn.coalesce('t0.c0', eb.val('x')),
-	eb('t0.c0', ''),
-	eb(''),
+	eb.ref('t0.c0').like(),
+	eb.ref('t0.c0').,
+	eb.ref(''),
 ];
 
-export const probeQuery = selectFrom(t0).where('t0.c0', '');
+export const probeQuery = selectFrom(t0).where((q) => q.ref('t0.c0').);
 
-export const probeJoin = selectFrom(t0).innerJoin(t1).on('${joinedText}', '=', '');
+export const probeJoin = selectFrom(t0).innerJoin(t1).on('${joinedText}', '');
 `;
 
 interface Position {
@@ -198,16 +199,17 @@ function probe(dir: string, tables: number) {
 		}
 		return positionAt(text, offset + skip);
 	};
-	const whereCall = ".where('t0.c0', '')";
-	const onCall = `.on('${joinedText}', '=', '')`;
+	const whereCall = "q.ref('t0.c0').)";
+	const onCall = `.on('${joinedText}', '')`;
 	return {
 		uri: pathToFileURL(join(dir, 'probe.ts')).href,
 		text,
-		operator: at("eb('t0.c0', '')", "eb('t0.c0', '".length),
-		column: at("eb('')", "eb('".length),
-		comparison: at("eb('t0.c0', '=', 'x')"),
+		method: at("eb.ref('t0.c0').,", "eb.ref('t0.c0').".length),
+		argument: at("eb.ref('t0.c0').like()", "eb.ref('t0.c0').like(".length),
+		column: at("eb.ref('')", "eb.ref('".length),
+		comparison: at("eb.ref('t0.c0').eq('x')", "eb.ref('t0.c0').".length),
 		coalesce: at('coalesce(', 1),
-		whereOperator: at(whereCall, whereCall.length - 2),
+		whereMethod: at(whereCall, whereCall.length - 1),
 		joinColumn: at(onCall, onCall.length - 2),
 	};
 }
@@ -257,18 +259,18 @@ const hover = (position: keyof Probe) => (server: Server, file: Probe) =>
 
 const SCENARIOS: readonly Scenario[] = [
 	{
-		name: "operator completion: eb('t0.c0', '‸",
-		run: completion('operator'),
+		name: "method completion: eb.ref('t0.c0').‸",
+		run: completion('method'),
 		check: (result) => {
 			const found = labels(result as Completions);
 			expect(
-				found.includes('like') && !found.includes('@>'),
-				`operator completion returned ${JSON.stringify(found)}`,
+				found.includes('like') && !found.includes('contains'),
+				`method completion returned ${JSON.stringify(found)}`,
 			);
 		},
 	},
 	{
-		name: "column completion: eb('‸",
+		name: "column completion: eb.ref('‸",
 		run: completion('column'),
 		check: (result) => {
 			const found = labels(result as Completions);
@@ -279,18 +281,18 @@ const SCENARIOS: readonly Scenario[] = [
 		},
 	},
 	{
-		name: "operator completion: .where('t0.c0', '‸",
-		run: completion('whereOperator'),
+		name: "method completion: .where((q) => q.ref('t0.c0').‸",
+		run: completion('whereMethod'),
 		check: (result) => {
 			const found = labels(result as Completions);
 			expect(
-				found.includes('like') && !found.includes('@>'),
+				found.includes('like') && !found.includes('contains'),
 				`where completion returned ${JSON.stringify(found)}`,
 			);
 		},
 	},
 	{
-		name: `join column completion: .on('${joinedText}', '=', '‸`,
+		name: `join column completion: .on('${joinedText}', '‸`,
 		run: completion('joinColumn'),
 		check: (result) => {
 			const found = labels(result as Completions);
@@ -301,14 +303,11 @@ const SCENARIOS: readonly Scenario[] = [
 		},
 	},
 	{
-		name: "hover: eb('t0.c0', '=', 'x')",
+		name: "hover: eb.ref('t0.c0').eq('x')",
 		run: hover('comparison'),
 		check: (result) => {
 			const text = JSON.stringify(result);
-			expect(
-				text.includes('ExpressionBuilder') || text.includes('eb'),
-				`hover returned ${text}`,
-			);
+			expect(text.includes('eq'), `hover returned ${text}`);
 		},
 	},
 	{
@@ -320,11 +319,11 @@ const SCENARIOS: readonly Scenario[] = [
 		},
 	},
 	{
-		name: "signature help: eb('t0.c0', '‸",
+		name: "signature help: eb.ref('t0.c0').like(‸",
 		run: (server, file) =>
 			server.request('textDocument/signatureHelp', {
 				textDocument: { uri: file.uri },
-				position: file.operator,
+				position: file.argument,
 			}),
 		check: (result) => {
 			const signatures = (result as { signatures?: unknown[] } | null)

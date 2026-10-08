@@ -51,7 +51,8 @@ export function integer<T extends number>() {
  *
  * As one of the integer types it can be an identity. It is ordered, and
  * compares with every other numeric type, so an `integer` expression is
- * accepted on the other side of a comparison.
+ * accepted on the other side of a comparison although its values are
+ * numbers.
  *
  * @example views: bigint()
  * @example id: bigint<OrderId>().identity()
@@ -401,11 +402,11 @@ export function vector<T extends number[]>() {
  * An array of `element`: `array(text())` is a `text[]` column whose value is
  * `string[]`. Elements are encoded by the element type and typed by the
  * element column, so `array(text().nullable())` holds `(string | null)[]`.
- * Modifiers on the result apply to the array column. A name given to the
- * element carries over.
+ * Modifiers on the result apply to the array column.
  *
- * The element is a fresh or nullable column: a default, a generated value or
- * an identity belongs to the array column, not its elements.
+ * The element is a fresh or nullable column: a default, a generated value,
+ * an identity or a name belongs to the array column, not its elements, and a
+ * name given to the element is ignored.
  *
  * Only one dimension is modelled, so the element can't itself be an array.
  * Postgres treats `integer[][]` as the same type as `integer[]`, with a
@@ -416,11 +417,12 @@ export function vector<T extends number[]>() {
  * @example scores: array(integer().nullable())
  * @example labels: array(text()).name('label_list').nullable()
  */
-export function array<D extends DataType<Exclude<Kind, 'array'>>, S>(
-	element: Column<D, S, unknown, unknown>,
+export function array<D extends DataType<Exclude<Kind, 'array'>>, T>(
+	element:
+		| Column<D, T, unknown, unknown>
+		| IntegerColumn<D, T, unknown, unknown>,
 ) {
-	return new Column<ArrayType<D>, S[]>({
-		dataType: new ArrayType(element.dataType),
-		columnName: element.columnName,
+	return new Column<ArrayType<D>, T[]>({
+		dataType: new ArrayType(element._quarry.dataType),
 	});
 }

@@ -40,9 +40,9 @@ interface Kind {
 	readonly name: string;
 	/** how a table declares a column of this kind */
 	readonly declare: string;
-	/** a valid `=` operand; absent when the type has no `=` */
+	/** a valid `eq` operand; absent when the type has no `eq` */
 	readonly eq?: string;
-	/** a type-specific comparison: operator and operand */
+	/** a type-specific comparison: method and its arguments */
 	readonly extra: readonly [string, string];
 	/** has the text operators and functions */
 	readonly text?: boolean;
@@ -71,21 +71,21 @@ export const KINDS: readonly Kind[] = [
 		name: 'smallint',
 		declare: 'smallint()',
 		eq: '1',
-		extra: ['>', '1'],
+		extra: ['gt', '1'],
 		ordered: true,
 	},
 	{
 		name: 'integer',
 		declare: 'integer()',
 		eq: '1',
-		extra: ['>', '1'],
+		extra: ['gt', '1'],
 		ordered: true,
 	},
 	{
 		name: 'bigint',
 		declare: 'bigint()',
 		eq: "'1'",
-		extra: ['>', "'1'"],
+		extra: ['gt', "'1'"],
 		ordered: true,
 	},
 	{
@@ -106,16 +106,16 @@ export const KINDS: readonly Kind[] = [
 		name: 'decimal',
 		declare: 'decimal()',
 		eq: "'1.5'",
-		extra: ['<', "'2'"],
+		extra: ['lt', "'2'"],
 		ordered: true,
 	},
-	{ name: 'boolean', declare: 'boolean()', eq: 'true', extra: ['is', 'false'] },
+	{ name: 'boolean', declare: 'boolean()', eq: 'true', extra: ['isFalse', ''] },
 	{ name: 'uuid', declare: 'uuid()', eq: "'x'", extra: ['in', "['x', 'y']"] },
 	{
 		name: 'bytea',
 		declare: 'bytea()',
 		eq: 'new Uint8Array()',
-		extra: ['<>', 'new Uint8Array()'],
+		extra: ['ne', 'new Uint8Array()'],
 	},
 	{
 		name: 'date',
@@ -128,14 +128,14 @@ export const KINDS: readonly Kind[] = [
 		name: 'time',
 		declare: 'time()',
 		eq: "'12:00'",
-		extra: ['>=', "'09:00'"],
+		extra: ['gte', "'09:00'"],
 		ordered: true,
 	},
 	{
 		name: 'timestamp',
 		declare: 'timestamp()',
 		eq: "'2020-01-01 00:00'",
-		extra: ['<=', "'2021-01-01 00:00'"],
+		extra: ['lte', "'2021-01-01 00:00'"],
 		ordered: true,
 	},
 	{
@@ -149,42 +149,46 @@ export const KINDS: readonly Kind[] = [
 		name: 'interval',
 		declare: 'interval()',
 		eq: "'1 day'",
-		extra: ['<', "'2 days'"],
+		extra: ['lt', "'2 days'"],
 		ordered: true,
 	},
 	{
 		name: 'jsonb',
 		declare: 'jsonb<{ a: number }>()',
 		eq: '{ a: 1 }',
-		extra: ['@>', '{ a: 1 }'],
+		extra: ['contains', '{ a: 1 }'],
 	},
 	{
 		name: 'inet',
 		declare: 'inet()',
 		eq: "'10.0.0.1'",
-		extra: ['<<', "'10.0.0.0/8'"],
+		extra: ['isSubnetOf', "'10.0.0.0/8'"],
 		ordered: true,
 	},
-	{ name: 'tsvector', declare: 'tsvector()', extra: ['@@', "'fat & rat'"] },
+	{
+		name: 'tsvector',
+		declare: 'tsvector()',
+		extra: ['matches', "'fat & rat'"],
+	},
 	{
 		name: 'daterange',
 		declare: 'daterange()',
 		eq: '{ empty: true }',
-		extra: ['@>', "'2020-01-01'"],
+		extra: ['contains', "'2020-01-01'"],
 	},
 	{
 		name: 'tstzrange',
 		declare: 'tstzrange()',
 		eq: '{ empty: true }',
-		extra: ['&&', '{ empty: true }'],
+		extra: ['overlaps', '{ empty: true }'],
 	},
-	{ name: 'vector', declare: 'vector()', extra: ['is not', 'null'] },
+	{ name: 'vector', declare: 'vector()', extra: ['isNotNull', ''] },
 	{ name: 'enum', declare: 'status()', eq: "'a'", extra: ['in', "['a', 'b']"] },
 	{
 		name: 'array',
 		declare: 'array(text())',
 		eq: "['x']",
-		extra: ['&&', "['x']"],
+		extra: ['overlaps', "['x']"],
 	},
 ];
 
@@ -240,6 +244,9 @@ ${columns.join('\n')}
 `;
 }
 
+/** `eb.ref(column)`, for a quoted column. */
+const ref = (column: string) => `eb.ref(${column})`;
+
 /** Comparisons, functions and a `selectFrom` query over `t{i}` and `t{j}`. */
 export function queryFile(i: number, tables: number) {
 	const j = (i + 1) % tables;
@@ -250,46 +257,47 @@ export function queryFile(i: number, tables: number) {
 		const kind = kindAt(i, k);
 		const col = `'t${i}.c${k}'`;
 		const other = `'t${j}.c${columnOf(j, kind)}'`;
-		const [op, operand] = kind.extra;
+		const [method, operand] = kind.extra;
 
 		comparisons.push(
-			`eb(${col}, '${op}', ${operand}),`,
-			`eb(${col}, 'is', null),`,
+			`${ref(col)}.${method}(${operand}),`,
+			`${ref(col)}.isNull(),`,
 		);
 		if (kind.eq) {
-			comparisons.push(`eb(${col}, '=', ${kind.eq}),`);
+			comparisons.push(`${ref(col)}.eq(${kind.eq}),`);
 			if (k % 2 === 0) {
-				comparisons.push(`eb(${col}, '=', eb.ref(${other})),`);
+				comparisons.push(`${ref(col)}.eq(${ref(other)}),`);
 			} else {
-				comparisons.push(`eb(eb.ref(${col}), '=', ${kind.eq}),`);
+				comparisons.push(`${ref(col)}.ne(${kind.eq}),`);
 			}
 			if (k % 3 === 0) {
 				comparisons.push(
-					`eb(eb.fn.coalesce(${col}, eb.val(${kind.eq})), '=', ${kind.eq}),`,
+					`eb.fn.coalesce(${col}, eb.val(${kind.eq})).eq(${kind.eq}),`,
 				);
 			}
 			if (k % 5 === 0) {
-				comparisons.push(`eb(${col}, 'in', [${kind.eq}, eb.ref(${other})]),`);
+				comparisons.push(`${ref(col)}.in([${kind.eq}, ${ref(other)}]),`);
 			}
 		}
 		if (kind.text) {
 			comparisons.push(
-				`eb(eb.fn.lower(${col}), 'like', '%x%'),`,
-				`eb(eb.fn.length(${col}), '>', 3),`,
+				`eb.fn.lower(${col}).like('%x%'),`,
+				`eb.fn.length(${col}).gt(3),`,
 			);
 		}
 		if (kind.ordered && kind.eq) {
-			comparisons.push(`eb(eb.fn.max(${col}), '>', ${kind.eq}),`);
+			comparisons.push(`eb.fn.max(${col}).gt(${kind.eq}),`);
 			if (k % 5 === 1) {
-				comparisons.push(
-					`eb(${col}, 'between', [eb.ref(${other}), ${kind.eq}]),`,
-				);
+				comparisons.push(`${ref(col)}.between([${ref(other)}, ${kind.eq}]),`);
 			}
 		}
 
 		if (kind.eq && k < 8) {
-			const method = k % 3 === 2 ? 'orWhere' : 'where';
-			conditions.push(`.${method}(${col}, '=', ${kind.eq})`);
+			conditions.push(
+				k % 3 === 2
+					? `.where((q) => q.ref(${col}).eq(${kind.eq}).or(q.ref(${col}).isNull()))`
+					: `.where(${col}, ${kind.eq})`,
+			);
 		}
 	});
 
@@ -304,31 +312,31 @@ const eb = expressionBuilder(t${i}, t${j});
 
 export const q${i} = [
 	${comparisons.join('\n\t')}
-	eb.and([eb('t${i}.id', '>', 1), eb('t${i}.c0', 'is', null)]),
-	eb(eb.fn.count(), '>', '5'),
-	// @ts-expect-error integers have no pattern operators
-	eb('t${i}.id', 'like', '1%'),
+	eb.and([eb.ref('t${i}.id').gt(1), eb.ref('t${i}.c0').isNull()]),
+	eb.fn.count().gt('5'),
+	// @ts-expect-error integers have no pattern methods
+	eb.ref('t${i}.id').like('1%'),
 	// @ts-expect-error lower takes text
 	eb.fn.lower('t${i}.id'),
 	// @ts-expect-error wrong value type
-	eb('t${i}.id', '=', 'x'),
+	eb.ref('t${i}.id').eq('x'),
 	// @ts-expect-error a text column is not an integer one
-	eb('t${i}.id', '=', eb.ref(${textOfJ})),
+	eb.ref('t${i}.id').eq(eb.ref(${textOfJ})),
 ];
 
 export const s${i} = selectFrom(t${i})
 	.innerJoin(t${j})
-	.on(${textOfJ}, '=', ${textOfI})
+	.on(${textOfJ}, ${textOfI})
 	${conditions.join('\n\t')}
-	.orWhere((q) =>
-		q.where('t${j}.id', '>', q.ref('t${i}.id')).orWhere(${textOfJ}, 'is', null),
+	.where((q) =>
+		q.ref('t${j}.id').gt(q.ref('t${i}.id')).or(q.ref(${textOfJ}).isNull()),
 	)
 	.select(['t${i}.id', ${textOfJ}]);
 
 export const s${i}Bad = selectFrom(t${i})
 	.innerJoin(t${j})
 	// @ts-expect-error the left-hand side is a column of the joined table
-	.on('t${i}.id', '=', 't${j}.id');
+	.on('t${i}.id', 't${j}.id');
 `;
 }
 

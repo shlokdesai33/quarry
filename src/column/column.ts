@@ -12,17 +12,14 @@ export class Column<D extends DataType, S, I = S, U = I>
 	extends BaseColumn<D, S, I, U>
 {
 	/**
-	 * Marks the column as nullable on select, insert, and update. Use `as()` for
+	 * Marks the column as nullable on select, insert, and update. Use `typed()` for
 	 * asymmetric nullability cases.
 	 *
 	 * @example text().nullable()
-	 * @example text().nullable().as<string | null, string | null, string>()
+	 * @example text().nullable().typed<string | null, string | null, string>()
 	 */
 	nullable() {
-		return new Column<D, S | null, I | null, U | null>({
-			dataType: this.dataType,
-			columnName: this.columnName,
-		});
+		return new Column<D, S | null, I | null, U | null>(this._quarry);
 	}
 
 	/**
@@ -32,10 +29,7 @@ export class Column<D extends DataType, S, I = S, U = I>
 	 * @example text().default()
 	 */
 	default() {
-		return new DefaultColumn<D, S, I | undefined, U>({
-			dataType: this.dataType,
-			columnName: this.columnName,
-		});
+		return new DefaultColumn<D, S, I | undefined, U>(this._quarry);
 	}
 
 	/**
@@ -45,23 +39,14 @@ export class Column<D extends DataType, S, I = S, U = I>
 	 * @example text().generated()
 	 */
 	generated() {
-		return new GeneratedColumn<D, S, never, never>({
-			dataType: this.dataType,
-			columnName: this.columnName,
-		});
+		return new GeneratedColumn<D, S, never, never>(this._quarry);
 	}
 
 	override name(columnName: string) {
-		return new Column<D, S, I, U>({
-			dataType: this.dataType,
-			columnName,
-		});
+		return new Column<D, S, I, U>({ ...this._quarry, columnName });
 	}
 
-	override as<X extends S, Y extends I & X, Z extends U & X>() {
-		return new Column<D, X, Y, Z>({
-			dataType: this.dataType,
-			columnName: this.columnName,
-		});
+	override typed<X extends S, Y extends I, Z extends U>() {
+		return new Column<D, X, Y, Z>(this._quarry);
 	}
 }

@@ -6,7 +6,7 @@ import type { DataType } from '../data-type/data-type.js';
  *
  * It lists only the properties the library reads, so that every column class
  * fits without their methods being compared (which fails for the generic
- * `as()`). The value types are `unknown`, not `any`: a factory called where
+ * `typed()`). The value types are `unknown`, not `any`: a factory called where
  * some column is expected (`columns: { a: text() }`) infers its value type
  * from this, and `unknown`, unlike `any`, fails the factory's constraint,
  * which is then used instead.
@@ -15,6 +15,8 @@ export interface AnyColumn {
 	readonly $select: unknown;
 	readonly $insert: unknown;
 	readonly $update: unknown;
-	readonly dataType: DataType;
-	readonly columnName: string | undefined;
+	readonly _quarry: {
+		readonly dataType: DataType;
+		readonly columnName: string | undefined;
+	};
 }

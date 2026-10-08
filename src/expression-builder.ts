@@ -1,109 +1,57 @@
 import type { AnyColumn } from './column/any-column.js';
-import { comparison } from './comparison.js';
-import { DataType } from './data-type/data-type.js';
-import {
-	type Expression,
-	Param,
-	Quantified,
-	TypedExpression,
-} from './expression.js';
+import type { DataType } from './data-type/data-type.js';
+import type { Expression, TypedExpression } from './expression.js';
+import { param, predicate, typedExpression } from './expression-methods.js';
 import { type Functions, functions } from './functions.js';
 import { type JsonFunctions, jsonFunctions } from './json.js';
 import type { OperationNode, ReferenceNode } from './node.js';
-import type {
-	NullOf,
-	Operand,
-	OperatorsOf,
-	Ref,
-	Refs,
-	RefsOf,
-	TypeOf,
-} from './refs.js';
+import type { AnyPredicate, Expr, Predicate, Value } from './operators.js';
+import type { NullOf, Ref, Refs, RefsOf } from './refs.js';
 import type { AnyTable } from './table.js';
-
-/** The operators that yield a boolean even when an operand is null. */
-type NullSafe = 'is' | 'is not' | 'is distinct from' | 'is not distinct from';
-
-/**
- * `null` if the right-hand side of a comparison can be null: an expression or
- * parameter that can be, a list or pair holding one, or `any` / `all` of an
- * array that can be or can hold null.
- */
-type NullIn<V> =
-	V extends Expression<infer T>
-		? NullOf<T>
-		: V extends readonly (infer I)[]
-			? NullIn<I>
-			: V extends Quantified<unknown, DataType, infer N>
-				? N
-				: never;
-
-/** `null` if `left operator value` can be unknown, as in SQL. */
-type NullOfComparison<R extends Refs, L, O, V> = O extends NullSafe
-	? never
-	: NullOf<TypeOf<R, L>> | NullIn<V>;
-
-/** A boolean expression, nullable when `N` is `null`. */
-type Predicate<N extends null = never> = TypedExpression<
-	boolean | N,
-	DataType<'boolean'>
->;
-
-type AnyPredicate = Expression<boolean | null>;
 
 /**
  * Builds expressions over the references in scope `R`. Only visible columns
- * can be referenced, and a comparison only admits the operators and value
- * types of its left-hand side's SQL type.
+ * can be referenced. A condition is a method of an expression, typed by the
+ * expression's SQL type: only the comparisons that type has, each taking the
+ * values and expressions it accepts.
+ *
+ * Its members don't depend on `this`, so it can be destructured.
+ *
+ * `R` is declared invariant, for type-checking speed: a builder is only ever
+ * used with its own scope, and without the annotation the compiler measures
+ * the variance by comparing the whole interface, once per program, and
+ * editors once per edit.
+ *
+ * @example eb.ref('users.email').like('%@example.com')
+ * @example eb.ref('users.age').between([18, eb.ref('users.maxAge')])
+ * @example eb.fn.lower('users.email').eq('ada@example.com')
+ * @example eb.val('admin').eq(eb.fn.any('users.tags'))
  */
-export interface ExpressionBuilder<R extends Refs> {
+export interface ExpressionBuilder<in out R extends Refs> {
 	/**
-	 * `left operator value`. The operators and what each takes come from the
-	 * SQL type of `left`, which also encodes `value`: a plain value or a
-	 * parameter, or an expression of a SQL type the operator accepts (also as
-	 * an item of a list or pair). The result is nullable when either operand
-	 * is, unless the operator is null-safe.
+	 * A column reference, with the comparison methods of its SQL type.
 	 *
-	 * `left` can also be a parameter compared with `any` / `all` of an array
-	 * column or expression, whose element type encodes it. Its operator and
-	 * type are not checked against the elements.
-	 *
-	 * @example eb('users.email', 'like', '%@example.com')
-	 * @example eb('users.age', 'between', [18, eb.ref('users.maxAge')])
-	 * @example eb('users.deletedAt', 'is', null)
-	 * @example eb(eb.fn.lower('users.email'), 'like', '%@example.com')
-	 * @example eb(eb.val('admin'), '=', eb.fn.any('users.tags'))
+	 * @example eb.ref('users.firstName').eq(eb.ref('users.lastName'))
 	 */
-	<
-		L extends Operand<R> | Param<unknown>,
-		O extends keyof OperatorsOf<R, L> & string,
-		V extends OperatorsOf<R, L>[O],
-	>(
-		left: L,
-		operator: O,
-		value: V,
-	): Predicate<NullOfComparison<R, L, O, V>>;
-
-	/**
-	 * A column reference, for positions that take a value by default.
-	 *
-	 * @example eb('users.firstName', '=', eb.ref('users.lastName'))
-	 */
-	ref<C extends Ref<R>>(
+	readonly ref: <C extends Ref<R>>(
 		column: C,
-	): TypedExpression<R[C]['$select'], R[C]['dataType']>;
+	) => Expr<R[C]['$select'], R[C]['_quarry']['dataType']>;
 
 	/**
 	 * A parameter, for positions that take a reference by default. Its SQL
-	 * type is whatever postgres infers, so it cannot be the left-hand side of
-	 * a comparison. Compared against something, it is encoded like a plain
-	 * value; elsewhere it is sent to the driver as is.
+	 * type is whatever postgres infers, so its only comparisons are with
+	 * `any` / `all` of an array, whose element type encodes it. A comparison
+	 * takes a plain value instead, except for an array as a whole: `in` and
+	 * `any` / `all` take an array parameter and encode its items. Elsewhere it
+	 * is sent to the driver as is.
 	 *
 	 * @example eb.fn.concat('users.firstName', eb.val(' '), 'users.lastName')
-	 * @example eb('users.id', 'in', eb.val(ids))
+	 * @example eb.ref('users.id').in(eb.val(ids))
 	 */
-	val<T extends readonly unknown[]>(value: T): Param<T>;
-	val<const T>(value: T): Param<T>;
+	readonly val: {
+		<T extends readonly unknown[]>(value: T): Value<T>;
+		<const T>(value: T): Value<T>;
+	};
 
 	/**
 	 * The SQL functions.
@@ -116,24 +64,33 @@ export interface ExpressionBuilder<R extends Refs> {
 	 * The jsonb functions: reading a field or path, and testing keys and
 	 * jsonpaths.
 	 *
-	 * @example eb(eb.json.text('users.settings', 'theme'), '=', 'dark')
+	 * @example eb.json.text('users.settings', 'theme').eq('dark')
 	 * @example eb.json.hasKey('users.settings', 'theme')
 	 */
 	readonly json: JsonFunctions<R>;
 
 	/** `(a and b and ...)`; `true` when empty. */
-	and<const E extends readonly AnyPredicate[]>(
+	readonly and: <const E extends readonly AnyPredicate[]>(
 		expressions: E,
-	): Predicate<NullOf<E[number]['$type']>>;
+	) => Predicate<NullOf<E[number]['_quarry']['$type']>>;
 
 	/** `(a or b or ...)`; `false` when empty. */
-	or<const E extends readonly AnyPredicate[]>(
+	readonly or: <const E extends readonly AnyPredicate[]>(
 		expressions: E,
-	): Predicate<NullOf<E[number]['$type']>>;
+	) => Predicate<NullOf<E[number]['_quarry']['$type']>>;
 
 	/** `not (expression)`. */
-	not<E extends AnyPredicate>(expression: E): Predicate<NullOf<E['$type']>>;
+	readonly not: <E extends AnyPredicate>(
+		expression: E,
+	) => Predicate<NullOf<E['_quarry']['$type']>>;
 }
+
+const junction =
+	(kind: 'and' | 'or') => (expressions: readonly AnyPredicate[]) =>
+		predicate({
+			kind,
+			operands: expressions.map((expression) => expression._quarry.node),
+		});
 
 /**
  * Creates an expression builder with the given tables in scope. The
@@ -141,7 +98,7 @@ export interface ExpressionBuilder<R extends Refs> {
  *
  * @example
  * const eb = expressionBuilder(users, posts.as('p'));
- * eb('p.authorId', '=', eb.ref('users.id'))
+ * eb.ref('p.authorId').eq(eb.ref('users.id'))
  */
 export function expressionBuilder<const T extends readonly AnyTable[]>(
 	...tables: T
@@ -163,75 +120,33 @@ export function expressionBuilder<const T extends readonly AnyTable[]>(
 			node: {
 				kind: 'reference',
 				table: tableName,
-				column: column.columnName ?? key,
+				column: column._quarry.columnName ?? key,
 			},
 			column,
 		};
 	};
 
 	const node = (arg: string | Expression<unknown>): OperationNode =>
-		typeof arg === 'string' ? resolve(arg).node : arg.toNode();
+		typeof arg === 'string' ? resolve(arg).node : arg._quarry.node;
 
 	const dataType = (
 		arg: string | TypedExpression<unknown, DataType>,
 	): DataType =>
-		typeof arg === 'string' ? resolve(arg).column.dataType : arg.dataType;
+		typeof arg === 'string'
+			? resolve(arg).column._quarry.dataType
+			: arg._quarry.dataType;
 
-	const junction =
-		(kind: 'and' | 'or') => (expressions: readonly AnyPredicate[]) =>
-			predicate({
-				kind,
-				operands: expressions.map((expression) => expression.toNode()),
-			});
-
-	const compare = (
-		left: string | TypedExpression<unknown, DataType> | Param<unknown>,
-		operator: string,
-		value: unknown,
-	) => {
-		if (left instanceof Param) {
-			const element = value instanceof Quantified ? value.element : undefined;
-			if (element === undefined) {
-				throw new Error(
-					'A parameter on the left needs any() or all() of an array column or expression on the right',
-				);
-			}
-			const serialize = (item: unknown) => element.serialize(item);
-			return predicate(
-				comparison(
-					{ kind: 'value', value: serialize(left.value) },
-					operator,
-					value,
-					serialize,
-				),
-			);
-		}
-
-		const type = dataType(left);
-		return predicate(
-			comparison(node(left), operator, value, (item) => type.serialize(item)),
-		);
-	};
-
-	return Object.assign(compare, {
-		ref: <C extends Ref<R>>(column: C) => {
+	return {
+		ref: (column: string) => {
 			const resolved = resolve(column);
-			return new TypedExpression<R[C]['$select'], R[C]['dataType']>(
-				resolved.node,
-				resolved.column.dataType,
-			);
+			return typedExpression(resolved.node, resolved.column._quarry.dataType);
 		},
-		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the overloads supply the type
-		val: (value: unknown): Param<never> => new Param(value as never),
+		val: (value: unknown) => param(value),
 		fn: functions<R>({ node, dataType }),
 		json: jsonFunctions<R>({ node, dataType }),
 		and: junction('and'),
 		or: junction('or'),
 		not: (expression: AnyPredicate) =>
-			predicate({ kind: 'not', operand: expression.toNode() }),
-	});
-}
-
-function predicate(node: OperationNode): Predicate {
-	return new TypedExpression(node, new DataType('boolean'));
+			predicate({ kind: 'not', operand: expression._quarry.node }),
+	};
 }
