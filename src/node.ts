@@ -13,7 +13,8 @@ export type OperationNode =
 	| OrNode
 	| NotNode
 	| FunctionNode
-	| RawNode;
+	| RawNode
+	| SelectNode;
 
 /**
  * A column reference, e.g. `"users"."first_name"`.
@@ -102,4 +103,38 @@ export type RawNode = {
 	readonly kind: 'raw';
 	readonly fragments: readonly string[];
 	readonly nodes: readonly OperationNode[];
+};
+
+/**
+ * A table in a `from` or `join`: its name in the database, and the name it
+ * is referenced by when that differs (`"users" as "managers"`).
+ */
+export type TableNode = {
+	readonly name: string;
+	readonly alias: string | undefined;
+};
+
+/** An entry of a select list, keyed in the result row by `alias`. */
+export type SelectionNode = {
+	readonly expression: OperationNode;
+	readonly alias: string;
+};
+
+/** `inner join table on condition`. */
+export type JoinNode = {
+	readonly table: TableNode;
+	readonly on: OperationNode;
+};
+
+/**
+ * A `select` query. An empty select list is valid in postgres and yields
+ * rows without columns.
+ */
+export type SelectNode = {
+	readonly kind: 'select';
+	readonly selections: readonly SelectionNode[];
+	readonly from: TableNode;
+	readonly joins: readonly JoinNode[];
+	readonly where: OperationNode | undefined;
+	readonly limit: number | undefined;
 };

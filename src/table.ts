@@ -18,13 +18,20 @@ export class Table<N extends string, S extends Schema> {
 		]: S['columns'][K extends `${N}.${infer C}` ? C : never];
 	};
 
-	constructor(name: N, schema: S) {
+	/**
+	 * What the library reads: not part of the API. `source` is the table's
+	 * name in the database, which `name` differs from for an alias.
+	 */
+	readonly _quarry: { readonly source: string };
+
+	constructor(name: N, schema: S, source: string = name) {
 		this.name = name;
 		this.schema = schema;
+		this._quarry = { source };
 	}
 
 	as<const A extends string>(alias: A) {
-		return new Table(alias, this.schema);
+		return new Table(alias, this.schema, this._quarry.source);
 	}
 }
 

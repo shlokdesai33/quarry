@@ -291,8 +291,8 @@ export interface TextMethods<
 
 /**
  * The methods of the boolean type, which is also the type of a comparison:
- * equality, the `is` tests, and combining conditions. `and` and `or` group
- * left to right, so `a.or(b).and(c)` is `(a or b) and c`.
+ * equality and the `is` tests. Conditions are combined by the builder's
+ * `and`, `or` and `not`.
  */
 export interface BooleanMethods<N extends null> extends EqualityMethods<
 	boolean,
@@ -307,12 +307,6 @@ export interface BooleanMethods<N extends null> extends EqualityMethods<
 	isFalse(): Predicate;
 	/** `is not false`: never null itself. */
 	isNotFalse(): Predicate;
-	/** `this and other` */
-	and<V extends AnyPredicate>(other: V): Predicate<N | NullIn<V>>;
-	/** `this or other` */
-	or<V extends AnyPredicate>(other: V): Predicate<N | NullIn<V>>;
-	/** `not this` */
-	not(): Predicate<N>;
 }
 
 /**

@@ -3,7 +3,7 @@ import { integer, text } from '../src/column-factories.js';
 import { compile } from '../src/compile.js';
 import { defineTable } from '../src/define-table.js';
 import { expressionBuilder } from '../src/expression-builder.js';
-import { selectFrom } from '../src/select-query-builder.js';
+import { fragment, selectFrom } from '../src/select-query-builder.js';
 
 const users = defineTable('users', {
 	columns: {
@@ -73,7 +73,7 @@ describe('where', () => {
 			where(
 				selectFrom(users)
 					.where((eb) =>
-						eb.ref('users.age').lt(13).or(eb.ref('users.age').gt(65)),
+						eb.or([eb.ref('users.age').lt(13), eb.ref('users.age').gt(65)]),
 					)
 					.where('users.role', 'member'),
 			),
@@ -93,15 +93,14 @@ describe('where', () => {
 		});
 	});
 
-	it('flattens chained and / or of the same kind', () => {
+	it('flattens nested and / or of the same kind', () => {
 		expect(
 			where(
 				selectFrom(users).where((eb) =>
-					eb
-						.ref('users.age')
-						.gt(1)
-						.and(eb.ref('users.age').lt(9))
-						.and(eb.ref('users.role').eq('admin')),
+					eb.and([
+						eb.and([eb.ref('users.age').gt(1), eb.ref('users.age').lt(9)]),
+						eb.ref('users.role').eq('admin'),
+					]),
 				),
 			),
 		).toEqual({
@@ -122,6 +121,54 @@ describe('where', () => {
 		const query = selectFrom(users);
 		query.where('users.age', 18);
 		expect(query.toWhereNode()).toBeUndefined();
+	});
+});
+
+describe('when', () => {
+	const byRole = (role: 'admin' | 'member' | undefined) =>
+		selectFrom(users)
+			.where((eb) => eb.ref('users.age').gte(18))
+			.when(role !== undefined, (qb) => qb.where('users.role', role!));
+
+	it('applies the build when the condition holds', () => {
+		expect(where(byRole('admin'))).toEqual({
+			sql: '("users"."age" >= $1 and "users"."role" = $2)',
+			params: [18, 'admin'],
+		});
+	});
+
+	it('leaves the query as it is otherwise', () => {
+		expect(where(byRole(undefined))).toEqual({
+			sql: '"users"."age" >= $1',
+			params: [18],
+		});
+	});
+});
+
+const adults = fragment(users, (qb) =>
+	qb.where((eb) => eb.ref('users.age').gte(18)),
+);
+const contactEmail = fragment(contacts, (qb) => qb.select(['contacts.email']));
+
+describe('pipe', () => {
+	it('applies the fragment to the query', () => {
+		expect(where(selectFrom(users).pipe(adults))).toEqual({
+			sql: '"users"."age" >= $1',
+			params: [18],
+		});
+	});
+
+	it('keeps what the query had, after a join', () => {
+		const query = selectFrom(users)
+			.select(['users.id'])
+			.innerJoin(contacts)
+			.on('contacts.userId', 'users.id')
+			.pipe(adults)
+			.pipe(contactEmail);
+		expect(compile(query.toNode())).toEqual({
+			sql: 'select "users"."id" as "id", "contacts"."email" as "email" from "users" inner join "contacts" on "contacts"."user_id" = "users"."id" where "users"."age" >= $1',
+			params: [18],
+		});
 	});
 });
 

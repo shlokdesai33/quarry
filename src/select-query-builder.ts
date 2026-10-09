@@ -1,10 +1,22 @@
+import { compile } from './compile.js';
 import type { DataType } from './data-type/data-type.js';
-import type { AliasedExpression, TypedExpression } from './expression.js';
+import { type Executor, NoRowError, TooManyRowsError } from './executor.js';
+import {
+	type AliasedExpression,
+	Expression,
+	type TypedExpression,
+} from './expression.js';
 import {
 	type ExpressionBuilder,
 	expressionBuilder,
 } from './expression-builder.js';
-import type { OperationNode } from './node.js';
+import type {
+	JoinNode,
+	OperationNode,
+	SelectNode,
+	SelectionNode,
+	TableNode,
+} from './node.js';
 import type { AnyPredicate, EqualsValue } from './operators.js';
 import type { Ref, Refs, RefsOf } from './refs.js';
 import type { AnyTable } from './table.js';
@@ -95,28 +107,146 @@ type ValueOf<R extends Refs, S> =
 			? T
 			: never;
 
-/** The result row of the selections `S`. */
-type Row<R extends Refs, S> = { [K in S as KeyOf<K>]: ValueOf<R, K> };
+/**
+ * The row `O` with the columns `A` added. Either alone when the other is
+ * empty, which saves flattening an intersection for every first selection
+ * and every fragment that selects nothing; `A` must then be written out
+ * rather than named, for hovers to list its columns.
+ */
+type AddRow<O, A> = [keyof O] extends [never]
+	? A
+	: [keyof A] extends [never]
+		? O
+		: Prettify<O & A>;
 
 /**
- * Starts a `select` from `table`.
+ * The result row after `when`, whose `build` selected the columns `P`: they
+ * are optional, since it may not have run. `O` itself when it selected none.
+ */
+type WhenRow<O, P> = [keyof P] extends [never] ? O : Prettify<O & Partial<P>>;
+
+/**
+ * What a fragment builds on: a query over the tables `T` it needs, with
+ * nothing selected yet.
+ */
+export type Fragment<T extends readonly AnyTable[]> = SelectQueryBuilder<
+	T,
+	Record<never, never>
+>;
+
+/**
+ * Any select query, by shape: a query over particular tables isn't assignable
+ * to one over any tables, since the tables appear in parameter types.
+ */
+interface AnyQuery {
+	readonly $output: unknown;
+	toNode(): SelectNode;
+}
+
+/** The tables the fragment's query `Q` joined onto its tables `P`. */
+type JoinedBy<Q, P extends readonly AnyTable[]> =
+	Q extends SelectQueryBuilder<infer T, unknown>
+		? T extends readonly [...P, ...infer J extends AnyTable[]]
+			? J
+			: never
+		: never;
+
+/**
+ * Nothing when the tables `P` are all among `T`; otherwise one more argument,
+ * so the call fails, labelled with the tables missing.
+ */
+type InScope<T extends readonly AnyTable[], P extends readonly AnyTable[]> = [
+	P[number],
+] extends [T[number]]
+	? []
+	: [missingTables: Exclude<P[number], T[number]>['name']];
+
+/** The arguments of any form of `on`. */
+type OnArgs<R extends Refs> =
+	| readonly [left: string, right: unknown]
+	| readonly [group: Group<R>]
+	| readonly [predicate: AnyPredicate];
+
+/** What a `select` over the tables `T` has recorded so far. */
+interface SelectState<T extends readonly AnyTable[]> {
+	readonly tables: T;
+	readonly from: TableNode;
+	readonly joins: readonly JoinNode[];
+	readonly where: WhereBuilder<RefsOf<T>>;
+	readonly selections: readonly SelectionNode[];
+	readonly limit: number | undefined;
+	/** What the query runs on; `undefined` when it was built on its own. */
+	readonly executor: Executor | undefined;
+}
+
+/** A table as `from` and `join` render it. */
+const tableNode = (table: AnyTable): TableNode => ({
+	name: table._quarry.source,
+	alias: table.name === table._quarry.source ? undefined : table.name,
+});
+
+/**
+ * Starts a `select` from `table`, built without a database: it can be
+ * inspected and composed, but runs only when started from `database(...)`.
  *
  * @example
  * selectFrom(users)
  *   .innerJoin(contacts)
  *   .on('contacts.userId', 'users.id')
  *   .where('users.role', 'admin')
- *   .where((eb) => eb.ref('users.age').gte(18).or(eb.ref('users.verified').isTrue()))
+ *   .where((eb) => eb.or([eb.ref('users.age').gte(18), eb.ref('users.verified').isTrue()]))
  *   .select(['users.id', 'contacts.email'])
  */
 export function selectFrom<T extends AnyTable>(
 	table: T,
 ): SelectQueryBuilder<[T], Record<never, never>> {
+	return selectFromWith(table, undefined);
+}
+
+/**
+ * A reusable piece of a query (conditions, joins, columns) over the tables it
+ * needs: one table, or several in an array. `pipe` applies it to any query
+ * those tables are in, in any position.
+ *
+ * @example
+ * const active = fragment(users, (qb) => qb.where('users.status', 'active'));
+ * const withContacts = fragment(users, (qb) =>
+ *   qb.innerJoin(contacts).on('contacts.userId', 'users.id'),
+ * );
+ * selectFrom(users).pipe(withContacts).pipe(active).select(['contacts.email'])
+ *
+ * @example
+ * const sameEmail = fragment([users, contacts], (qb) =>
+ *   qb.where((eb) => eb.ref('contacts.email').eq(eb.ref('users.email'))),
+ * );
+ */
+export function fragment<X extends AnyTable, Q extends AnyQuery>(
+	table: X,
+	build: (qb: Fragment<[X]>) => Q,
+): (qb: Fragment<[X]>) => Q;
+export function fragment<
+	const T extends readonly AnyTable[],
+	Q extends AnyQuery,
+>(tables: T, build: (qb: Fragment<[...T]>) => Q): (qb: Fragment<[...T]>) => Q;
+export function fragment<Q>(_tables: unknown, build: Q): Q {
+	return build;
+}
+
+/** `selectFrom`, with the executor the query runs on. */
+export function selectFromWith<T extends AnyTable>(
+	table: T,
+	executor: Executor | undefined,
+): SelectQueryBuilder<[T], Record<never, never>> {
 	const tables: [T] = [table];
-	return new SelectQueryBuilder<[T], Record<never, never>>(
+	return new SelectQueryBuilder<[T], Record<never, never>>({
 		tables,
-		new WhereBuilder(expressionBuilder(...tables)),
-	);
+		from: tableNode(table),
+		joins: [],
+		where: new WhereBuilder(expressionBuilder(...tables)),
+		selections: [],
+		limit: undefined,
+		executor,
+	});
 }
 
 /**
@@ -130,12 +260,10 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 	/** The type of a result row. Never set. */
 	declare readonly $output: O;
 
-	readonly #tables: T;
-	readonly #where: WhereBuilder<RefsOf<T>>;
+	readonly #state: SelectState<T>;
 
-	constructor(tables: T, where: WhereBuilder<RefsOf<T>>) {
-		this.#tables = tables;
-		this.#where = where;
+	constructor(state: SelectState<T>) {
+		this.#state = state;
 	}
 
 	/**
@@ -148,49 +276,177 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 	 */
 	readonly where: Condition<RefsOf<T>, SelectQueryBuilder<T, O>> = (
 		...args: ConditionArgs<RefsOf<T>>
-	) => new SelectQueryBuilder<T, O>(this.#tables, this.#where.add(args));
+	) =>
+		new SelectQueryBuilder<T, O>({
+			...this.#state,
+			where: this.#state.where.add(args),
+		});
 
-	/**
-	 * Joins `table`, whose columns are in scope from `on` onwards.
-	 *
-	 * Not implemented yet: only puts the table in scope; the join itself is
-	 * not recorded.
-	 */
+	/** Joins `table`, whose columns are in scope from `on` onwards. */
 	innerJoin<J extends AnyTable>(table: J): JoinBuilder<T, J, O> {
-		const tables: [...T, J] = [...this.#tables, table];
+		const tables: [...T, J] = [...this.#state.tables, table];
 		return new JoinBuilder<T, J, O>(
-			new SelectQueryBuilder<[...T, J], O>(
+			{
+				...this.#state,
 				tables,
-				this.#where.rescope(expressionBuilder(...tables)),
-			),
+				where: this.#state.where.rescope(expressionBuilder(...tables)),
+			},
+			table,
 		);
 	}
 
 	/**
-	 * Sets the select list. A column is keyed by its name, an expression by
-	 * its alias.
-	 *
-	 * Not implemented yet: only types the result row.
+	 * Adds to the select list. A column is keyed by its name, an expression
+	 * by its alias.
 	 *
 	 * @example .select(['users.id', 'contacts.email'])
 	 * @example .select((eb) => [eb.fn.lower('users.email').as('email')])
 	 */
 	select<const S extends readonly Selection<RefsOf<T>>[]>(
 		selections: S | ((eb: ExpressionBuilder<RefsOf<T>>) => S),
-	): SelectQueryBuilder<T, Prettify<O & Row<RefsOf<T>, S[number]>>> {
-		void selections;
-		return new SelectQueryBuilder<T, Prettify<O & Row<RefsOf<T>, S[number]>>>(
-			this.#tables,
-			this.#where,
+	): SelectQueryBuilder<
+		T,
+		AddRow<O, { [K in S[number] as KeyOf<K>]: ValueOf<RefsOf<T>, K> }>
+	> {
+		const eb = expressionBuilder(...this.#state.tables);
+		const list = typeof selections === 'function' ? selections(eb) : selections;
+		const added = list.map((selection): SelectionNode =>
+			typeof selection === 'string'
+				? {
+						expression: eb.ref(selection)._quarry.node,
+						alias: selection.slice(selection.indexOf('.') + 1),
+					}
+				: {
+						expression: selection.expression._quarry.node,
+						alias: selection.alias,
+					},
 		);
+		return new SelectQueryBuilder({
+			...this.#state,
+			selections: [...this.#state.selections, ...added],
+		});
+	}
+
+	/**
+	 * Applies `build` only when `condition` holds, for the parts of a query
+	 * that depend on input. It keeps the tables, so it can't join; the
+	 * columns it selects are optional in the result row. Like a fragment,
+	 * `build` starts from nothing selected, so its row is just its columns.
+	 *
+	 * @example .when(onlyActive, (qb) => qb.where('users.status', 'active'))
+	 * @example .when(withEmail, (qb) => qb.select(['users.email']))
+	 */
+	when<P>(
+		condition: boolean,
+		build: (qb: Fragment<T>) => SelectQueryBuilder<T, P>,
+	): SelectQueryBuilder<T, WhenRow<O, P>> {
+		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the row type doesn't affect what `build` can do; `WhenRow` adds the earlier columns back
+		const query = condition ? build(this as unknown as Fragment<T>) : this;
+		return new SelectQueryBuilder<T, WhenRow<O, P>>(query.#state);
+	}
+
+	/**
+	 * Applies a reusable piece of a query made with `fragment`. Its tables
+	 * must be in this query, in any position; the tables it joins are added to
+	 * this query's, and the columns it selects to this query's row.
+	 *
+	 * @example
+	 * const active = fragment(users, (qb) => qb.where('users.status', 'active'));
+	 * selectFrom(users).innerJoin(contacts).on('contacts.userId', 'users.id').pipe(active)
+	 */
+	pipe<P extends readonly AnyTable[], Q extends AnyQuery>(
+		piece: (qb: Fragment<P>) => Q,
+		..._inScope: InScope<T, P>
+	): SelectQueryBuilder<[...T, ...JoinedBy<Q, P>], AddRow<O, Q['$output']>> {
+		type Tables = [...T, ...JoinedBy<Q, P>];
+		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- `InScope` checks every reference the fragment can make is in scope here
+		const query = piece(this as unknown as Fragment<P>);
+		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the fragment returned a query built on this one's state
+		const built = query as unknown as this;
+		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- that state has these tables, then the fragment's joins
+		const state = built.#state as unknown as SelectState<Tables>;
+		return new SelectQueryBuilder<Tables, AddRow<O, Q['$output']>>(state);
+	}
+
+	/** Runs the query and returns every row. */
+	async all(): Promise<O[]> {
+		return (await this.#execute(undefined)).rows;
+	}
+
+	/** Runs the query with `limit 1` and returns its row, if any. */
+	async first(): Promise<O | undefined> {
+		const [row] = (await this.#execute(1)).rows;
+		return row;
+	}
+
+	/**
+	 * Runs the query and returns its one row: throws `NoRowError` when there
+	 * is none and `TooManyRowsError` when there are several. Fetches at most
+	 * two rows, enough to tell.
+	 */
+	async one(): Promise<O> {
+		const { query, rows } = await this.#execute(2);
+		const [row, ...rest] = rows;
+		if (row === undefined) {
+			throw new NoRowError(query);
+		}
+		if (rest.length > 0) {
+			throw new TooManyRowsError(query);
+		}
+		return row;
+	}
+
+	/**
+	 * Runs the query and returns its row, if any: throws `TooManyRowsError`
+	 * when there are several. Fetches at most two rows, enough to tell.
+	 */
+	async maybeOne(): Promise<O | undefined> {
+		const { query, rows } = await this.#execute(2);
+		const [row, ...rest] = rows;
+		if (rest.length > 0) {
+			throw new TooManyRowsError(query);
+		}
+		return row;
+	}
+
+	/** The whole query as one node. */
+	toNode(): SelectNode {
+		const { from, joins, where, selections, limit } = this.#state;
+		return {
+			kind: 'select',
+			selections,
+			from,
+			joins,
+			where: where.toNode(),
+			limit,
+		};
 	}
 
 	/**
 	 * The `where` clause as one node, `undefined` when it is empty. For
-	 * inspecting the conditions until the query compiles as a whole.
+	 * inspecting the conditions on their own.
 	 */
 	toWhereNode(): OperationNode | undefined {
-		return this.#where.toNode();
+		return this.#state.where.toNode();
+	}
+
+	/** Runs the query, fetching at most `limit` rows besides any limit of its own. */
+	async #execute(limit: number | undefined) {
+		const { executor } = this.#state;
+		if (executor === undefined) {
+			throw new Error(
+				'The query has no database to run on: start it from `database(executor).selectFrom(...)`',
+			);
+		}
+		const node = this.toNode();
+		const query = compile(
+			limit === undefined
+				? node
+				: { ...node, limit: Math.min(node.limit ?? limit, limit) },
+		);
+		const { rows } = await executor.execute(query);
+		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the select list supplies the row type
+		return { query, rows: rows as O[] };
 	}
 }
 
@@ -199,10 +455,12 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
  * joined table is already in scope, so the condition can reference it.
  */
 export class JoinBuilder<T extends readonly AnyTable[], J extends AnyTable, O> {
-	readonly #query: SelectQueryBuilder<[...T, J], O>;
+	readonly #state: SelectState<[...T, J]>;
+	readonly #table: J;
 
-	constructor(query: SelectQueryBuilder<[...T, J], O>) {
-		this.#query = query;
+	constructor(state: SelectState<[...T, J]>, table: J) {
+		this.#state = state;
+		this.#table = table;
 	}
 
 	/**
@@ -211,15 +469,35 @@ export class JoinBuilder<T extends readonly AnyTable[], J extends AnyTable, O> {
 	 * of a SQL type its `=` takes. Any other condition (other operators,
 	 * values, expressions, several conditions) goes in a callback.
 	 *
-	 * Not implemented yet: the condition is checked but not recorded.
-	 *
 	 * @example .on('contacts.userId', 'users.id')
-	 * @example .on((eb) => eb.ref('contacts.userId').eq(eb.ref('users.id')).and(eb.ref('contacts.kind').eq('primary')))
+	 * @example .on((eb) => eb.and([eb.ref('contacts.userId').eq(eb.ref('users.id')), eb.ref('contacts.kind').eq('primary')]))
 	 */
 	readonly on: JoinCondition<
 		RefsOf<[...T, J]>,
 		T,
 		RefsOf<[J]>,
 		SelectQueryBuilder<[...T, J], O>
-	> = () => this.#query;
+	> = (...args: OnArgs<RefsOf<[...T, J]>>) =>
+		new SelectQueryBuilder<[...T, J], O>({
+			...this.#state,
+			joins: [
+				...this.#state.joins,
+				{ table: tableNode(this.#table), on: this.#conditionOf(args) },
+			],
+		});
+
+	#conditionOf(args: OnArgs<RefsOf<[...T, J]>>): OperationNode {
+		const eb = expressionBuilder(...this.#state.tables);
+		if (args.length === 2) {
+			const [left, right] = args;
+			return {
+				kind: 'binary',
+				left: eb.ref(left)._quarry.node,
+				operator: '=',
+				right: eb.ref(String(right))._quarry.node,
+			};
+		}
+		const [first] = args;
+		return Expression.is(first) ? first._quarry.node : first(eb)._quarry.node;
+	}
 }

@@ -295,7 +295,7 @@ export function queryFile(i: number, tables: number) {
 		if (kind.eq && k < 8) {
 			conditions.push(
 				k % 3 === 2
-					? `.where((q) => q.ref(${col}).eq(${kind.eq}).or(q.ref(${col}).isNull()))`
+					? `.where((q) => q.or([q.ref(${col}).eq(${kind.eq}), q.ref(${col}).isNull()]))`
 					: `.where(${col}, ${kind.eq})`,
 			);
 		}
@@ -304,7 +304,7 @@ export function queryFile(i: number, tables: number) {
 	const textOfI = `'t${i}.c${columnOf(i, TEXT)}'`;
 	const textOfJ = `'t${j}.c${columnOf(j, TEXT)}'`;
 
-	return `import { expressionBuilder, selectFrom } from './lib.js';
+	return `import { expressionBuilder, fragment, selectFrom } from './lib.js';
 import { t${i} } from './t${i}.js';
 import { t${j} } from './t${j}.js';
 
@@ -329,7 +329,7 @@ export const s${i} = selectFrom(t${i})
 	.on(${textOfJ}, ${textOfI})
 	${conditions.join('\n\t')}
 	.where((q) =>
-		q.ref('t${j}.id').gt(q.ref('t${i}.id')).or(q.ref(${textOfJ}).isNull()),
+		q.or([q.ref('t${j}.id').gt(q.ref('t${i}.id')), q.ref(${textOfJ}).isNull()]),
 	)
 	.select(['t${i}.id', ${textOfJ}]);
 
@@ -337,6 +337,19 @@ export const s${i}Bad = selectFrom(t${i})
 	.innerJoin(t${j})
 	// @ts-expect-error the left-hand side is a column of the joined table
 	.on('t${i}.id', 't${j}.id');
+
+const filter${i} = fragment(t${i}, (qb) =>
+	qb.where('t${i}.id', 1).where((q) => q.ref(${textOfI}).isNotNull()),
+);
+
+const join${i} = fragment(t${i}, (qb) =>
+	qb.innerJoin(t${j}).on(${textOfJ}, ${textOfI}),
+);
+
+export const p${i} = selectFrom(t${i})
+	.pipe(filter${i})
+	.pipe(join${i})
+	.select(['t${i}.id', ${textOfJ}]);
 `;
 }
 
@@ -372,7 +385,7 @@ function library(variant: Variant, dir: string) {
 export { defineEnum } from '${src}/define-enum.js';
 export { defineTable } from '${src}/define-table.js';
 export { expressionBuilder } from '${src}/expression-builder.js';
-export { selectFrom } from '${src}/select-query-builder.js';
+export { fragment, selectFrom } from '${src}/select-query-builder.js';
 `;
 }
 

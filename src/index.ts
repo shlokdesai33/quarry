@@ -1,7 +1,7 @@
 import { array, integer, text } from './column-factories.js';
 import { defineEnum } from './define-enum.js';
 import { defineTable } from './define-table.js';
-import { selectFrom } from './select-query-builder.js';
+import { fragment, selectFrom } from './select-query-builder.js';
 
 const status = defineEnum('status', ['active', 'inactive']);
 
@@ -44,7 +44,7 @@ export const Employee = defineTable('employees', {
 	},
 });
 
-const test = selectFrom(User)
+const test = await selectFrom(User)
 	.innerJoin(Contact)
 	.on('contacts.userId', 'users.id')
 	.innerJoin(Employee)
@@ -56,10 +56,11 @@ const test = selectFrom(User)
 			eb.and([
 				eb.ref('contacts.email').eq('shlok@slash.com'),
 				eb.ref('contacts.email').ilike('%@slash.com%'),
-			])
+			]),
 		]),
 	)
-	.select(['users.id', 'users.roles']);
+	.select(['users.id', 'users.roles'])
+	.first();
 
 const joined = selectFrom(User).innerJoin(Contact);
 
@@ -72,3 +73,38 @@ joined.on('contacts.id', 'users.id');
 // other operators, and values, go in a callback
 joined.on((eb) => eb.ref('contacts.userId').lt(eb.ref('users.id')));
 joined.on((eb) => eb.ref('contacts.userId').eq(1));
+
+// `when`: parts of a query that depend on input. Columns it selects are
+// optional in the row: { id: UserId; email: string; roles?: string[] }
+export function findUsers(filters: { email?: string; withRoles?: boolean }) {
+	const { email } = filters;
+	return selectFrom(User)
+		.select(['users.id', 'users.email'])
+		.when(email !== undefined, (qb) => qb.where('users.email', email ?? ''))
+		.when(filters.withRoles === true, (qb) => qb.select(['users.roles']));
+}
+
+// `fragment` + `pipe`: a piece of a query reused across queries, made for the
+// tables it needs. It applies wherever those tables are in the query; it can
+// join and select, too
+const activeUsers = fragment(User, (qb) => qb.where('users.status', 'active'));
+
+const withContacts = fragment(User, (qb) =>
+	qb.innerJoin(Contact).on('contacts.userId', 'users.id'),
+);
+
+const withPhone = fragment(Contact, (qb) => qb.select(['contacts.phone']));
+
+export const activeUserEmails = selectFrom(User)
+	.pipe(activeUsers)
+	.select(['users.id', 'users.email']);
+
+// { id: UserId; phone: string | null }
+export const activeUserContacts = selectFrom(User)
+	.innerJoin(Employee)
+	.on('employees.userId', 'users.id')
+	.pipe(withContacts)
+	.pipe(withPhone)
+	.select(['users.id'])
+	.when(true, (qb) => qb.select(['employees.email']))
+	.one()

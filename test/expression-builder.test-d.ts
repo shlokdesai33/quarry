@@ -805,25 +805,18 @@ describe('logical operators', () => {
 });
 
 describe('boolean methods', () => {
-	it('combine conditions, nullable if either side is', () => {
+	it('do not combine conditions: the builder does', () => {
+		// a boolean column is a condition
 		expectTypeOf(
-			typeOf(eb.ref('users.age').gt(1).and(eb.ref('users.age').lt(9))),
-		).toEqualTypeOf<boolean>();
-		expectTypeOf(
-			typeOf(eb.ref('users.age').gt(1).or(eb.ref('users.email').eq('x'))),
-		).toEqualTypeOf<boolean | null>();
-		expectTypeOf(typeOf(eb.ref('users.email').eq('x').not())).toEqualTypeOf<
-			boolean | null
-		>();
-		// a boolean column is a condition too
-		expectTypeOf(
-			typeOf(eb.ref('users.admin').and(eb.ref('users.age').gt(1))),
+			typeOf(eb.and([eb.ref('users.admin'), eb.ref('users.age').gt(1)])),
 		).toEqualTypeOf<boolean>();
 
-		// @ts-expect-error only a boolean is combined
-		eb.ref('users.age').gt(1).and(eb.ref('users.age'));
-		// @ts-expect-error only a boolean has `and`
-		eb.ref('users.age').and(eb.ref('users.age').gt(1));
+		// @ts-expect-error `eb.and([a, b])`
+		eb.ref('users.age').gt(1).and(eb.ref('users.age').lt(9));
+		// @ts-expect-error `eb.or([a, b])`
+		eb.ref('users.admin').or(eb.ref('users.age').gt(1));
+		// @ts-expect-error `eb.not(a)`
+		eb.ref('users.email').eq('x').not();
 	});
 
 	it('test truth, never null', () => {
@@ -837,10 +830,10 @@ describe('boolean methods', () => {
 
 	it('are methods of every predicate, wherever it comes from', () => {
 		expectTypeOf(
-			typeOf(eb.not(eb.ref('users.admin')).or(eb.ref('users.admin'))),
+			typeOf(eb.not(eb.ref('users.admin')).isTrue()),
 		).toEqualTypeOf<boolean>();
 		expectTypeOf(
-			typeOf(eb.and([eb.ref('users.age').gt(1)]).not()),
+			typeOf(eb.and([eb.ref('users.age').gt(1)]).isNotFalse()),
 		).toEqualTypeOf<boolean>();
 	});
 });

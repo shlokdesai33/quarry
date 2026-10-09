@@ -100,34 +100,10 @@ export function compare(
 	);
 }
 
-/** `kind` of the operands, unwrapping those that are `kind` themselves. */
-function junction(
-	kind: 'and' | 'or',
-	operands: readonly Expression<unknown>[],
-): Predicate<null> {
-	return predicate({
-		kind,
-		operands: operands.flatMap((operand) => {
-			const node = operand._quarry.node;
-			return node.kind === kind ? node.operands : [node];
-		}),
-	});
-}
-
 const methods: Record<
 	string,
 	(this: Expression<unknown>, value: never) => unknown
-> = {
-	and(other: Expression<unknown>) {
-		return junction('and', [this, other]);
-	},
-	or(other: Expression<unknown>) {
-		return junction('or', [this, other]);
-	},
-	not() {
-		return predicate({ kind: 'not', operand: this._quarry.node });
-	},
-};
+> = {};
 for (const [name, operator] of Object.entries(OPERATORS)) {
 	methods[name] = function (this: Expression<unknown>, value: unknown) {
 		return compare(this, operator, value);

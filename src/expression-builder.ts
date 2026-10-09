@@ -85,11 +85,15 @@ export interface ExpressionBuilder<in out R extends Refs> {
 	) => Predicate<NullOf<E['_quarry']['$type']>>;
 }
 
+/** `kind` of the operands, unwrapping those that are `kind` themselves. */
 const junction =
 	(kind: 'and' | 'or') => (expressions: readonly AnyPredicate[]) =>
 		predicate({
 			kind,
-			operands: expressions.map((expression) => expression._quarry.node),
+			operands: expressions.flatMap((expression) => {
+				const node = expression._quarry.node;
+				return node.kind === kind ? node.operands : [node];
+			}),
 		});
 
 /**

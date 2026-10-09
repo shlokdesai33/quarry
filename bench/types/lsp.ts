@@ -176,6 +176,8 @@ export const probe = [
 export const probeQuery = selectFrom(t0).where((q) => q.ref('t0.c0').);
 
 export const probeJoin = selectFrom(t0).innerJoin(t1).on('${joinedText}', '');
+
+export const probePipe = selectFrom(t0).pipe(join0).where('');
 `;
 
 interface Position {
@@ -201,6 +203,7 @@ function probe(dir: string, tables: number) {
 	};
 	const whereCall = "q.ref('t0.c0').)";
 	const onCall = `.on('${joinedText}', '')`;
+	const pipeWhere = ".pipe(join0).where('')";
 	return {
 		uri: pathToFileURL(join(dir, 'probe.ts')).href,
 		text,
@@ -211,6 +214,7 @@ function probe(dir: string, tables: number) {
 		coalesce: at('coalesce(', 1),
 		whereMethod: at(whereCall, whereCall.length - 1),
 		joinColumn: at(onCall, onCall.length - 2),
+		pipeColumn: at(pipeWhere, pipeWhere.length - 2),
 	};
 }
 
@@ -299,6 +303,17 @@ const SCENARIOS: readonly Scenario[] = [
 			expect(
 				found.includes('t0.c0') && !found.includes('t0.id'),
 				`join completion returned ${JSON.stringify(found.slice(0, 10))}`,
+			);
+		},
+	},
+	{
+		name: "column completion after pipe: .pipe(join0).where('‸",
+		run: completion('pipeColumn'),
+		check: (result) => {
+			const found = labels(result as Completions);
+			expect(
+				found.includes('t0.c0') && found.includes('t1.id'),
+				`pipe completion returned ${JSON.stringify(found.slice(0, 10))}`,
 			);
 		},
 	},
