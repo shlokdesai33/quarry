@@ -273,3 +273,18 @@ describe('pipe', () => {
 		selectFrom(users).pipe(() => 1);
 	});
 });
+
+describe('tag', () => {
+	it('keeps the query’s tables and row', () => {
+		const query = selectFrom(users)
+			.innerJoin(contacts)
+			.on('contacts.userId', 'users.id')
+			.select(['users.id', 'contacts.email']);
+		expectTypeOf(query.tag('users.withEmail')).toEqualTypeOf<typeof query>();
+	});
+
+	it('takes a string', () => {
+		// @ts-expect-error a tag is a string
+		selectFrom(users).tag(1);
+	});
+});

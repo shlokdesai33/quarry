@@ -21,4 +21,13 @@ describe('running a query', () => {
 		expectTypeOf(query.one()).toEqualTypeOf<Promise<Row>>();
 		expectTypeOf(query.maybeOne()).toEqualTypeOf<Promise<Row | undefined>>();
 	});
+
+	it('gives the executor the tag, if any', () => {
+		database({
+			execute: async (compiled) => {
+				expectTypeOf(compiled.tag).toEqualTypeOf<string | undefined>();
+				return { rows: [] };
+			},
+		});
+	});
 });

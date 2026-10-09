@@ -172,6 +172,58 @@ describe('pipe', () => {
 	});
 });
 
+describe('tag', () => {
+	it('is stored on the query and compiled beside its SQL, not into it', () => {
+		const query = selectFrom(users).select(['users.id']).tag('users.ids');
+		expect(query.toNode().tag).toBe('users.ids');
+		expect(compile(query.toNode())).toEqual({
+			sql: 'select "users"."id" as "id" from "users"',
+			params: [],
+			tag: 'users.ids',
+		});
+	});
+
+	it('is absent until set', () => {
+		const query = selectFrom(users).select(['users.id']);
+		expect(query.toNode().tag).toBeUndefined();
+		expect(compile(query.toNode())).not.toHaveProperty('tag');
+	});
+
+	it('survives chaining, joins, `when` and `pipe`', () => {
+		const query = selectFrom(users)
+			.tag('users.withContacts')
+			.where('users.role', 'admin')
+			.innerJoin(contacts)
+			.on('contacts.userId', 'users.id')
+			.when(true, (qb) => qb.select(['contacts.email']))
+			.pipe(adults)
+			.select(['users.id']);
+		expect(query.toNode().tag).toBe('users.withContacts');
+	});
+
+	it('can be set inside `when` and fragments', () => {
+		expect(
+			selectFrom(users)
+				.when(true, (qb) => qb.tag('inWhen'))
+				.toNode().tag,
+		).toBe('inWhen');
+		const tagged = fragment(users, (qb) => qb.tag('inFragment'));
+		expect(selectFrom(users).pipe(tagged).toNode().tag).toBe('inFragment');
+	});
+
+	it('is replaced by a later call', () => {
+		expect(selectFrom(users).tag('first').tag('second').toNode().tag).toBe(
+			'second',
+		);
+	});
+
+	it('leaves the builder it was called on unchanged', () => {
+		const query = selectFrom(users);
+		query.tag('ignored');
+		expect(query.toNode().tag).toBeUndefined();
+	});
+});
+
 describe('innerJoin', () => {
 	it('puts the joined table in scope, keeping earlier conditions', () => {
 		const query = selectFrom(users)

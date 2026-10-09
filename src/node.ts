@@ -137,4 +137,6 @@ export type SelectNode = {
 	readonly joins: readonly JoinNode[];
 	readonly where: OperationNode | undefined;
 	readonly limit: number | undefined;
+	/** A label passed on with the compiled query, never rendered into its SQL. */
+	readonly tag: string | undefined;
 };

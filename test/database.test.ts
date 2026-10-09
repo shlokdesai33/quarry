@@ -87,6 +87,24 @@ describe('the query', () => {
 		expect(ran[0]?.sql).toBe('select from "users"');
 	});
 
+	it('passes the tag to the executor beside the SQL', async () => {
+		const { db, ran } = fake([]);
+		await db.selectFrom(users).select(['users.id']).tag('users.ids').first();
+		expect(ran).toEqual([
+			{
+				sql: 'select "users"."id" as "id" from "users" limit $1',
+				params: [1],
+				tag: 'users.ids',
+			},
+		]);
+	});
+
+	it('passes no tag when none was set', async () => {
+		const { db, ran } = fake([]);
+		await db.selectFrom(users).all();
+		expect(ran[0]).not.toHaveProperty('tag');
+	});
+
 	it('runs only when started from a database', async () => {
 		await expect(selectFrom(users).all()).rejects.toThrow(
 			'The query has no database to run on',
@@ -135,6 +153,12 @@ describe('one', () => {
 		await expect(failure).rejects.toMatchObject({
 			query: { sql: 'select from "users" limit $1', params: [2] },
 		});
+	});
+
+	it('keeps the tag on the query it throws with', async () => {
+		await expect(
+			fake([]).db.selectFrom(users).tag('users.one').one(),
+		).rejects.toMatchObject({ query: { tag: 'users.one' } });
 	});
 
 	it('throws when there are several', async () => {

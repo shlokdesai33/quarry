@@ -175,6 +175,8 @@ interface SelectState<T extends readonly AnyTable[]> {
 	readonly where: WhereBuilder<RefsOf<T>>;
 	readonly selections: readonly SelectionNode[];
 	readonly limit: number | undefined;
+	/** The label set by `tag()`. */
+	readonly tag: string | undefined;
 	/** What the query runs on; `undefined` when it was built on its own. */
 	readonly executor: Executor | undefined;
 }
@@ -245,6 +247,7 @@ export function selectFromWith<T extends AnyTable>(
 		where: new WhereBuilder(expressionBuilder(...tables)),
 		selections: [],
 		limit: undefined,
+		tag: undefined,
 		executor,
 	});
 }
@@ -368,6 +371,17 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 		return new SelectQueryBuilder<Tables, AddRow<O, Q['$output']>>(state);
 	}
 
+	/**
+	 * Labels the query, e.g. for logging or tracing. The tag goes to the
+	 * executor with the compiled query and is never written into its SQL. A
+	 * later call replaces it.
+	 *
+	 * @example .tag('users.findByEmail')
+	 */
+	tag(name: string): SelectQueryBuilder<T, O> {
+		return new SelectQueryBuilder<T, O>({ ...this.#state, tag: name });
+	}
+
 	/** Runs the query and returns every row. */
 	async all(): Promise<O[]> {
 		return (await this.#execute(undefined)).rows;
@@ -411,7 +425,7 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 
 	/** The whole query as one node. */
 	toNode(): SelectNode {
-		const { from, joins, where, selections, limit } = this.#state;
+		const { from, joins, where, selections, limit, tag } = this.#state;
 		return {
 			kind: 'select',
 			selections,
@@ -419,6 +433,7 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 			joins,
 			where: where.toNode(),
 			limit,
+			tag,
 		};
 	}
 

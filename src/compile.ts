@@ -3,16 +3,21 @@ import type { OperationNode, SelectNode, TableNode } from './node.js';
 export interface CompiledQuery {
 	readonly sql: string;
 	readonly params: readonly unknown[];
+	/** The query's label from `tag()`, if any. It is not part of `sql`. */
+	readonly tag?: string;
 }
 
 /**
  * Renders a node tree to SQL text and a positional parameter list.
- * Parameters are numbered in the order they are encountered.
+ * Parameters are numbered in the order they are encountered. A select's tag
+ * is carried over as is.
  */
 export function compile(node: OperationNode): CompiledQuery {
 	const params: unknown[] = [];
 	const sql = render(node, params);
-	return { sql, params };
+	return node.kind === 'select' && node.tag !== undefined
+		? { sql, params, tag: node.tag }
+		: { sql, params };
 }
 
 function render(node: OperationNode, params: unknown[]): string {
