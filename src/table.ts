@@ -1,3 +1,4 @@
+import type { TableNode } from './node.js';
 import type { Schema } from './types.js';
 
 export class Table<N extends string, S extends Schema> {
@@ -36,3 +37,11 @@ export class Table<N extends string, S extends Schema> {
 }
 
 export type AnyTable = Table<string, Schema>;
+
+/** A table as `from`, `join` and the write queries render it. */
+export function tableNode(table: AnyTable): TableNode {
+	return {
+		name: table._quarry.source,
+		alias: table.name === table._quarry.source ? undefined : table.name,
+	};
+}

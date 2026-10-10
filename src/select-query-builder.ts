@@ -1,11 +1,7 @@
 import { compile } from './compile.js';
 import type { DataType } from './data-type/data-type.js';
 import { type Executor, NoRowError, TooManyRowsError } from './executor.js';
-import {
-	type AliasedExpression,
-	Expression,
-	type TypedExpression,
-} from './expression.js';
+import { Expression, type TypedExpression } from './expression.js';
 import {
 	type ExpressionBuilder,
 	expressionBuilder,
@@ -19,7 +15,13 @@ import type {
 } from './node.js';
 import type { AnyPredicate, EqualsValue } from './operators.js';
 import type { Ref, Refs, RefsOf } from './refs.js';
-import type { AnyTable } from './table.js';
+import {
+	type AddRow,
+	type RowOf,
+	type Selection,
+	selectionNodes,
+} from './row.js';
+import { type AnyTable, tableNode } from './table.js';
 import type { Prettify } from './types.js';
 import {
 	type Condition,
@@ -89,36 +91,6 @@ interface JoinCondition<
 	(predicate: AnyPredicate): B;
 }
 
-/** An entry of a select list: a column reference or a named expression. */
-type Selection<R extends Refs> = Ref<R> | AliasedExpression<unknown, string>;
-
-/** The key a selection has in the result row. */
-type KeyOf<S> = S extends `${string}.${infer C}`
-	? C
-	: S extends AliasedExpression<unknown, infer A>
-		? A
-		: never;
-
-/** The type a selection has in the result row. */
-type ValueOf<R extends Refs, S> =
-	S extends Ref<R>
-		? R[S]['$select']
-		: S extends AliasedExpression<infer T, string>
-			? T
-			: never;
-
-/**
- * The row `O` with the columns `A` added. Either alone when the other is
- * empty, which saves flattening an intersection for every first selection
- * and every fragment that selects nothing; `A` must then be written out
- * rather than named, for hovers to list its columns.
- */
-type AddRow<O, A> = [keyof O] extends [never]
-	? A
-	: [keyof A] extends [never]
-		? O
-		: Prettify<O & A>;
-
 /**
  * The result row after `when`, whose `build` selected the columns `P`: they
  * are optional, since it may not have run. `O` itself when it selected none.
@@ -180,12 +152,6 @@ interface SelectState<T extends readonly AnyTable[]> {
 	/** What the query runs on; `undefined` when it was built on its own. */
 	readonly executor: Executor | undefined;
 }
-
-/** A table as `from` and `join` render it. */
-const tableNode = (table: AnyTable): TableNode => ({
-	name: table._quarry.source,
-	alias: table.name === table._quarry.source ? undefined : table.name,
-});
 
 /**
  * Starts a `select` from `table`, built without a database: it can be
@@ -307,23 +273,10 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 	 */
 	select<const S extends readonly Selection<RefsOf<T>>[]>(
 		selections: S | ((eb: ExpressionBuilder<RefsOf<T>>) => S),
-	): SelectQueryBuilder<
-		T,
-		AddRow<O, { [K in S[number] as KeyOf<K>]: ValueOf<RefsOf<T>, K> }>
-	> {
+	): SelectQueryBuilder<T, AddRow<O, RowOf<RefsOf<T>, S[number]>>> {
 		const eb = expressionBuilder(...this.#state.tables);
 		const list = typeof selections === 'function' ? selections(eb) : selections;
-		const added = list.map((selection): SelectionNode =>
-			typeof selection === 'string'
-				? {
-						expression: eb.ref(selection)._quarry.node,
-						alias: selection.slice(selection.indexOf('.') + 1),
-					}
-				: {
-						expression: selection.expression._quarry.node,
-						alias: selection.alias,
-					},
-		);
+		const added = selectionNodes(eb, list);
 		return new SelectQueryBuilder({
 			...this.#state,
 			selections: [...this.#state.selections, ...added],
