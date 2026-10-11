@@ -140,3 +140,82 @@ export type SelectNode = {
 	/** A label passed on with the compiled query, never rendered into its SQL. */
 	readonly tag: string | undefined;
 };
+
+/**
+ * `column = value` in an `update` or an upsert's `do update`, by the
+ * column's name in the database.
+ */
+export type SetNode = {
+	readonly column: string;
+	readonly value: OperationNode;
+};
+
+/**
+ * Rows of values aligned with `columns` (names in the database); an
+ * `undefined` value is the column's `default`. `unnest` sends each column as
+ * one array parameter, for many rows; `values` lists the rows.
+ */
+export type RowsNode = {
+	readonly columns: readonly string[];
+	readonly rows: readonly (readonly (OperationNode | undefined)[])[];
+	readonly strategy: 'values' | 'unnest';
+};
+
+/** What an upsert does on a conflict. */
+export type ConflictActionNode =
+	| { readonly kind: 'nothing' }
+	| {
+			/** Each column set from `excluded`; `undefined` for every inserted column. */
+			readonly kind: 'merge';
+			readonly columns: readonly string[] | undefined;
+			readonly where: OperationNode | undefined;
+	  }
+	| {
+			readonly kind: 'update';
+			readonly set: readonly SetNode[];
+			readonly where: OperationNode | undefined;
+	  };
+
+/** `on conflict (target) where ... do ...`. */
+export type OnConflictNode = {
+	readonly target: readonly string[];
+	/** The predicate of a partial unique index the target names. */
+	readonly where: OperationNode | undefined;
+	readonly action: ConflictActionNode;
+};
+
+/** What every write query records besides its own clauses. */
+type WriteNode = {
+	readonly table: TableNode;
+	readonly returning: readonly SelectionNode[];
+	/** The number of rows the query must affect, as `expectRows` sets it. */
+	readonly expectRows: number | undefined;
+	readonly tag: string | undefined;
+};
+
+/** An `insert` query. Recorded only: `compile` doesn't render it yet. */
+export type InsertNode = WriteNode & {
+	readonly kind: 'insert';
+	readonly values: RowsNode;
+	readonly onConflict: OnConflictNode | undefined;
+};
+
+/**
+ * An `update` query. Recorded only: `compile` doesn't render it yet. `many`
+ * is the rows of an `updateMany`, matched to the table's by the `by`
+ * columns. `allRows` is set by `allRows()`, which stands in for `where`.
+ */
+export type UpdateNode = WriteNode & {
+	readonly kind: 'update';
+	readonly set: readonly SetNode[];
+	readonly many: (RowsNode & { readonly by: readonly string[] }) | undefined;
+	readonly where: OperationNode | undefined;
+	readonly allRows: boolean;
+};
+
+/** A `delete` query. Recorded only: `compile` doesn't render it yet. */
+export type DeleteNode = WriteNode & {
+	readonly kind: 'delete';
+	readonly where: OperationNode | undefined;
+	readonly allRows: boolean;
+};
