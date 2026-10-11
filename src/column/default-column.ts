@@ -15,7 +15,10 @@ export class DefaultColumn<D extends DataType, S, I, U>
 	 * @example text().default().nullable()
 	 */
 	nullable() {
-		return new DefaultColumn<D, S | null, I | null, U | null>(this._quarry);
+		return new DefaultColumn<D, S | null, I | null, U | null>({
+			...this._quarry,
+			nullable: true,
+		});
 	}
 
 	/**
