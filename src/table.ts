@@ -1,5 +1,5 @@
-import type { CallSite } from './call-site.js';
 import type { Schema } from './types.js';
+import type { CallSite } from './call-site.js';
 
 export class Table<N extends string, S extends Schema> {
 	readonly name: N;
