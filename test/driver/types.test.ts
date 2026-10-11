@@ -9,6 +9,7 @@ import { executorTypes } from '../../src/driver/quarry.js';
 import { parseTag } from '../../src/driver/ops.js';
 import {
 	arrayLiteral,
+	copyLine,
 	defaultTypes,
 	encodeParam,
 	formatTimestamp,
@@ -216,5 +217,26 @@ describe('quarry parsers', () => {
 		expect(executorTypes({ raw: true })).toEqual({});
 		expect(executorTypes({ types: defaultTypes })[oids.int8]?.('5')).toBe(5n);
 		expect(executorTypes({})[oids.int8]).toBeUndefined();
+	});
+});
+
+describe('COPY text', () => {
+	it('escapes special characters and writes NULL as \\N', () => {
+		expect(
+			copyLine([
+				1,
+				'a\tb\nc\\d\re',
+				null,
+				undefined,
+				true,
+				['x', null],
+				new Uint8Array([1, 255]),
+				{ k: 'v' },
+			]),
+		).toBe(
+			'1\ta\\tb\\nc\\\\d\\re\t\\N\t\\N\tt\t{"x",NULL}\t\\\\x01ff\t{"k":"v"}\n',
+		);
+		expect(copyLine([])).toBe('\n');
+		expect(copyLine(['\\N'])).toBe('\\\\N\n');
 	});
 });

@@ -333,3 +333,50 @@ export function encodeParam(value: unknown): WireValue {
 	if (Array.isArray(value)) return arrayLiteral(value);
 	return textOf(value);
 }
+
+const COPY_SPECIAL = /[\\\t\n\r]/;
+const COPY_SPECIAL_ALL = /[\\\t\n\r]/g;
+const COPY_ESCAPES: Readonly<Record<string, string>> = {
+	'\\': '\\\\',
+	'\t': '\\t',
+	'\n': '\\n',
+	'\r': '\\r',
+};
+
+/**
+ * One row in COPY text format: values as their Postgres text (like
+ * `encodeParam`, byte arrays as `\x…` hex), tab-separated, `\N` for NULL,
+ * with backslash, tab, newline and carriage return escaped.
+ */
+export function copyLine(values: readonly unknown[]): string {
+	let line = '';
+	for (let i = 0; i < values.length; i++) {
+		if (i > 0) line += '\t';
+		const value = values[i];
+		if (value === null || value === undefined) {
+			line += '\\N';
+			continue;
+		}
+		const text = Array.isArray(value) ? arrayLiteral(value) : textOf(value);
+		line += COPY_SPECIAL.test(text)
+			? text.replace(COPY_SPECIAL_ALL, (ch) => COPY_ESCAPES[ch] ?? ch)
+			: text;
+	}
+	return `${line}\n`;
+}
+
+/** Batches rows into COPY text chunks of about `size` characters. */
+export async function* copyChunks(
+	rows: AsyncIterable<readonly unknown[]> | Iterable<readonly unknown[]>,
+	size = 65536,
+): AsyncGenerator<string, void, undefined> {
+	let chunk = '';
+	for await (const row of rows) {
+		chunk += copyLine(row);
+		if (chunk.length >= size) {
+			yield chunk;
+			chunk = '';
+		}
+	}
+	if (chunk !== '') yield chunk;
+}

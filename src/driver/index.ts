@@ -31,6 +31,8 @@ export type {
 export { nodeSockets } from './node-socket.js';
 export {
 	arrayLiteral,
+	copyChunks,
+	copyLine,
 	defaultTypes,
 	encodeParam,
 	formatTimestamp,

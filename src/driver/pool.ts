@@ -570,6 +570,17 @@ export class Pool implements AsyncDisposable {
 		);
 	}
 
+	/** Bulk-loads rows with COPY; see `Connection.copyRows`. */
+	copyRows(
+		sql: string,
+		rows: AsyncIterable<readonly unknown[]> | Iterable<readonly unknown[]>,
+		options?: Pick<QueryOptions, 'signal' | 'timeout'>,
+	): Promise<number> {
+		return this.#with(options?.signal, (connection) =>
+			connection.copyRows(sql, rows, options),
+		);
+	}
+
 	async *copyTo(
 		sql: string,
 		options?: Pick<QueryOptions, 'signal' | 'timeout'>,

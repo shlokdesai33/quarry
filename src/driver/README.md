@@ -72,6 +72,8 @@ Queries issued concurrently on one connection are pipelined into shared socket w
 
 Statements are prepared and cached per connection (100 by default; `statementCacheSize`, `prepare: false`). This is safe behind PgBouncer 1.21+ with `max_prepared_statements`.
 
+From a cached statement's second run, columns whose parser has a binary twin (int2/int4/oid, float8, bool, bytea, and timestamptz decoded to `Date`) are received in binary, which is cheaper to decode and gives identical values. Custom parsers and raw types always get text. Turn it off with `binaryResults: false`.
+
 ### Decoding
 
 Results arrive in text format and are decoded per type OID:
@@ -94,6 +96,7 @@ Canceled queries throw `QueryCanceled`, whose `reason` is `'abort'`, `'timeout'`
 ```ts
 for await (const batch of conn.cursor(sql, params, { batchSize: 1000 })) { … }
 for await (const row of pool.stream(sql, params)) { … }
+await conn.copyRows('copy items (id, name) from stdin', rows); // bulk insert: rows as value arrays, encoded like parameters
 await conn.copyFrom('copy items from stdin', asyncIterableOfChunks);
 for await (const chunk of conn.copyTo('copy items to stdout')) { … }
 const unlisten = await pool.listen('events', (n) => …); // dedicated connection, re-subscribes after reconnecting

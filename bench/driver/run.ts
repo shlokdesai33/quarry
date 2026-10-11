@@ -11,10 +11,13 @@
  * installed and built) it adds pg-native.
  */
 import { createRequire } from 'node:module';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { Pool as PgPool } from 'pg';
 import postgres from 'postgres';
 import { createPool } from '../../src/driver/pool.ts';
 import { quarryTypes } from '../../src/driver/quarry-types.ts';
+import { copyChunks } from '../../src/driver/types.ts';
 import { findBinDir, startCluster } from '../../test/driver/setup/cluster.ts';
 
 const args = process.argv.slice(2);
@@ -29,6 +32,8 @@ const POOL = 10;
 interface Adapter {
 	readonly name: string;
 	query(sql: string, params?: unknown[]): Promise<unknown[]>;
+	/** Bulk-loads rows with COPY, where the driver supports it. */
+	copy?(sql: string, rows: unknown[][]): Promise<void>;
 	end(): Promise<void>;
 }
 
@@ -53,6 +58,9 @@ function adapters(url: string): Adapter[] {
 		{
 			name: 'quarry',
 			query: async (text, params = []) => (await ours.query(text, params)).rows,
+			copy: async (text, rows) => {
+				await ours.copyRows(text, rows);
+			},
 			end: () => ours.end(),
 		},
 		{
@@ -72,6 +80,10 @@ function adapters(url: string): Adapter[] {
 			query: async (text, params = []) => [
 				...(await sql.unsafe(text, params as never[], { prepare: true })),
 			],
+			copy: async (text, rows) => {
+				const writable = await sql.unsafe(text).writable();
+				await pipeline(Readable.from(copyChunks(rows)), writable);
+			},
 			end: () => sql.end(),
 		},
 	];
@@ -118,6 +130,8 @@ interface Scenario {
 	run(adapter: Adapter): Promise<number>;
 	/** Report time per unit (latency) rather than units per second. */
 	readonly latency?: boolean;
+	/** Only for adapters that support COPY. */
+	readonly needsCopy?: boolean;
 }
 
 const ROWS = 100_000;
@@ -236,6 +250,27 @@ const scenarios: Scenario[] = [
 				);
 			}),
 	},
+	{
+		name: 'bulk insert 10k rows (COPY)',
+		unit: ['batch', 'batches'],
+		latency: true,
+		needsCopy: true,
+		run: (a) =>
+			concurrent(a, 1, 5, () => {
+				const rows = Array.from({ length: 10_000 }, (_, i) => [
+					`copy ${seq}-${i}`,
+					i / 10,
+					'2024-01-01 00:00:00+00',
+				]);
+				seq++;
+				return (
+					a.copy?.(
+						'copy bench_writes (name, score, created) from stdin',
+						rows,
+					) ?? Promise.resolve()
+				);
+			}),
+	},
 ];
 
 async function setup(url: string) {
@@ -277,6 +312,7 @@ async function main() {
 		for (const scenario of scenarios) {
 			const row = new Map<string, number>();
 			for (const adapter of list) {
+				if (scenario.needsCopy && adapter.copy === undefined) continue;
 				await scenario.run(adapter); // warm up
 				const samples: number[] = [];
 				for (let r = 0; r < runs; r++) {
@@ -300,8 +336,12 @@ async function main() {
 		for (const scenario of scenarios) {
 			const row = results.get(scenario.name);
 			const values = names.map((n) => row?.get(n) ?? Number.NaN);
-			const best = scenario.latency ? Math.min(...values) : Math.max(...values);
+			const present = values.filter((v) => !Number.isNaN(v));
+			const best = scenario.latency
+				? Math.min(...present)
+				: Math.max(...present);
 			const cells = values.map((v) => {
+				if (Number.isNaN(v)) return '—';
 				const text = scenario.latency
 					? v < 1
 						? `${(v * 1000).toFixed(0)} µs`

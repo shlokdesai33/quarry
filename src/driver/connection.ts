@@ -55,7 +55,12 @@ import { Writer } from './protocol/writer.js';
 import { asResult, asRows, type RowMode } from './rows.js';
 import type { DriverSocket } from './socket.js';
 import { Transaction, type TransactionOptions } from './transaction.js';
-import { defaultTypes, encodeParam, type TypeParsers } from './types.js';
+import {
+	copyChunks,
+	defaultTypes,
+	encodeParam,
+	type TypeParsers,
+} from './types.js';
 
 export interface QueryOptions {
 	/** `object` (default) rows keyed by column name, or positional `array` rows. */
@@ -984,6 +989,23 @@ export class Connection implements AsyncDisposable {
 				options?.timeout,
 			);
 		});
+	}
+
+	/**
+	 * Bulk-loads rows with `COPY … FROM STDIN` in text format, the fastest
+	 * way to insert many rows. Each row is an array of values in the
+	 * statement's column order, encoded like query parameters. Returns the
+	 * number of rows copied.
+	 *
+	 * @example
+	 * await conn.copyRows('copy users (id, name) from stdin', [[1, 'Ada'], [2, 'Grace']]);
+	 */
+	copyRows(
+		sql: string,
+		rows: AsyncIterable<readonly unknown[]> | Iterable<readonly unknown[]>,
+		options?: Pick<QueryOptions, 'signal' | 'timeout'>,
+	): Promise<number> {
+		return this.copyFrom(sql, copyChunks(rows), options);
 	}
 
 	/** Runs `COPY … TO STDOUT`, yielding the data in chunks, with backpressure. */

@@ -231,6 +231,57 @@ describe.skipIf(noPg)('COPY', () => {
 		expect(text).toBe('0,label 0 é\n1,label 1 é\n2,label 2 é\n');
 	});
 
+	it('bulk-loads rows with copyRows, round-tripping awkward values', async () => {
+		await using conn = await open();
+		const name = table('copyrows');
+		await conn.query(
+			`create temp table ${name} (id int, t text, b bytea, j jsonb, a text[], ts timestamptz, f float8)`,
+		);
+		const tricky = [
+			'tab\there\tand\tthere',
+			'line\nbreak\n\\',
+			'back\\slash',
+			'\\N',
+			'cr\rlf',
+			'',
+			'é😀',
+		];
+		const rows = Array.from({ length: 20_000 }, (_, i) => [
+			i,
+			i < tricky.length ? tricky[i] : i % 5 === 0 ? null : `row ${i}`,
+			new Uint8Array([i % 256, 0, 255]),
+			{ i, s: 'q"uote' },
+			['x', null, 'y,z'],
+			new Date(Date.UTC(2024, 0, 1) + i * 1000),
+			i / 3,
+		]);
+		expect(
+			await conn.copyRows(
+				`copy ${name} (id, t, b, j, a, ts, f) from stdin`,
+				rows,
+			),
+		).toBe(20_000);
+		const back = await conn.query(
+			`select id, t, b, j, a, ts::text as ts, f from ${name} order by id`,
+		);
+		expect(back.rows.length).toBe(20_000);
+		back.rows.forEach((row, i) => {
+			const [id, t, b, j, a, ts, f] = rows[i] ?? [];
+			expect(row).toEqual({
+				id,
+				t,
+				b,
+				j,
+				a,
+				ts:
+					ts instanceof Date
+						? ts.toISOString().replace('T', ' ').replace('.000Z', '+00')
+						: ts,
+				f,
+			});
+		});
+	});
+
 	it('reports bad COPY data and keeps the connection usable', async () => {
 		await using conn = await open();
 		const name = table('copy');
