@@ -1,0 +1,21 @@
+{
+	"name": "quarry-driver-bench",
+	"private": true,
+	"type": "module",
+	"description": "Comprehensive benchmark of quarry/driver against other PostgreSQL clients; see README.md.",
+	"scripts": {
+		"bench": "node orchestrate.ts",
+		"report": "node analyze.ts",
+		"charts": "python3 charts.py"
+	},
+	"dependencies": {
+		"@neondatabase/serverless": "1.2.0",
+		"esbuild": "0.28.2",
+		"pg": "8.23.1",
+		"pg-copy-streams": "7.0.0",
+		"pg-cursor": "2.22.1",
+		"pg-native": "3.9.1",
+		"postgres": "3.4.9",
+		"ws": "8.22.0"
+	}
+}
