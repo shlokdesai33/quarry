@@ -10,6 +10,7 @@ import {
 	TransactionTimeout,
 	UniqueViolation,
 } from '../../../src/driver/errors.js';
+import { connect } from '../../../src/driver/connect.js';
 import { createPool, type PoolOptions } from '../../../src/driver/pool.js';
 import { TransactionRolledBack } from '../../../src/driver/transaction.js';
 import { noPg, open, options, rejection, table } from './helpers.js';
@@ -455,6 +456,24 @@ describe.skipIf(noPg)('pool', () => {
 		held.release();
 		await ending;
 		await expect(p.query('select 1')).rejects.toBeInstanceOf(DriverError);
+	});
+
+	it('ends within a timeout even with a query still running', async () => {
+		const p = pool({ max: 1 });
+		const running = p.query('select pg_sleep(10)').catch((e: unknown) => e);
+		await sleep(50);
+		const started = Date.now();
+		await p.end({ timeout: 200 });
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(await running).toBeInstanceOf(ConnectionError);
+	});
+
+	it('aborts connecting with a signal', async () => {
+		const controller = new AbortController();
+		controller.abort();
+		await expect(
+			connect(options(), { signal: controller.signal }),
+		).rejects.toThrow(/abort/i);
 	});
 
 	it('listens on a dedicated connection and re-subscribes after it drops', async () => {

@@ -608,8 +608,12 @@ export class Pool implements AsyncDisposable {
 		return this.#listener.listen(channel, handler);
 	}
 
-	/** Closes every connection once it is released, and fails waiters. */
-	async end(): Promise<void> {
+	/**
+	 * Fails waiters and closes every connection once its queries finish (or,
+	 * with `timeout` in milliseconds, after at most that long, failing
+	 * whatever is still running).
+	 */
+	async end(options: { timeout?: number } = {}): Promise<void> {
 		if (this.#ended) return;
 		this.#ended = true;
 		for (const waiter of this.#waiters.splice(0)) {
@@ -620,9 +624,9 @@ export class Pool implements AsyncDisposable {
 		await Promise.all([
 			...idle.map(async ({ connection, timer }) => {
 				if (timer !== undefined) clearTimeout(timer);
-				await connection.close();
+				await connection.close(options);
 			}),
-			...[...this.#busy].map((connection) => connection.close()),
+			...[...this.#busy].map((connection) => connection.close(options)),
 			this.#listener?.close(),
 		]);
 	}

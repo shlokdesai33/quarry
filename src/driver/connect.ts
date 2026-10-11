@@ -28,11 +28,13 @@ import type {
  */
 export async function connect(
 	options?: ConnectionOptions | string,
+	{ signal }: { signal?: AbortSignal } = {},
 ): Promise<Connection> {
 	return openConnection(
 		resolveConfig(
 			typeof options === 'string' ? { connectionString: options } : options,
 		),
+		signal,
 	);
 }
 

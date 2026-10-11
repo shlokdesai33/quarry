@@ -1214,8 +1214,33 @@ export class Connection implements AsyncDisposable {
 		return new Promise((resolve) => this.#idleWaiters.push(resolve));
 	}
 
-	/** Waits for queued queries, then closes gracefully. */
-	async close(): Promise<void> {
+	/**
+	 * Waits for queued queries, then closes gracefully. With `timeout`
+	 * (milliseconds), queries still running after it are failed and the
+	 * socket destroyed.
+	 */
+	async close(options: { timeout?: number } = {}): Promise<void> {
+		if (this.#closed) return;
+		const timer =
+			options.timeout === undefined
+				? undefined
+				: setTimeout(
+						() =>
+							this.#fail(
+								new ConnectionError(
+									`The connection was closed after waiting ${options.timeout}ms for queries`,
+								),
+							),
+						options.timeout,
+					);
+		try {
+			await this.#close();
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
+	async #close(): Promise<void> {
 		if (this.#closed) return;
 		if (!this.#ending) {
 			this.#ending = true;
