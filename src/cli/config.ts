@@ -1,3 +1,4 @@
+import { resolveCallSite } from '../call-site.js';
 import type { Database } from '../database.js';
 import type { AnyTable } from '../table.js';
 
@@ -41,12 +42,26 @@ function isTable(value: unknown): value is AnyTable {
 	);
 }
 
-/** The tables of a config's `schema`. */
+/**
+ * The tables of a config's `schema`. An object's tables are put in the order
+ * they were defined in, since a module namespace lists its exports sorted.
+ */
 export function schemaTables(schema: QuarryConfig['schema']): AnyTable[] {
-	const values: unknown[] = Array.isArray(schema)
-		? schema
-		: Object.values(schema);
-	return values.filter(isTable);
+	if (Array.isArray(schema)) return schema.filter(isTable);
+	const tables = Object.values(schema).filter(isTable);
+	const order = new Map(
+		tables.map((table) => [table, resolveCallSite(table._quarry.site)]),
+	);
+	return tables.toSorted((a, b) => {
+		const x = order.get(a);
+		const y = order.get(b);
+		if (x === undefined || y === undefined) return 0;
+		return x.file === y.file
+			? x.line - y.line || x.column - y.column
+			: x.file < y.file
+				? -1
+				: 1;
+	});
 }
 
 /** Reads a config module's exports, or explains what is wrong with them. */

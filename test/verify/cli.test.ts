@@ -7,6 +7,7 @@ import { text } from '../../src/column-factories.js';
 import { defineTable } from '../../src/define-table.js';
 import { type Io, runCli, usage } from '../../src/cli/run.js';
 import { database } from '../../src/database.js';
+import * as fixtures from './fixtures/schema.js';
 import { schema as driftSchema, users } from './fixtures/schema.js';
 import {
 	postgresAvailable,
@@ -85,6 +86,12 @@ describe('config', () => {
 			schemaTables({ users, status: () => {}, n: 1, nothing: null }),
 		).toEqual([users]);
 		expect(schemaTables(driftSchema)).toHaveLength(3);
+		const { invoices, orders } = fixtures;
+		expect(schemaTables({ invoices, orders, users })).toEqual([
+			users,
+			orders,
+			invoices,
+		]);
 	});
 });
 
