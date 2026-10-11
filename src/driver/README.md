@@ -4,6 +4,12 @@ A PostgreSQL driver with no runtime dependencies, written for quarry but usable 
 
 It requires PostgreSQL 18 or later (connecting to an older server fails with a clear error; a pooler that hides the version is assumed to front 18+). Newer releases are expected to work: unknown messages, fields, parameters and types are tolerated. `connection.capabilities` reports what poolers and proxies may change, such as the negotiated protocol version.
 
+## Runtimes
+
+- **Node, Bun and Deno:** run on `node:net`/`node:tls`, with every feature available, including SCRAM channel binding and client certificates. `pnpm test:runtimes` runs the same smoke test on all three.
+- **Cloudflare Workers:** the `cloudflare:sockets` adapter is picked automatically. Workers' TLS always verifies against public CAs and doesn't expose the server certificate, so there are no custom CAs, client certificates, direct TLS or channel binding there. `pnpm test:workers` (with `MINIFLARE_FROM` pointing at a Miniflare install) runs the smoke test inside workerd.
+- **Anything else:** pass `socket` (a `SocketFactory`).
+
 ## Connecting
 
 ```ts

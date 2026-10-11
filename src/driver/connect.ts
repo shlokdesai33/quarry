@@ -8,10 +8,12 @@ import {
 } from './config.js';
 import { Connection } from './connection.js';
 import { ConnectionError, PostgresError } from './errors.js';
+import { cloudflareSockets, isCloudflareWorkers } from './cloudflare-socket.js';
 import { nodeSockets } from './node-socket.js';
 import * as fe from './protocol/frontend.js';
 import type {
 	DriverSocket,
+	SocketFactory,
 	SocketTarget,
 	TlsConnectOptions,
 } from './socket.js';
@@ -32,6 +34,11 @@ export async function connect(
 			typeof options === 'string' ? { connectionString: options } : options,
 		),
 	);
+}
+
+/** `cloudflare:sockets` on Cloudflare Workers; Node's `net`/`tls` elsewhere (Node, Bun, Deno). */
+function defaultSockets(): SocketFactory {
+	return isCloudflareWorkers() ? cloudflareSockets : nodeSockets;
 }
 
 /** Opens a connection from a resolved configuration, trying each host in turn. */
@@ -231,7 +238,7 @@ async function attempt(
 	version: number,
 	state: Attempt,
 ): Promise<Connection> {
-	const factory = config.socket ?? nodeSockets;
+	const factory = config.socket ?? defaultSockets();
 	const target = socketTarget(host);
 	const tls =
 		plan === 'plain'
@@ -392,7 +399,7 @@ async function sendCancel(
 	pid: number,
 	key: Uint8Array,
 ): Promise<void> {
-	const factory = config.socket ?? nodeSockets;
+	const factory = config.socket ?? defaultSockets();
 	const tls =
 		plan === 'plain'
 			? undefined
