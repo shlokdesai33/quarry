@@ -94,14 +94,14 @@ export function parse(
 /**
  * Binds values to a prepared statement, creating a portal. Strings are sent
  * in text format and byte arrays in binary format. Results are requested in
- * `resultFormat` (0 text, 1 binary) for every column.
+ * `resultFormat` (0 text, 1 binary) for every column, or per column.
  */
 export function bind(
 	w: Writer,
 	portal: string,
 	statement: string,
 	values: readonly WireValue[],
-	resultFormat: 0 | 1 = 0,
+	resultFormat: 0 | 1 | readonly number[] = 0,
 ): Writer {
 	w.begin(0x42).cstring(portal).cstring(statement);
 	if (values.some((value) => value instanceof Uint8Array)) {
@@ -113,7 +113,11 @@ export function bind(
 	w.int16(values.length);
 	for (const value of values) w.value(value);
 	if (resultFormat === 0) w.int16(0);
-	else w.int16(1).int16(1);
+	else if (resultFormat === 1) w.int16(1).int16(1);
+	else {
+		w.int16(resultFormat.length);
+		for (const format of resultFormat) w.int16(format);
+	}
 	return w.end();
 }
 

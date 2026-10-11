@@ -79,6 +79,12 @@ export interface QueryOptions {
 	readonly statementTimeout?: number | string;
 	/** Receives where the query spent its time once it settles. */
 	readonly onTiming?: (timing: OpTiming) => void;
+	/**
+	 * Ask for binary results for columns whose parser has a binary twin
+	 * (default: the connection's `binaryResults`). Values decode the same;
+	 * only cached statements, from their second run, use it.
+	 */
+	readonly binary?: boolean;
 }
 
 export interface CursorOptions extends QueryOptions {
@@ -699,6 +705,7 @@ export class Connection implements AsyncDisposable {
 			paramTypes: undefined,
 			error: undefined,
 			decoders: new Map(),
+			plans: new Map(),
 		};
 		this.#statements.set(key, statement);
 		if (this.#statements.size > this.#config.statementCacheSize) {
@@ -769,6 +776,7 @@ export class Connection implements AsyncDisposable {
 				(options?.prepare ?? this.#config.prepare) &&
 				this.#config.statementCacheSize > 0,
 			paramTypes: options?.paramTypes ?? [],
+			binary: options?.binary ?? this.#config.binaryResults,
 		};
 	}
 

@@ -143,6 +143,13 @@ export interface ConnectionOptions {
 	readonly prepare?: boolean | undefined;
 	/** The most prepared statements kept per connection (default 100). */
 	readonly statementCacheSize?: number | undefined;
+	/**
+	 * Receive columns in binary where the configured parser has a binary
+	 * twin (int2/int4/oid, float8, bool, bytea, timestamptz as Date),
+	 * from a cached statement's second run (default true). Values are
+	 * identical either way; custom and raw types always stay text.
+	 */
+	readonly binaryResults?: boolean | undefined;
 	/** How sockets are opened; defaults to Node's `net`/`tls`. */
 	readonly socket?: SocketFactory | undefined;
 	readonly onNotice?: (notice: Notice) => void | undefined;
@@ -193,6 +200,7 @@ export interface ResolvedConfig {
 	readonly types: TypeParsers | undefined;
 	readonly prepare: boolean;
 	readonly statementCacheSize: number;
+	readonly binaryResults: boolean;
 	readonly socket: SocketFactory | undefined;
 	readonly onNotice: ((notice: Notice) => void) | undefined;
 	readonly onNotification: ((notification: Notification) => void) | undefined;
@@ -609,6 +617,7 @@ export function resolveConfig(options: ConnectionOptions = {}): ResolvedConfig {
 		types: options.types,
 		prepare: options.prepare ?? true,
 		statementCacheSize: options.statementCacheSize ?? 100,
+		binaryResults: options.binaryResults ?? true,
 		socket: options.socket,
 		onNotice: options.onNotice,
 		onNotification: options.onNotification,

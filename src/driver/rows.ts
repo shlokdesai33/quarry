@@ -1,3 +1,4 @@
+import { binaryParser, type BinaryParser } from './binary.js';
 import { ProtocolError } from './errors.js';
 import type { QueryResult } from './ops.js';
 import type { Field } from './protocol/messages.js';
@@ -15,6 +16,9 @@ export type RowDecoder = (
 ) => unknown;
 
 type Build = (values: unknown[]) => Record<string, unknown>;
+
+/** Binary values without a decoder: a copy, so rows never alias the read buffer. */
+const copy: BinaryParser = (b, s, e) => new Uint8Array(b.subarray(s, e));
 
 /**
  * A function building `{ name0: v[0], … }` for one result shape: an object
@@ -61,7 +65,11 @@ export function rowDecoder(
 	mode: RowMode,
 ): RowDecoder {
 	const count = fields.length;
-	const binary = fields.map((field) => field.format === 1);
+	const binary: (BinaryParser | undefined)[] = fields.map((field) =>
+		field.format === 1
+			? (binaryParser(field.typeOid, types[field.typeOid]) ?? copy)
+			: undefined,
+	);
 	const parsers: (TextParser | undefined)[] = fields.map((field) =>
 		field.format === 1 ? undefined : types[field.typeOid],
 	);
@@ -92,8 +100,9 @@ export function rowDecoder(
 			const valueEnd = pos + length;
 			if (length < 0 || valueEnd > end)
 				throw new ProtocolError('Invalid value length in DataRow');
-			if (binary[i]) {
-				row.push(bytes.slice(pos, valueEnd));
+			const decode = binary[i];
+			if (decode !== undefined) {
+				row.push(decode(bytes, pos, valueEnd));
 			} else {
 				const parse = parsers[i];
 				const text = utf8(bytes, pos, valueEnd);

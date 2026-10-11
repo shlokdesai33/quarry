@@ -187,11 +187,17 @@ const array =
 	(text) =>
 		parseArray(text, parse, delimiter);
 
-const bool: TextParser = (text) => text === 't';
-const int: TextParser = (text) => Number.parseInt(text, 10);
-const float: TextParser = (text) => Number(text);
-const bigint: TextParser = (text) => BigInt(text);
-const json: TextParser = (text) => JSON.parse(text);
+/** Built-in text parsers. Shared, so a binary decoder can be matched to the parser it stands in for. */
+export const parseBool: TextParser = (text) => text === 't';
+export const parseInteger: TextParser = (text) => Number.parseInt(text, 10);
+export const parseFloat: TextParser = (text) => Number(text);
+export const parseBigInt: TextParser = (text) => BigInt(text);
+export const parseJson: TextParser = (text) => JSON.parse(text);
+const bool = parseBool;
+const int = parseInteger;
+const float = parseFloat;
+const bigint = parseBigInt;
+const json = parseJson;
 
 /**
  * The default parsers: lossless conversions only. int2, int4, oid and

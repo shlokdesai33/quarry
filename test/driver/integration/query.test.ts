@@ -11,7 +11,8 @@ import {
 	CheckViolation,
 } from '../../../src/driver/errors.js';
 import type { Notice } from '../../../src/driver/notice.js';
-import { rawTypes } from '../../../src/driver/types.js';
+import { quarryTypes } from '../../../src/driver/quarry-types.js';
+import { oids, rawTypes } from '../../../src/driver/types.js';
 import { noPg, open, rejection, table } from './helpers.js';
 
 describe.skipIf(noPg)('queries', () => {
@@ -87,6 +88,47 @@ describe.skipIf(noPg)('queries', () => {
 			},
 		);
 		expect(rows).toEqual([['1', 't', '{"x": 1}', '{1,2}']]);
+	});
+
+	it('decodes binary results exactly like text, and only where a built-in parser has a binary twin', async () => {
+		const sql = `select
+			b, i2, i4, o, f4, f8, bytes, ts
+		from (values
+			(true, (-32768)::int2, (-2147483648)::int4, 4294967295::oid, 'NaN'::float4, '-0'::float8, '\\x00ff'::bytea, '-infinity'::timestamptz),
+			(false, 32767::int2, 2147483647::int4, 0::oid, 'Infinity'::float4, '1e-310'::float8, ''::bytea, 'infinity'::timestamptz),
+			(null, 1::int2, 0::int4, 26::oid, '-1.5'::float4, '-Infinity'::float8, null, '0044-03-15 12:00:00.123456+00 BC'::timestamptz),
+			(true, 0::int2, 7::int4, 1::oid, '3.4e38'::float4, '0.1'::float8, '\\xdeadbeef'::bytea, '1969-12-31 23:59:59.9995+00'::timestamptz),
+			(true, 0::int2, 7::int4, 1::oid, '1'::float4, 'NaN'::float8, '\\x'::bytea, '2024-02-29 13:45:01.000999+05:30'::timestamptz)
+		) as t(b, i2, i4, o, f4, f8, bytes, ts)`;
+		await using c = await open({ types: quarryTypes });
+		const text = await c.query(sql, [], { binary: false });
+		await c.query(sql); // describes the statement
+		const binary = await c.query(sql);
+		expect(binary.fields.map((f) => f.format)).toEqual([
+			1, 1, 1, 1, 0, 1, 1, 1,
+		]);
+		expect(text.fields.every((f) => f.format === 0)).toBe(true);
+		expect(binary.rows).toEqual(text.rows);
+		expect(Object.is(binary.rows[0]?.['f8'], -0)).toBe(true);
+
+		// a custom parser keeps its column in text
+		const custom = {
+			...quarryTypes,
+			[oids.timestamptz]: (t: string) => `custom ${t}`,
+		};
+		await c.query('select now() as t, 1 as n', [], { types: custom });
+		const mixed = await c.query<{ t: string; n: number }>(
+			'select now() as t, 1 as n',
+			[],
+			{ types: custom },
+		);
+		expect(mixed.fields.map((f) => f.format)).toEqual([0, 1]);
+		expect(mixed.rows[0]?.t).toMatch(/^custom /);
+		const raw = await c.query('select 1 as n', [], { types: rawTypes });
+		expect(
+			(await c.query('select 1 as n', [], { types: rawTypes })).rows,
+		).toEqual(raw.rows);
+		expect(raw.rows).toEqual([{ n: '1' }]);
 	});
 
 	it('builds rows safely whatever the column names', async () => {

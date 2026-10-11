@@ -4,7 +4,11 @@ import {
 	arrayOids,
 	oids,
 	parseArray,
+	parseBool,
 	parseBytea,
+	parseFloat,
+	parseInteger,
+	parseJson,
 	type TextParser,
 	type TypeParsers,
 } from './types.js';
@@ -175,10 +179,10 @@ export function parseRange<T>(
 export const parseVector: TextParser = (text) => JSON.parse(text);
 
 const identity: TextParser = (text) => text;
-const int: TextParser = (text) => Number.parseInt(text, 10);
-const float: TextParser = (text) => Number(text);
-const bool: TextParser = (text) => text === 't';
-const json: TextParser = (text) => JSON.parse(text);
+const int = parseInteger;
+const float = parseFloat;
+const bool = parseBool;
+const json = parseJson;
 const dateRange: TextParser = (text) => parseRange(text, identity);
 const timeRange: TextParser = (text) => parseRange(text, parseTimestamptz);
 const array =

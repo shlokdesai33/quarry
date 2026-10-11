@@ -10,6 +10,7 @@ import * as fe from './protocol/frontend.js';
 import type { WireValue } from './protocol/frontend.js';
 import type { BackendMessage, Field } from './protocol/messages.js';
 import type { Writer } from './protocol/writer.js';
+import { formatPlan, type FormatPlan } from './binary.js';
 import { rowDecoder, type RowDecoder, type RowMode } from './rows.js';
 import type { TypeParsers } from './types.js';
 
@@ -24,7 +25,13 @@ export interface Statement {
 	/** The Parse error, when parsing failed; later binds of it report this. */
 	error: PostgresError | undefined;
 	/** Decoders by types and row mode, so rows of a cached statement skip rebuilding one. */
-	readonly decoders: Map<TypeParsers, Map<RowMode, RowDecoder>>;
+	/** Decoders by result fields (text or binary plan), types and row mode, so rows of a cached statement skip rebuilding one. */
+	readonly decoders: Map<
+		readonly Field[],
+		Map<TypeParsers, Map<RowMode, RowDecoder>>
+	>;
+	/** Result format plans by types, once the result columns are known. */
+	readonly plans: Map<TypeParsers, FormatPlan>;
 }
 
 /** What an operation may use on its connection. */
@@ -142,6 +149,22 @@ export interface QueryOpOptions {
 	readonly types: TypeParsers | undefined;
 	readonly prepare: boolean;
 	readonly paramTypes: readonly number[];
+	/** Ask for binary results for columns with a matching binary decoder. */
+	readonly binary: boolean;
+}
+
+/** The result format plan for a described statement, cached per types. */
+function planFor(
+	statement: Statement,
+	fields: readonly Field[],
+	types: TypeParsers,
+): FormatPlan {
+	let plan = statement.plans.get(types);
+	if (plan === undefined) {
+		plan = formatPlan(fields, types);
+		statement.plans.set(types, plan);
+	}
+	return plan;
 }
 
 function decoderFor(
@@ -151,10 +174,15 @@ function decoderFor(
 	mode: RowMode,
 ): RowDecoder {
 	if (statement === undefined) return rowDecoder(fields, types, mode);
-	let byMode = statement.decoders.get(types);
+	let byTypes = statement.decoders.get(fields);
+	if (byTypes === undefined) {
+		byTypes = new Map();
+		statement.decoders.set(fields, byTypes);
+	}
+	let byMode = byTypes.get(types);
 	if (byMode === undefined) {
 		byMode = new Map();
-		statement.decoders.set(types, byMode);
+		byTypes.set(types, byMode);
 	}
 	let decoder = byMode.get(mode);
 	if (decoder === undefined) {
@@ -172,6 +200,7 @@ export class QueryOp extends Op {
 	readonly #options: QueryOpOptions;
 	readonly #resolve: (result: QueryResult<unknown>) => void;
 	readonly #reject: (error: Error) => void;
+	#planFields: readonly Field[] | undefined;
 	#statement: Statement | undefined;
 	#createdStatement = false;
 	#types: TypeParsers | undefined;
@@ -215,7 +244,15 @@ export class QueryOp extends Op {
 				fe.parse(w, statement.name, this.#sql, this.#options.paramTypes);
 				fe.describe(w, 'S', statement.name);
 			}
-			fe.bind(w, '', statement.name, this.#values);
+			const known = statement.fields;
+			if (!created && this.#options.binary && known !== undefined) {
+				// columns already known: ask for binary where a decoder matches
+				const plan = planFor(statement, known, this.#types);
+				this.#planFields = plan.fields;
+				fe.bind(w, '', statement.name, this.#values, plan.formats);
+			} else {
+				fe.bind(w, '', statement.name, this.#values);
+			}
 		} else {
 			fe.parse(w, '', this.#sql, this.#options.paramTypes);
 			fe.bind(w, '', '', this.#values);
@@ -238,7 +275,7 @@ export class QueryOp extends Op {
 	override dataRow(bytes: Uint8Array, start: number, end: number): boolean {
 		let decoder = this.#decoder;
 		if (decoder === undefined) {
-			const fields = this.#statement?.fields;
+			const fields = this.#planFields ?? this.#statement?.fields;
 			if (fields === undefined)
 				throw new ProtocolError('DataRow before RowDescription');
 			this.#setFields(fields);
@@ -257,10 +294,12 @@ export class QueryOp extends Op {
 				if (this.#statement && this.#createdStatement)
 					this.#statement.parsed = true;
 				return false;
-			case 'BindComplete':
-				if (this.#fields === undefined && this.#statement?.fields !== undefined)
-					this.#setFields(this.#statement.fields);
+			case 'BindComplete': {
+				const fields = this.#planFields ?? this.#statement?.fields;
+				if (this.#fields === undefined && fields !== undefined)
+					this.#setFields(fields);
 				return false;
+			}
 			case 'CloseComplete':
 			case 'EmptyQueryResponse':
 			case 'PortalSuspended':
