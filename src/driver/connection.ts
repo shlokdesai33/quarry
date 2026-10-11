@@ -28,6 +28,7 @@ import {
 	closedError,
 	type Description,
 	type OpContext,
+	type OpTiming,
 	type QueryOpOptions,
 	type QueryResult,
 	type Statement,
@@ -61,6 +62,8 @@ export interface QueryOptions {
 	 * `begin … commit`; inside one, the previous value is restored after it.
 	 */
 	readonly statementTimeout?: number | string;
+	/** Receives where the query spent its time once it settles. */
+	readonly onTiming?: (timing: OpTiming) => void;
 }
 
 export interface CursorOptions extends QueryOptions {
@@ -496,6 +499,7 @@ export class Connection implements AsyncDisposable {
 			const op = this.#queue[this.#written];
 			if (op === undefined) break;
 			this.#written++;
+			if (op.onTiming !== undefined) op.writtenAt = performance.now();
 			op.write(this.#ctx);
 			op.written = true;
 			if (op.exclusive) this.#blocking = op;
@@ -548,6 +552,7 @@ export class Connection implements AsyncDisposable {
 			);
 			return;
 		}
+		if (op.onTiming !== undefined) op.queuedAt = performance.now();
 		this.#queue.push(op);
 		this.#schedule();
 		if (signal) {
@@ -630,6 +635,7 @@ export class Connection implements AsyncDisposable {
 				(result) => resolve(asResult<R>(result)),
 				reject,
 			);
+			op.onTiming = options?.onTiming;
 			this.#enqueue(op, options?.signal, options?.timeout);
 		});
 	}

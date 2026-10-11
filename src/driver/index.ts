@@ -18,7 +18,7 @@ export {
 } from './connection.js';
 export * from './errors.js';
 export type { Notice, Notification } from './notice.js';
-export type { Description, QueryResult } from './ops.js';
+export type { Description, OpTiming, QueryResult } from './ops.js';
 export type { Field } from './protocol/messages.js';
 export type { RowMode } from './rows.js';
 export type {
@@ -55,3 +55,17 @@ export {
 	type SettingValue,
 	type TransactionOptions,
 } from './transaction.js';
+export {
+	executorTypes,
+	PgExecutor,
+	pgExecutor,
+	type ExecutorSource,
+	type PgExecutorOptions,
+	type QueryEvent,
+} from './quarry.js';
+export {
+	parseRange,
+	parseTimestamptz,
+	parseVector,
+	quarryTypes,
+} from './quarry-types.js';

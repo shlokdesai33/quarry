@@ -58,6 +58,14 @@ export interface QueryResult<R = Record<string, unknown>> {
 	readonly fields: readonly Field[];
 }
 
+/** Where an operation spent its time, in milliseconds. */
+export interface OpTiming {
+	/** Waiting on the connection behind other operations, before being sent. */
+	readonly queuedMs: number;
+	/** From being sent until the server finished (server work, transfer and decoding). */
+	readonly execMs: number;
+}
+
 /** Base for queued operations: written in order, then fed backend messages until ReadyForQuery. */
 export abstract class Op {
 	written = false;
@@ -66,6 +74,10 @@ export abstract class Op {
 	readonly exclusive: boolean = false;
 	/** Set when this client asked the server to cancel this operation. */
 	canceledBy: 'abort' | 'timeout' | undefined;
+	/** Receives the operation's timing when it settles, if set. */
+	onTiming: ((timing: OpTiming) => void) | undefined;
+	queuedAt = 0;
+	writtenAt = 0;
 	readonly #cleanups: (() => void)[] = [];
 
 	onSettle(cleanup: () => void): void {
@@ -75,6 +87,14 @@ export abstract class Op {
 	protected settle(): void {
 		this.done = true;
 		for (const cleanup of this.#cleanups.splice(0)) cleanup();
+		if (this.onTiming !== undefined) {
+			const now = performance.now();
+			const written = this.writtenAt || now;
+			this.onTiming({
+				queuedMs: written - this.queuedAt,
+				execMs: now - written,
+			});
+		}
 	}
 
 	abstract write(ctx: OpContext): void;

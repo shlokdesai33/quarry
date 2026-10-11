@@ -43,6 +43,8 @@ export class AbortError extends DriverError {
 export interface ErrorQuery {
 	readonly sql: string;
 	readonly params: readonly unknown[];
+	/** The query's label (quarry's `tag()`), when it has one. */
+	readonly tag?: string | undefined;
 }
 
 /**
