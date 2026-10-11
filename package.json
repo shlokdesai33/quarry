@@ -17,6 +17,7 @@
 		"./package.json": "./package.json"
 	},
 	"scripts": {
+		"bench:driver": "node --import ./bench/driver/register.mjs bench/driver/run.ts",
 		"bench:lsp": "node bench/types/lsp.ts",
 		"bench:types": "node bench/types/run.ts",
 		"build": "tsdown && tsc -p tsconfig.build.json --emitDeclarationOnly",

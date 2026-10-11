@@ -21,6 +21,8 @@ const MAX_DATE = 8.64e15;
  * representable Dates.
  */
 export function parseTimestamptz(text: string): Date {
+	const fast = fastTimestamptz(text);
+	if (fast !== undefined) return new Date(fast);
 	if (text === 'infinity') return new Date(MAX_DATE);
 	if (text === '-infinity') return new Date(-MAX_DATE);
 	const m = TIMESTAMPTZ.exec(text);
@@ -35,6 +37,76 @@ export function parseTimestamptz(text: string): Date {
 	date.setUTCFullYear(year, Number(m[2]) - 1, Number(m[3]));
 	date.setUTCHours(Number(m[4]), Number(m[5]), Number(m[6]), ms);
 	return new Date(date.getTime() - offset * 1000);
+}
+
+function digits(text: string, at: number, count: number): number {
+	let value = 0;
+	for (let i = at; i < at + count; i++) {
+		const d = text.charCodeAt(i) - 48;
+		if (d < 0 || d > 9) return -1;
+		value = value * 10 + d;
+	}
+	return value;
+}
+
+/**
+ * The common case without a regex: `YYYY-MM-DD HH:MM:SS[.f…]±HH[:MM[:SS]]`
+ * for years 100–9999. Undefined for anything else.
+ */
+function fastTimestamptz(text: string): number | undefined {
+	if (
+		text.length < 22 ||
+		text.charCodeAt(4) !== 45 ||
+		text.charCodeAt(10) !== 32 ||
+		text.charCodeAt(19) === 32
+	)
+		return undefined;
+	const year = digits(text, 0, 4);
+	const month = digits(text, 5, 2);
+	const day = digits(text, 8, 2);
+	const hour = digits(text, 11, 2);
+	const minute = digits(text, 14, 2);
+	const second = digits(text, 17, 2);
+	if (
+		year < 100 ||
+		month < 0 ||
+		day < 0 ||
+		hour < 0 ||
+		minute < 0 ||
+		second < 0
+	)
+		return undefined;
+	let pos = 19;
+	let ms = 0;
+	if (text.charCodeAt(pos) === 46) {
+		pos++;
+		let scale = 100;
+		while (pos < text.length) {
+			const d = text.charCodeAt(pos) - 48;
+			if (d < 0 || d > 9) break;
+			ms += d * scale;
+			scale /= 10;
+			pos++;
+		}
+		ms = Math.floor(ms + 1e-9);
+	}
+	const sign = text.charCodeAt(pos);
+	if (sign !== 43 && sign !== 45) return undefined;
+	let offset = digits(text, pos + 1, 2) * 3600;
+	pos += 3;
+	if (text.charCodeAt(pos) === 58) {
+		offset += digits(text, pos + 1, 2) * 60;
+		pos += 3;
+		if (text.charCodeAt(pos) === 58) {
+			offset += digits(text, pos + 1, 2);
+			pos += 3;
+		}
+	}
+	if (pos !== text.length || offset < 0) return undefined;
+	return (
+		Date.UTC(year, month - 1, day, hour, minute, second, ms) -
+		(sign === 45 ? -offset : offset) * 1000
+	);
 }
 
 /**
