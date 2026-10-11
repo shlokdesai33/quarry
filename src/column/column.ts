@@ -19,7 +19,10 @@ export class Column<D extends DataType, S, I = S, U = I>
 	 * @example text().nullable().typed<string | null, string | null, string>()
 	 */
 	nullable() {
-		return new Column<D, S | null, I | null, U | null>(this._quarry);
+		return new Column<D, S | null, I | null, U | null>({
+			...this._quarry,
+			nullable: true,
+		});
 	}
 
 	/**
@@ -29,7 +32,10 @@ export class Column<D extends DataType, S, I = S, U = I>
 	 * @example text().default()
 	 */
 	default() {
-		return new DefaultColumn<D, S, I | undefined, U>(this._quarry);
+		return new DefaultColumn<D, S, I | undefined, U>({
+			...this._quarry,
+			fill: 'default',
+		});
 	}
 
 	/**
@@ -39,7 +45,10 @@ export class Column<D extends DataType, S, I = S, U = I>
 	 * @example text().generated()
 	 */
 	generated() {
-		return new GeneratedColumn<D, S, never, never>(this._quarry);
+		return new GeneratedColumn<D, S, never, never>({
+			...this._quarry,
+			fill: 'generated',
+		});
 	}
 
 	override name(columnName: string) {

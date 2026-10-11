@@ -53,14 +53,17 @@ export function comparison(
 	switch (operator) {
 		case 'is':
 		case 'is not': {
+			// the typed methods only pass these; a literal is inlined, so check
+			if (value !== null && typeof value !== 'boolean') {
+				throw new TypeError(
+					`\`${operator}\` compares with true, false or null`,
+				);
+			}
 			return {
 				kind: 'binary',
 				left,
 				operator,
-				right: {
-					kind: 'literal',
-					value: value as boolean | null,
-				},
+				right: { kind: 'literal', value },
 			};
 		}
 		case 'in':

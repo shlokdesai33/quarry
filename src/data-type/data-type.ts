@@ -11,6 +11,11 @@ type Options = {
 	 * reaches this.
 	 */
 	readonly serialize?: (value: unknown) => string;
+	/**
+	 * The type modifiers, e.g. `[255]` for `varchar(255)` or `[10, 2]` for
+	 * `numeric(10, 2)`.
+	 */
+	readonly modifiers?: readonly number[] | undefined;
 };
 
 /**
@@ -37,6 +42,13 @@ export class DataType<K extends Kind = Kind> {
 	readonly kind: K;
 
 	/**
+	 * The type modifiers, e.g. `[255]` for `varchar(255)`, or `undefined`
+	 * when none were given and the column takes any. Only `db.verify` reads
+	 * them; values aren't checked against them.
+	 */
+	readonly modifiers: readonly number[] | undefined;
+
+	/**
 	 * How values are encoded, where they aren't sent as is.
 	 */
 	readonly #options: Options;
@@ -45,10 +57,12 @@ export class DataType<K extends Kind = Kind> {
 	 * Creates a data type of the given kind.
 	 *
 	 * @param kind the name of the SQL type.
-	 * @param options how values are encoded, where they aren't sent as is.
+	 * @param options how values are encoded, where they aren't sent as is,
+	 * and the type modifiers.
 	 */
 	constructor(kind: K, options: Options = {}) {
 		this.kind = kind;
+		this.modifiers = options.modifiers;
 		this.#options = options;
 	}
 

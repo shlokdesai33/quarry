@@ -1,7 +1,11 @@
 import { defineConfig } from 'tsdown';
 
 export default defineConfig({
-	entry: ['src/index.ts', 'src/driver/index.ts'],
+	entry: {
+		index: 'src/index.ts',
+		'driver/index': 'src/driver/index.ts',
+		cli: 'src/cli/main.ts',
+	},
 	format: ['esm'],
 	platform: 'neutral',
 	target: 'node22',

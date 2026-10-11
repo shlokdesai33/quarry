@@ -1,4 +1,8 @@
+import type { CallSite } from '../call-site.js';
 import type { DataType } from '../data-type/data-type.js';
+
+/** Where the value of a column omitted on insert comes from, if anywhere. */
+export type ColumnFill = 'default' | 'generated' | 'identity' | undefined;
 
 /** What a column is constructed from. */
 export type ColumnArgs<D extends DataType> = {
@@ -11,6 +15,12 @@ export type ColumnArgs<D extends DataType> = {
 	 * is declared under.
 	 */
 	readonly columnName?: string | undefined;
+	/** Whether the column was made `nullable()`. */
+	readonly nullable?: boolean | undefined;
+	/** The value modifier the column was given. */
+	readonly fill?: ColumnFill;
+	/** Where the column's factory was called. */
+	readonly site?: CallSite | undefined;
 };
 
 /**
@@ -58,11 +68,16 @@ export abstract class BaseColumn<D extends DataType, S, I, U> {
 	 * What the library reads: not part of the API. `dataType` is the SQL type
 	 * of the column, which encodes values compared against it; `columnName`
 	 * its name in the database, when it differs from the key it is declared
-	 * under.
+	 * under. The rest mirror the modifiers for `db.verify`: `nullable`, `fill`
+	 * (`default()`, `generated()` or `identity()`), and `site`, where the
+	 * column's factory was called.
 	 */
 	readonly _quarry: {
 		readonly dataType: D;
 		readonly columnName: string | undefined;
+		readonly nullable: boolean;
+		readonly fill: ColumnFill;
+		readonly site: CallSite | undefined;
 	};
 
 	/**
@@ -70,8 +85,14 @@ export abstract class BaseColumn<D extends DataType, S, I, U> {
 	 *
 	 * @param args the arguments for the column.
 	 */
-	constructor({ dataType, columnName }: ColumnArgs<D>) {
-		this._quarry = { dataType, columnName };
+	constructor({
+		dataType,
+		columnName,
+		nullable = false,
+		fill,
+		site,
+	}: ColumnArgs<D>) {
+		this._quarry = { dataType, columnName, nullable, fill, site };
 	}
 
 	/**

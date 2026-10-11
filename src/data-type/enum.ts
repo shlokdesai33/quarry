@@ -1,3 +1,4 @@
+import type { CallSite } from '../call-site.js';
 import { DataType } from './data-type.js';
 
 /**
@@ -21,9 +22,13 @@ export class EnumType<N extends string = string> extends DataType<'enum'> {
 	 */
 	readonly values: readonly string[];
 
-	constructor(enumName: N, values: readonly string[]) {
+	/** Where `defineEnum` was called, for `db.verify`. */
+	readonly site: CallSite | undefined;
+
+	constructor(enumName: N, values: readonly string[], site?: CallSite) {
 		super('enum');
 		this.enumName = enumName;
 		this.values = values;
+		this.site = site;
 	}
 }

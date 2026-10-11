@@ -3,6 +3,9 @@
 	"version": "0.0.0",
 	"description": "A type-safe SQL query builder for PostgreSQL.",
 	"license": "MIT",
+	"bin": {
+		"quarry": "./dist/cli.js"
+	},
 	"files": [
 		"dist",
 		"src"

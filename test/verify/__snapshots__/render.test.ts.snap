@@ -1,0 +1,753 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`github annotations 1`] = `
+"::error file=src/schema.ts,line=23,col=10,title=quarry(column-type-mismatch)::users.email is varchar(320) in the database, but varchar(255) in the code%0Ahelp: alter table users alter column email type varchar(255) using email::varchar(255);%0Aor declare it as varchar(320)
+::error file=src/schema.ts,line=25,col=8,title=quarry(column-type-mismatch)::users.age is bigint in the database, but integer in the code%0Ahelp: alter table users alter column age type integer using age::integer;%0Aor declare it as bigint()
+::error file=src/schema.ts,line=14,col=23,title=quarry(enum-label-mismatch)::enum user_status differs: the database lacks 'archived'; the code lacks 'banned'%0Ahelp: alter type user_status add value 'archived' after 'suspended';%0Aadd 'banned' to defineEnum('user_status', ...); postgres can't drop enum labels
+::error file=src/schema.ts,line=28,col=14,title=quarry(column-nullable-mismatch)::users.created_at allows null in the database, but not in the code%0Ahelp: alter table users alter column created_at set not null;%0Aor add .nullable() in the code
+::error file=src/schema.ts,line=28,col=14,title=quarry(column-default-missing)::users.created_at has no default in the database, but the code declares default()%0Ahelp: alter table users alter column created_at set default <expression>;%0Aor remove .default() from the code
+::warning file=src/schema.ts,line=20,col=22,title=quarry(column-extra)::column users.legacy_code is in the database but not in the code, and is not null without a default, so inserts will fail%0Adeclare it: legacyCode: text().name('legacy_code')
+::error file=src/schema.ts,line=36,col=10,title=quarry(column-type-mismatch)::orders.total is numeric(12,2) in the database, but numeric(10,2) in the code%0Ahelp: alter table orders alter column total type numeric(10,2) using total::numeric(10,2);%0Aor declare it as decimal(12, 2)
+::error file=src/schema.ts,line=37,col=11,title=quarry(column-nullable-mismatch)::orders.search allows null in the database, but not in the code%0Ahelp: alter table orders alter column search set not null;%0Aor add .nullable() in the code
+::warning file=src/schema.ts,line=37,col=11,title=quarry(column-generated-missing)::orders.search is not generated in the database, but the code declares generated()%0Arecreate the column as generated always as (...) stored, or declare it .default() or .nullable()
+::error file=src/schema.ts,line=41,col=25,title=quarry(table-missing)::table invoices does not exist in the database%0Ahelp: create table invoices (%0A  id bigint generated always as identity,%0A  order_id bigint not null%0A);
+quarry verify: 8 errors, 2 warnings, 0 notes in 3 tables, 14 columns
+"
+`;
+
+exports[`json 1`] = `
+"{
+  "ok": false,
+  "diagnostics": [
+    {
+      "table": "users",
+      "column": "email",
+      "key": "email",
+      "severity": "error",
+      "code": "column-type-mismatch",
+      "message": "users.email is varchar(320) in the database, but varchar(255) in the code",
+      "expected": "varchar(255)",
+      "actual": "varchar(320)",
+      "label": "found varchar(320)",
+      "hint": "or declare it as varchar(320)",
+      "fix": "alter table users alter column email type varchar(255) using email::varchar(255);",
+      "source": {
+        "file": "/project/src/schema.ts",
+        "line": 23,
+        "column": 10
+      }
+    },
+    {
+      "table": "users",
+      "column": "age",
+      "key": "age",
+      "severity": "error",
+      "code": "column-type-mismatch",
+      "message": "users.age is bigint in the database, but integer in the code",
+      "expected": "integer",
+      "actual": "bigint",
+      "label": "found bigint",
+      "hint": "or declare it as bigint()",
+      "fix": "alter table users alter column age type integer using age::integer;",
+      "source": {
+        "file": "/project/src/schema.ts",
+        "line": 25,
+        "column": 8
+      }
+    },
+    {
+      "table": "users",
+      "column": "status",
+      "key": "status",
+      "expected": "'active', 'suspended', 'archived'",
+      "actual": "'active', 'suspended', 'banned'",
+      "severity": "error",
+      "code": "enum-label-mismatch",
+      "message": "enum user_status differs: the database lacks 'archived'; the code lacks 'banned'",
+      "label": "the database lacks 'archived'; the code lacks 'banned'",
+      "hint": "add 'banned' to defineEnum('user_status', ...); postgres can't drop enum labels",
+      "fix": "alter type user_status add value 'archived' after 'suspended';",
+      "source": {
+        "file": "/project/src/schema.ts",
+        "line": 14,
+        "column": 23
+      }
+    },
+    {
+      "table": "users",
+      "column": "created_at",
+      "key": "createdAt",
+      "severity": "error",
+      "code": "column-nullable-mismatch",
+      "message": "users.created_at allows null in the database, but not in the code",
+      "expected": "not null",
+      "actual": "null",
+      "label": "nullable in the database",
+      "hint": "or add .nullable() in the code",
+      "fix": "alter table users alter column created_at set not null;",
+      "source": {
+        "file": "/project/src/schema.ts",
+        "line": 28,
+        "column": 14
+      }
+    },
+    {
+      "table": "users",
+      "column": "created_at",
+      "key": "createdAt",
+      "severity": "error",
+      "code": "column-default-missing",
+      "message": "users.created_at has no default in the database, but the code declares default()",
+      "expected": "default",
+      "actual": "no default",
+      "label": "no default in the database",
+      "hint": "or remove .default() from the code",
+      "fix": "alter table users alter column created_at set default <expression>;",
+      "source": {
+        "file": "/project/src/schema.ts",
+        "line": 28,
+        "column": 14
+      }
+    },
+    {
+      "severity": "warning",
+      "code": "column-extra",
+      "message": "column users.legacy_code is in the database but not in the code, and is not null without a default, so inserts will fail",
+      "table": "users",
+      "column": "legacy_code",
+      "actual": "text",
+      "label": "legacy_code is not declared",
+      "hint": "declare it: legacyCode: text().name('legacy_code')",
+      "source": {
+        "file": "/project/src/schema.ts",
+        "line": 20,
+        "column": 22
+      }
+    },
+    {
+      "table": "orders",
+      "column": "total",
+      "key": "total",
+      "severity": "error",
+      "code": "column-type-mismatch",
+      "message": "orders.total is numeric(12,2) in the database, but numeric(10,2) in the code",
+      "expected": "numeric(10,2)",
+      "actual": "numeric(12,2)",
+      "label": "found numeric(12,2)",
+      "hint": "or declare it as decimal(12, 2)",
+      "fix": "alter table orders alter column total type numeric(10,2) using total::numeric(10,2);",
+      "source": {
+        "file": "/project/src/schema.ts",
+        "line": 36,
+        "column": 10
+      }
+    },
+    {
+      "table": "orders",
+      "column": "search",
+      "key": "search",
+      "severity": "error",
+      "code": "column-nullable-mismatch",
+      "message": "orders.search allows null in the database, but not in the code",
+      "expected": "not null",
+      "actual": "null",
+      "label": "nullable in the database",
+      "hint": "or add .nullable() in the code",
+      "fix": "alter table orders alter column search set not null;",
+      "source": {
+        "file": "/project/src/schema.ts",
+        "line": 37,
+        "column": 11
+      }
+    },
+    {
+      "table": "orders",
+      "column": "search",
+      "key": "search",
+      "severity": "warning",
+      "code": "column-generated-missing",
+      "message": "orders.search is not generated in the database, but the code declares generated()",
+      "expected": "generated",
+      "actual": "no default",
+      "label": "not generated in the database",
+      "hint": "recreate the column as generated always as (...) stored, or declare it .default() or .nullable()",
+      "source": {
+        "file": "/project/src/schema.ts",
+        "line": 37,
+        "column": 11
+      }
+    },
+    {
+      "severity": "error",
+      "code": "table-missing",
+      "message": "table invoices does not exist in the database",
+      "table": "invoices",
+      "label": "not in the database",
+      "fix": "create table invoices (\\n  id bigint generated always as identity,\\n  order_id bigint not null\\n);",
+      "source": {
+        "file": "/project/src/schema.ts",
+        "line": 41,
+        "column": 25
+      }
+    }
+  ],
+  "tables": [
+    {
+      "name": "users",
+      "relation": "public.users",
+      "kind": "table",
+      "status": "error",
+      "columns": [
+        {
+          "key": "id",
+          "name": "id",
+          "expected": "integer",
+          "actual": "integer",
+          "status": "ok",
+          "codes": []
+        },
+        {
+          "key": "email",
+          "name": "email",
+          "expected": "varchar(255)",
+          "actual": "varchar(320)",
+          "status": "error",
+          "codes": [
+            "column-type-mismatch"
+          ]
+        },
+        {
+          "key": "displayName",
+          "name": "display_name",
+          "expected": "text null",
+          "actual": "text null",
+          "status": "ok",
+          "codes": []
+        },
+        {
+          "key": "age",
+          "name": "age",
+          "expected": "integer null",
+          "actual": "bigint null",
+          "status": "error",
+          "codes": [
+            "column-type-mismatch"
+          ]
+        },
+        {
+          "key": "status",
+          "name": "status",
+          "expected": "user_status",
+          "actual": "user_status",
+          "status": "error",
+          "codes": [
+            "enum-label-mismatch"
+          ]
+        },
+        {
+          "key": "tags",
+          "name": "tags",
+          "expected": "text[]",
+          "actual": "text[]",
+          "status": "ok",
+          "codes": []
+        },
+        {
+          "key": "createdAt",
+          "name": "created_at",
+          "expected": "timestamptz",
+          "actual": "timestamptz null",
+          "status": "error",
+          "codes": [
+            "column-nullable-mismatch",
+            "column-default-missing"
+          ]
+        },
+        {
+          "name": "legacy_code",
+          "actual": "text",
+          "status": "warning",
+          "codes": [
+            "column-extra"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "orders",
+      "relation": "public.orders",
+      "kind": "table",
+      "status": "error",
+      "columns": [
+        {
+          "key": "id",
+          "name": "id",
+          "expected": "bigint",
+          "actual": "bigint",
+          "status": "ok",
+          "codes": []
+        },
+        {
+          "key": "userId",
+          "name": "user_id",
+          "expected": "integer",
+          "actual": "integer",
+          "status": "ok",
+          "codes": []
+        },
+        {
+          "key": "total",
+          "name": "total",
+          "expected": "numeric(10,2)",
+          "actual": "numeric(12,2)",
+          "status": "error",
+          "codes": [
+            "column-type-mismatch"
+          ]
+        },
+        {
+          "key": "search",
+          "name": "search",
+          "expected": "tsvector",
+          "actual": "tsvector null",
+          "status": "error",
+          "codes": [
+            "column-nullable-mismatch",
+            "column-generated-missing"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "invoices",
+      "status": "error",
+      "columns": [
+        {
+          "key": "id",
+          "name": "id",
+          "expected": "bigint",
+          "status": "error",
+          "codes": [
+            "table-missing"
+          ]
+        },
+        {
+          "key": "orderId",
+          "name": "order_id",
+          "expected": "bigint",
+          "status": "error",
+          "codes": [
+            "table-missing"
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "errors": 8,
+    "warnings": 2,
+    "infos": 0,
+    "tables": 3,
+    "columns": 14,
+    "durationMs": 12.4
+  }
+}
+"
+`;
+
+exports[`pretty > in ASCII on a narrow terminal 1`] = `
+"  x quarry(column-type-mismatch): users.email is
+    varchar(320) in the database, but varchar(255) in the
+    code
+   ,-[src/schema.ts:23:10]
+22 | id: integer().identity(),
+23 | email: varchar(255),
+   : ---------+---------
+   :          \`-- found varchar(320)
+24 | displayName: text().name('display_name').nullable(),
+   \`----
+  help: alter table users alter column email type varchar(255) using email::varchar(255);
+        or declare it as varchar(320)
+
+  x quarry(column-type-mismatch): users.age is bigint in the
+    database, but integer in the code
+   ,-[src/schema.ts:25:8]
+24 | displayName: text().name('display_name').nullable(),
+25 | age: integer().nullable(),
+   : ------------+------------
+   :             \`-- found bigint
+26 | status: status().default(),
+   \`----
+  help: alter table users alter column age type integer using age::integer;
+        or declare it as bigint()
+
+  x quarry(enum-label-mismatch): enum user_status differs:
+    the database lacks 'archived'; the code lacks 'banned'
+   ,-[src/schema.ts:14:23]
+14 | export const status = defineEnum('user_status', [
+   :                       +-----------------------
+   :                       \`-- the database lacks 'archiv...
+15 |     'active',
+   \`----
+  help: alter type user_status add value 'archived' after 'suspended';
+        add 'banned' to defineEnum('user_status', ...);
+        postgres can't drop enum labels
+
+  x quarry(column-nullable-mismatch): users.created_at
+    allows null in the database, but not in the code
+   ,-[src/schema.ts:28:14]
+27 |     tags: array(text()).default(),
+28 |     createdAt: timestamptz().name('created_at').defa...
+   :     +--------------------------------------------------
+   :     \`-- nullable in the database
+29 | },
+   \`----
+  help: alter table users alter column created_at set not null;
+        or add .nullable() in the code
+
+  x quarry(column-default-missing): users.created_at has no
+    default in the database, but the code declares default()
+   ,-[src/schema.ts:28:14]
+27 |     tags: array(text()).default(),
+28 |     createdAt: timestamptz().name('created_at').defa...
+   :     +--------------------------------------------------
+   :     \`-- no default in the database
+29 | },
+   \`----
+  help: alter table users alter column created_at set default <expression>;
+        or remove .default() from the code
+
+  ! quarry(column-extra): column users.legacy_code is in the
+    database but not in the code, and is not null without a
+    default, so inserts will fail
+   ,-[src/schema.ts:20:22]
+20 | export const users = defineTable('users', {
+   :                      +------------------
+   :                      \`-- legacy_code is not declared
+21 |     columns: {
+   \`----
+  help: declare it: legacyCode: text().name('legacy_code')
+
+  x quarry(column-type-mismatch): orders.total is
+    numeric(12,2) in the database, but numeric(10,2) in the
+    code
+   ,-[src/schema.ts:36:10]
+35 | userId: integer().name('user_id'),
+36 | total: decimal(10, 2),
+   : ----------+----------
+   :           \`-- found numeric(12,2)
+37 | search: tsvector().generated(),
+   \`----
+  help: alter table orders alter column total type numeric(10,2) using total::numeric(10,2);
+        or declare it as decimal(12, 2)
+
+  x quarry(column-nullable-mismatch): orders.search allows
+    null in the database, but not in the code
+   ,-[src/schema.ts:37:11]
+36 |     total: decimal(10, 2),
+37 |     search: tsvector().generated(),
+   :     --------------+---------------
+   :                   \`-- nullable in the database
+38 | },
+   \`----
+  help: alter table orders alter column search set not null;
+        or add .nullable() in the code
+
+  ! quarry(column-generated-missing): orders.search is not
+    generated in the database, but the code declares
+    generated()
+   ,-[src/schema.ts:37:11]
+36 |     total: decimal(10, 2),
+37 |     search: tsvector().generated(),
+   :     --------------+---------------
+   :                   \`-- not generated in the database
+38 | },
+   \`----
+  help: recreate the column as generated always as (...)
+        stored, or declare it .default() or .nullable()
+
+  x quarry(table-missing): table invoices does not exist in
+    the database
+   ,-[src/schema.ts:41:25]
+41 | export const invoices = defineTable('invoices', {
+   :                         +---------------------
+   :                         \`-- not in the database
+42 |     columns: {
+   \`----
+  help: create table invoices (
+          id bigint generated always as identity,
+          order_id bigint not null
+        );
+
+  x 8 errors, 2 warnings
+    3 tables, 14 columns checked in 12ms
+"
+`;
+
+exports[`pretty > with colour and links 1`] = `
+"  [31m×[39m [31m[1mquarry(column-type-mismatch):[22m[39m [1musers.email is varchar(320) in the database, but varchar(255) in[22m
+[1m    the code[22m
+   [2m╭─[[22m]8;;file:///project/src/schema.ts\\src/schema.ts:23:10]8;;\\[2m][22m
+[2m22[22m [2m│[22m id: integer().identity(),
+[2m23[22m [2m│[22m email: varchar(255),
+   [2m·[22m [31m─────────┬─────────[39m
+   [2m·[22m          [31m╰── found varchar(320)[39m
+[2m24[22m [2m│[22m displayName: text().name('display_name').nullable(),
+   [2m╰────[22m
+  [36mhelp:[39m [36malter table users alter column email type varchar(255) using email::varchar(255);[39m
+        or declare it as varchar(320)
+
+  [31m×[39m [31m[1mquarry(column-type-mismatch):[22m[39m [1musers.age is bigint in the database, but integer in the code[22m
+   [2m╭─[[22m]8;;file:///project/src/schema.ts\\src/schema.ts:25:8]8;;\\[2m][22m
+[2m24[22m [2m│[22m displayName: text().name('display_name').nullable(),
+[2m25[22m [2m│[22m age: integer().nullable(),
+   [2m·[22m [31m────────────┬────────────[39m
+   [2m·[22m             [31m╰── found bigint[39m
+[2m26[22m [2m│[22m status: status().default(),
+   [2m╰────[22m
+  [36mhelp:[39m [36malter table users alter column age type integer using age::integer;[39m
+        or declare it as bigint()
+
+  [31m×[39m [31m[1mquarry(enum-label-mismatch):[22m[39m [1menum user_status differs: the database lacks 'archived'; the code[22m
+[1m    lacks 'banned'[22m
+   [2m╭─[[22m]8;;file:///project/src/schema.ts\\src/schema.ts:14:23]8;;\\[2m][22m
+[2m14[22m [2m│[22m export const status = defineEnum('user_status', [
+   [2m·[22m                       [31m───────────┬────────────[39m
+   [2m·[22m                                  [31m╰── the database lacks 'archived'; the code lacks 'banned'[39m
+[2m15[22m [2m│[22m     'active',
+   [2m╰────[22m
+  [36mhelp:[39m [36malter type user_status add value 'archived' after 'suspended';[39m
+        add 'banned' to defineEnum('user_status', ...); postgres can't drop enum labels
+
+  [31m×[39m [31m[1mquarry(column-nullable-mismatch):[22m[39m [1musers.created_at allows null in the database, but not in the[22m
+[1m    code[22m
+   [2m╭─[[22m]8;;file:///project/src/schema.ts\\src/schema.ts:28:14]8;;\\[2m][22m
+[2m27[22m [2m│[22m     tags: array(text()).default(),
+[2m28[22m [2m│[22m     createdAt: timestamptz().name('created_at').default(),
+   [2m·[22m     [31m──────────────────────────┬──────────────────────────[39m
+   [2m·[22m                               [31m╰── nullable in the database[39m
+[2m29[22m [2m│[22m },
+   [2m╰────[22m
+  [36mhelp:[39m [36malter table users alter column created_at set not null;[39m
+        or add .nullable() in the code
+
+  [31m×[39m [31m[1mquarry(column-default-missing):[22m[39m [1musers.created_at has no default in the database, but the code[22m
+[1m    declares default()[22m
+   [2m╭─[[22m]8;;file:///project/src/schema.ts\\src/schema.ts:28:14]8;;\\[2m][22m
+[2m27[22m [2m│[22m     tags: array(text()).default(),
+[2m28[22m [2m│[22m     createdAt: timestamptz().name('created_at').default(),
+   [2m·[22m     [31m──────────────────────────┬──────────────────────────[39m
+   [2m·[22m                               [31m╰── no default in the database[39m
+[2m29[22m [2m│[22m },
+   [2m╰────[22m
+  [36mhelp:[39m [36malter table users alter column created_at set default <expression>;[39m
+        or remove .default() from the code
+
+  [33m⚠[39m [33m[1mquarry(column-extra):[22m[39m [1mcolumn users.legacy_code is in the database but not in the code, and is[22m
+[1m    not null without a default, so inserts will fail[22m
+   [2m╭─[[22m]8;;file:///project/src/schema.ts\\src/schema.ts:20:22]8;;\\[2m][22m
+[2m20[22m [2m│[22m export const users = defineTable('users', {
+   [2m·[22m                      [33m─────────┬─────────[39m
+   [2m·[22m                               [33m╰── legacy_code is not declared[39m
+[2m21[22m [2m│[22m     columns: {
+   [2m╰────[22m
+  [36mhelp:[39m declare it: legacyCode: text().name('legacy_code')
+
+  [31m×[39m [31m[1mquarry(column-type-mismatch):[22m[39m [1morders.total is numeric(12,2) in the database, but numeric(10,2)[22m
+[1m    in the code[22m
+   [2m╭─[[22m]8;;file:///project/src/schema.ts\\src/schema.ts:36:10]8;;\\[2m][22m
+[2m35[22m [2m│[22m userId: integer().name('user_id'),
+[2m36[22m [2m│[22m total: decimal(10, 2),
+   [2m·[22m [31m──────────┬──────────[39m
+   [2m·[22m           [31m╰── found numeric(12,2)[39m
+[2m37[22m [2m│[22m search: tsvector().generated(),
+   [2m╰────[22m
+  [36mhelp:[39m [36malter table orders alter column total type numeric(10,2) using total::numeric(10,2);[39m
+        or declare it as decimal(12, 2)
+
+  [31m×[39m [31m[1mquarry(column-nullable-mismatch):[22m[39m [1morders.search allows null in the database, but not in the code[22m
+   [2m╭─[[22m]8;;file:///project/src/schema.ts\\src/schema.ts:37:11]8;;\\[2m][22m
+[2m36[22m [2m│[22m     total: decimal(10, 2),
+[2m37[22m [2m│[22m     search: tsvector().generated(),
+   [2m·[22m     [31m──────────────┬───────────────[39m
+   [2m·[22m                   [31m╰── nullable in the database[39m
+[2m38[22m [2m│[22m },
+   [2m╰────[22m
+  [36mhelp:[39m [36malter table orders alter column search set not null;[39m
+        or add .nullable() in the code
+
+  [33m⚠[39m [33m[1mquarry(column-generated-missing):[22m[39m [1morders.search is not generated in the database, but the code[22m
+[1m    declares generated()[22m
+   [2m╭─[[22m]8;;file:///project/src/schema.ts\\src/schema.ts:37:11]8;;\\[2m][22m
+[2m36[22m [2m│[22m     total: decimal(10, 2),
+[2m37[22m [2m│[22m     search: tsvector().generated(),
+   [2m·[22m     [33m──────────────┬───────────────[39m
+   [2m·[22m                   [33m╰── not generated in the database[39m
+[2m38[22m [2m│[22m },
+   [2m╰────[22m
+  [36mhelp:[39m recreate the column as generated always as (...) stored, or declare it .default() or
+        .nullable()
+
+  [31m×[39m [31m[1mquarry(table-missing):[22m[39m [1mtable invoices does not exist in the database[22m
+   [2m╭─[[22m]8;;file:///project/src/schema.ts\\src/schema.ts:41:25]8;;\\[2m][22m
+[2m41[22m [2m│[22m export const invoices = defineTable('invoices', {
+   [2m·[22m                         [31m──────────┬───────────[39m
+   [2m·[22m                                   [31m╰── not in the database[39m
+[2m42[22m [2m│[22m     columns: {
+   [2m╰────[22m
+  [36mhelp:[39m [36mcreate table invoices ([39m
+        [36m  id bigint generated always as identity,[39m
+        [36m  order_id bigint not null[39m
+        [36m);[39m
+
+  [31m✖[39m [31m8 errors[39m, [33m2 warnings[39m[2m · [22m[2m3 tables, 14 columns checked in 12ms[22m
+"
+`;
+
+exports[`pretty > without colour 1`] = `
+"  × quarry(column-type-mismatch): users.email is varchar(320) in the database, but varchar(255) in
+    the code
+   ╭─[src/schema.ts:23:10]
+22 │ id: integer().identity(),
+23 │ email: varchar(255),
+   · ─────────┬─────────
+   ·          ╰── found varchar(320)
+24 │ displayName: text().name('display_name').nullable(),
+   ╰────
+  help: alter table users alter column email type varchar(255) using email::varchar(255);
+        or declare it as varchar(320)
+
+  × quarry(column-type-mismatch): users.age is bigint in the database, but integer in the code
+   ╭─[src/schema.ts:25:8]
+24 │ displayName: text().name('display_name').nullable(),
+25 │ age: integer().nullable(),
+   · ────────────┬────────────
+   ·             ╰── found bigint
+26 │ status: status().default(),
+   ╰────
+  help: alter table users alter column age type integer using age::integer;
+        or declare it as bigint()
+
+  × quarry(enum-label-mismatch): enum user_status differs: the database lacks 'archived'; the code
+    lacks 'banned'
+   ╭─[src/schema.ts:14:23]
+14 │ export const status = defineEnum('user_status', [
+   ·                       ───────────┬────────────
+   ·                                  ╰── the database lacks 'archived'; the code lacks 'banned'
+15 │     'active',
+   ╰────
+  help: alter type user_status add value 'archived' after 'suspended';
+        add 'banned' to defineEnum('user_status', ...); postgres can't drop enum labels
+
+  × quarry(column-nullable-mismatch): users.created_at allows null in the database, but not in the
+    code
+   ╭─[src/schema.ts:28:14]
+27 │     tags: array(text()).default(),
+28 │     createdAt: timestamptz().name('created_at').default(),
+   ·     ──────────────────────────┬──────────────────────────
+   ·                               ╰── nullable in the database
+29 │ },
+   ╰────
+  help: alter table users alter column created_at set not null;
+        or add .nullable() in the code
+
+  × quarry(column-default-missing): users.created_at has no default in the database, but the code
+    declares default()
+   ╭─[src/schema.ts:28:14]
+27 │     tags: array(text()).default(),
+28 │     createdAt: timestamptz().name('created_at').default(),
+   ·     ──────────────────────────┬──────────────────────────
+   ·                               ╰── no default in the database
+29 │ },
+   ╰────
+  help: alter table users alter column created_at set default <expression>;
+        or remove .default() from the code
+
+  ⚠ quarry(column-extra): column users.legacy_code is in the database but not in the code, and is
+    not null without a default, so inserts will fail
+   ╭─[src/schema.ts:20:22]
+20 │ export const users = defineTable('users', {
+   ·                      ─────────┬─────────
+   ·                               ╰── legacy_code is not declared
+21 │     columns: {
+   ╰────
+  help: declare it: legacyCode: text().name('legacy_code')
+
+  × quarry(column-type-mismatch): orders.total is numeric(12,2) in the database, but numeric(10,2)
+    in the code
+   ╭─[src/schema.ts:36:10]
+35 │ userId: integer().name('user_id'),
+36 │ total: decimal(10, 2),
+   · ──────────┬──────────
+   ·           ╰── found numeric(12,2)
+37 │ search: tsvector().generated(),
+   ╰────
+  help: alter table orders alter column total type numeric(10,2) using total::numeric(10,2);
+        or declare it as decimal(12, 2)
+
+  × quarry(column-nullable-mismatch): orders.search allows null in the database, but not in the code
+   ╭─[src/schema.ts:37:11]
+36 │     total: decimal(10, 2),
+37 │     search: tsvector().generated(),
+   ·     ──────────────┬───────────────
+   ·                   ╰── nullable in the database
+38 │ },
+   ╰────
+  help: alter table orders alter column search set not null;
+        or add .nullable() in the code
+
+  ⚠ quarry(column-generated-missing): orders.search is not generated in the database, but the code
+    declares generated()
+   ╭─[src/schema.ts:37:11]
+36 │     total: decimal(10, 2),
+37 │     search: tsvector().generated(),
+   ·     ──────────────┬───────────────
+   ·                   ╰── not generated in the database
+38 │ },
+   ╰────
+  help: recreate the column as generated always as (...) stored, or declare it .default() or
+        .nullable()
+
+  × quarry(table-missing): table invoices does not exist in the database
+   ╭─[src/schema.ts:41:25]
+41 │ export const invoices = defineTable('invoices', {
+   ·                         ──────────┬───────────
+   ·                                   ╰── not in the database
+42 │     columns: {
+   ╰────
+  help: create table invoices (
+          id bigint generated always as identity,
+          order_id bigint not null
+        );
+
+  ✖ 8 errors, 2 warnings · 3 tables, 14 columns checked in 12ms
+"
+`;
+
+exports[`table view 1`] = `
+"  × users  public.users (table)
+      column                      code           database          issues
+    ✔ id                          integer        integer
+    × email                       varchar(255)   varchar(320)      column-type-mismatch
+    ✔ display_name (displayName)  text null      text null
+    × age                         integer null   bigint null       column-type-mismatch
+    × status                      user_status    user_status       enum-label-mismatch
+    ✔ tags                        text[]         text[]
+    × created_at (createdAt)      timestamptz    timestamptz null  column-nullable-mismatch, column-default-missing
+    ⚠ legacy_code                 —              text              column-extra
+
+  × orders  public.orders (table)
+      column                      code           database          issues
+    ✔ id                          bigint         bigint
+    ✔ user_id (userId)            integer        integer
+    × total                       numeric(10,2)  numeric(12,2)     column-type-mismatch
+    × search                      tsvector       tsvector null     column-nullable-mismatch, column-generated-missing
+
+  × invoices  missing
+      column                      code           database          issues
+    × id                          bigint         —                 table-missing
+    × order_id (orderId)          bigint         —                 table-missing
+
+  ✖ 8 errors, 2 warnings · 3 tables, 14 columns checked in 12ms
+"
+`;
