@@ -3,6 +3,9 @@
 	"version": "0.0.0",
 	"description": "A type-safe SQL query builder for PostgreSQL.",
 	"license": "MIT",
+	"bin": {
+		"quarry": "./dist/cli.js"
+	},
 	"files": [
 		"dist",
 		"src"
@@ -14,9 +17,14 @@
 			"types": "./dist/index.d.ts",
 			"default": "./dist/index.js"
 		},
+		"./driver": {
+			"types": "./dist/driver/index.d.ts",
+			"default": "./dist/driver/index.js"
+		},
 		"./package.json": "./package.json"
 	},
 	"scripts": {
+		"bench:driver": "node --import ./bench/driver/register.mjs bench/driver/run.ts",
 		"bench:lsp": "node bench/types/lsp.ts",
 		"bench:types": "node bench/types/run.ts",
 		"build": "tsdown && tsc -p tsconfig.build.json --emitDeclarationOnly",
@@ -28,15 +36,21 @@
 		"lint": "oxlint --type-aware",
 		"test": "vitest run --typecheck",
 		"test:runtime": "vitest run",
+		"test:runtimes": "node --import ./bench/driver/register.mjs test/driver/runtime/smoke.ts && bun test/driver/runtime/smoke.ts && deno run -A --sloppy-imports --no-lock test/driver/runtime/smoke.ts",
+		"test:workers": "pnpm build && node test/driver/runtime/workers.mjs",
 		"test:types": "vitest run --typecheck.only",
 		"test:watch": "vitest --typecheck",
 		"typecheck": "tsc --noEmit"
 	},
 	"devDependencies": {
 		"@types/node": "^26.4.0",
+		"@types/pg": "^8.23.1",
 		"oxfmt": "^0.65.0",
 		"oxlint": "^1.80.0",
 		"oxlint-tsgolint": "^7.0.2001",
+		"pg": "^8.23.1",
+		"pg-protocol": "^1.16.1",
+		"postgres": "^3.4.9",
 		"tsdown": "^0.22.14",
 		"typescript": "^7.0.2",
 		"vitest": "^4.1.11"

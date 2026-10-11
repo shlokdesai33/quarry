@@ -1,0 +1,121 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`db.verify against PostgreSQL > the drift fixture 1`] = `
+"  × quarry(column-type-mismatch): users.email is varchar(320) in the database, but varchar(255) in
+    the code
+   ╭─[test/verify/fixtures/schema.ts:23:10]
+22 │ id: integer().identity(),
+23 │ email: varchar(255),
+   · ─────────┬─────────
+   ·          ╰── found varchar(320)
+24 │ displayName: text().name('display_name').nullable(),
+   ╰────
+  help: alter table users alter column email type varchar(255) using email::varchar(255);
+        or declare it as varchar(320)
+
+  × quarry(column-type-mismatch): users.age is bigint in the database, but integer in the code
+   ╭─[test/verify/fixtures/schema.ts:25:8]
+24 │ displayName: text().name('display_name').nullable(),
+25 │ age: integer().nullable(),
+   · ────────────┬────────────
+   ·             ╰── found bigint
+26 │ status: status().default(),
+   ╰────
+  help: alter table users alter column age type integer using age::integer;
+        or declare it as bigint()
+
+  × quarry(enum-label-mismatch): enum user_status differs: the database lacks 'archived'; the code
+    lacks 'banned'
+   ╭─[test/verify/fixtures/schema.ts:14:23]
+14 │ export const status = defineEnum('user_status', [
+   ·                       ───────────┬────────────
+   ·                                  ╰── the database lacks 'archived'; the code lacks 'banned'
+15 │     'active',
+   ╰────
+  help: alter type user_status add value 'archived' after 'suspended';
+        add 'banned' to defineEnum('user_status', ...); postgres can't drop enum labels
+
+  × quarry(column-nullable-mismatch): users.created_at allows null in the database, but not in the
+    code
+   ╭─[test/verify/fixtures/schema.ts:28:14]
+27 │     tags: array(text()).default(),
+28 │     createdAt: timestamptz().name('created_at').default(),
+   ·     ──────────────────────────┬──────────────────────────
+   ·                               ╰── nullable in the database
+29 │ },
+   ╰────
+  help: alter table users alter column created_at set not null;
+        or add .nullable() in the code
+
+  × quarry(column-default-missing): users.created_at has no default in the database, but the code
+    declares default()
+   ╭─[test/verify/fixtures/schema.ts:28:14]
+27 │     tags: array(text()).default(),
+28 │     createdAt: timestamptz().name('created_at').default(),
+   ·     ──────────────────────────┬──────────────────────────
+   ·                               ╰── no default in the database
+29 │ },
+   ╰────
+  help: alter table users alter column created_at set default <expression>;
+        or remove .default() from the code
+
+  ⚠ quarry(column-extra): column users.legacy_code is in the database but not in the code, and is
+    not null without a default, so inserts will fail
+   ╭─[test/verify/fixtures/schema.ts:20:22]
+20 │ export const users = defineTable('users', {
+   ·                      ─────────┬─────────
+   ·                               ╰── legacy_code is not declared
+21 │     columns: {
+   ╰────
+  help: declare it: legacyCode: text().name('legacy_code')
+
+  × quarry(column-type-mismatch): orders.total is numeric(12,2) in the database, but numeric(10,2)
+    in the code
+   ╭─[test/verify/fixtures/schema.ts:36:10]
+35 │ userId: integer().name('user_id'),
+36 │ total: decimal(10, 2),
+   · ──────────┬──────────
+   ·           ╰── found numeric(12,2)
+37 │ search: tsvector().generated(),
+   ╰────
+  help: alter table orders alter column total type numeric(10,2) using total::numeric(10,2);
+        or declare it as decimal(12, 2)
+
+  × quarry(column-nullable-mismatch): orders.search allows null in the database, but not in the code
+   ╭─[test/verify/fixtures/schema.ts:37:11]
+36 │     total: decimal(10, 2),
+37 │     search: tsvector().generated(),
+   ·     ──────────────┬───────────────
+   ·                   ╰── nullable in the database
+38 │ },
+   ╰────
+  help: alter table orders alter column search set not null;
+        or add .nullable() in the code
+
+  ⚠ quarry(column-generated-missing): orders.search is not generated in the database, but the code
+    declares generated()
+   ╭─[test/verify/fixtures/schema.ts:37:11]
+36 │     total: decimal(10, 2),
+37 │     search: tsvector().generated(),
+   ·     ──────────────┬───────────────
+   ·                   ╰── not generated in the database
+38 │ },
+   ╰────
+  help: recreate the column as generated always as (...) stored, or declare it .default() or
+        .nullable()
+
+  × quarry(table-missing): table invoices does not exist in the database
+   ╭─[test/verify/fixtures/schema.ts:41:25]
+41 │ export const invoices = defineTable('invoices', {
+   ·                         ──────────┬───────────
+   ·                                   ╰── not in the database
+42 │     columns: {
+   ╰────
+  help: create table invoices (
+          id bigint generated always as identity,
+          order_id bigint not null
+        );
+
+  ✖ 8 errors, 2 warnings · 3 tables, 14 columns checked in 5ms
+"
+`;

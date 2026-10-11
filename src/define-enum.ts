@@ -1,3 +1,4 @@
+import { captureCallSite } from './call-site.js';
 import { Column } from './column/column.js';
 import { EnumType } from './data-type/enum.js';
 
@@ -22,9 +23,11 @@ export function defineEnum<const N extends string, const T extends string>(
 	enumName: N,
 	values: readonly T[],
 ) {
+	const dataType = new EnumType(enumName, values, captureCallSite(defineEnum));
 	return function $defineEnum<X extends T>() {
 		return new Column<EnumType<N>, X>({
-			dataType: new EnumType(enumName, values),
+			dataType,
+			site: captureCallSite($defineEnum),
 		});
 	};
 }

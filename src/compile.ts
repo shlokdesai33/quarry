@@ -1,4 +1,15 @@
-import type { OperationNode, SelectNode, TableNode } from './node.js';
+import type {
+	DeleteNode,
+	InsertNode,
+	OnConflictNode,
+	OperationNode,
+	RowsNode,
+	SelectionNode,
+	SelectNode,
+	SetNode,
+	TableNode,
+	UpdateNode,
+} from './node.js';
 
 export interface CompiledQuery {
 	readonly sql: string;
@@ -7,17 +18,171 @@ export interface CompiledQuery {
 	readonly tag?: string;
 }
 
+/** A whole statement: a query or a write. */
+export type StatementNode =
+	| OperationNode
+	| InsertNode
+	| UpdateNode
+	| DeleteNode;
+
 /**
  * Renders a node tree to SQL text and a positional parameter list.
- * Parameters are numbered in the order they are encountered. A select's tag
+ * Parameters are numbered in the order they are encountered. A query's tag
  * is carried over as is.
  */
-export function compile(node: OperationNode): CompiledQuery {
+export function compile(node: StatementNode): CompiledQuery {
 	const params: unknown[] = [];
-	const sql = render(node, params);
-	return node.kind === 'select' && node.tag !== undefined
-		? { sql, params, tag: node.tag }
-		: { sql, params };
+	let sql: string;
+	switch (node.kind) {
+		case 'insert':
+			sql = renderInsert(node, params);
+			break;
+		case 'update':
+			sql = renderUpdate(node, params);
+			break;
+		case 'delete':
+			sql = renderDelete(node, params);
+			break;
+		default:
+			sql = render(node, params);
+	}
+	const tag = 'tag' in node ? node.tag : undefined;
+	return tag === undefined ? { sql, params } : { sql, params, tag };
+}
+
+/** Whether rows can go as one array parameter per column: plain values only, no defaults, no array columns. */
+function unnestable(rows: RowsNode): boolean {
+	return (
+		rows.types.length === rows.columns.length &&
+		rows.types.every((type) => !type.endsWith(']')) &&
+		rows.rows.every((row) => row.every((cell) => cell?.kind === 'value'))
+	);
+}
+
+/** `unnest($1::integer[], $2::text[])`, one array parameter per column. */
+function renderUnnest(rows: RowsNode, params: unknown[]): string {
+	const arrays = rows.columns.map((_, i) => {
+		params.push(
+			rows.rows.map((row) => {
+				const cell = row[i];
+				return cell?.kind === 'value' ? cell.value : null;
+			}),
+		);
+		return `$${params.length}::${rows.types[i]}[]`;
+	});
+	return `unnest(${arrays.join(', ')})`;
+}
+
+function renderSets(sets: readonly SetNode[], params: unknown[]): string {
+	return sets
+		.map((set) => `${identifier(set.column)} = ${render(set.value, params)}`)
+		.join(', ');
+}
+
+function renderReturning(
+	returning: readonly SelectionNode[],
+	params: unknown[],
+): string {
+	if (returning.length === 0) return '';
+	return ` returning ${returning.map((s) => `${render(s.expression, params)} as ${identifier(s.alias)}`).join(', ')}`;
+}
+
+function renderOnConflict(
+	onConflict: OnConflictNode,
+	inserted: readonly string[],
+	params: unknown[],
+): string {
+	let sql = ` on conflict (${onConflict.target.map(identifier).join(', ')})`;
+	if (onConflict.where !== undefined)
+		sql += ` where ${render(onConflict.where, params)}`;
+	const { action } = onConflict;
+	if (action.kind === 'nothing') return `${sql} do nothing`;
+	const sets =
+		action.kind === 'update'
+			? renderSets(action.set, params)
+			: (action.columns ?? inserted)
+					.map((c) => `${identifier(c)} = excluded.${identifier(c)}`)
+					.join(', ');
+	if (sets === '')
+		throw new Error('An upsert that merges needs columns to set');
+	sql += ` do update set ${sets}`;
+	if (action.where !== undefined)
+		sql += ` where ${render(action.where, params)}`;
+	return sql;
+}
+
+function renderInsert(node: InsertNode, params: unknown[]): string {
+	const { columns, rows } = node.values;
+	if (rows.length === 0) throw new Error('An insert needs at least one row');
+	let sql = `insert into ${renderTable(node.table)}`;
+	if (columns.length === 0) {
+		if (rows.length > 1)
+			throw new Error(
+				'An insert of several rows needs at least one column to set',
+			);
+		sql += ' default values';
+	} else if (node.values.strategy === 'unnest' && unnestable(node.values)) {
+		sql += ` (${columns.map(identifier).join(', ')}) select * from ${renderUnnest(node.values, params)}`;
+	} else {
+		const values = rows.map(
+			(row) =>
+				`(${row.map((cell) => (cell === undefined ? 'default' : render(cell, params))).join(', ')})`,
+		);
+		sql += ` (${columns.map(identifier).join(', ')}) values ${values.join(', ')}`;
+	}
+	if (node.onConflict !== undefined)
+		sql += renderOnConflict(node.onConflict, columns, params);
+	return sql + renderReturning(node.returning, params);
+}
+
+/** The alias `updateMany`'s rows are joined under. */
+const MANY = 'quarry_rows';
+
+function renderUpdate(node: UpdateNode, params: unknown[]): string {
+	const target = identifier(node.table.alias ?? node.table.name);
+	const sets: string[] = [];
+	if (node.set.length > 0) sets.push(renderSets(node.set, params));
+	const where: string[] = [];
+	let from = '';
+	const { many } = node;
+	if (many !== undefined) {
+		if (!unnestable(many)) {
+			throw new Error(
+				'updateMany needs every row to set the same columns, each to a plain value',
+			);
+		}
+		const updated = many.columns.filter((c) => !many.by.includes(c));
+		if (updated.length > 0) {
+			sets.push(
+				updated
+					.map((c) => `${identifier(c)} = ${identifier(MANY)}.${identifier(c)}`)
+					.join(', '),
+			);
+		}
+		from = ` from ${renderUnnest(many, params)} as ${identifier(MANY)}(${many.columns.map(identifier).join(', ')})`;
+		where.push(
+			...many.by.map(
+				(c) =>
+					`${target}.${identifier(c)} = ${identifier(MANY)}.${identifier(c)}`,
+			),
+		);
+	}
+	if (sets.length === 0) throw new Error('An update needs columns to set');
+	if (node.where !== undefined) where.push(render(node.where, params));
+	else if (!node.allRows && many === undefined)
+		throw new Error('An update needs where() or allRows()');
+	let sql = `update ${renderTable(node.table)} set ${sets.join(', ')}${from}`;
+	if (where.length > 0)
+		sql += ` where ${where.length === 1 ? where[0] : where.map((w) => `(${w})`).join(' and ')}`;
+	return sql + renderReturning(node.returning, params);
+}
+
+function renderDelete(node: DeleteNode, params: unknown[]): string {
+	let sql = `delete from ${renderTable(node.table)}`;
+	if (node.where !== undefined) sql += ` where ${render(node.where, params)}`;
+	else if (!node.allRows)
+		throw new Error('A delete needs where() or allRows()');
+	return sql + renderReturning(node.returning, params);
 }
 
 function render(node: OperationNode, params: unknown[]): string {

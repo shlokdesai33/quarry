@@ -1,3 +1,4 @@
+import { captureCallSite } from './call-site.js';
 import type { Schema } from './types.js';
 import { Table } from './table.js';
 
@@ -8,5 +9,5 @@ export function defineTable<N extends string, S extends Schema>(
 	name: N,
 	schema: S,
 ) {
-	return new Table(name, schema);
+	return new Table(name, schema, name, captureCallSite(defineTable));
 }

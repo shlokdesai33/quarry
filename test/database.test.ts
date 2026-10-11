@@ -1,14 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { integer, text } from '../src/column-factories.js';
-import type { CompiledQuery } from '../src/compile.js';
-import { database } from '../src/database.js';
+import { databaseWith } from '../src/database.js';
 import { defineTable } from '../src/define-table.js';
-import {
-	type Executor,
-	NoRowError,
-	TooManyRowsError,
-} from '../src/executor.js';
+import { NoRowError, TooManyRowsError } from '../src/executor.js';
 import { selectFrom } from '../src/select-query-builder.js';
+import { fakeExecutor } from './helpers/executor.js';
 
 const users = defineTable('users', {
 	columns: {
@@ -29,14 +25,8 @@ const contacts = defineTable('contacts', {
 
 /** A database returning `rows`, recording the queries it ran. */
 function fake(rows: readonly unknown[]) {
-	const ran: CompiledQuery[] = [];
-	const executor: Executor = {
-		execute: async (query) => {
-			ran.push(query);
-			return { rows };
-		},
-	};
-	return { db: database(executor), ran };
+	const { executor, ran } = fakeExecutor(rows);
+	return { db: databaseWith(executor), ran };
 }
 
 describe('the query', () => {

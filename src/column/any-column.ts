@@ -1,4 +1,6 @@
+import type { CallSite } from '../call-site.js';
 import type { DataType } from '../data-type/data-type.js';
+import type { ColumnFill } from './base-column.js';
 
 /**
  * Constraint for "some column". Only for use in `extends` positions: lookups
@@ -18,5 +20,8 @@ export interface AnyColumn {
 	readonly _quarry: {
 		readonly dataType: DataType;
 		readonly columnName: string | undefined;
+		readonly nullable: boolean;
+		readonly fill: ColumnFill;
+		readonly site: CallSite | undefined;
 	};
 }

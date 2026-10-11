@@ -1,3 +1,4 @@
+import { captureCallSite } from './call-site.js';
 import { Column } from './column/column.js';
 import { IntegerColumn } from './column/integer-column.js';
 import { ArrayType } from './data-type/array.js';
@@ -23,6 +24,7 @@ import type { Range } from './range.js';
 export function smallint<T extends number>() {
 	return new IntegerColumn<DataType<'smallint'>, T>({
 		dataType: new DataType('smallint'),
+		site: captureCallSite(smallint),
 	});
 }
 
@@ -40,6 +42,7 @@ export function smallint<T extends number>() {
 export function integer<T extends number>() {
 	return new IntegerColumn<DataType<'integer'>, T>({
 		dataType: new DataType('integer'),
+		site: captureCallSite(integer),
 	});
 }
 
@@ -60,6 +63,7 @@ export function integer<T extends number>() {
 export function bigint<T extends string>() {
 	return new IntegerColumn<DataType<'bigint'>, T>({
 		dataType: new DataType('bigint'),
+		site: captureCallSite(bigint),
 	});
 }
 
@@ -77,6 +81,7 @@ export function bigint<T extends string>() {
 export function real<T extends number>() {
 	return new Column<DataType<'real'>, T>({
 		dataType: new DataType('real'),
+		site: captureCallSite(real),
 	});
 }
 
@@ -95,6 +100,7 @@ export function real<T extends number>() {
 export function doublePrecision<T extends number>() {
 	return new Column<DataType<'double precision'>, T>({
 		dataType: new DataType('double precision'),
+		site: captureCallSite(doublePrecision),
 	});
 }
 
@@ -104,16 +110,20 @@ export function doublePrecision<T extends number>() {
  * JavaScript number would do, and values are written as strings for the same
  * reason. `T` narrows it.
  *
- * Precision and scale aren't modelled; the column holds any number of digits
- * on either side of the decimal point. It is ordered, and compares with every
- * other numeric type.
+ * Without a precision the column holds any number of digits on either side
+ * of the decimal point. A precision and scale, as in `numeric(10, 2)`, are
+ * checked by `db.verify` only; values aren't. It is ordered, and compares
+ * with every other numeric type.
  *
- * @example price: decimal()
+ * @example price: decimal(10, 2)
  * @example balance: decimal().default()
  */
-export function decimal<T extends string>() {
+export function decimal<T extends string>(precision?: number, scale?: number) {
 	return new Column<DataType<'decimal'>, T>({
-		dataType: new DataType('decimal'),
+		dataType: new DataType('decimal', {
+			modifiers: modifiers(precision, scale),
+		}),
+		site: captureCallSite(decimal),
 	});
 }
 
@@ -132,6 +142,7 @@ export function decimal<T extends string>() {
 export function boolean<T extends boolean>() {
 	return new Column<DataType<'boolean'>, T>({
 		dataType: new DataType('boolean'),
+		site: captureCallSite(boolean),
 	});
 }
 
@@ -151,22 +162,24 @@ export function boolean<T extends boolean>() {
 export function text<T extends string>() {
 	return new Column<DataType<'text'>, T>({
 		dataType: new DataType('text'),
+		site: captureCallSite(text),
 	});
 }
 
 /**
  * A `varchar` column, whose value is a `string`. `T` narrows it.
  *
- * A length limit isn't modelled, and postgres treats a `varchar` without one
- * like `text`. It admits the same operators as `text()` and compares with it,
- * so the two can be mixed in a comparison.
+ * Postgres treats a `varchar` without a length limit like `text`. A limit is
+ * checked by `db.verify` only; values aren't. It admits the same operators as
+ * `text()` and compares with it, so the two can be mixed in a comparison.
  *
- * @example nickname: varchar()
+ * @example nickname: varchar(32)
  * @example code: varchar<'US' | 'CA'>()
  */
-export function varchar<T extends string>() {
+export function varchar<T extends string>(length?: number) {
 	return new Column<DataType<'varchar'>, T>({
-		dataType: new DataType('varchar'),
+		dataType: new DataType('varchar', { modifiers: modifiers(length) }),
+		site: captureCallSite(varchar),
 	});
 }
 
@@ -185,6 +198,7 @@ export function varchar<T extends string>() {
 export function uuid<T extends string>() {
 	return new Column<DataType<'uuid'>, T>({
 		dataType: new DataType('uuid'),
+		site: captureCallSite(uuid),
 	});
 }
 
@@ -200,6 +214,7 @@ export function uuid<T extends string>() {
 export function bytea<T extends Uint8Array>() {
 	return new Column<DataType<'bytea'>, T>({
 		dataType: new DataType('bytea'),
+		site: captureCallSite(bytea),
 	});
 }
 
@@ -216,6 +231,7 @@ export function bytea<T extends Uint8Array>() {
 export function date<T extends string>() {
 	return new Column<DataType<'date'>, T>({
 		dataType: new DataType('date'),
+		site: captureCallSite(date),
 	});
 }
 
@@ -230,6 +246,7 @@ export function date<T extends string>() {
 export function time<T extends string>() {
 	return new Column<DataType<'time'>, T>({
 		dataType: new DataType('time'),
+		site: captureCallSite(time),
 	});
 }
 
@@ -247,6 +264,7 @@ export function time<T extends string>() {
 export function timestamp<T extends string>() {
 	return new Column<DataType<'timestamp'>, T>({
 		dataType: new DataType('timestamp'),
+		site: captureCallSite(timestamp),
 	});
 }
 
@@ -264,6 +282,7 @@ export function timestamp<T extends string>() {
 export function timestamptz<T extends Date>() {
 	return new Column<DataType<'timestamptz'>, T>({
 		dataType: new DataType('timestamptz'),
+		site: captureCallSite(timestamptz),
 	});
 }
 
@@ -279,6 +298,7 @@ export function timestamptz<T extends Date>() {
 export function interval<T extends string>() {
 	return new Column<DataType<'interval'>, T>({
 		dataType: new DataType('interval'),
+		site: captureCallSite(interval),
 	});
 }
 
@@ -303,6 +323,7 @@ export function interval<T extends string>() {
 export function jsonb<T extends NonNullable<unknown>>() {
 	return new Column<JsonbType, T>({
 		dataType: new JsonbType(),
+		site: captureCallSite(jsonb),
 	});
 }
 
@@ -321,6 +342,7 @@ export function jsonb<T extends NonNullable<unknown>>() {
 export function inet<T extends string>() {
 	return new Column<DataType<'inet'>, T>({
 		dataType: new DataType('inet'),
+		site: captureCallSite(inet),
 	});
 }
 
@@ -337,6 +359,7 @@ export function inet<T extends string>() {
 export function tsvector<T extends string>() {
 	return new Column<DataType<'tsvector'>, T>({
 		dataType: new DataType('tsvector'),
+		site: captureCallSite(tsvector),
 	});
 }
 
@@ -358,6 +381,7 @@ export function tsvector<T extends string>() {
 export function daterange<T extends Range<string>>() {
 	return new Column<DateRangeType, T>({
 		dataType: new DateRangeType(),
+		site: captureCallSite(daterange),
 	});
 }
 
@@ -378,6 +402,7 @@ export function daterange<T extends Range<string>>() {
 export function tstzrange<T extends Range<Date>>() {
 	return new Column<TstzRangeType, T>({
 		dataType: new TstzRangeType(),
+		site: captureCallSite(tstzrange),
 	});
 }
 
@@ -395,6 +420,7 @@ export function tstzrange<T extends Range<Date>>() {
 export function vector<T extends number[]>() {
 	return new Column<VectorType, T>({
 		dataType: new VectorType(),
+		site: captureCallSite(vector),
 	});
 }
 
@@ -424,5 +450,16 @@ export function array<D extends DataType<Exclude<Kind, 'array'>>, T>(
 ) {
 	return new Column<ArrayType<D>, T[]>({
 		dataType: new ArrayType(element._quarry.dataType),
+		site: captureCallSite(array),
 	});
+}
+
+/** The type modifiers given, up to the first one left out. */
+function modifiers(...values: (number | undefined)[]) {
+	const given: number[] = [];
+	for (const value of values) {
+		if (value === undefined) break;
+		given.push(value);
+	}
+	return given.length > 0 ? given : undefined;
 }
