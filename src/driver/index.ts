@@ -41,3 +41,17 @@ export {
 	type TextParser,
 	type TypeParsers,
 } from './types.js';
+export {
+	createPool,
+	Pool,
+	PoolClient,
+	type PoolOptions,
+	type PoolStats,
+} from './pool.js';
+export {
+	Transaction,
+	TransactionRolledBack,
+	type IsolationLevel,
+	type SettingValue,
+	type TransactionOptions,
+} from './transaction.js';

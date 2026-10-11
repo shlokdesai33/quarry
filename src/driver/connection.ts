@@ -38,6 +38,7 @@ import { Reader } from './protocol/reader.js';
 import { Writer } from './protocol/writer.js';
 import { asResult, asRows, type RowMode } from './rows.js';
 import type { DriverSocket } from './socket.js';
+import { Transaction, type TransactionOptions } from './transaction.js';
 import { defaultTypes, encodeParam, type TypeParsers } from './types.js';
 
 export interface QueryOptions {
@@ -51,8 +52,15 @@ export interface QueryOptions {
 	readonly paramTypes?: readonly number[];
 	/** Cancels the query when aborted. A query not yet sent is dropped without contacting the server. */
 	readonly signal?: AbortSignal;
-	/** Cancels the query after this many milliseconds (client-side; see `statement_timeout` for server-side). */
+	/** Cancels the query after this many milliseconds, from the client. */
 	readonly timeout?: number;
+	/**
+	 * A server-side `statement_timeout` for this query only (milliseconds,
+	 * or a Postgres interval such as `'2s'`). Applied with
+	 * `set_config(…, true)`: outside a transaction the query is wrapped in
+	 * `begin … commit`; inside one, the previous value is restored after it.
+	 */
+	readonly statementTimeout?: number | string;
 }
 
 export interface CursorOptions extends QueryOptions {
@@ -598,6 +606,14 @@ export class Connection implements AsyncDisposable {
 		params: readonly unknown[] = [],
 		options?: QueryOptions,
 	): Promise<QueryResult<R>> {
+		if (options?.statementTimeout !== undefined) {
+			return this.#queryWithTimeout<R>(
+				sql,
+				params,
+				options,
+				options.statementTimeout,
+			);
+		}
 		return new Promise((resolve, reject) => {
 			let values;
 			try {
@@ -616,6 +632,59 @@ export class Connection implements AsyncDisposable {
 			);
 			this.#enqueue(op, options?.signal, options?.timeout);
 		});
+	}
+
+	async #queryWithTimeout<R>(
+		sql: string,
+		params: readonly unknown[],
+		options: QueryOptions,
+		timeout: number | string,
+	): Promise<QueryResult<R>> {
+		const { statementTimeout: _, ...rest } = options;
+		const value = typeof timeout === 'number' ? `${timeout}ms` : timeout;
+		const set = "select set_config('statement_timeout', $1, true) as previous";
+		if (this.#status === 'I') {
+			// pipelined together, so they reach the server back to back
+			const settled = await Promise.allSettled([
+				this.query('begin'),
+				this.query(set, [value]),
+				this.query<R>(sql, params, rest),
+				this.query('commit'),
+			]);
+			const result = settled[2];
+			if (result?.status === 'rejected') throw result.reason;
+			const failed = settled.find((s) => s.status === 'rejected');
+			if (failed?.status === 'rejected') throw failed.reason;
+			if (result?.status !== 'fulfilled')
+				throw new ConnectionError('Query did not run');
+			return result.value;
+		}
+		const previous = this.query<{ previous: string }>(
+			"select current_setting('statement_timeout') as previous, set_config('statement_timeout', $1, true)",
+			[value],
+		);
+		const [before, result] = await Promise.allSettled([
+			previous,
+			this.query<R>(sql, params, rest),
+		]);
+		if (before.status === 'fulfilled' && this.#status === 'T') {
+			this.query(set, [before.value.rows[0]?.previous ?? '0']).catch(() => {});
+		}
+		if (result.status === 'rejected') throw result.reason;
+		if (before.status === 'rejected') throw before.reason;
+		return result.value;
+	}
+
+	/**
+	 * Runs `fn` in a transaction: committed when it resolves, rolled back
+	 * when it throws. Serialization failures and deadlocks can be retried,
+	 * and settings applied with bound parameters.
+	 */
+	transaction<T>(
+		fn: (tx: Transaction) => Promise<T>,
+		options?: TransactionOptions,
+	): Promise<T> {
+		return Transaction.run(this, fn, options);
 	}
 
 	/**
