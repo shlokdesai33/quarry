@@ -72,6 +72,25 @@ function adapters(url: string): Adapter[] {
 			end: () => sql.end(),
 		},
 	];
+	// Bun's built-in client, when running under Bun
+	const bun: unknown = Reflect.get(globalThis, 'Bun');
+	if (bun !== undefined) {
+		const BunSQL = Reflect.get(bun as object, 'SQL') as new (
+			url: string,
+			options: object,
+		) => {
+			unsafe(text: string, params: unknown[]): Promise<unknown[]>;
+			close(): Promise<void>;
+		};
+		const bunSql = new BunSQL(url, { max: POOL });
+		all.push({
+			name: 'Bun.sql',
+			query: async (text, params = []) => [
+				...(await bunSql.unsafe(text, params)),
+			],
+			end: () => bunSql.close(),
+		});
+	}
 	return all.filter((a) => only === undefined || only.includes(a.name));
 }
 
