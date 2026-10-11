@@ -1,4 +1,4 @@
-import type { Executor } from './executor.js';
+import type { Executor, RunOptions } from './executor.js';
 import {
 	type ExpressionBuilder,
 	expressionBuilder,
@@ -20,7 +20,10 @@ import {
 import {
 	type ColumnKey,
 	columnOf,
-	notImplemented,
+	exactlyOne,
+	atMostOne,
+	executeWrite,
+	writeRows,
 	rowCount,
 	rowsNode,
 	type SetValues,
@@ -247,33 +250,67 @@ export class UpdateQueryBuilder<T extends AnyTable, O, M extends UpdateNeeds> {
 		return condition ? build(this) : this;
 	}
 
-	/** Runs the query, resolving to the number of rows updated. Not implemented yet. */
-	execute(this: UpdateQueryBuilder<T, unknown, never>): Promise<WriteResult> {
-		return notImplemented('update');
+	/**
+	 * Runs the query, resolving to the number of rows updated. Throws
+	 * `RowCountError` if `expectRows` was set and a different number was.
+	 */
+	execute(
+		this: UpdateQueryBuilder<T, unknown, never>,
+		options?: RunOptions,
+	): Promise<WriteResult> {
+		return executeWrite(this.#state.executor, this.toNode(), options);
 	}
 
-	/** Runs the query and returns every `returning` row. Not implemented yet. */
-	all(this: UpdateQueryBuilder<T, O & object, never>): Promise<O[]> {
-		return notImplemented('update');
-	}
-
-	/** Runs the query and returns its first `returning` row, if any. Not implemented yet. */
-	first(
+	/** Runs the query and returns every `returning` row. */
+	async all(
 		this: UpdateQueryBuilder<T, O & object, never>,
-	): Promise<O | undefined> {
-		return notImplemented('update');
+		options?: RunOptions,
+	): Promise<O[]> {
+		return (await writeRows<O>(this.#state.executor, this.toNode(), options))
+			.rows;
 	}
 
-	/** Runs the query and returns its one `returning` row. Not implemented yet. */
-	one(this: UpdateQueryBuilder<T, O & object, never>): Promise<O> {
-		return notImplemented('update');
-	}
-
-	/** Runs the query and returns its `returning` row, if any. Not implemented yet. */
-	maybeOne(
+	/** Runs the query and returns its first `returning` row, if any. */
+	async first(
 		this: UpdateQueryBuilder<T, O & object, never>,
+		options?: RunOptions,
 	): Promise<O | undefined> {
-		return notImplemented('update');
+		const { rows } = await writeRows<O>(
+			this.#state.executor,
+			this.toNode(),
+			options,
+		);
+		return rows[0];
+	}
+
+	/**
+	 * Runs the query and returns its one `returning` row: throws
+	 * `NoRowError` when there is none and `TooManyRowsError` when there are
+	 * several (after the statement has run).
+	 */
+	async one(
+		this: UpdateQueryBuilder<T, O & object, never>,
+		options?: RunOptions,
+	): Promise<O> {
+		const { query, rows } = await writeRows<O>(
+			this.#state.executor,
+			this.toNode(),
+			options,
+		);
+		return exactlyOne(query, rows);
+	}
+
+	/** Runs the query and returns its `returning` row, if any: throws `TooManyRowsError` when there are several. */
+	async maybeOne(
+		this: UpdateQueryBuilder<T, O & object, never>,
+		options?: RunOptions,
+	): Promise<O | undefined> {
+		const { query, rows } = await writeRows<O>(
+			this.#state.executor,
+			this.toNode(),
+			options,
+		);
+		return atMostOne(query, rows);
 	}
 
 	/** The whole query as one node. */

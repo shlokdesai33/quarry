@@ -1,4 +1,4 @@
-import type { Executor } from './executor.js';
+import type { Executor, RunOptions } from './executor.js';
 import {
 	type ExpressionBuilder,
 	expressionBuilder,
@@ -29,7 +29,10 @@ import {
 	columnOf,
 	type Excluded,
 	excluded,
-	notImplemented,
+	exactlyOne,
+	atMostOne,
+	executeWrite,
+	writeRows,
 	rowCount,
 	rowsNode,
 	type SetValues,
@@ -86,7 +89,7 @@ export function insertIntoWith<T extends AnyTable>(
 ): InsertQueryBuilder<T, undefined, 'values'> {
 	return new InsertQueryBuilder({
 		table,
-		values: { columns: [], rows: [], strategy: 'values' },
+		values: { columns: [], types: [], rows: [], strategy: 'values' },
 		onConflict: undefined,
 		returning: [],
 		expectRows: undefined,
@@ -202,33 +205,67 @@ export class InsertQueryBuilder<T extends AnyTable, O, M extends 'values'> {
 		return condition ? build(this) : this;
 	}
 
-	/** Runs the query, resolving to the number of rows inserted. Not implemented yet. */
-	execute(this: InsertQueryBuilder<T, unknown, never>): Promise<WriteResult> {
-		return notImplemented('insert');
+	/**
+	 * Runs the query, resolving to the number of rows inserted. Throws
+	 * `RowCountError` if `expectRows` was set and a different number was.
+	 */
+	execute(
+		this: InsertQueryBuilder<T, unknown, never>,
+		options?: RunOptions,
+	): Promise<WriteResult> {
+		return executeWrite(this.#state.executor, this.toNode(), options);
 	}
 
-	/** Runs the query and returns every `returning` row. Not implemented yet. */
-	all(this: InsertQueryBuilder<T, O & object, never>): Promise<O[]> {
-		return notImplemented('insert');
-	}
-
-	/** Runs the query and returns its first `returning` row, if any. Not implemented yet. */
-	first(
+	/** Runs the query and returns every `returning` row. */
+	async all(
 		this: InsertQueryBuilder<T, O & object, never>,
-	): Promise<O | undefined> {
-		return notImplemented('insert');
+		options?: RunOptions,
+	): Promise<O[]> {
+		return (await writeRows<O>(this.#state.executor, this.toNode(), options))
+			.rows;
 	}
 
-	/** Runs the query and returns its one `returning` row. Not implemented yet. */
-	one(this: InsertQueryBuilder<T, O & object, never>): Promise<O> {
-		return notImplemented('insert');
-	}
-
-	/** Runs the query and returns its `returning` row, if any. Not implemented yet. */
-	maybeOne(
+	/** Runs the query and returns its first `returning` row, if any. */
+	async first(
 		this: InsertQueryBuilder<T, O & object, never>,
+		options?: RunOptions,
 	): Promise<O | undefined> {
-		return notImplemented('insert');
+		const { rows } = await writeRows<O>(
+			this.#state.executor,
+			this.toNode(),
+			options,
+		);
+		return rows[0];
+	}
+
+	/**
+	 * Runs the query and returns its one `returning` row: throws
+	 * `NoRowError` when there is none and `TooManyRowsError` when there are
+	 * several (after the statement has run).
+	 */
+	async one(
+		this: InsertQueryBuilder<T, O & object, never>,
+		options?: RunOptions,
+	): Promise<O> {
+		const { query, rows } = await writeRows<O>(
+			this.#state.executor,
+			this.toNode(),
+			options,
+		);
+		return exactlyOne(query, rows);
+	}
+
+	/** Runs the query and returns its `returning` row, if any: throws `TooManyRowsError` when there are several. */
+	async maybeOne(
+		this: InsertQueryBuilder<T, O & object, never>,
+		options?: RunOptions,
+	): Promise<O | undefined> {
+		const { query, rows } = await writeRows<O>(
+			this.#state.executor,
+			this.toNode(),
+			options,
+		);
+		return atMostOne(query, rows);
 	}
 
 	/** The whole query as one node. */

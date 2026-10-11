@@ -1,6 +1,13 @@
 import { compile } from './compile.js';
 import type { DataType } from './data-type/data-type.js';
-import { type Executor, NoRowError, TooManyRowsError } from './executor.js';
+import {
+	type Executor,
+	NoRowError,
+	type QueryDescription,
+	type RunOptions,
+	type StreamOptions,
+	TooManyRowsError,
+} from './executor.js';
 import { Expression, type TypedExpression } from './expression.js';
 import {
 	type ExpressionBuilder,
@@ -336,13 +343,13 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 	}
 
 	/** Runs the query and returns every row. */
-	async all(): Promise<O[]> {
-		return (await this.#execute(undefined)).rows;
+	async all(options?: RunOptions): Promise<O[]> {
+		return (await this.#execute(undefined, options)).rows;
 	}
 
 	/** Runs the query with `limit 1` and returns its row, if any. */
-	async first(): Promise<O | undefined> {
-		const [row] = (await this.#execute(1)).rows;
+	async first(options?: RunOptions): Promise<O | undefined> {
+		const [row] = (await this.#execute(1, options)).rows;
 		return row;
 	}
 
@@ -351,8 +358,8 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 	 * is none and `TooManyRowsError` when there are several. Fetches at most
 	 * two rows, enough to tell.
 	 */
-	async one(): Promise<O> {
-		const { query, rows } = await this.#execute(2);
+	async one(options?: RunOptions): Promise<O> {
+		const { query, rows } = await this.#execute(2, options);
 		const [row, ...rest] = rows;
 		if (row === undefined) {
 			throw new NoRowError(query);
@@ -367,13 +374,38 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 	 * Runs the query and returns its row, if any: throws `TooManyRowsError`
 	 * when there are several. Fetches at most two rows, enough to tell.
 	 */
-	async maybeOne(): Promise<O | undefined> {
-		const { query, rows } = await this.#execute(2);
+	async maybeOne(options?: RunOptions): Promise<O | undefined> {
+		const { query, rows } = await this.#execute(2, options);
 		const [row, ...rest] = rows;
 		if (rest.length > 0) {
 			throw new TooManyRowsError(query);
 		}
 		return row;
+	}
+
+	/**
+	 * Runs the query and yields its rows as they arrive, fetching
+	 * `batchSize` (default 1000) at a time through a cursor, so a large
+	 * result never sits in memory at once. Breaking out of the loop stops
+	 * the query.
+	 *
+	 * @example
+	 * for await (const user of db.selectFrom(users).select(['users.id']).stream()) { … }
+	 */
+	async *stream(options?: StreamOptions): AsyncGenerator<O, void, undefined> {
+		const executor = this.#executor();
+		for await (const batch of executor.stream(
+			compile(this.toNode()),
+			options,
+		)) {
+			// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the select list supplies the row type
+			yield* batch as readonly O[];
+		}
+	}
+
+	/** The query's parameter and result types, as the server reports them without running it. */
+	describe(): Promise<QueryDescription> {
+		return this.#executor().describe(compile(this.toNode()));
 	}
 
 	/** The whole query as one node. */
@@ -398,21 +430,26 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 		return this.#state.where.toNode();
 	}
 
-	/** Runs the query, fetching at most `limit` rows besides any limit of its own. */
-	async #execute(limit: number | undefined) {
+	#executor(): Executor {
 		const { executor } = this.#state;
 		if (executor === undefined) {
 			throw new Error(
-				'The query has no database to run on: start it from `database(executor).selectFrom(...)`',
+				'The query has no database to run on: start it from `database(...).selectFrom(...)`',
 			);
 		}
+		return executor;
+	}
+
+	/** Runs the query, fetching at most `limit` rows besides any limit of its own. */
+	async #execute(limit: number | undefined, options: RunOptions | undefined) {
+		const executor = this.#executor();
 		const node = this.toNode();
 		const query = compile(
 			limit === undefined
 				? node
 				: { ...node, limit: Math.min(node.limit ?? limit, limit) },
 		);
-		const { rows } = await executor.execute(query);
+		const { rows } = await executor.execute(query, options);
 		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the select list supplies the row type
 		return { query, rows: rows as O[] };
 	}

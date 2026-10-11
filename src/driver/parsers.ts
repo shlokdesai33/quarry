@@ -1,17 +1,5 @@
-import type { Range } from '../range.js';
 import { DriverError } from './errors.js';
-import {
-	arrayOids,
-	oids,
-	parseArray,
-	parseBool,
-	parseBytea,
-	parseFloat,
-	parseInteger,
-	parseJson,
-	type TextParser,
-	type TypeParsers,
-} from './types.js';
+import { parseArray, type TextParser, type TypeParsers } from './types.js';
 
 const TIMESTAMPTZ =
 	/^(\d{4,})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)(\.\d+)?([+-])(\d\d)(?::?(\d\d))?(?::?(\d\d))?( BC)?$/;
@@ -118,12 +106,22 @@ function fastTimestamptz(text: string): number | undefined {
 
 /**
  * Parses range output (`[2024-01-01,2024-02-01)`, `(,"a b"]`, `empty`) into
- * quarry's `Range`, each bound through `parse`.
+ * a `RangeValue`, each bound through `parse`.
  */
+/** A range value: `empty`, or bounds (`null` when unbounded) with their inclusivity. */
+export type RangeValue<T> =
+	| {
+			readonly empty: false;
+			readonly lower: T | null;
+			readonly upper: T | null;
+			readonly bounds: '[)' | '(]' | '[]' | '()';
+	  }
+	| { readonly empty: true };
+
 export function parseRange<T>(
 	text: string,
 	parse: (bound: string) => T,
-): Range<T> {
+): RangeValue<T> {
 	if (text === 'empty') return { empty: true };
 	const open = text[0];
 	const close = text[text.length - 1];
@@ -186,54 +184,6 @@ export function parseRange<T>(
 /** pgvector's `vector` and `halfvec` output, `[1,2.5,3]`. */
 export const parseVector: TextParser = (text) => JSON.parse(text);
 
-const identity: TextParser = (text) => text;
-const int = parseInteger;
-const float = parseFloat;
-const bool = parseBool;
-const json = parseJson;
-const dateRange: TextParser = (text) => parseRange(text, identity);
-const timeRange: TextParser = (text) => parseRange(text, parseTimestamptz);
-const array =
-	(parse?: TextParser, delimiter?: string): TextParser =>
-	(text) =>
-		parseArray(text, parse, delimiter);
-
-/**
- * Parsers matching the TypeScript types quarry's columns declare: int8 and
- * numeric as strings, timestamptz as a Date, date/time/timestamp/interval
- * as strings, ranges as `Range` objects, jsonb parsed, bytea as bytes, and
- * arrays of each. Extension types and other arrays are added from the
- * catalog by `catalogTypes`.
- */
-export const quarryTypes: TypeParsers = Object.freeze({
-	[oids.bool]: bool,
-	[oids.int2]: int,
-	[oids.int4]: int,
-	[oids.oid]: int,
-	[oids.float4]: float,
-	[oids.float8]: float,
-	[oids.json]: json,
-	[oids.jsonb]: json,
-	[oids.bytea]: parseBytea,
-	[oids.timestamptz]: parseTimestamptz,
-	[oids.daterange]: dateRange,
-	[oids.tstzrange]: timeRange,
-	[arrayOids.bool]: array(bool),
-	[arrayOids.int2]: array(int),
-	[arrayOids.int4]: array(int),
-	[arrayOids.oid]: array(int),
-	[arrayOids.int8]: array(),
-	[arrayOids.float4]: array(float),
-	[arrayOids.float8]: array(float),
-	[arrayOids.json]: array(json),
-	[arrayOids.jsonb]: array(json),
-	[arrayOids.bytea]: array(parseBytea),
-	[arrayOids.timestamptz]: array(parseTimestamptz),
-	[arrayOids.daterange]: array(dateRange),
-	[arrayOids.tstzrange]: array(timeRange),
-	[arrayOids.box]: array(undefined, ';'),
-});
-
 /** One row of the catalog query. */
 export interface CatalogType {
 	readonly oid: number;
@@ -260,10 +210,8 @@ export function catalogTypes(
 	}
 	for (const type of catalog) {
 		if (type.elem === 0 || base[type.oid] !== undefined) continue;
-		parsers[type.oid] = array(
-			base[type.elem] ?? parsers[type.elem],
-			type.delim,
-		);
+		const element = base[type.elem] ?? parsers[type.elem];
+		parsers[type.oid] = (text) => parseArray(text, element, type.delim);
 	}
 	return Object.freeze({ ...parsers, ...base });
 }

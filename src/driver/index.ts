@@ -32,10 +32,16 @@ export { nodeSockets } from './node-socket.js';
 export { cloudflareSockets } from './cloudflare-socket.js';
 export {
 	arrayLiteral,
+	arrayOids,
 	copyChunks,
 	copyLine,
 	defaultTypes,
 	encodeParam,
+	parseBigInt,
+	parseBool,
+	parseFloat,
+	parseInteger,
+	parseJson,
 	formatTimestamp,
 	oids,
 	parseArray,
@@ -59,19 +65,14 @@ export {
 	type TransactionOptions,
 } from './transaction.js';
 export {
-	executorTypes,
-	PgExecutor,
-	pgExecutor,
-	type ExecutorSource,
-	type PgExecutorOptions,
-	type QueryEvent,
-} from './quarry.js';
-export {
+	catalogQuery,
+	catalogTypes,
 	parseRange,
 	parseTimestamptz,
 	parseVector,
-	quarryTypes,
-} from './quarry-types.js';
+	type CatalogType,
+	type RangeValue,
+} from './parsers.js';
 export { OAuthError, type OAuthFailure } from './auth/oauth.js';
 export {
 	detectCapabilities,

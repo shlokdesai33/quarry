@@ -1,10 +1,27 @@
 import type { AnyColumn } from './column/any-column.js';
+import { compile, type CompiledQuery } from './compile.js';
+import {
+	type ExecuteResult,
+	type Executor,
+	NoRowError,
+	RowCountError,
+	type RunOptions,
+	TooManyRowsError,
+} from './executor.js';
 import { Expression } from './expression.js';
 import { typedExpression } from './expression-methods.js';
-import type { OperationNode, RowsNode, SetNode } from './node.js';
+import type {
+	DeleteNode,
+	InsertNode,
+	OperationNode,
+	RowsNode,
+	SetNode,
+	UpdateNode,
+} from './node.js';
 import type { Expr } from './operators.js';
 import type { AnyTable } from './table.js';
 import type { Prettify } from './types.js';
+import { codeType, renderType } from './verify/sql-type.js';
 
 /** The columns of the table `T`, by the keys they are declared under. */
 type Columns<T extends AnyTable> = T['schema']['columns'];
@@ -112,6 +129,9 @@ export function rowsNode(
 	const columns = keys.map((key) => columnOf(table, key));
 	return {
 		columns: columns.map(({ name }) => name),
+		types: columns.map(({ column }) =>
+			renderType(codeType(column._quarry.dataType)),
+		),
 		rows: rows.map((row) => {
 			const values = new Map(Object.entries(row));
 			return keys.map((key, i) => {
@@ -150,13 +170,62 @@ export function rowCount(count: number): number {
 	return count;
 }
 
-/** Running a write query, which isn't supported yet. */
-export function notImplemented(
-	kind: 'insert' | 'update' | 'delete',
-): Promise<never> {
-	return Promise.reject(
-		new Error(
-			`Running ${kind} queries isn't implemented yet: inspect them with toNode()`,
-		),
-	);
+/** Compiles and runs a write query, checking `expectRows`. */
+async function runWrite(
+	executor: Executor | undefined,
+	node: InsertNode | UpdateNode | DeleteNode,
+	options: RunOptions | undefined,
+): Promise<{ readonly query: CompiledQuery; readonly result: ExecuteResult }> {
+	if (executor === undefined) {
+		throw new Error(
+			'The query has no database to run on: start it from `database(...)`',
+		);
+	}
+	const query = compile(node);
+	const result = await executor.execute(query, options);
+	const count = result.rowCount ?? 0;
+	if (node.expectRows !== undefined && count !== node.expectRows) {
+		throw new RowCountError(query, node.expectRows, count);
+	}
+	return { query, result };
+}
+
+/** Runs a write query, resolving to the number of rows it affected. */
+export async function executeWrite(
+	executor: Executor | undefined,
+	node: InsertNode | UpdateNode | DeleteNode,
+	options: RunOptions | undefined,
+): Promise<WriteResult> {
+	const { result } = await runWrite(executor, node, options);
+	return { rowCount: result.rowCount ?? 0 };
+}
+
+/** Runs a write query, returning its `returning` rows, typed by the caller's `returning` list. */
+// eslint-disable-next-line typescript/no-unnecessary-type-parameters -- the builder's row type, which only its returning list knows
+export async function writeRows<O>(
+	executor: Executor | undefined,
+	node: InsertNode | UpdateNode | DeleteNode,
+	options: RunOptions | undefined,
+): Promise<{ readonly query: CompiledQuery; readonly rows: O[] }> {
+	const { query, result } = await runWrite(executor, node, options);
+	// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the returning list supplies the row type
+	return { query, rows: result.rows as O[] };
+}
+
+/** The one row: throws `NoRowError` or `TooManyRowsError` otherwise. */
+export function exactlyOne<O>(query: CompiledQuery, rows: readonly O[]): O {
+	const [row, ...rest] = rows;
+	if (row === undefined) throw new NoRowError(query);
+	if (rest.length > 0) throw new TooManyRowsError(query);
+	return row;
+}
+
+/** The row, if any: throws `TooManyRowsError` for several. */
+export function atMostOne<O>(
+	query: CompiledQuery,
+	rows: readonly O[],
+): O | undefined {
+	const [row, ...rest] = rows;
+	if (rest.length > 0) throw new TooManyRowsError(query);
+	return row;
 }

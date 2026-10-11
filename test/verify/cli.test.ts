@@ -6,7 +6,8 @@ import { parseConfig, schemaTables } from '../../src/cli/config.js';
 import { text } from '../../src/column-factories.js';
 import { defineTable } from '../../src/define-table.js';
 import { type Io, runCli, usage } from '../../src/cli/run.js';
-import { database } from '../../src/database.js';
+import { databaseWith } from '../../src/database.js';
+import { fakeExecutor } from '../helpers/executor.js';
 import * as fixtures from './fixtures/schema.js';
 import { schema as driftSchema, users } from './fixtures/schema.js';
 import {
@@ -70,7 +71,7 @@ describe('arguments', () => {
 
 describe('config', () => {
 	test('exports may be the default export or named', () => {
-		const db = database({ execute: async () => ({ rows: [] }) });
+		const db = databaseWith(fakeExecutor().executor);
 		const named = parseConfig({ db, schema: [users] });
 		const fallback = parseConfig({ default: { db, schema: [users] } });
 		expect(typeof named).toBe('object');
@@ -176,7 +177,7 @@ describe.skipIf(!postgresAvailable)('quarry verify against PostgreSQL', () => {
 		let closed = false;
 		const { io: streams, out } = io({
 			load: async () => ({
-				db: database(db.executor),
+				db: databaseWith(db.executor),
 				schema: { table },
 				close: () => {
 					closed = true;

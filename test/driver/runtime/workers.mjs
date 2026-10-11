@@ -7,7 +7,7 @@
  *
  *   MINIFLARE_FROM=/tmp/cf node test/driver/runtime/workers.mjs [info.json]
  */
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 
@@ -33,7 +33,7 @@ if (process.argv[2]) {
 }
 
 const worker = `
-import { connect, createPool, QueryCanceled } from './driver.js';
+import { connect, createPool, QueryCanceled } from './driver/index.js';
 
 async function check(results, name, fn) {
 	try { await fn(); results.push(['ok', name]); }
@@ -99,17 +99,19 @@ export default {
 };
 `;
 
+// every built module, since the driver entry shares chunks with the others
+const dist = new URL('../../../dist/', import.meta.url);
+const builtModules = readdirSync(dist, { recursive: true })
+	.filter((file) => String(file).endsWith('.js'))
+	.map((file) => ({
+		type: 'ESModule',
+		path: String(file),
+		contents: readFileSync(new URL(String(file), dist), 'utf8'),
+	}));
 const mf = new Miniflare({
 	modules: [
 		{ type: 'ESModule', path: 'worker.mjs', contents: worker },
-		{
-			type: 'ESModule',
-			path: 'driver.js',
-			contents: readFileSync(
-				new URL('../../../dist/driver/index.js', import.meta.url),
-				'utf8',
-			),
-		},
+		...builtModules,
 	],
 	compatibilityDate: '2025-09-01',
 });

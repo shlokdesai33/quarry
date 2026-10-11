@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client, Pool, type PoolConfig } from 'pg';
 import type { Executor } from '../../../src/executor.js';
+import { executorFrom } from '../../helpers/executor.js';
 
 /**
  * A database for the integration tests: `QUARRY_TEST_DATABASE_URL` when set,
@@ -93,11 +94,9 @@ export async function startDatabase(): Promise<TestDatabase> {
 	});
 	return {
 		pool,
-		executor: {
-			execute: async ({ sql, params }) => ({
-				rows: (await pool.query(sql, [...params])).rows,
-			}),
-		},
+		executor: executorFrom(async ({ sql, params }) => ({
+			rows: (await pool.query(sql, [...params])).rows,
+		})),
 		sql: async (text) => {
 			await pool.query(text);
 		},

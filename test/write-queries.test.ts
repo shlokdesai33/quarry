@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { integer, jsonb, text, timestamptz } from '../src/column-factories.js';
 import { compile } from '../src/compile.js';
-import { database } from '../src/database.js';
+import { databaseWith } from '../src/database.js';
+import {
+	NoRowError,
+	RowCountError,
+	TooManyRowsError,
+} from '../src/executor.js';
+import { executorFrom, fakeExecutor } from './helpers/executor.js';
 import { defineTable } from '../src/define-table.js';
 import { deleteFrom } from '../src/delete-query-builder.js';
 import { insertInto } from '../src/insert-query-builder.js';
@@ -15,6 +21,13 @@ const users = defineTable('users', {
 		name: text().nullable(),
 		createdAt: timestamptz().name('created_at').default(),
 		settings: jsonb<{ theme: string }>().default(),
+	},
+});
+
+const events = defineTable('events', {
+	columns: {
+		id: integer().identity(),
+		at: timestamptz().default(),
 	},
 });
 
@@ -41,6 +54,7 @@ describe('insertInto', () => {
 			table: { name: 'users', alias: undefined },
 			values: {
 				columns: ['email', 'name', 'settings'],
+				types: ['text', 'text', 'jsonb'],
 				rows: [
 					[value('ada@example.com'), value(null), value('{"theme":"dark"}')],
 				],
@@ -63,6 +77,7 @@ describe('insertInto', () => {
 			.toNode();
 		expect(values).toEqual({
 			columns: ['email', 'name', 'created_at'],
+			types: ['text', 'text', 'timestamptz'],
 			rows: [
 				[value('ada@example.com'), value('Ada'), undefined],
 				[value('alan@example.com'), value(null), value(at)],
@@ -220,6 +235,7 @@ describe('updateMany', () => {
 		expect(many).toEqual({
 			by: ['id'],
 			columns: ['id', 'name', 'created_at'],
+			types: ['integer', 'text', 'timestamptz'],
 			rows: [
 				[value(1), value('Ada'), undefined],
 				[value(2), undefined, value(new Date(0))],
@@ -262,18 +278,179 @@ describe('deleteFrom', () => {
 	});
 });
 
-describe('running a write query', () => {
-	const db = database({ execute: async () => ({ rows: [] }) });
+describe('compiling write queries', () => {
+	it('renders an insert with values, defaults, on conflict and returning', () => {
+		const query = compile(
+			insertInto(users)
+				.values({ email: 'ada@example.com', name: null })
+				.onConflict('email')
+				.merge(['name'])
+				.returning(['users.id'])
+				.tag('users.upsert')
+				.toNode(),
+		);
+		expect(query).toEqual({
+			sql: 'insert into "users" ("email", "name") values ($1, $2) on conflict ("email") do update set "name" = excluded."name" returning "users"."id" as "id"',
+			params: ['ada@example.com', null],
+			tag: 'users.upsert',
+		});
+		expect(compile(insertInto(events).values({}).toNode()).sql).toBe(
+			'insert into "events" default values',
+		);
+		expect(
+			compile(
+				insertInto(users)
+					.values({ email: 'a', name: null })
+					.onConflict('email')
+					.doNothing()
+					.toNode(),
+			).sql,
+		).toBe(
+			'insert into "users" ("email", "name") values ($1, $2) on conflict ("email") do nothing',
+		);
+	});
 
-	it('is not implemented yet', async () => {
+	it('sends many rows as one array per column with unnest, or falls back to values', () => {
+		const many = compile(
+			insertInto(users)
+				.values([
+					{ email: 'a', name: 'A' },
+					{ email: 'b', name: null },
+				])
+				.toNode(),
+		);
+		expect(many).toEqual({
+			sql: 'insert into "users" ("email", "name") select * from unnest($1::text[], $2::text[])',
+			params: [
+				['a', 'b'],
+				['A', null],
+			],
+		});
+		// a row that leaves a column to its default can't go through unnest
+		const ragged = compile(
+			insertInto(users)
+				.values([
+					{ email: 'a', name: 'A' },
+					{ email: 'b', name: 'B', settings: { theme: 'x' } },
+				])
+				.toNode(),
+		);
+		expect(ragged.sql).toBe(
+			'insert into "users" ("email", "name", "settings") values ($1, $2, default), ($3, $4, $5)',
+		);
+	});
+
+	it('renders updates, updateMany and deletes', () => {
+		expect(
+			compile(
+				update(users)
+					.set({ name: 'Ada' })
+					.where('users.id', 1)
+					.returning(['users.name'])
+					.toNode(),
+			),
+		).toEqual({
+			sql: 'update "users" set "name" = $1 where "users"."id" = $2 returning "users"."name" as "name"',
+			params: ['Ada', 1],
+		});
+		expect(
+			compile(update(users).set({ name: null }).allRows().toNode()).sql,
+		).toBe('update "users" set "name" = $1');
+		expect(
+			compile(
+				updateMany(
+					users,
+					[
+						{ id: 1, name: 'A' },
+						{ id: 2, name: 'B' },
+					],
+					{ by: 'id' },
+				).toNode(),
+			),
+		).toEqual({
+			sql: 'update "users" set "name" = "quarry_rows"."name" from unnest($1::integer[], $2::text[]) as "quarry_rows"("id", "name") where "users"."id" = "quarry_rows"."id"',
+			params: [
+				[1, 2],
+				['A', 'B'],
+			],
+		});
+		expect(() =>
+			compile(
+				updateMany(users, [{ id: 1, name: 'A' }, { id: 2 }], {
+					by: 'id',
+				}).toNode(),
+			),
+		).toThrow(/every row to set the same columns/);
+		expect(
+			compile(
+				deleteFrom(users)
+					.where('users.id', 3)
+					.returning(['users.email'])
+					.toNode(),
+			).sql,
+		).toBe(
+			'delete from "users" where "users"."id" = $1 returning "users"."email" as "email"',
+		);
+		expect(compile(deleteFrom(users).allRows().toNode()).sql).toBe(
+			'delete from "users"',
+		);
+	});
+});
+
+describe('running a write query', () => {
+	it('resolves to the row count and the returning rows', async () => {
+		const { executor, ran } = fakeExecutor([{ id: 7 }]);
+		const db = databaseWith(executor);
+		expect(await db.deleteFrom(users).where('users.id', 7).execute()).toEqual({
+			rowCount: 1,
+		});
+		expect(
+			await db
+				.insertInto(users)
+				.values({ email: 'a', name: null })
+				.returning(['users.id'])
+				.one(),
+		).toEqual({ id: 7 });
+		expect(
+			await db
+				.update(users)
+				.set({ name: 'A' })
+				.allRows()
+				.returning(['users.id'])
+				.first(),
+		).toEqual({ id: 7 });
+		expect(ran.map((q) => q.sql.split(' ')[0])).toEqual([
+			'delete',
+			'insert',
+			'update',
+		]);
+	});
+
+	it('enforces expectRows and one-row results after the statement ran', async () => {
+		const none = databaseWith(
+			executorFrom(async () => ({ rows: [], rowCount: 0 })),
+		);
+		const error = await none
+			.update(users)
+			.set({ name: 'A' })
+			.where('users.id', 1)
+			.expectRows(1)
+			.execute()
+			.catch((e: unknown) => e);
+		expect(error).toBeInstanceOf(RowCountError);
+		expect(error).toMatchObject({ expected: 1, actual: 0 });
 		await expect(
-			db.insertInto(users).values({ email: 'a', name: null }).execute(),
-		).rejects.toThrow("Running insert queries isn't implemented yet");
+			none.deleteFrom(users).where('users.id', 1).returning(['users.id']).one(),
+		).rejects.toBeInstanceOf(NoRowError);
+		const two = databaseWith(fakeExecutor([{ id: 1 }, { id: 2 }]).executor);
 		await expect(
-			db.update(users).set({ name: 'Ada' }).where('users.id', 1).execute(),
-		).rejects.toThrow("Running update queries isn't implemented yet");
+			two.deleteFrom(users).allRows().returning(['users.id']).maybeOne(),
+		).rejects.toBeInstanceOf(TooManyRowsError);
+	});
+
+	it('needs a database', async () => {
 		await expect(
-			db.deleteFrom(users).where('users.id', 1).returning(['users.id']).all(),
-		).rejects.toThrow("Running delete queries isn't implemented yet");
+			insertInto(users).values({ email: 'a', name: null }).execute(),
+		).rejects.toThrow(/no database to run on/);
 	});
 });

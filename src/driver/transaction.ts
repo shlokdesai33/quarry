@@ -143,6 +143,11 @@ export class Transaction {
 		this.#depth = depth;
 	}
 
+	/** The connection's transaction status: `transaction`, or `failed` after an error. */
+	get transactionStatus(): 'idle' | 'transaction' | 'failed' {
+		return this.#conn.transactionStatus;
+	}
+
 	/** 0 for the outermost transaction, 1+ for savepoints. */
 	get depth(): number {
 		return this.#depth;

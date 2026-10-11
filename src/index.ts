@@ -24,10 +24,52 @@ export {
 	vector,
 } from './column-factories.js';
 export { compile, type CompiledQuery } from './compile.js';
-export { database, type Database } from './database.js';
+export {
+	database,
+	type Database,
+	type DatabaseSource,
+	type DatabaseTransaction,
+} from './database.js';
+export type { RawTypes } from './decode.js';
+export {
+	AbortError,
+	CheckViolation,
+	ConnectionError,
+	connect,
+	createPool,
+	DeadlockDetected,
+	DriverError,
+	ExclusionViolation,
+	ForeignKeyViolation,
+	IdleInTransactionTimeout,
+	IntegrityConstraintViolation,
+	LockNotAvailable,
+	NotNullViolation,
+	OAuthError,
+	PostgresError,
+	ProtocolError,
+	QueryCanceled,
+	ReadOnlyTransaction,
+	SerializationFailure,
+	TransactionRolledBack,
+	TransactionTimeout,
+	UndefinedColumn,
+	UndefinedTable,
+	UniqueViolation,
+	type PoolOptions,
+} from './driver/index.js';
+export type { DatabaseOptions, QueryEvent } from './driver-executor.js';
 export { defineEnum } from './define-enum.js';
 export { defineTable } from './define-table.js';
-export { NoRowError, TooManyRowsError, type Executor } from './executor.js';
+export {
+	NoRowError,
+	RowCountError,
+	TooManyRowsError,
+	type QueryDescription,
+	type RunOptions,
+	type StreamOptions,
+	type TransactionOptions,
+} from './executor.js';
 export {
 	expressionBuilder,
 	type ExpressionBuilder,

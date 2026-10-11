@@ -1,5 +1,5 @@
 import type { Field } from './protocol/messages.js';
-import { parseTimestamptz } from './quarry-types.js';
+import { parseTimestamptz } from './parsers.js';
 import {
 	oids,
 	parseBool,

@@ -1,4 +1,4 @@
-import type { Executor } from './executor.js';
+import type { Executor, RunOptions } from './executor.js';
 import {
 	type ExpressionBuilder,
 	expressionBuilder,
@@ -17,7 +17,14 @@ import {
 	type ConditionArgs,
 	WhereBuilder,
 } from './where-builder.js';
-import { notImplemented, rowCount, type WriteResult } from './write-query.js';
+import {
+	atMostOne,
+	exactlyOne,
+	executeWrite,
+	rowCount,
+	writeRows,
+	type WriteResult,
+} from './write-query.js';
 
 /** What a `delete` from `T` has recorded so far. */
 interface DeleteState<T extends AnyTable> {
@@ -138,33 +145,67 @@ export class DeleteQueryBuilder<T extends AnyTable, O, M extends 'where'> {
 		return condition ? build(this) : this;
 	}
 
-	/** Runs the query, resolving to the number of rows deleted. Not implemented yet. */
-	execute(this: DeleteQueryBuilder<T, unknown, never>): Promise<WriteResult> {
-		return notImplemented('delete');
+	/**
+	 * Runs the query, resolving to the number of rows deleted. Throws
+	 * `RowCountError` if `expectRows` was set and a different number was.
+	 */
+	execute(
+		this: DeleteQueryBuilder<T, unknown, never>,
+		options?: RunOptions,
+	): Promise<WriteResult> {
+		return executeWrite(this.#state.executor, this.toNode(), options);
 	}
 
-	/** Runs the query and returns every `returning` row. Not implemented yet. */
-	all(this: DeleteQueryBuilder<T, O & object, never>): Promise<O[]> {
-		return notImplemented('delete');
-	}
-
-	/** Runs the query and returns its first `returning` row, if any. Not implemented yet. */
-	first(
+	/** Runs the query and returns every `returning` row. */
+	async all(
 		this: DeleteQueryBuilder<T, O & object, never>,
-	): Promise<O | undefined> {
-		return notImplemented('delete');
+		options?: RunOptions,
+	): Promise<O[]> {
+		return (await writeRows<O>(this.#state.executor, this.toNode(), options))
+			.rows;
 	}
 
-	/** Runs the query and returns its one `returning` row. Not implemented yet. */
-	one(this: DeleteQueryBuilder<T, O & object, never>): Promise<O> {
-		return notImplemented('delete');
-	}
-
-	/** Runs the query and returns its `returning` row, if any. Not implemented yet. */
-	maybeOne(
+	/** Runs the query and returns its first `returning` row, if any. */
+	async first(
 		this: DeleteQueryBuilder<T, O & object, never>,
+		options?: RunOptions,
 	): Promise<O | undefined> {
-		return notImplemented('delete');
+		const { rows } = await writeRows<O>(
+			this.#state.executor,
+			this.toNode(),
+			options,
+		);
+		return rows[0];
+	}
+
+	/**
+	 * Runs the query and returns its one `returning` row: throws
+	 * `NoRowError` when there is none and `TooManyRowsError` when there are
+	 * several (after the statement has run).
+	 */
+	async one(
+		this: DeleteQueryBuilder<T, O & object, never>,
+		options?: RunOptions,
+	): Promise<O> {
+		const { query, rows } = await writeRows<O>(
+			this.#state.executor,
+			this.toNode(),
+			options,
+		);
+		return exactlyOne(query, rows);
+	}
+
+	/** Runs the query and returns its `returning` row, if any: throws `TooManyRowsError` when there are several. */
+	async maybeOne(
+		this: DeleteQueryBuilder<T, O & object, never>,
+		options?: RunOptions,
+	): Promise<O | undefined> {
+		const { query, rows } = await writeRows<O>(
+			this.#state.executor,
+			this.toNode(),
+			options,
+		);
+		return atMostOne(query, rows);
 	}
 
 	/** The whole query as one node. */

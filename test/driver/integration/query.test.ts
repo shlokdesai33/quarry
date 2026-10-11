@@ -11,7 +11,7 @@ import {
 	CheckViolation,
 } from '../../../src/driver/errors.js';
 import type { Notice } from '../../../src/driver/notice.js';
-import { quarryTypes } from '../../../src/driver/quarry-types.js';
+import { quarryTypes } from '../../../src/decode.js';
 import { oids, rawTypes } from '../../../src/driver/types.js';
 import { noPg, open, rejection, table } from './helpers.js';
 

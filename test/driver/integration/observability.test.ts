@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { PostgresError, UniqueViolation } from '../../../src/driver/errors.js';
 import { createPool } from '../../../src/driver/pool.js';
-import { pgExecutor } from '../../../src/driver/quarry.js';
+import { DriverExecutor } from '../../../src/driver-executor.js';
 import type { SpanLike, TracerLike } from '../../../src/driver/telemetry.js';
 import { cluster, noPg, open, options, rejection } from './helpers.js';
 
@@ -85,7 +85,7 @@ describe.skipIf(noPg)('OpenTelemetry spans', () => {
 	it('names spans after quarry tags, and does not trace the statements behind a timeout', async () => {
 		const { tracer, spans } = recordingTracer();
 		await using pool = createPool({ ...options(), telemetry: { tracer } });
-		const executor = pgExecutor(pool, { catalog: false });
+		const executor = new DriverExecutor(pool, { catalog: false });
 		await executor.execute(
 			{ sql: 'select 1', params: [], tag: 'health.check' },
 			{ timeout: '5s' },

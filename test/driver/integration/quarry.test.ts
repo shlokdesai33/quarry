@@ -1,3 +1,4 @@
+/* oxlint-disable no-await-in-loop -- tests run their steps in order */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
 	array,
@@ -12,45 +13,39 @@ import {
 	tstzrange,
 	vector,
 } from '../../../src/column-factories.js';
-import { database } from '../../../src/database.js';
+import { database, type Database } from '../../../src/database.js';
 import { defineEnum } from '../../../src/define-enum.js';
 import { defineTable } from '../../../src/define-table.js';
-import { NoRowError } from '../../../src/executor.js';
-import {
-	DriverError,
-	QueryCanceled,
-	UniqueViolation,
-} from '../../../src/driver/errors.js';
+import type { QueryEvent } from '../../../src/driver-executor.js';
 import { createPool, type Pool } from '../../../src/driver/pool.js';
-import { pgExecutor, type QueryEvent } from '../../../src/driver/quarry.js';
+import { QueryCanceled, UniqueViolation } from '../../../src/driver/errors.js';
+import { NoRowError, RowCountError } from '../../../src/executor.js';
 import { noPg, options, pg, rejection, table } from './helpers.js';
 
 const mood = defineEnum('quarry_mood', ['happy', 'sad']);
 // quarry refers to columns by table name, so the tables keep plain names
 // inside a schema of their own
 const schema = table('quarry');
-const usersName = 'users';
-const postsName = 'posts';
 
-const users = defineTable(usersName, {
+const users = defineTable('users', {
 	columns: {
 		id: integer().identity(),
 		firstName: text().name('first_name').nullable(),
 		email: text(),
-		admin: boolean(),
-		balance: decimal(),
-		visits: bigint(),
-		roles: array(text()),
-		moods: array(mood()),
-		settings: jsonb<{ theme: string }>(),
-		createdAt: timestamptz().name('created_at'),
-		active: daterange(),
-		window: tstzrange(),
+		admin: boolean().default(),
+		balance: decimal().default(),
+		visits: bigint().default(),
+		roles: array(text()).default(),
+		moods: array(mood()).default(),
+		settings: jsonb<{ theme: string }>().default(),
+		createdAt: timestamptz().name('created_at').default(),
+		active: daterange().default(),
+		window: tstzrange().default(),
 		embedding: vector().nullable(),
 	},
 });
 
-const posts = defineTable(postsName, {
+const posts = defineTable('posts', {
 	columns: {
 		id: integer().identity(),
 		userId: integer().name('user_id'),
@@ -58,15 +53,16 @@ const posts = defineTable(postsName, {
 	},
 });
 
-const sql = (query: string, params: unknown[] = []) => ({ sql: query, params });
+/** A view that sleeps, so a select can run long enough to cancel. */
+const slow = defineTable('slow', { columns: { done: text() } });
 
 // the fixture uses pgvector; the suite is skipped where it isn't installed
 describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
-	'quarry adapter',
+	'quarry on the driver',
 	() => {
 		let pool: Pool;
+		let db: Database;
 		const events: QueryEvent[] = [];
-		const executor = () => pgExecutor(pool, { onQuery: (e) => events.push(e) });
 
 		beforeAll(async () => {
 			pool = createPool({
@@ -74,53 +70,60 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				max: 4,
 				params: { search_path: `${schema},public` },
 			});
+			db = database(pool, { onQuery: (e) => events.push(e) });
 			await pool.simpleQuery(`
 			create extension if not exists vector;
 			create schema ${schema};
 			create type quarry_mood as enum ('happy', 'sad');
-			create table ${usersName} (
+			create table users (
 				id int generated always as identity primary key,
-				first_name text, email text unique not null, admin boolean not null,
-				balance numeric not null, visits bigint not null, roles text[] not null,
-				moods quarry_mood[] not null, settings jsonb not null, created_at timestamptz not null,
-				active daterange not null, "window" tstzrange not null, embedding vector(3)
+				first_name text, email text unique not null, admin boolean not null default false,
+				balance numeric not null default 0, visits bigint not null default 0, roles text[] not null default '{}',
+				moods quarry_mood[] not null default '{}', settings jsonb not null default '{"theme":"light"}',
+				created_at timestamptz not null default now(), active daterange not null default 'empty',
+				"window" tstzrange not null default '(,)', embedding vector(3)
 			);
-			create table ${postsName} (id int generated always as identity primary key, user_id int not null, title text not null);
+			create table posts (id int generated always as identity primary key, user_id int not null, title text not null);
+			create view slow as select pg_sleep(2)::text as done;
 		`);
-			await pool.query(
-				`insert into ${usersName} (first_name, email, admin, balance, visits, roles, moods, settings, created_at, active, "window", embedding)
-			 values ($1, $2, true, '12345678901234567890.5', 9007199254740993, $3, $4, $5, $6, '[2024-01-01,2024-02-01)', $7, '[1,2.5,3]'),
-			        (null, 'b@x', false, '0', 1, '{}', '{}', '{"theme":"light"}', '2024-06-01 00:00:00+00', 'empty', '(,)', null)`,
-				[
-					'Ada',
-					'a@x',
-					['admin', 'a,b "q"'],
-					['happy', 'sad'],
-					{ theme: 'dark' },
-					new Date(Date.UTC(2024, 0, 2, 3, 4, 5, 678)),
-					'["2024-01-01 00:00:00+00","2024-01-02 12:00:00+00")',
-				],
-			);
-			await pool.query(
-				`insert into ${postsName} (user_id, title) values (1, 'first'), (1, 'second')`,
-			);
 		});
 
 		afterAll(async () => {
 			await pool
-				?.query(`drop table if exists ${usersName}, ${postsName}`)
+				?.query(`drop schema if exists ${schema} cascade`)
 				.catch(() => {});
 			await pool?.end();
 		});
 
-		it('decodes rows to the TypeScript types quarry declares', async () => {
-			const db = database(executor());
-			const row = await db
-				.selectFrom(users)
-				.select([
+		it('inserts with returning, decoding to the TypeScript types quarry declares', async () => {
+			const ada = await db
+				.insertInto(users)
+				.values({
+					firstName: 'Ada',
+					email: 'a@x',
+					admin: true,
+					balance: '12345678901234567890.5',
+					visits: '9007199254740993',
+					roles: ['admin', 'a,b "q"'],
+					moods: ['happy', 'sad'],
+					settings: { theme: 'dark' },
+					createdAt: new Date(Date.UTC(2024, 0, 2, 3, 4, 5, 678)),
+					active: {
+						empty: false,
+						lower: '2024-01-01',
+						upper: '2024-02-01',
+						bounds: '[)',
+					},
+					window: {
+						empty: false,
+						lower: new Date(Date.UTC(2024, 0, 1)),
+						upper: new Date(Date.UTC(2024, 0, 2, 12)),
+						bounds: '[)',
+					},
+					embedding: [1, 2.5, 3],
+				})
+				.returning([
 					'users.id',
-					'users.firstName',
-					'users.admin',
 					'users.balance',
 					'users.visits',
 					'users.roles',
@@ -131,12 +134,9 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					'users.window',
 					'users.embedding',
 				])
-				.where('users.email', 'a@x')
 				.one();
-			expect(row).toEqual({
+			expect(ada).toEqual({
 				id: 1,
-				firstName: 'Ada',
-				admin: true,
 				balance: '12345678901234567890.5',
 				visits: '9007199254740993',
 				roles: ['admin', 'a,b "q"'],
@@ -157,26 +157,93 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				},
 				embedding: [1, 2.5, 3],
 			});
-			const other = await db
-				.selectFrom(users)
-				.select([
-					'users.active',
-					'users.window',
-					'users.moods',
-					'users.embedding',
+			// several rows go through unnest
+			const many = await db
+				.insertInto(users)
+				.values([
+					{ firstName: null, email: 'b@x', embedding: null },
+					{ firstName: 'Cy', email: 'c@x', embedding: null },
 				])
-				.where('users.email', 'b@x')
-				.one();
-			expect(other).toEqual({
-				active: { empty: true },
-				window: { empty: false, lower: null, upper: null, bounds: '()' },
-				moods: [],
-				embedding: null,
-			});
+				.returning(['users.email', 'users.active', 'users.window'])
+				.all();
+			expect(many).toEqual([
+				{
+					email: 'b@x',
+					active: { empty: true },
+					window: { empty: false, lower: null, upper: null, bounds: '()' },
+				},
+				{
+					email: 'c@x',
+					active: { empty: true },
+					window: { empty: false, lower: null, upper: null, bounds: '()' },
+				},
+			]);
+			await db
+				.insertInto(posts)
+				.values([
+					{ userId: 1, title: 'first' },
+					{ userId: 1, title: 'second' },
+				])
+				.execute();
 		});
 
-		it('runs joins, first, maybeOne and one with quarry semantics', async () => {
-			const db = database(executor());
+		it('upserts, updates, updates many and deletes', async () => {
+			const merged = await db
+				.insertInto(users)
+				.values({ email: 'a@x', firstName: 'Ada Lovelace', embedding: null })
+				.onConflict('email')
+				.merge(['firstName'])
+				.returning(['users.id', 'users.firstName'])
+				.one();
+			expect(merged).toEqual({ id: 1, firstName: 'Ada Lovelace' });
+			expect(
+				await db
+					.insertInto(users)
+					.values({ email: 'a@x', firstName: null, embedding: null })
+					.onConflict('email')
+					.doNothing()
+					.execute(),
+			).toEqual({
+				rowCount: 0,
+			});
+			const updated = await db
+				.update(users)
+				.set({ visits: '42' })
+				.where('users.email', 'b@x')
+				.returning(['users.visits'])
+				.one();
+			expect(updated).toEqual({ visits: '42' });
+			expect(
+				await db
+					.updateMany(
+						users,
+						[
+							{ id: 2, firstName: 'Bea' },
+							{ id: 3, firstName: 'Cyd' },
+						],
+						{ by: 'id' },
+					)
+					.returning(['users.firstName'])
+					.all(),
+			).toEqual(
+				expect.arrayContaining([{ firstName: 'Bea' }, { firstName: 'Cyd' }]),
+			);
+			const removed = await db
+				.deleteFrom(posts)
+				.where('posts.title', 'second')
+				.returning(['posts.title'])
+				.all();
+			expect(removed).toEqual([{ title: 'second' }]);
+			await expect(
+				db
+					.deleteFrom(posts)
+					.where('posts.title', 'nope')
+					.expectRows(1)
+					.execute(),
+			).rejects.toBeInstanceOf(RowCountError);
+		});
+
+		it('selects with joins and quarry’s result semantics', async () => {
 			const titles = await db
 				.selectFrom(users)
 				.innerJoin(posts)
@@ -184,17 +251,7 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				.select(['users.email', 'posts.title'])
 				.where('users.admin', true)
 				.all();
-			expect(titles.map((t) => t.title).toSorted()).toEqual([
-				'first',
-				'second',
-			]);
-			expect(
-				await db
-					.selectFrom(users)
-					.select(['users.id'])
-					.where('users.email', 'nobody')
-					.maybeOne(),
-			).toBeUndefined();
+			expect(titles).toEqual([{ email: 'a@x', title: 'first' }]);
 			await expect(
 				db
 					.selectFrom(users)
@@ -210,195 +267,175 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 			expect(first).toEqual({ email: 'a@x' });
 		});
 
-		it('passes the tag, timings and row count to onQuery', async () => {
-			events.length = 0;
-			await database(executor())
+		it('streams rows and describes queries', async () => {
+			const emails: string[] = [];
+			for await (const row of db
+				.selectFrom(users)
+				.select(['users.email'])
+				.stream({ batchSize: 1 }))
+				emails.push(row.email);
+			expect(emails.toSorted()).toEqual(['a@x', 'b@x', 'c@x']);
+			for await (const _ of db
 				.selectFrom(users)
 				.select(['users.id'])
-				.tag('users.ids')
-				.all();
-			const event = events.find((e) => e.tag === 'users.ids');
-			expect(event).toMatchObject({
-				kind: 'execute',
-				command: 'SELECT',
-				rowCount: 2,
-				error: undefined,
-			});
-			expect(event?.sql).toContain('select "');
-			expect(event?.durationMs).toBeGreaterThan(0);
-			expect(event?.durationMs).toBeGreaterThanOrEqual(
-				(event?.phases.execMs ?? 0) - 0.5,
-			);
-			expect(event?.phases.acquireMs).toBeGreaterThanOrEqual(0);
-		});
-
-		it('maps errors to typed classes carrying the query, tag and the caller’s stack', async () => {
-			events.length = 0;
-			const ex = executor();
-			const error = await rejection(
-				ex.execute({
-					...sql(
-						`insert into ${postsName} (id, user_id, title) overriding system value values (1, 1, 'dup')`,
-					),
-					tag: 'posts.insert',
-				}),
-				UniqueViolation,
-			);
-			expect(error.query?.tag).toBe('posts.insert');
-			expect(error.constraint).toBe(`${postsName}_pkey`);
-			expect(error.stack).toContain('query issued at');
-			expect(error.stack).toContain('quarry.test.ts');
-			expect(events.at(-1)?.error).toBe(error);
-		});
-
-		it('returns raw text for opted-in types', async () => {
-			const raw = database(
-				pgExecutor(pool, { raw: ['timestamptz', 'daterange', 'vector'] }),
-			);
-			const row = await raw
+				.stream({ timeout: '5s' }))
+				break;
+			const description = await db
 				.selectFrom(users)
-				.select([
-					'users.createdAt',
-					'users.active',
-					'users.embedding',
-					'users.id',
-				])
-				.where('users.email', 'a@x')
-				.one();
-			expect(row).toEqual({
-				createdAt: '2024-01-02 03:04:05.678+00',
-				active: '[2024-01-01,2024-02-01)',
-				embedding: '[1,2.5,3]',
-				id: 1,
-			});
-			const allRaw = await pgExecutor(pool, { raw: true }).execute(
-				sql('select 1 as one, array[1] as a'),
-			);
-			expect(allRaw.rows).toEqual([{ one: '1', a: '{1}' }]);
-		});
-
-		it('returns positional rows', async () => {
-			const result = await executor().execute(sql('select 1 as a, 2 as a'), {
-				rowMode: 'array',
-			});
-			expect(result.rows).toEqual([[1, 2]]);
+				.select(['users.id', 'users.email'])
+				.where('users.email', 'x')
+				.describe();
+			expect(description.params).toEqual([25]);
+			expect(description.columns.map((c) => [c.name, c.typeOid])).toEqual([
+				['id', 23],
+				['email', 25],
+			]);
 		});
 
 		it('cancels with a signal and times out on the server', async () => {
 			const controller = new AbortController();
-			const ex = executor().with({ signal: controller.signal });
 			const running = rejection(
-				ex.execute(sql('select pg_sleep(10)')),
+				db
+					.selectFrom(slow)
+					.select(['slow.done'])
+					.all({ signal: controller.signal }),
 				QueryCanceled,
 			);
 			setTimeout(() => controller.abort(), 100);
 			expect((await running).reason).toBe('abort');
 			const timedOut = await rejection(
-				executor().execute(sql('select pg_sleep(10)'), { timeout: '100ms' }),
+				db.selectFrom(slow).select(['slow.done']).all({ timeout: '100ms' }),
 				QueryCanceled,
 			);
 			expect(timedOut.reason).toBe('statement_timeout');
 		});
 
-		it('streams in batches', async () => {
-			const sizes: number[] = [];
-			for await (const batch of executor().stream(
-				sql('select generate_series(1, 2500) as n'),
-				{ batchSize: 1000 },
-			))
-				sizes.push(batch.length);
-			expect(sizes).toEqual([1000, 1000, 500]);
-			expect(events.at(-1)).toMatchObject({ kind: 'stream', rowCount: 2500 });
-			await expect(async () => {
-				for await (const _ of executor().stream(sql('select 1'), {
-					timeout: 100,
-				})) {
-					// needs a transaction
-				}
-			}).rejects.toBeInstanceOf(DriverError);
-		});
-
-		it('describes a query without running it', async () => {
-			const description = await executor().describe(
-				sql(`select "id", "email" from ${usersName} where "email" = $1`),
+		it('reports tags and timings to onQuery, and enriches errors', async () => {
+			events.length = 0;
+			await db.selectFrom(users).select(['users.id']).tag('users.ids').all();
+			expect(events.find((e) => e.tag === 'users.ids')).toMatchObject({
+				kind: 'execute',
+				command: 'SELECT',
+				rowCount: 3,
+				error: undefined,
+			});
+			const error = await rejection(
+				db
+					.insertInto(users)
+					.values({ email: 'a@x', firstName: null, embedding: null })
+					.tag('users.create')
+					.execute(),
+				UniqueViolation,
 			);
-			expect(description.params).toEqual([25]);
-			expect(
-				description.columns.map((c) => [c.name, c.typeOid, c.columnNumber > 0]),
-			).toEqual([
-				['id', 23, true],
-				['email', 25, true],
-			]);
+			expect(error.query?.tag).toBe('users.create');
+			expect(error.columns).toEqual(['email']);
+			expect(error.stack).toContain('query issued at');
+			expect(error.stack).toContain('quarry.test.ts');
+			expect(events.at(-1)?.error).toBe(error);
 		});
 
-		it('runs transactions with savepoints, after-commit hooks and settings', async () => {
-			const ex = executor();
+		it('runs transactions with savepoints, settings and after-commit hooks', async () => {
 			const committed: string[] = [];
-			const row = await ex.transaction(
+			const titles = await db.transaction(
 				async (tx) => {
-					await tx.execute(
-						sql(`insert into ${postsName} (user_id, title) values (1, 'tx')`),
-					);
+					await tx
+						.insertInto(posts)
+						.values({ userId: 1, title: 'tx' })
+						.execute();
 					tx.afterCommit(() => committed.push('done'));
 					await expect(
 						tx.transaction(async (inner) => {
 							inner.afterCommit(() => committed.push('dropped'));
-							await inner.execute(
-								sql(
-									`insert into ${postsName} (user_id, title) values (1, 'rolled back')`,
-								),
-							);
-							await inner.execute(sql('select pg_sleep(1)'), { timeout: 50 });
+							await inner
+								.insertInto(posts)
+								.values({ userId: 1, title: 'rolled back' })
+								.execute();
+							await inner
+								.deleteFrom(posts)
+								.where('posts.title', 'missing')
+								.expectRows(1)
+								.execute();
 						}),
-					).rejects.toBeInstanceOf(QueryCanceled);
-					const tenant = await tx.execute(
-						sql("select current_setting('app.tenant') as t"),
+					).rejects.toBeInstanceOf(RowCountError);
+					await tx.setLocal('app.user', 7);
+					return (await tx.selectFrom(posts).select(['posts.title']).all()).map(
+						(r) => r.title,
 					);
-					expect(tenant.rows).toEqual([{ t: 'acme' }]);
-					return database(tx)
-						.selectFrom(posts)
-						.select(['posts.title'])
-						.where('posts.userId', 1)
-						.all();
 				},
-				{ settings: { 'app.tenant': 'acme' }, isolation: 'repeatable read' },
+				{
+					isolation: 'repeatable read',
+					settings: { 'app.tenant': 'acme' },
+					timeout: '5s',
+				},
 			);
-			expect(row.map((r) => r.title)).toContain('tx');
-			expect(row.map((r) => r.title)).not.toContain('rolled back');
+			expect(titles.toSorted()).toEqual(['first', 'tx']);
 			expect(committed).toEqual(['done']);
-
 			await expect(
-				ex.transaction(async (tx) => {
-					await tx.execute(
-						sql(
-							`insert into ${postsName} (user_id, title) values (1, 'never')`,
-						),
-					);
-					tx.afterCommit(() => committed.push('never'));
+				db.transaction(async (tx) => {
+					await tx
+						.insertInto(posts)
+						.values({ userId: 1, title: 'never' })
+						.execute();
 					throw new Error('rollback');
 				}),
 			).rejects.toThrow('rollback');
-			const never = await database(ex)
-				.selectFrom(posts)
-				.select(['posts.id'])
-				.where('posts.title', 'never')
-				.maybeOne();
-			expect(never).toBeUndefined();
-			expect(committed).toEqual(['done']);
-			expect(() => ex.afterCommit(() => {})).toThrow(
-				/not inside a transaction/,
+			expect(
+				await db
+					.selectFrom(posts)
+					.select(['posts.id'])
+					.where('posts.title', 'never')
+					.maybeOne(),
+			).toBeUndefined();
+		});
+
+		it('leaves opted-in types as text', async () => {
+			const raw = database(pool, {
+				raw: ['timestamptz', 'daterange', 'vector'],
+			});
+			const row = await raw
+				.selectFrom(users)
+				.select(['users.createdAt', 'users.active', 'users.embedding'])
+				.where('users.id', 1)
+				.one();
+			expect(row).toEqual({
+				createdAt: '2024-01-02 03:04:05.678+00',
+				active: '[2024-01-01,2024-02-01)',
+				embedding: '[1,2.5,3]',
+			});
+		});
+
+		it('verifies the schema through the driver', async () => {
+			const report = await db.verify([users, posts]);
+			expect(report.diagnostics.filter((d) => d.severity === 'error')).toEqual(
+				[],
 			);
 		});
 
-		it('creates and closes its own pool from options', async () => {
-			await using ex = pgExecutor({
+		it('opens and closes its own pool from options or a connection string', async () => {
+			await using own = database({
 				...options(),
 				max: 1,
 				params: { search_path: schema },
 			});
-			expect((await ex.execute(sql('select 41 + 1 as n'))).rows).toEqual([
-				{ n: 42 },
-			]);
+			expect(
+				await own
+					.selectFrom(posts)
+					.select(['posts.title'])
+					.where('posts.title', 'first')
+					.one(),
+			).toEqual({ title: 'first' });
+			const c = pg;
+			if (c === null) return;
+			const url = `postgres://${c.users.trust.user}@${c.host}:${c.port}/${c.database}?sslmode=disable&search_path=${schema}`;
+			const fromUrl = database(url);
+			expect(
+				await fromUrl
+					.selectFrom(users)
+					.select(['users.email'])
+					.where('users.id', 1)
+					.one(),
+			).toEqual({ email: 'a@x' });
+			await fromUrl.close();
 		});
 	},
 );

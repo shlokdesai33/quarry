@@ -16,7 +16,7 @@ import { pipeline } from 'node:stream/promises';
 import { Pool as PgPool } from 'pg';
 import postgres from 'postgres';
 import { createPool } from '../../src/driver/pool.ts';
-import { quarryTypes } from '../../src/driver/quarry-types.ts';
+import { quarryTypes } from '../../src/decode.ts';
 import { copyChunks } from '../../src/driver/types.ts';
 import { findBinDir, startCluster } from '../../test/driver/setup/cluster.ts';
 

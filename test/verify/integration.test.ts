@@ -33,7 +33,8 @@ import {
 	varchar,
 } from '../../src/column-factories.js';
 import type { CompiledQuery } from '../../src/compile.js';
-import { database } from '../../src/database.js';
+import { databaseWith } from '../../src/database.js';
+import { executorFrom } from '../helpers/executor.js';
 import { defineEnum } from '../../src/define-enum.js';
 import { defineTable } from '../../src/define-table.js';
 import type { Executor } from '../../src/executor.js';
@@ -57,12 +58,12 @@ async function verify(
 	executor: Executor = db.executor,
 ) {
 	const queries: CompiledQuery[] = [];
-	const report = await database({
-		execute: (query) => {
+	const report = await databaseWith(
+		executorFrom((query) => {
 			queries.push(query);
 			return executor.execute(query);
-		},
-	}).verify(tables, options);
+		}),
+	).verify(tables, options);
 	expect(queries).toHaveLength(tables.length === 0 ? 0 : 1);
 	return report;
 }
@@ -442,9 +443,9 @@ describe.skipIf(!postgresAvailable)('db.verify against PostgreSQL', () => {
 		});
 		try {
 			const textual = await verify(driftSchema, undefined, {
-				execute: async ({ sql, params }) => ({
+				...executorFrom(async ({ sql, params }) => ({
 					rows: (await textPool.query(sql, [...params])).rows,
-				}),
+				})),
 			});
 			const parsed = await verify(driftSchema);
 			expect(withoutDuration(textual)).toEqual(withoutDuration(parsed));
@@ -464,9 +465,9 @@ describe.skipIf(!postgresAvailable)('db.verify against PostgreSQL', () => {
 				[defineTable('readonly_t', { columns: { a: text() } })],
 				undefined,
 				{
-					execute: async ({ sql, params }) => ({
+					...executorFrom(async ({ sql, params }) => ({
 						rows: (await readOnly.query(sql, [...params])).rows,
-					}),
+					})),
 				},
 			);
 			expect(report.ok).toBe(true);

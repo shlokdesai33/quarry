@@ -157,6 +157,8 @@ export type SetNode = {
  */
 export type RowsNode = {
 	readonly columns: readonly string[];
+	/** The columns' SQL types as DDL writes them, for `unnest`'s array casts. */
+	readonly types: readonly string[];
 	readonly rows: readonly (readonly (OperationNode | undefined)[])[];
 	readonly strategy: 'values' | 'unnest';
 };
@@ -193,7 +195,7 @@ type WriteNode = {
 	readonly tag: string | undefined;
 };
 
-/** An `insert` query. Recorded only: `compile` doesn't render it yet. */
+/** An `insert` query. */
 export type InsertNode = WriteNode & {
 	readonly kind: 'insert';
 	readonly values: RowsNode;
@@ -201,7 +203,7 @@ export type InsertNode = WriteNode & {
 };
 
 /**
- * An `update` query. Recorded only: `compile` doesn't render it yet. `many`
+ * An `update` query. `many`
  * is the rows of an `updateMany`, matched to the table's by the `by`
  * columns. `allRows` is set by `allRows()`, which stands in for `where`.
  */
@@ -213,7 +215,7 @@ export type UpdateNode = WriteNode & {
 	readonly allRows: boolean;
 };
 
-/** A `delete` query. Recorded only: `compile` doesn't render it yet. */
+/** A `delete` query. */
 export type DeleteNode = WriteNode & {
 	readonly kind: 'delete';
 	readonly where: OperationNode | undefined;

@@ -7,7 +7,8 @@ import {
 	tsvector,
 } from '../src/column-factories.js';
 import type { DataType } from '../src/data-type/data-type.js';
-import { database } from '../src/database.js';
+import { databaseWith } from '../src/database.js';
+import { fakeExecutor } from './helpers/executor.js';
 import { defineTable } from '../src/define-table.js';
 import {
 	type DeleteQueryBuilder,
@@ -264,7 +265,7 @@ describe('update', () => {
 	});
 
 	it('type-checks an optimistic lock', () => {
-		const db = database({ execute: async () => ({ rows: [] }) });
+		const db = databaseWith(fakeExecutor().executor);
 		const save = (id: number, version: number, body: string) =>
 			db
 				.update(docs)
@@ -357,7 +358,7 @@ describe('deleteFrom', () => {
 });
 
 describe('database', () => {
-	const db = database({ execute: async () => ({ rows: [] }) });
+	const db = databaseWith(fakeExecutor().executor);
 
 	it('starts each kind of query', () => {
 		expectTypeOf(db.insertInto(users)).toEqualTypeOf<

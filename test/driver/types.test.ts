@@ -3,9 +3,8 @@ import {
 	catalogTypes,
 	parseRange,
 	parseTimestamptz,
-	quarryTypes,
-} from '../../src/driver/quarry-types.js';
-import { executorTypes } from '../../src/driver/quarry.js';
+} from '../../src/driver/parsers.js';
+import { initialTypes, quarryTypes } from '../../src/decode.js';
 import { parseTag } from '../../src/driver/ops.js';
 import {
 	arrayLiteral,
@@ -209,14 +208,14 @@ describe('quarry parsers', () => {
 	});
 
 	it('removes raw types and their arrays', () => {
-		const parsers = executorTypes({ raw: ['timestamptz', oids.int4] });
+		const parsers = initialTypes(undefined, ['timestamptz', oids.int4]);
 		expect(parsers[oids.timestamptz]).toBeUndefined();
 		expect(parsers[1185]).toBeUndefined();
 		expect(parsers[oids.int4]).toBeUndefined();
 		expect(parsers[oids.bool]).toBeDefined();
-		expect(executorTypes({ raw: true })).toEqual({});
-		expect(executorTypes({ types: defaultTypes })[oids.int8]?.('5')).toBe(5n);
-		expect(executorTypes({})[oids.int8]).toBeUndefined();
+		expect(initialTypes(undefined, true)).toEqual({});
+		expect(initialTypes(defaultTypes, undefined)[oids.int8]?.('5')).toBe(5n);
+		expect(initialTypes(undefined, undefined)[oids.int8]).toBeUndefined();
 	});
 });
 

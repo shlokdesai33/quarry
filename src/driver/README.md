@@ -150,25 +150,23 @@ await pool.transaction(async (tx) => {
 
 ## With quarry
 
+quarry uses this driver by default; you don't need to touch it directly:
+
 ```ts
 import { database } from 'quarry';
-import { createPool, pgExecutor } from 'quarry/driver';
 
-const executor = pgExecutor(createPool(process.env.DATABASE_URL), {
-	onQuery: (e) => log(e),
+const db = database(process.env.DATABASE_URL, { onQuery: (e) => log(e) });
+const user = await db
+	.selectFrom(users)
+	.where('users.id', id)
+	.one({ signal: request.signal, timeout: '2s' });
+await db.transaction(async (tx) => {
+	await tx.insertInto(orders).values(order).execute();
+	tx.afterCommit(() => queue.publish('order.created'));
 });
-const db = database(executor);
-await executor.transaction(async (tx) =>
-	database(tx).selectFrom(users).where('users.id', id).one(),
-);
-database(executor.with({ signal: request.signal, timeout: '2s' }));
 ```
 
-The executor:
-
-- Decodes values to the TypeScript types quarry's columns declare (`quarryTypes`): int8/numeric as strings, timestamptz as `Date`, ranges as `Range`, pgvector as `number[]`. Enum and extension arrays are resolved once from `pg_type`.
-- `raw: true` or `raw: ['timestamptz', …]` leaves values as text for codecs.
-- `onQuery` reports SQL, tag, row count, error and timings (acquire, queue, exec).
+`database()` also takes a pool, client or connection from this module, or driver options. quarry decodes values to the TypeScript types its columns declare, reports `onQuery` events, and adds the query, tag and caller's stack to errors. All of that lives in quarry; this module knows nothing about quarry.
 
 ## Development
 
