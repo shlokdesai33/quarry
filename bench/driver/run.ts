@@ -6,8 +6,11 @@
  *
  * Without `--url` it starts a throwaway cluster with the test harness
  * (PG_VERSION / PG_BIN pick the server). Prints a markdown table of the
- * median of `--runs` runs per scenario.
+ * median of `--runs` runs per scenario. Under Bun it adds `Bun.sql`; with
+ * `PG_NATIVE_FROM=<dir>` (a directory where `pg` and `pg-native` are
+ * installed and built) it adds pg-native.
  */
+import { createRequire } from 'node:module';
 import { Pool as PgPool } from 'pg';
 import postgres from 'postgres';
 import { createPool } from '../../src/driver/pool.ts';
@@ -72,6 +75,19 @@ function adapters(url: string): Adapter[] {
 			end: () => sql.end(),
 		},
 	];
+	// pg-native (libpq), from wherever it was built: it needs a native toolchain
+	const nativeFrom = process.env['PG_NATIVE_FROM'];
+	if (nativeFrom !== undefined) {
+		const NativePool = createRequire(`${nativeFrom}/`)('pg').native
+			.Pool as typeof PgPool;
+		const nativePool = new NativePool({ connectionString: url, max: POOL });
+		all.push({
+			name: 'pg-native',
+			query: async (text, params = []) =>
+				(await nativePool.query(text, params)).rows,
+			end: () => nativePool.end(),
+		});
+	}
 	// Bun's built-in client, when running under Bun
 	const bun: unknown = Reflect.get(globalThis, 'Bun');
 	if (bun !== undefined) {
