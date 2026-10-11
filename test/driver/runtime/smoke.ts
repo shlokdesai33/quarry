@@ -6,7 +6,7 @@
  *
  *   node --import ./bench/driver/register.mjs test/driver/runtime/smoke.ts [info.json]
  *   bun test/driver/runtime/smoke.ts [info.json]
- *   deno run -A --sloppy-imports test/driver/runtime/smoke.ts [info.json]
+ *   deno run -A --sloppy-imports --no-lock test/driver/runtime/smoke.ts [info.json]
  *
  * Exits non-zero if any check fails.
  */

@@ -107,4 +107,4 @@ export const activeUserContacts = selectFrom(User)
 	.pipe(withPhone)
 	.select(['users.id'])
 	.when(true, (qb) => qb.select(['employees.email']))
-	.one();
+	.one()
