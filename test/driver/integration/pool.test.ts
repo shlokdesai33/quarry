@@ -245,6 +245,72 @@ describe.skipIf(noPg)('pool', () => {
 		expect(p.stats).toMatchObject({ total: 4, idle: 4, busy: 0, waiting: 0 });
 	});
 
+	it('pipelines queries onto shared connections once the pool is full', async () => {
+		await using p = pool({ max: 2, pipeline: 50 });
+		await Promise.all([p.query('select 1'), p.query('select 1')]);
+		// the second connection may still be opening after both queries ran
+		while (p.stats.idle < 2) await sleep(5);
+		let maxWaiting = 0;
+		const run = (count: number) =>
+			Promise.allSettled(
+				Array.from({ length: count }, (_, i) => {
+					const q =
+						i % 25 === 7
+							? p.query('select 1/0')
+							: p.query<{ v: number }>('select $1::int as v', [i]);
+					maxWaiting = Math.max(maxWaiting, p.stats.waiting);
+					return q;
+				}),
+			);
+		// up to 2 × 50 in flight: nobody waits
+		const results = await run(100);
+		expect(maxWaiting).toBe(0);
+		results.forEach((r, i) => {
+			if (i % 25 === 7) expect(r.status).toBe('rejected');
+			else
+				expect(r.status === 'fulfilled' && r.value.rows[0]).toEqual({ v: i });
+		});
+		// beyond that, the rest wait their turn and still complete
+		const more = await run(300);
+		expect(maxWaiting).toBe(200);
+		expect(more.filter((r) => r.status === 'fulfilled')).toHaveLength(288);
+		expect(p.stats).toMatchObject({ total: 2, busy: 0, idle: 2 });
+	});
+
+	it('gives every query its own connection with pipeline: false', async () => {
+		await using p = pool({ max: 1, pipeline: false });
+		await p.query('select 1');
+		let maxWaiting = 0;
+		await Promise.all(
+			Array.from({ length: 20 }, () => {
+				const q = p.query('select 1');
+				maxWaiting = Math.max(maxWaiting, p.stats.waiting);
+				return q;
+			}),
+		);
+		expect(maxWaiting).toBeGreaterThan(0);
+	});
+
+	it('lets a waiting acquire in while queries are being pipelined', async () => {
+		await using p = pool({ max: 1 });
+		await p.query('select 1');
+		const busy = Array.from({ length: 10 }, () =>
+			p.query('select pg_sleep(0.02)'),
+		);
+		const client = p.acquire();
+		const later = p.query('select 2 as x');
+		const order: string[] = [];
+		await Promise.all([
+			client.then((c) => {
+				order.push('acquired');
+				return c.release();
+			}),
+			later.then(() => order.push('later query')),
+			...busy,
+		]);
+		expect(order).toEqual(['acquired', 'later query']);
+	});
+
 	it('times out, aborts and limits waiting acquires', async () => {
 		await using p = pool({ max: 1, acquireTimeout: 100, maxWaiting: 1 });
 		await using held = await p.acquire();

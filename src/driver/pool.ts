@@ -26,6 +26,13 @@ export interface PoolOptions extends ConnectionOptions {
 	readonly acquireTimeout?: number | undefined;
 	/** The most callers waiting for a connection before `acquire` fails fast (default unlimited). */
 	readonly maxWaiting?: number | undefined;
+	/**
+	 * Once every connection is in use, `query`, `simpleQuery` and `describe`
+	 * share connections, pipelining up to this many queries on each (default
+	 * 50; 0 or false to give every query a connection to itself). Reserved
+	 * clients, transactions, cursors and COPY always get their own.
+	 */
+	readonly pipeline?: number | false | undefined;
 	/** Runs on each new connection before it is used, e.g. to set session state. */
 	readonly onConnect?:
 		| ((connection: Connection) => Promise<void> | void)
@@ -162,6 +169,9 @@ export class Pool implements AsyncDisposable {
 	readonly #acquireTimeout: number;
 	readonly #maxWaiting: number;
 	readonly #onConnect: PoolOptions['onConnect'];
+	readonly #pipeline: number;
+	/** Queries in flight on each connection lent out for `query` (shareable). */
+	readonly #shared = new Map<Connection, number>();
 	readonly #idle: Idle[] = [];
 	readonly #busy = new Set<Connection>();
 	readonly #expiresAt = new WeakMap<Connection, number>();
@@ -181,6 +191,7 @@ export class Pool implements AsyncDisposable {
 		this.#acquireTimeout = o.acquireTimeout ?? 30_000;
 		this.#maxWaiting = o.maxWaiting ?? Number.POSITIVE_INFINITY;
 		this.#onConnect = o.onConnect;
+		this.#pipeline = o.pipeline === false ? 0 : (o.pipeline ?? 50);
 		if (this.#max < 1) throw new DriverError('max must be at least 1');
 		this.#fillMin();
 	}
@@ -240,6 +251,7 @@ export class Pool implements AsyncDisposable {
 			if (idle?.timer !== undefined) clearTimeout(idle.timer);
 		}
 		this.#busy.delete(connection);
+		this.#shared.delete(connection);
 		this.#serveWaiters();
 		this.#fillMin();
 	}
@@ -309,6 +321,23 @@ export class Pool implements AsyncDisposable {
 		}
 	}
 
+	/** An idle connection, marked busy, or undefined; most recently used first, so surplus connections time out. */
+	#takeIdle(): Connection | undefined {
+		if (this.#ended) return undefined;
+		while (this.#idle.length > 0) {
+			const idle = this.#idle.pop();
+			if (idle === undefined) break;
+			if (idle.timer !== undefined) clearTimeout(idle.timer);
+			if (idle.connection.closed || this.#expired(idle.connection)) {
+				void idle.connection.close();
+				continue;
+			}
+			this.#busy.add(idle.connection);
+			return idle.connection;
+		}
+		return undefined;
+	}
+
 	#take(signal?: AbortSignal): Promise<Connection> {
 		if (this.#ended)
 			return Promise.reject(new DriverError('The pool has ended'));
@@ -318,18 +347,8 @@ export class Pool implements AsyncDisposable {
 					cause: signal.reason,
 				}),
 			);
-		while (this.#idle.length > 0) {
-			// most recently used first, so surplus connections go idle and time out
-			const idle = this.#idle.pop();
-			if (idle === undefined) break;
-			if (idle.timer !== undefined) clearTimeout(idle.timer);
-			if (idle.connection.closed || this.#expired(idle.connection)) {
-				void idle.connection.close();
-				continue;
-			}
-			this.#busy.add(idle.connection);
-			return Promise.resolve(idle.connection);
-		}
+		const idle = this.#takeIdle();
+		if (idle !== undefined) return Promise.resolve(idle);
 		if (this.#waiters.length >= this.#maxWaiting) {
 			return Promise.reject(
 				new DriverError(
@@ -425,12 +444,67 @@ export class Pool implements AsyncDisposable {
 		}
 	}
 
+	/**
+	 * A connection already lent out for queries that can take one more: the
+	 * least loaded, and only once the pool is full and nobody is waiting for
+	 * a connection of their own.
+	 */
+	#pickShared(): Connection | undefined {
+		if (
+			this.#pipeline <= 1 ||
+			this.#idle.length > 0 ||
+			this.#waiters.length > 0 ||
+			this.#total() < this.#max
+		) {
+			return undefined;
+		}
+		let best: Connection | undefined;
+		let fewest = this.#pipeline;
+		for (const [connection, count] of this.#shared) {
+			if (
+				count < fewest &&
+				!connection.closed &&
+				connection.transactionStatus === 'idle' &&
+				!this.#expired(connection)
+			) {
+				best = connection;
+				fewest = count;
+			}
+		}
+		return best;
+	}
+
+	/** Runs `fn` on a shareable connection: pipelined onto a busy one when the pool is full. */
+	async #withShared<T>(
+		signal: AbortSignal | undefined,
+		fn: (connection: Connection) => Promise<T>,
+	): Promise<T> {
+		if (this.#pipeline <= 1) return this.#with(signal, fn);
+		// registered before any await, so queries issued in the same tick see it
+		const ready = signal?.aborted
+			? undefined
+			: (this.#pickShared() ?? this.#takeIdle());
+		const connection = ready ?? (await this.#take(signal));
+		this.#shared.set(connection, (this.#shared.get(connection) ?? 0) + 1);
+		try {
+			return await fn(connection);
+		} finally {
+			const left = (this.#shared.get(connection) ?? 1) - 1;
+			if (left > 0) {
+				this.#shared.set(connection, left);
+			} else {
+				this.#shared.delete(connection);
+				this.#release(connection, false);
+			}
+		}
+	}
+
 	query<R = Record<string, unknown>>(
 		sql: string,
 		params?: readonly unknown[],
 		options?: QueryOptions,
 	): Promise<QueryResult<R>> {
-		return this.#with(options?.signal, (connection) =>
+		return this.#withShared(options?.signal, (connection) =>
 			connection.query<R>(sql, params, options),
 		);
 	}
@@ -439,7 +513,7 @@ export class Pool implements AsyncDisposable {
 		sql: string,
 		options?: Pick<QueryOptions, 'rowMode' | 'types' | 'signal' | 'timeout'>,
 	): Promise<QueryResult<R>[]> {
-		return this.#with(options?.signal, (connection) =>
+		return this.#withShared(options?.signal, (connection) =>
 			connection.simpleQuery<R>(sql, options),
 		);
 	}
@@ -448,7 +522,7 @@ export class Pool implements AsyncDisposable {
 		sql: string,
 		options?: Pick<QueryOptions, 'paramTypes' | 'signal' | 'timeout'>,
 	): Promise<Description> {
-		return this.#with(options?.signal, (connection) =>
+		return this.#withShared(options?.signal, (connection) =>
 			connection.describe(sql, options),
 		);
 	}
