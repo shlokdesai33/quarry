@@ -6,7 +6,10 @@
 		"declarationMap": true,
 		"emitDeclarationOnly": true,
 		"outDir": "dist",
-		"rootDir": "src"
+		"rootDir": "src",
+		// AbortSignal, timers, WebCrypto and Symbol.asyncDispose; the tests pull
+		// these in for the main config
+		"types": ["node"]
 	},
 	"include": ["src"],
 	"exclude": ["**/*.test.ts", "**/*.test-d.ts"]
