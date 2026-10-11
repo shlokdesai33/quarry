@@ -51,6 +51,6 @@ export function formatTable(report: VerifyReport, terminal: Terminal): string {
 		}
 		return lines.join('\n');
 	});
-	blocks.push(formatSummary(report, paint, glyphs));
+	blocks.push(formatSummary(report, paint, glyphs, terminal.width));
 	return `${blocks.join('\n\n')}\n`;
 }

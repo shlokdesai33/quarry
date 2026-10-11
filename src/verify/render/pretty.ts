@@ -30,7 +30,7 @@ export function formatPretty(
 	const blocks = report.diagnostics.map((diagnostic) =>
 		formatDiagnostic(diagnostic, { terminal, paint, glyphs, read }),
 	);
-	blocks.push(formatSummary(report, paint, glyphs));
+	blocks.push(formatSummary(report, paint, glyphs, terminal.width));
 	return `${blocks.join('\n\n')}\n`;
 }
 
@@ -100,20 +100,34 @@ export function formatSummary(
 	report: VerifyReport,
 	paint: Paint,
 	glyphs: Glyphs,
+	width: number,
 ): string {
 	const { errors, warnings, infos, tables, columns, durationMs } =
 		report.summary;
 	const checked = `${plural(tables, 'table')}, ${plural(columns, 'column')} checked in ${Math.round(durationMs)}ms`;
 	const counts = [
-		errors > 0 && paint('red', plural(errors, 'error')),
-		warnings > 0 && paint('yellow', plural(warnings, 'warning')),
-		infos > 0 && paint('cyan', plural(infos, 'note')),
+		errors > 0 && (['red', plural(errors, 'error')] as const),
+		warnings > 0 && (['yellow', plural(warnings, 'warning')] as const),
+		infos > 0 && (['cyan', plural(infos, 'note')] as const),
 	].filter((part) => part !== false);
-	const separator = paint('dim', ` ${glyphs.separator} `);
-	if (counts.length === 0) {
-		return `  ${paint('green', glyphs.ok)} ${paint('bold', 'schema matches the database')}${separator}${paint('dim', checked)}`;
-	}
-	const icon =
-		errors > 0 ? paint('red', glyphs.failed) : paint('yellow', glyphs.warning);
-	return `  ${icon} ${counts.join(', ')}${separator}${paint('dim', checked)}`;
+	const [icon, headline] =
+		counts.length === 0
+			? [paint('green', glyphs.ok), 'schema matches the database']
+			: [
+					errors > 0
+						? paint('red', glyphs.failed)
+						: warnings > 0
+							? paint('yellow', glyphs.warning)
+							: paint('cyan', glyphs.info),
+					counts.map(([, text]) => text).join(', '),
+				];
+	const styled =
+		counts.length === 0
+			? paint('bold', headline)
+			: counts.map(([color, text]) => paint(color, text)).join(', ');
+	const separator = ` ${glyphs.separator} `;
+	const fits = 4 + headline.length + separator.length + checked.length <= width;
+	return fits
+		? `  ${icon} ${styled}${paint('dim', separator)}${paint('dim', checked)}`
+		: `  ${icon} ${styled}\n    ${paint('dim', checked)}`;
 }
