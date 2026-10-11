@@ -32,6 +32,12 @@ export {
 	expressionBuilder,
 	type ExpressionBuilder,
 } from './expression-builder.js';
+export { deleteFrom, type DeleteQueryBuilder } from './delete-query-builder.js';
+export {
+	insertInto,
+	type InsertQueryBuilder,
+	type OnConflictBuilder,
+} from './insert-query-builder.js';
 export type { Range } from './range.js';
 export {
 	fragment,
@@ -40,6 +46,11 @@ export {
 	type SelectQueryBuilder,
 } from './select-query-builder.js';
 export type { AnyTable, Table } from './table.js';
+export {
+	update,
+	updateMany,
+	type UpdateQueryBuilder,
+} from './update-query-builder.js';
 export type {
 	InferInsertType,
 	InferSelectType,
