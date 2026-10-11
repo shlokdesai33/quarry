@@ -288,17 +288,16 @@ describe.skipIf(!pg?.oauth)(
 );
 
 describe.skipIf(noPg)('capabilities', () => {
-	it('reports what the server supports', async () => {
+	it('reports what the connection supports', async () => {
 		await using conn = await open();
-		const caps = conn.capabilities;
-		expect(caps.serverVersionNum).toBe(cluster().serverVersionNum);
-		expect(caps.reportsHotStandby).toBe(true);
-		expect(caps.directTls).toBe(
-			caps.serverVersionNum !== undefined && caps.serverVersionNum >= 170000,
+		expect(conn.capabilities).toMatchObject({
+			protocol: '3.2',
+			longCancelKeys: true,
+			reportsHotStandby: true,
+		});
+		expect(conn.capabilities.saslMechanisms).toContain('SCRAM-SHA-256');
+		expect(conn.capabilities.serverVersion).toBe(
+			conn.parameters.get('server_version'),
 		);
-		expect(caps.returningOldNew).toBe(
-			caps.serverVersionNum !== undefined && caps.serverVersionNum >= 180000,
-		);
-		expect(caps.saslMechanisms).toContain('SCRAM-SHA-256');
 	});
 });

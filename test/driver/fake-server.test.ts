@@ -48,7 +48,7 @@ async function fakeServer(script: Script): Promise<number> {
 const ready: BackendMessage[] = [
 	{ type: 'AuthenticationOk' },
 	{ type: 'BackendKeyData', pid: 7, key: new Uint8Array([1, 2, 3, 4]) },
-	{ type: 'ParameterStatus', name: 'server_version', value: '16.4' },
+	{ type: 'ParameterStatus', name: 'server_version', value: '18.1' },
 	{ type: 'ReadyForQuery', status: 'I' },
 ];
 
@@ -72,7 +72,7 @@ describe('protocol negotiation with older servers and poolers', () => {
 		});
 		await using conn = await connect(options(port));
 		expect(conn.protocol).toBe('3.0');
-		expect(conn.parameters.get('server_version')).toBe('16.4');
+		expect(conn.parameters.get('server_version')).toBe('18.1');
 	});
 
 	it('reconnects with 3.0 when a pooler rejects 3.2 outright', async () => {
@@ -208,8 +208,7 @@ describe('tolerating the unknown and refusing the unsafe', () => {
 		expect(conn.unrecognizedProtocolOptions).toEqual(['_pq_.future_option']);
 		expect(conn.parameters.get('some_future_setting')).toBe('x');
 		expect(conn.capabilities).toMatchObject({
-			serverVersionNum: 160004,
-			returningOldNew: false,
+			serverVersion: '18.1',
 			longCancelKeys: true,
 		});
 		const pending = conn.query('select 1');
@@ -321,5 +320,44 @@ describe('tolerating the unknown and refusing the unsafe', () => {
 			oauthToken: async () => 'tok',
 		});
 		expect(conn.capabilities.saslMechanisms).toEqual(['OAUTHBEARER']);
+	});
+});
+
+describe('server version', () => {
+	const serving = (version: string | undefined) =>
+		fakeServer((_socket, _version, send) =>
+			send(
+				{ type: 'AuthenticationOk' },
+				...(version === undefined
+					? []
+					: [
+							{
+								type: 'ParameterStatus' as const,
+								name: 'server_version',
+								value: version,
+							},
+						]),
+				{ type: 'ReadyForQuery', status: 'I' },
+			),
+		);
+
+	it('refuses servers older than PostgreSQL 18', async () => {
+		const error = await connect(
+			options(await serving('17.6 (Debian 17.6-1)')),
+		).catch((e: unknown) => e);
+		expect(error).toBeInstanceOf(ConnectionError);
+		expect(error).toMatchObject({
+			code: 'EVERSION',
+			message:
+				'quarry requires PostgreSQL 18 or later; the server reports version 17.6 (Debian 17.6-1)',
+		});
+	});
+
+	it('accepts 18, newer versions, and poolers that hide the version', async () => {
+		for (const version of ['18.0', '19devel', '20.1', 'pooler', undefined]) {
+			// oxlint-disable-next-line no-await-in-loop
+			await using conn = await connect(options(await serving(version)));
+			expect(conn.capabilities.serverVersion).toBe(version);
+		}
 	});
 });

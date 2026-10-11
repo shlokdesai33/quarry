@@ -7,7 +7,7 @@ import {
 	QueryCanceled,
 } from '../../../src/driver/errors.js';
 import type { Notification } from '../../../src/driver/notice.js';
-import { noPg, open, pgAtLeast, rejection, table } from './helpers.js';
+import { noPg, open, rejection, table } from './helpers.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -24,7 +24,7 @@ describe.skipIf(noPg)('cancellation and timeouts', () => {
 
 	it('cancels with an AbortSignal (protocol 3.2 key)', async () => {
 		await using conn = await open();
-		expect(conn.protocol).toBe(pgAtLeast(18) ? '3.2' : '3.0');
+		expect(conn.protocol).toBe('3.2');
 		const controller = new AbortController();
 		const running = rejection(
 			conn.query('select pg_sleep(10)', [], { signal: controller.signal }),
@@ -44,13 +44,7 @@ describe.skipIf(noPg)('cancellation and timeouts', () => {
 		for (const overrides of [
 			{ protocol: '3.0' as const },
 			{ ssl: 'require' as const },
-			...(pgAtLeast(17)
-				? [
-						{
-							ssl: { mode: 'require' as const, negotiation: 'direct' as const },
-						},
-					]
-				: []),
+			{ ssl: { mode: 'require' as const, negotiation: 'direct' as const } },
 		]) {
 			await using conn = await open(overrides);
 			const running = conn.query('select pg_sleep(10)', [], { timeout: 150 });

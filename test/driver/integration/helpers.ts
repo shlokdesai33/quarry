@@ -13,10 +13,6 @@ export const pg = inject('pg');
 /** Skip a suite when there is no PostgreSQL to test against. */
 export const noPg = pg === null;
 
-/** Whether the test server is at least this major version, for gating version-specific tests. */
-export const pgAtLeast = (major: number): boolean =>
-	pg !== null && pg.serverVersionNum >= major * 10000;
-
 export function cluster() {
 	if (pg === null) throw new Error('No test cluster');
 	return pg;

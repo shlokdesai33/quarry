@@ -68,10 +68,10 @@ const USERS = {
 export function findBinDir(): string | undefined {
 	const candidates: string[] = [];
 	if (process.env['PG_BIN']) candidates.push(process.env['PG_BIN']);
-	// PG_VERSION picks an installed major version; 18 is the primary tested one
+	// PG_VERSION picks an installed major version (18 or later; 18 is the tested one)
 	const versions = process.env['PG_VERSION']
 		? [process.env['PG_VERSION']]
-		: ['18', '19', '17', '16'];
+		: ['18', '19', '20'];
 	for (const v of versions) candidates.push(`/usr/lib/postgresql/${v}/bin`);
 	if (!process.env['PG_VERSION']) {
 		try {
@@ -249,9 +249,12 @@ export async function startCluster(binDir: string): Promise<RunningCluster> {
 	const port = await freePort();
 	makeCertificates(dir);
 	const versionNum = serverVersionNum(binDir);
-	// OAuth validators exist from PostgreSQL 18
-	const validator =
-		versionNum >= 180000 ? buildValidator(binDir, dir) : undefined;
+	if (versionNum < 180000) {
+		throw new Error(
+			`The driver needs PostgreSQL 18 or later; ${binDir} is ${versionNum}`,
+		);
+	}
+	const validator = buildValidator(binDir, dir);
 
 	run(join(binDir, 'initdb'), [
 		'-D',

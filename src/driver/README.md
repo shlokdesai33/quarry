@@ -2,7 +2,7 @@
 
 A PostgreSQL driver with no runtime dependencies, written for quarry but usable on its own. It speaks the wire protocol directly (3.2 with fallback to 3.0), over Node's `net`/`tls` by default, behind a small socket interface for other runtimes.
 
-PostgreSQL 18 is the tested version; others work on a best-effort basis through feature detection (`connection.capabilities`).
+It requires PostgreSQL 18 or later (connecting to an older server fails with a clear error; a pooler that hides the version is assumed to front 18+). Newer releases are expected to work: unknown messages, fields, parameters and types are tolerated. `connection.capabilities` reports what poolers and proxies may change, such as the negotiated protocol version.
 
 ## Connecting
 

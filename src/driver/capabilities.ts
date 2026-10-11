@@ -1,48 +1,32 @@
+import { ConnectionError } from './errors.js';
+
+/** The oldest PostgreSQL release the driver supports, as `server_version_num`. */
+export const MIN_SERVER_VERSION_NUM = 180000;
+
 /**
- * What the server on the other end of a connection supports, detected from
- * the negotiated protocol version and the parameters the server reported.
- * Code that depends on a server feature consults this rather than
- * comparing version numbers itself, so supporting a new release means
- * adding a field here.
- *
- * Behind a pooler, `server_version` may be the pooler's own setting or
- * missing; version-derived fields are then false, and callers should
- * treat them as "not known to be supported".
+ * What the other end of a connection supports beyond PostgreSQL 18
+ * itself, which the driver requires: things a pooler or proxy in between
+ * may change, and what the server offered during authentication.
  */
 export interface Capabilities {
-	/** The negotiated protocol version, e.g. `3.2`. */
+	/** The negotiated protocol version, e.g. `3.2`; poolers may negotiate 3.0. */
 	readonly protocol: `3.${number}`;
 	/** The negotiated protocol minor version. */
 	readonly protocolMinor: number;
-	/** `server_version` as reported, e.g. `18.6 (Ubuntu 18.6-1.pgdg24.04+2)`. */
-	readonly serverVersion: string | undefined;
-	/**
-	 * The server version as a number, like `server_version_num` (`180006`).
-	 * Parsed from `server_version`, since `server_version_num` itself is not
-	 * reported at startup; undefined when it can't be parsed.
-	 */
-	readonly serverVersionNum: number | undefined;
 	/** Cancel keys longer than 4 bytes (protocol 3.2). */
 	readonly longCancelKeys: boolean;
-	/** `in_hot_standby` is reported, so the server's role is known without a query (PostgreSQL 14+). */
+	/** `server_version` as reported, e.g. `18.6 (Ubuntu 18.6-1.pgdg24.04+2)`; poolers may hide or replace it. */
+	readonly serverVersion: string | undefined;
+	/** `in_hot_standby` is reported, so the server's role is known without a query. */
 	readonly reportsHotStandby: boolean;
-	/** `pg_prepared_statements.result_types` (PostgreSQL 16+). */
-	readonly preparedStatementResultTypes: boolean;
-	/** Direct TLS negotiation, `sslnegotiation=direct` (PostgreSQL 17+). */
-	readonly directTls: boolean;
-	/** The `transaction_timeout` setting (PostgreSQL 17+). */
-	readonly transactionTimeout: boolean;
-	/** `RETURNING` in `MERGE` (PostgreSQL 17+). */
-	readonly mergeReturning: boolean;
-	/** `RETURNING old.*, new.*` (PostgreSQL 18+). */
-	readonly returningOldNew: boolean;
-	/** SASL mechanisms the server offered during authentication, e.g. `OAUTHBEARER` (PostgreSQL 18+). */
+	/** SASL mechanisms offered during authentication, e.g. `SCRAM-SHA-256-PLUS` or `OAUTHBEARER`. */
 	readonly saslMechanisms: readonly string[];
 }
 
 /**
- * Parses `server_version` (`18.6`, `16.4 (Debian …)`, `19devel`, `9.6.24`)
- * into the `server_version_num` form: `180006`, `160004`, `190000`, `90624`.
+ * Parses `server_version` (`18.6`, `18.6 (Debian …)`, `19devel`, `9.6.24`)
+ * into the `server_version_num` form (`180006`, `190000`, `90624`), or
+ * undefined when it isn't a version (e.g. set by a pooler).
  */
 export function parseServerVersion(
 	text: string | undefined,
@@ -55,26 +39,33 @@ export function parseServerVersion(
 	return major * 10000 + minor * 100 + Number(match[3] ?? 0);
 }
 
+/**
+ * Fails for servers older than PostgreSQL 18. A version that can't be
+ * read (a pooler hiding it) passes: the server is assumed to be 18+.
+ */
+export function checkServerVersion(serverVersion: string | undefined): void {
+	const num = parseServerVersion(serverVersion);
+	if (num !== undefined && num < MIN_SERVER_VERSION_NUM) {
+		throw new ConnectionError(
+			`quarry requires PostgreSQL 18 or later; the server reports version ${serverVersion}`,
+			{
+				code: 'EVERSION',
+			},
+		);
+	}
+}
+
 export function detectCapabilities(
 	protocolMinor: number,
 	parameters: ReadonlyMap<string, string>,
 	saslMechanisms: readonly string[],
 ): Capabilities {
-	const serverVersion = parameters.get('server_version');
-	const num = parseServerVersion(serverVersion);
-	const atLeast = (major: number) => num !== undefined && num >= major * 10000;
 	return {
 		protocol: `3.${protocolMinor}`,
 		protocolMinor,
-		serverVersion,
-		serverVersionNum: num,
 		longCancelKeys: protocolMinor >= 2,
+		serverVersion: parameters.get('server_version'),
 		reportsHotStandby: parameters.has('in_hot_standby'),
-		preparedStatementResultTypes: atLeast(16),
-		directTls: atLeast(17),
-		transactionTimeout: atLeast(17),
-		mergeReturning: atLeast(17),
-		returningOldNew: atLeast(18),
 		saslMechanisms,
 	};
 }

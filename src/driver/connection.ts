@@ -13,7 +13,11 @@ import {
 	parseOAuthFailure,
 	type OAuthFailure,
 } from './auth/oauth.js';
-import { detectCapabilities, type Capabilities } from './capabilities.js';
+import {
+	checkServerVersion,
+	detectCapabilities,
+	type Capabilities,
+} from './capabilities.js';
 import {
 	findPgpassPassword,
 	type AuthMethod,
@@ -421,6 +425,7 @@ export class Connection implements AsyncDisposable {
 				}
 				case 'ReadyForQuery':
 					this.#status = msg.status;
+					checkServerVersion(this.#parameters.get('server_version'));
 					this.#capabilities = detectCapabilities(
 						this.#protocolMinor,
 						this.#parameters,
