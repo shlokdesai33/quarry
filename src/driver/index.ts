@@ -1,0 +1,43 @@
+export { connect, openConnection } from './connect.js';
+export {
+	parseConnectionString,
+	resolveConfig,
+	type ConnectionOptions,
+	type HostTarget,
+	type PasswordSource,
+	type ResolvedConfig,
+	type SslMode,
+	type SslOptions,
+	type TargetSessionAttrs,
+} from './config.js';
+export {
+	Connection,
+	quoteIdentifier,
+	type CursorOptions,
+	type QueryOptions,
+} from './connection.js';
+export * from './errors.js';
+export type { Notice, Notification } from './notice.js';
+export type { Description, QueryResult } from './ops.js';
+export type { Field } from './protocol/messages.js';
+export type { RowMode } from './rows.js';
+export type {
+	DriverSocket,
+	SocketConnectOptions,
+	SocketFactory,
+	SocketTarget,
+	TlsConnectOptions,
+} from './socket.js';
+export { nodeSockets } from './node-socket.js';
+export {
+	arrayLiteral,
+	defaultTypes,
+	encodeParam,
+	formatTimestamp,
+	oids,
+	parseArray,
+	parseBytea,
+	rawTypes,
+	type TextParser,
+	type TypeParsers,
+} from './types.js';

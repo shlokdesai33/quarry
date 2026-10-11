@@ -155,23 +155,25 @@ export type CancelReason =
 	/** A cancel request from this or another client (`pg_cancel_backend`). */
 	| 'user'
 	/** This client canceled it through an `AbortSignal`. */
-	| 'abort';
+	| 'abort'
+	/** This client canceled it when its client-side `timeout` expired. */
+	| 'timeout';
 
 /** 57014: the statement was canceled. */
 export class QueryCanceled extends PostgresError {
+	#by: 'abort' | 'timeout' | undefined;
+
 	/** Why it was canceled. */
 	get reason(): CancelReason {
-		if (this.#aborted) return 'abort';
+		if (this.#by !== undefined) return this.#by;
 		return this.message.includes('statement timeout')
 			? 'statement_timeout'
 			: 'user';
 	}
 
-	#aborted = false;
-
-	/** @internal Marks the cancel as requested by this client's signal. */
-	markAborted(): void {
-		this.#aborted = true;
+	/** @internal Records that this client requested the cancel, and why. */
+	canceledBy(reason: 'abort' | 'timeout'): void {
+		this.#by = reason;
 	}
 }
 
