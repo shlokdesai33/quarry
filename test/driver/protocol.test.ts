@@ -22,6 +22,16 @@ function readAll(reader: Reader): BackendMessage[] {
 	return out;
 }
 
+/** Byte fields as plain Uint8Arrays, so messages compare equal whether the reader hands out Buffers or not. */
+function plain<T extends object>(message: T): T {
+	const out = { ...message };
+	for (const [key, value] of Object.entries(out)) {
+		if (value instanceof Uint8Array)
+			Reflect.set(out, key, new Uint8Array(value));
+	}
+	return out;
+}
+
 /** Feeds `stream` to a reader in random-sized chunks and collects the messages. */
 function readChunked(stream: Uint8Array, rand: () => number): BackendMessage[] {
 	const reader = new Reader();
@@ -31,7 +41,7 @@ function readChunked(stream: Uint8Array, rand: () => number): BackendMessage[] {
 		const size = Math.max(1, Math.floor(rand() * rand() * 64));
 		reader.push(stream.subarray(at, at + size));
 		at += size;
-		out.push(...readAll(reader));
+		out.push(...readAll(reader).map(plain));
 	}
 	expect(reader.buffered).toBe(0);
 	return out;

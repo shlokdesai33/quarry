@@ -89,6 +89,23 @@ describe.skipIf(noPg)('queries', () => {
 		expect(rows).toEqual([['1', 't', '{"x": 1}', '{1,2}']]);
 	});
 
+	it('builds rows safely whatever the column names', async () => {
+		const { rows } = await conn.query<Record<string, unknown>>(
+			`select 1 as "a""b", 2 as "line\nbreak", 3 as "${'x'.repeat(63)}", 4 as "__proto__", '{"polluted":true}'::jsonb as "constructor"`,
+		);
+		const row = rows[0] ?? {};
+		expect(Object.getPrototypeOf(row)).toBe(Object.prototype);
+		expect(Object.keys(row)).toEqual([
+			'a"b',
+			'line\nbreak',
+			'x'.repeat(63),
+			'__proto__',
+			'constructor',
+		]);
+		expect(Object.getOwnPropertyDescriptor(row, '__proto__')?.value).toBe(4);
+		expect(({} as Record<string, unknown>)['polluted']).toBeUndefined();
+	});
+
 	it('parses nested and special arrays', async () => {
 		const { rows } = await conn.query<{
 			m: unknown;

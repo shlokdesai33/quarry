@@ -97,6 +97,14 @@ export abstract class Op {
 		}
 	}
 
+	/**
+	 * Takes a DataRow straight from the read buffer, without a message
+	 * object; false when this operation doesn't accept rows that way.
+	 */
+	dataRow(_bytes: Uint8Array, _start: number, _end: number): boolean {
+		return false;
+	}
+
 	abstract write(ctx: OpContext): void;
 	/** Handles one message; true when the operation is complete. */
 	abstract handle(msg: BackendMessage, ctx: OpContext): boolean;
@@ -227,18 +235,24 @@ export class QueryOp extends Op {
 		);
 	}
 
+	override dataRow(bytes: Uint8Array, start: number, end: number): boolean {
+		let decoder = this.#decoder;
+		if (decoder === undefined) {
+			const fields = this.#statement?.fields;
+			if (fields === undefined)
+				throw new ProtocolError('DataRow before RowDescription');
+			this.#setFields(fields);
+			decoder = this.#decoder;
+		}
+		// oxlint-disable-next-line typescript/no-non-null-assertion
+		this.#rows.push(decoder!(bytes, start, end));
+		return true;
+	}
+
 	handle(msg: BackendMessage, ctx: OpContext): boolean {
 		switch (msg.type) {
 			case 'DataRow':
-				if (this.#decoder === undefined) {
-					const fields = this.#statement?.fields;
-					if (fields === undefined)
-						throw new ProtocolError('DataRow before RowDescription');
-					this.#setFields(fields);
-				}
-				// oxlint-disable-next-line typescript/no-non-null-assertion
-				this.#rows.push(this.#decoder!(msg.payload));
-				return false;
+				return !this.dataRow(msg.payload, 0, msg.payload.length);
 			case 'ParseComplete':
 				if (this.#statement && this.#createdStatement)
 					this.#statement.parsed = true;
@@ -394,6 +408,13 @@ export class SimpleQueryOp extends Op {
 		fe.query(ctx.writer, this.#sql);
 	}
 
+	override dataRow(bytes: Uint8Array, start: number, end: number): boolean {
+		if (this.#decoder === undefined)
+			throw new ProtocolError('DataRow before RowDescription');
+		this.#rows.push(this.#decoder(bytes, start, end));
+		return true;
+	}
+
 	handle(msg: BackendMessage, ctx: OpContext): boolean {
 		switch (msg.type) {
 			case 'RowDescription':
@@ -402,10 +423,7 @@ export class SimpleQueryOp extends Op {
 				this.#rows = [];
 				return false;
 			case 'DataRow':
-				if (this.#decoder === undefined)
-					throw new ProtocolError('DataRow before RowDescription');
-				this.#rows.push(this.#decoder(msg.payload));
-				return false;
+				return !this.dataRow(msg.payload, 0, msg.payload.length);
 			case 'CommandComplete': {
 				const { command, rowCount } = parseTag(msg.tag);
 				this.#results.push({
@@ -687,6 +705,14 @@ export class CursorOp extends Op {
 		}
 	}
 
+	override dataRow(bytes: Uint8Array, start: number, end: number): boolean {
+		if (this.#synced) return true;
+		if (this.#decoder === undefined)
+			throw new ProtocolError('DataRow before RowDescription');
+		this.#batch.push(this.#decoder(bytes, start, end));
+		return true;
+	}
+
 	handle(msg: BackendMessage, ctx: OpContext): boolean {
 		switch (msg.type) {
 			case 'ParseComplete':
@@ -711,11 +737,7 @@ export class CursorOp extends Op {
 				if (this.#exhausted && !this.#synced) this.#sync(true);
 				return false;
 			case 'DataRow':
-				if (this.#synced) return false;
-				if (this.#decoder === undefined)
-					throw new ProtocolError('DataRow before RowDescription');
-				this.#batch.push(this.#decoder(msg.payload));
-				return false;
+				return !this.dataRow(msg.payload, 0, msg.payload.length);
 			case 'PortalSuspended':
 				if (!this.#synced) this.#deliver(false);
 				return false;

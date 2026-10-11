@@ -551,14 +551,17 @@ export class Connection implements AsyncDisposable {
 	// --- incoming ----------------------------------------------------------
 
 	#onData(chunk: Uint8Array): void {
+		const reader = this.#reader;
 		try {
-			this.#reader.push(chunk);
-			for (
-				let msg = this.#reader.next();
-				msg !== undefined;
-				msg = this.#reader.next()
-			) {
-				this.#dispatch(msg);
+			reader.push(chunk);
+			for (let type = reader.nextType(); type >= 0; type = reader.nextType()) {
+				if (type === 0x44 && !this.#starting) {
+					// rows go straight from the buffer to the operation's decoder
+					const op = this.#queue[0];
+					if (op?.written && op.dataRow(reader.bytes, reader.start, reader.end))
+						continue;
+				}
+				this.#dispatch(reader.parse());
 				if (this.#closed) return;
 			}
 		} catch (error) {

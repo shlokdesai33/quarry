@@ -1,6 +1,6 @@
 import { ProtocolError } from '../errors.js';
 import type { BackendMessage, Field, NoticeFields } from './messages.js';
-import { utf8 } from './text.js';
+import { allocate, asBuffer, utf8 } from './text.js';
 
 const EMPTY = new Uint8Array(0);
 
@@ -35,8 +35,9 @@ export class Reader {
 		return this.#buf.length - this.#pos + this.#pendingLength;
 	}
 
-	push(chunk: Uint8Array): void {
-		if (chunk.length === 0) return;
+	push(bytes: Uint8Array): void {
+		if (bytes.length === 0) return;
+		const chunk = asBuffer(bytes);
 		if (this.#needed > 0) {
 			this.#pending.push(chunk);
 			this.#pendingLength += chunk.length;
@@ -57,7 +58,7 @@ export class Reader {
 
 	#join(): void {
 		const rest = this.#buf.length - this.#pos;
-		const next = new Uint8Array(rest + this.#pendingLength);
+		const next = allocate(rest + this.#pendingLength);
 		next.set(this.#buf.subarray(this.#pos));
 		let at = rest;
 		for (const chunk of this.#pending) {
@@ -76,16 +77,34 @@ export class Reader {
 		this.#pos = 0;
 	}
 
-	/** The next complete message, or `undefined` if more bytes are needed. */
-	next(): BackendMessage | undefined {
-		if (this.#needed > 0) return undefined;
+	/** The buffer holding the message found by the latest `nextType`. */
+	bytes: Uint8Array = EMPTY;
+	/** Where that message's body starts and ends in `bytes`. */
+	start = 0;
+	end = 0;
+	#type = -1;
+
+	/**
+	 * Finds the next complete message without decoding it: returns its type
+	 * byte (and sets `bytes`, `start` and `end`), or -1 if more bytes are
+	 * needed. `parse` then decodes it, or the caller reads the body itself,
+	 * which is how rows avoid allocating a message object each.
+	 */
+	nextType(): number {
+		if (this.#needed > 0) return -1;
 		const available = this.#buf.length - this.#pos;
 		if (available < 5) {
 			if (available > 0) this.#needed = 5;
-			return undefined;
+			return -1;
 		}
-		const type = this.#buf[this.#pos] ?? 0;
-		const length = this.#view.getInt32(this.#pos + 1);
+		const buf = this.#buf;
+		const pos = this.#pos;
+		const type = buf[pos] ?? 0;
+		const length =
+			((buf[pos + 1] ?? 0) << 24) |
+			((buf[pos + 2] ?? 0) << 16) |
+			((buf[pos + 3] ?? 0) << 8) |
+			(buf[pos + 4] ?? 0);
 		if (length < 4 || length > this.#maxMessageSize) {
 			throw new ProtocolError(
 				`Invalid length ${length} for message type 0x${type.toString(16)}`,
@@ -93,12 +112,30 @@ export class Reader {
 		}
 		if (available < length + 1) {
 			this.#needed = length + 1;
-			return undefined;
+			return -1;
 		}
-		const start = this.#pos + 5;
-		const end = this.#pos + 1 + length;
-		this.#pos = end;
-		return parseMessage(type, this.#buf, this.#view, start, end);
+		this.bytes = buf;
+		this.start = pos + 5;
+		this.end = pos + 1 + length;
+		this.#pos = this.end;
+		this.#type = type;
+		return type;
+	}
+
+	/** Decodes the message found by the latest `nextType`. */
+	parse(): BackendMessage {
+		return parseMessage(
+			this.#type,
+			this.bytes,
+			this.#view,
+			this.start,
+			this.end,
+		);
+	}
+
+	/** The next complete message, or `undefined` if more bytes are needed. */
+	next(): BackendMessage | undefined {
+		return this.nextType() < 0 ? undefined : this.parse();
 	}
 }
 

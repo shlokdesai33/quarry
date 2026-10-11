@@ -1,22 +1,57 @@
 import { ProtocolError } from './errors.js';
+import type { QueryResult } from './ops.js';
 import type { Field } from './protocol/messages.js';
 import { utf8 } from './protocol/text.js';
-import type { QueryResult } from './ops.js';
 import type { TextParser, TypeParsers } from './types.js';
 
 /** `object` rows are keyed by column name (the last wins on duplicates); `array` rows are positional. */
 export type RowMode = 'object' | 'array';
 
-/** Decodes one DataRow body into a row. */
-export type RowDecoder = (payload: Uint8Array) => unknown;
+/** Decodes one DataRow body, `bytes[start, end)`, into a row. */
+export type RowDecoder = (
+	bytes: Uint8Array,
+	start: number,
+	end: number,
+) => unknown;
 
-function int32(bytes: Uint8Array, at: number): number {
-	return (
-		((bytes[at] ?? 0) << 24) |
-		((bytes[at + 1] ?? 0) << 16) |
-		((bytes[at + 2] ?? 0) << 8) |
-		(bytes[at + 3] ?? 0)
-	);
+type Build = (values: unknown[]) => Record<string, unknown>;
+
+/**
+ * A function building `{ name0: v[0], … }` for one result shape: an object
+ * literal gives every row the same hidden class from the start. Undefined
+ * where `new Function` is forbidden (e.g. Cloudflare Workers) or a name
+ * can't be written as a plain property (`__proto__`).
+ */
+function literalBuilder(names: readonly string[]): Build | undefined {
+	if (names.includes('__proto__')) return undefined;
+	const body = `return {${names.map((name, i) => `${JSON.stringify(name)}: v[${i}]`).join(', ')}};`;
+	try {
+		// oxlint-disable-next-line typescript/no-implied-eval, typescript/no-unsafe-type-assertion
+		return new Function('v', body) as Build;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Builds rows with plain assignments; `__proto__` is defined as an own property, never as the prototype. */
+function assignBuilder(names: readonly string[]): Build {
+	return (values) => {
+		const row: Record<string, unknown> = {};
+		for (let i = 0; i < names.length; i++) {
+			const name = names[i] ?? '';
+			if (name === '__proto__') {
+				Object.defineProperty(row, name, {
+					value: values[i],
+					enumerable: true,
+					writable: true,
+					configurable: true,
+				});
+			} else {
+				row[name] = values[i];
+			}
+		}
+		return row;
+	};
 }
 
 /** Builds a decoder for rows of `fields`, parsing text values by type OID. */
@@ -26,80 +61,53 @@ export function rowDecoder(
 	mode: RowMode,
 ): RowDecoder {
 	const count = fields.length;
-	const names = fields.map((field) => field.name);
 	const binary = fields.map((field) => field.format === 1);
 	const parsers: (TextParser | undefined)[] = fields.map((field) =>
 		field.format === 1 ? undefined : types[field.typeOid],
 	);
 
-	const value = (
-		payload: Uint8Array,
-		i: number,
-		start: number,
-		end: number,
-	): unknown => {
-		if (binary[i]) return payload.slice(start, end);
-		const text = utf8(payload, start, end);
-		const parse = parsers[i];
-		return parse === undefined ? text : parse(text);
-	};
-
-	const check = (payload: Uint8Array): void => {
+	const values = (bytes: Uint8Array, start: number, end: number): unknown[] => {
 		if (
-			payload.length < 2 ||
-			((payload[0] ?? 0) << 8) + (payload[1] ?? 0) !== count
+			end - start < 2 ||
+			(((bytes[start] ?? 0) << 8) | (bytes[start + 1] ?? 0)) !== count
 		) {
 			throw new ProtocolError(
 				'DataRow column count does not match RowDescription',
 			);
 		}
-	};
-
-	if (mode === 'array') {
-		return (payload) => {
-			check(payload);
-			const row: unknown[] = [];
-			let pos = 2;
-			for (let i = 0; i < count; i++) {
-				if (pos + 4 > payload.length)
-					throw new ProtocolError('DataRow too short');
-				const length = int32(payload, pos);
-				pos += 4;
-				if (length === -1) {
-					row[i] = null;
-					continue;
-				}
-				const end = pos + length;
-				if (length < 0 || end > payload.length)
-					throw new ProtocolError('Invalid value length in DataRow');
-				row[i] = value(payload, i, pos, end);
-				pos = end;
-			}
-			return row;
-		};
-	}
-	return (payload) => {
-		check(payload);
-		const row: Record<string, unknown> = {};
-		let pos = 2;
+		const row: unknown[] = [];
+		let pos = start + 2;
 		for (let i = 0; i < count; i++) {
-			if (pos + 4 > payload.length)
-				throw new ProtocolError('DataRow too short');
-			const length = int32(payload, pos);
+			if (pos + 4 > end) throw new ProtocolError('DataRow too short');
+			const length =
+				((bytes[pos] ?? 0) << 24) |
+				((bytes[pos + 1] ?? 0) << 16) |
+				((bytes[pos + 2] ?? 0) << 8) |
+				(bytes[pos + 3] ?? 0);
 			pos += 4;
-			const name = names[i] ?? '';
 			if (length === -1) {
-				row[name] = null;
+				row.push(null);
 				continue;
 			}
-			const end = pos + length;
-			if (length < 0 || end > payload.length)
+			const valueEnd = pos + length;
+			if (length < 0 || valueEnd > end)
 				throw new ProtocolError('Invalid value length in DataRow');
-			row[name] = value(payload, i, pos, end);
-			pos = end;
+			if (binary[i]) {
+				row.push(bytes.slice(pos, valueEnd));
+			} else {
+				const parse = parsers[i];
+				const text = utf8(bytes, pos, valueEnd);
+				row.push(parse === undefined ? text : parse(text));
+			}
+			pos = valueEnd;
 		}
 		return row;
 	};
+
+	if (mode === 'array') return values;
+	const names = fields.map((field) => field.name);
+	const build = literalBuilder(names) ?? assignBuilder(names);
+	return (bytes, start, end) => build(values(bytes, start, end));
 }
 
 /**
