@@ -90,7 +90,7 @@ describe.skipIf(noPg)('queries', () => {
 	});
 
 	it('builds rows safely whatever the column names', async () => {
-		const { rows } = await conn.query<Record<string, unknown>>(
+		const { rows } = await conn.query(
 			`select 1 as "a""b", 2 as "line\nbreak", 3 as "${'x'.repeat(63)}", 4 as "__proto__", '{"polluted":true}'::jsonb as "constructor"`,
 		);
 		const row = rows[0] ?? {};
