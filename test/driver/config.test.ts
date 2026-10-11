@@ -8,7 +8,9 @@ import {
 } from '../../src/driver/auth/encoding.js';
 import { md5, md5Password } from '../../src/driver/auth/md5.js';
 import { ScramClient, saslprep } from '../../src/driver/auth/scram.js';
+import { parseServerVersion } from '../../src/driver/capabilities.js';
 import {
+	parseRequireAuth,
 	findPgpassPassword,
 	parseConnectionString,
 	resolveConfig,
@@ -133,13 +135,13 @@ describe('resolveConfig', () => {
 		).toThrow(/direct/);
 		expect(
 			resolveConfig({ env: { PGMAXPROTOCOLVERSION: '3.0' } }).protocol,
-		).toBe('3.0');
+		).toEqual({ min: 0, max: 0 });
 		expect(
 			resolveConfig({
 				connectionString: 'postgres://h/d?min_protocol_version=3.2',
 				env: {},
 			}).protocol,
-		).toBe('3.2');
+		).toEqual({ min: 2, max: 2 });
 	});
 
 	it('pairs hosts with ports and validates them', () => {
@@ -310,5 +312,75 @@ describe('auth primitives', () => {
 		await expect(
 			client.final(utf8Encode('r=abc123,s=AAAA,i=0')),
 		).rejects.toThrow(/iteration/);
+	});
+});
+
+describe('versions and policies', () => {
+	it('parses server_version like server_version_num', () => {
+		expect(parseServerVersion('18.6 (Ubuntu 18.6-1.pgdg24.04+2)')).toBe(180006);
+		expect(parseServerVersion('16.4')).toBe(160004);
+		expect(parseServerVersion('19devel')).toBe(190000);
+		expect(parseServerVersion('19beta1')).toBe(190000);
+		expect(parseServerVersion('9.6.24')).toBe(90624);
+		expect(parseServerVersion('pgbouncer')).toBeUndefined();
+		expect(parseServerVersion(undefined)).toBeUndefined();
+	});
+
+	it('resolves the protocol version range', () => {
+		expect(resolveConfig({ env: {} }).protocol).toEqual({ min: 0, max: 2 });
+		expect(resolveConfig({ protocol: '3.0', env: {} }).protocol).toEqual({
+			min: 0,
+			max: 0,
+		});
+		expect(
+			resolveConfig({ minProtocolVersion: 'latest', env: {} }).protocol,
+		).toEqual({ min: 2, max: 2 });
+		expect(
+			resolveConfig({ env: { PGMAXPROTOCOLVERSION: '3.0' } }).protocol,
+		).toEqual({ min: 0, max: 0 });
+		expect(() => resolveConfig({ protocol: '3.1', env: {} })).toThrow(
+			/3.1 was never used/,
+		);
+		expect(() => resolveConfig({ protocol: '3.9', env: {} })).toThrow(
+			/Unsupported/,
+		);
+		expect(() =>
+			resolveConfig({
+				minProtocolVersion: '3.2',
+				maxProtocolVersion: '3.0',
+				env: {},
+			}),
+		).toThrow(/above/);
+	});
+
+	it('parses require_auth lists and negations', () => {
+		expect(parseRequireAuth(undefined)).toBeUndefined();
+		expect([...(parseRequireAuth('scram-sha-256,oauth') ?? [])]).toEqual([
+			'scram-sha-256',
+			'oauth',
+		]);
+		expect([
+			...(parseRequireAuth(['!password', '!md5', '!none']) ?? []),
+		]).toEqual(['scram-sha-256', 'oauth', 'gss', 'sspi']);
+		expect(() => parseRequireAuth('md5,!password')).toThrow(/cannot mix/);
+		expect(() => parseRequireAuth('kerberos')).toThrow(
+			/Invalid require_auth method/,
+		);
+	});
+
+	it('reads client certificate settings', () => {
+		const config = resolveConfig({
+			connectionString:
+				'postgres://h/d?sslcert=/c.crt&sslkey=/c.key&sslpassword=pw',
+			env: {},
+		});
+		expect(config.ssl).toMatchObject({
+			certFile: '/c.crt',
+			keyFile: '/c.key',
+			passphrase: 'pw',
+		});
+		expect(
+			resolveConfig({ env: { PGSSLCERT: '/e.crt', PGSSLKEY: '/e.key' } }).ssl,
+		).toMatchObject({ certFile: '/e.crt', keyFile: '/e.key' });
 	});
 });

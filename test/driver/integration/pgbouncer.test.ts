@@ -1,6 +1,10 @@
 /* oxlint-disable no-await-in-loop -- tests run their steps in order */
 import { describe, expect, it } from 'vitest';
+import { versionAtLeast } from '../setup/cluster.js';
 import { cluster, open, pg, table } from './helpers.js';
+
+// named prepared statements in transaction mode need PgBouncer 1.21+
+const prepare = versionAtLeast(pg?.bouncerVersion, 1, 21);
 
 const bouncer = () => ({
 	host: cluster().host,
@@ -8,14 +12,15 @@ const bouncer = () => ({
 	user: 'postgres',
 	password: undefined,
 	ssl: 'disable' as const,
+	prepare,
 });
 
 // PgBouncer runs in transaction mode with max_prepared_statements set, so
 // server connections are shared between clients between transactions.
 describe.skipIf(!pg?.bouncerPort)('PgBouncer in transaction mode', () => {
-	it('negotiates protocol 3.2', async () => {
+	it('negotiates a protocol version', async () => {
 		await using conn = await open(bouncer());
-		expect(conn.protocol).toBe('3.2');
+		expect(['3.0', '3.2']).toContain(conn.protocol);
 	});
 
 	it('runs pipelined prepared statements from many clients over few server connections', async () => {

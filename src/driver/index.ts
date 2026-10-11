@@ -69,3 +69,11 @@ export {
 	parseVector,
 	quarryTypes,
 } from './quarry-types.js';
+export { OAuthError, type OAuthFailure } from './auth/oauth.js';
+export {
+	detectCapabilities,
+	parseServerVersion,
+	type Capabilities,
+} from './capabilities.js';
+export type { AuthMethod, OAuthContext, ProtocolVersion } from './config.js';
+export { LATEST_PROTOCOL_MINOR } from './protocol/frontend.js';

@@ -5,7 +5,14 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { connect } from '../../../src/driver/connect.js';
 import { ConnectionError, PostgresError } from '../../../src/driver/errors.js';
-import { cluster, noPg, open, recordingSockets, rejection } from './helpers.js';
+import {
+	cluster,
+	noPg,
+	open,
+	pgAtLeast,
+	recordingSockets,
+	rejection,
+} from './helpers.js';
 
 const ssl = () => cluster().users.sslOnly;
 
@@ -161,7 +168,7 @@ describe.skipIf(noPg)('TLS', () => {
 		);
 	});
 
-	it('direct TLS (sslnegotiation=direct)', async () => {
+	it.skipIf(!pgAtLeast(17))('direct TLS (sslnegotiation=direct)', async () => {
 		const rec = recordingSockets();
 		await using conn = await open({
 			...ssl(),
@@ -201,13 +208,21 @@ describe.skipIf(noPg)('TLS', () => {
 });
 
 describe.skipIf(noPg)('startup', () => {
-	it('negotiates protocol 3.2 with a 32-byte cancel key on PostgreSQL 18', async () => {
-		await using conn = await open();
-		expect(conn.protocol).toBe('3.2');
-		expect(conn.parameters.get('server_version')).toMatch(/^18/);
-		expect(conn.parameters.get('client_encoding')).toBe('UTF8');
-		expect(conn.parameters.get('DateStyle')).toBe('ISO, MDY');
-	});
+	it.skipIf(!pgAtLeast(18))(
+		'negotiates protocol 3.2 with a 32-byte cancel key on PostgreSQL 18',
+		async () => {
+			await using conn = await open();
+			expect(conn.protocol).toBe('3.2');
+			expect(conn.capabilities.serverVersionNum).toBeGreaterThanOrEqual(180000);
+			expect(conn.capabilities).toMatchObject({
+				protocol: '3.2',
+				longCancelKeys: true,
+				returningOldNew: true,
+			});
+			expect(conn.parameters.get('client_encoding')).toBe('UTF8');
+			expect(conn.parameters.get('DateStyle')).toBe('ISO, MDY');
+		},
+	);
 
 	it('speaks 3.0 when asked', async () => {
 		await using conn = await open({ protocol: '3.0' });

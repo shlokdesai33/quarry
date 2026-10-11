@@ -24,6 +24,23 @@ export interface TestCluster {
 	readonly ca: string;
 	readonly dataDir: string;
 	readonly binDir: string;
+	/** The server's version as `server_version_num`, e.g. 180006. */
+	readonly serverVersionNum: number;
+	/** Extensions the server can create (`pg_available_extensions`). */
+	readonly extensions: readonly string[];
+	/** PgBouncer's version, e.g. `1.26.0`, when it runs. */
+	readonly bouncerVersion: string | undefined;
+	/** A client certificate (CN=cert_user) signed by `ca`, its key, and the key encrypted with `keyPassphrase`. */
+	readonly client: {
+		readonly certFile: string;
+		readonly keyFile: string;
+		readonly encryptedKeyFile: string;
+		readonly keyPassphrase: string;
+		readonly cert: string;
+		readonly key: string;
+	};
+	/** Whether `oauth_user` authenticates with OAUTHBEARER (the test validator was built). */
+	readonly oauth: boolean;
 	readonly users: {
 		readonly superuser: { user: string; password: string };
 		readonly trust: { user: string };
@@ -31,6 +48,8 @@ export interface TestCluster {
 		readonly md5: { user: string; password: string };
 		readonly scram: { user: string; password: string };
 		readonly sslOnly: { user: string; password: string };
+		readonly cert: { user: string };
+		readonly oauth: { user: string };
 	};
 }
 
@@ -41,24 +60,38 @@ const USERS = {
 	md5: { user: 'md5_user', password: 'md5-pw' },
 	scram: { user: 'scram_user', password: 'scram pässwörd ½' },
 	sslOnly: { user: 'ssl_only', password: 'ssl-pw' },
+	cert: { user: 'cert_user' },
+	oauth: { user: 'oauth_user' },
 } as const;
 
 /** Finds the PostgreSQL server binaries: `PG_BIN`, `pg_config --bindir`, or the newest under /usr/lib/postgresql. */
 export function findBinDir(): string | undefined {
 	const candidates: string[] = [];
 	if (process.env['PG_BIN']) candidates.push(process.env['PG_BIN']);
-	for (const v of ['18', '17', '16'])
-		candidates.push(`/usr/lib/postgresql/${v}/bin`);
-	try {
-		candidates.push(
-			execFileSync('pg_config', ['--bindir'], { encoding: 'utf8' }).trim(),
-		);
-	} catch {
-		// no pg_config on PATH
+	// PG_VERSION picks an installed major version; 18 is the primary tested one
+	const versions = process.env['PG_VERSION']
+		? [process.env['PG_VERSION']]
+		: ['18', '19', '17', '16'];
+	for (const v of versions) candidates.push(`/usr/lib/postgresql/${v}/bin`);
+	if (!process.env['PG_VERSION']) {
+		try {
+			candidates.push(
+				execFileSync('pg_config', ['--bindir'], { encoding: 'utf8' }).trim(),
+			);
+		} catch {
+			// no pg_config on PATH
+		}
 	}
 	return candidates.find(
 		(dir) => existsSync(join(dir, 'initdb')) && existsSync(join(dir, 'pg_ctl')),
 	);
+}
+
+/** `postgres --version` as `server_version_num`. */
+function serverVersionNum(binDir: string): number {
+	const text = run(join(binDir, 'postgres'), ['--version']);
+	const match = /(\d+)(?:\.(\d+))?/.exec(text);
+	return Number(match?.[1] ?? 0) * 10000 + Number(match?.[2] ?? 0);
 }
 
 async function freePort(): Promise<number> {
@@ -133,6 +166,71 @@ function makeCertificates(dir: string): void {
 		'-out',
 		'server.crt',
 	]);
+	ssl([
+		'req',
+		'-newkey',
+		'rsa:2048',
+		'-nodes',
+		'-subj',
+		'/CN=cert_user',
+		'-keyout',
+		'client.key',
+		'-out',
+		'client.csr',
+	]);
+	ssl([
+		'x509',
+		'-req',
+		'-in',
+		'client.csr',
+		'-CA',
+		'ca.crt',
+		'-CAkey',
+		'ca.key',
+		'-CAcreateserial',
+		'-days',
+		'3',
+		'-sha256',
+		'-out',
+		'client.crt',
+	]);
+	ssl([
+		'pkcs8',
+		'-topk8',
+		'-v2',
+		'aes-256-cbc',
+		'-in',
+		'client.key',
+		'-passout',
+		`pass:${KEY_PASSPHRASE}`,
+		'-out',
+		'client-encrypted.key',
+	]);
+}
+
+const KEY_PASSPHRASE = 'client key pässphrase';
+
+/** Builds the test OAuth validator; undefined when there is no compiler or server headers. */
+function buildValidator(binDir: string, dir: string): string | undefined {
+	try {
+		const include = run(join(binDir, 'pg_config'), [
+			'--includedir-server',
+		]).trim();
+		const out = join(dir, 'quarry_oauth_validator.so');
+		run(existsSync('/usr/bin/gcc') ? 'gcc' : 'cc', [
+			'-shared',
+			'-fPIC',
+			'-O1',
+			'-I',
+			include,
+			'-o',
+			out,
+			join(import.meta.dirname, 'oauth_validator.c'),
+		]);
+		return out;
+	} catch {
+		return undefined;
+	}
 }
 
 export interface RunningCluster {
@@ -150,6 +248,10 @@ export async function startCluster(binDir: string): Promise<RunningCluster> {
 	const dataDir = join(dir, 'data');
 	const port = await freePort();
 	makeCertificates(dir);
+	const versionNum = serverVersionNum(binDir);
+	// OAuth validators exist from PostgreSQL 18
+	const validator =
+		versionNum >= 180000 ? buildValidator(binDir, dir) : undefined;
 
 	run(join(binDir, 'initdb'), [
 		'-D',
@@ -172,6 +274,8 @@ export async function startCluster(binDir: string): Promise<RunningCluster> {
 				`ssl = on`,
 				`ssl_cert_file = '${join(dir, 'server.crt')}'`,
 				`ssl_key_file = '${join(dir, 'server.key')}'`,
+				`ssl_ca_file = '${join(dir, 'ca.crt')}'`,
+				...(validator ? [`oauth_validator_libraries = '${validator}'`] : []),
 				`password_encryption = 'scram-sha-256'`,
 				`max_connections = 300`,
 				`fsync = off`,
@@ -193,6 +297,12 @@ export async function startCluster(binDir: string): Promise<RunningCluster> {
 			'host all trust_user 127.0.0.1/32 trust',
 			'host all password_user 127.0.0.1/32 password',
 			'host all md5_user 127.0.0.1/32 md5',
+			'hostssl all cert_user 127.0.0.1/32 cert',
+			...(validator
+				? [
+						'host all oauth_user 127.0.0.1/32 oauth issuer="https://issuer.example.com" scope="openid postgres"',
+					]
+				: []),
 			'host all all 127.0.0.1/32 scram-sha-256',
 			'',
 		].join('\n'),
@@ -230,12 +340,34 @@ export async function startCluster(binDir: string): Promise<RunningCluster> {
 	);
 	psql(`create user scram_user superuser password '${USERS.scram.password}'`);
 	psql(`create user ssl_only password '${USERS.sslOnly.password}'`);
+	psql(`create user cert_user`);
+	psql(`create user oauth_user`);
 	psql(`create database quarry_test owner scram_user`);
+	const extensions = run(join(binDir, 'psql'), [
+		'-h',
+		dir,
+		'-p',
+		String(port),
+		'-U',
+		'postgres',
+		'-d',
+		'postgres',
+		'-At',
+		'-c',
+		'select name from pg_available_extensions',
+	])
+		.split('\n')
+		.filter(Boolean);
 	psql(`grant all on database quarry_test to public`);
 
 	let bouncer: ChildProcess | undefined;
 	let bouncerPort: number | undefined;
-	if (existsSync('/usr/sbin/pgbouncer') || process.env['PGBOUNCER_BIN']) {
+	let bouncerVersion: string | undefined;
+	const bouncerBin = process.env['PGBOUNCER_BIN'] ?? '/usr/sbin/pgbouncer';
+	if (!process.env['QUARRY_SKIP_PGBOUNCER'] && existsSync(bouncerBin)) {
+		bouncerVersion = /(\d+\.\d+(?:\.\d+)?)/.exec(
+			run(bouncerBin, ['--version']),
+		)?.[1];
 		bouncerPort = await freePort();
 		writeFileSync(
 			join(dir, 'userlist.txt'),
@@ -255,7 +387,10 @@ export async function startCluster(binDir: string): Promise<RunningCluster> {
 				`auth_type = trust`,
 				`auth_file = ${join(dir, 'userlist.txt')}`,
 				`pool_mode = transaction`,
-				`max_prepared_statements = 200`,
+				// protocol-level prepared statements in transaction mode: PgBouncer 1.21+
+				...(versionAtLeast(bouncerVersion, 1, 21)
+					? ['max_prepared_statements = 200']
+					: []),
 				`default_pool_size = 4`,
 				`max_client_conn = 200`,
 				`ignore_startup_parameters = extra_float_digits,options`,
@@ -263,11 +398,9 @@ export async function startCluster(binDir: string): Promise<RunningCluster> {
 				'',
 			].join('\n'),
 		);
-		bouncer = spawn(
-			process.env['PGBOUNCER_BIN'] ?? '/usr/sbin/pgbouncer',
-			[join(dir, 'pgbouncer.ini')],
-			{ stdio: 'ignore' },
-		);
+		bouncer = spawn(bouncerBin, [join(dir, 'pgbouncer.ini')], {
+			stdio: 'ignore',
+		});
 		await waitForPort(bouncerPort);
 	}
 
@@ -281,6 +414,18 @@ export async function startCluster(binDir: string): Promise<RunningCluster> {
 			ca: readFileSync(join(dir, 'ca.crt'), 'utf8'),
 			dataDir,
 			binDir,
+			serverVersionNum: versionNum,
+			extensions,
+			bouncerVersion,
+			client: {
+				certFile: join(dir, 'client.crt'),
+				keyFile: join(dir, 'client.key'),
+				encryptedKeyFile: join(dir, 'client-encrypted.key'),
+				keyPassphrase: KEY_PASSPHRASE,
+				cert: readFileSync(join(dir, 'client.crt'), 'utf8'),
+				key: readFileSync(join(dir, 'client.key'), 'utf8'),
+			},
+			oauth: validator !== undefined,
 			users: USERS,
 		},
 		async stop() {
@@ -317,4 +462,14 @@ async function waitForPort(port: number): Promise<void> {
 		await new Promise((r) => setTimeout(r, 50));
 	}
 	throw new Error(`Nothing listening on port ${port}`);
+}
+
+/** Whether a dotted version such as `1.26.0` is at least major.minor. */
+export function versionAtLeast(
+	version: string | undefined,
+	major: number,
+	minor: number,
+): boolean {
+	const [a = 0, b = 0] = (version ?? '0').split('.').map(Number);
+	return a > major || (a === major && b >= minor);
 }

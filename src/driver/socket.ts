@@ -7,6 +7,8 @@ export interface TlsConnectOptions {
 	/** Client certificate and key (PEM), for `cert` authentication. */
 	readonly cert: string | undefined;
 	readonly key: string | undefined;
+	/** The passphrase of an encrypted `key`. */
+	readonly passphrase: string | undefined;
 	/** Verify the certificate chain. */
 	readonly verifyChain: boolean;
 	/** Verify the certificate matches the host name (needs `verifyChain`). */

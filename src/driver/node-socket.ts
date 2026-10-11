@@ -38,6 +38,9 @@ function tlsOptions(
 		...(options.ca === undefined ? {} : { ca: [options.ca].flat() }),
 		...(options.cert === undefined ? {} : { cert: options.cert }),
 		...(options.key === undefined ? {} : { key: options.key }),
+		...(options.passphrase === undefined
+			? {}
+			: { passphrase: options.passphrase }),
 		...(options.alpn === undefined ? {} : { ALPNProtocols: [...options.alpn] }),
 	};
 }
@@ -84,10 +87,19 @@ class NodeSocket implements DriverSocket {
 		raw.removeAllListeners('close');
 		raw.removeAllListeners('error');
 		raw.removeAllListeners('drain');
-		const secure = this.#tls.connect({
-			...tlsOptions(this.#tls, options),
-			socket: raw,
-		});
+		let secure: Tls.TLSSocket;
+		try {
+			secure = this.#tls.connect({
+				...tlsOptions(this.#tls, options),
+				socket: raw,
+			});
+		} catch (error) {
+			// e.g. an encrypted client key with the wrong passphrase
+			raw.destroy();
+			throw connectionError(
+				error instanceof Error ? error : new Error(String(error)),
+			);
+		}
 		await new Promise<void>((resolve, reject) => {
 			const fail = (error: Error & { code?: string }) => {
 				secure.destroy();
@@ -154,9 +166,19 @@ export const nodeSockets: SocketFactory = {
 				target.kind === 'unix'
 					? { path: target.path }
 					: { host: target.host, port: target.port };
-			const s = options.tls
-				? tls.connect({ ...base, ...tlsOptions(tls, options.tls) })
-				: net.connect(base);
+			let s: Net.Socket;
+			try {
+				s = options.tls
+					? tls.connect({ ...base, ...tlsOptions(tls, options.tls) })
+					: net.connect(base);
+			} catch (error) {
+				reject(
+					connectionError(
+						error instanceof Error ? error : new Error(String(error)),
+					),
+				);
+				return;
+			}
 			const fail = (error: Error & { code?: string }) => {
 				s.destroy();
 				reject(connectionError(error));

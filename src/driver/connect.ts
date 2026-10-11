@@ -126,26 +126,61 @@ async function readText(path: string): Promise<string> {
 	return readFile(path, 'utf8');
 }
 
+/** Reads `~/.postgresql/<name>` when it exists, as libpq's default certificate locations. */
+async function readDefault(name: string): Promise<string | undefined> {
+	try {
+		const [{ readFile }, { homedir }, { join }] = await Promise.all([
+			import('node:fs/promises'),
+			import('node:os'),
+			import('node:path'),
+		]);
+		return await readFile(join(homedir(), '.postgresql', name), 'utf8');
+	} catch {
+		return undefined;
+	}
+}
+
 async function tlsOptions(
 	config: ResolvedConfig,
 	host: HostTarget,
 	direct: boolean,
 ): Promise<TlsConnectOptions> {
 	const { ssl } = config;
+	const verifyChain = ssl.mode === 'verify-ca' || ssl.mode === 'verify-full';
+	let ca =
+		ssl.ca ??
+		(ssl.rootCertFile === undefined
+			? undefined
+			: await readText(ssl.rootCertFile));
+	if (ca === undefined && verifyChain) ca = await readDefault('root.crt');
+	let cert =
+		ssl.cert ??
+		(ssl.certFile === undefined ? undefined : await readText(ssl.certFile));
+	let key =
+		ssl.key ??
+		(ssl.keyFile === undefined ? undefined : await readText(ssl.keyFile));
+	if (cert === undefined && key === undefined) {
+		const [defaultCert, defaultKey] = await Promise.all([
+			readDefault('postgresql.crt'),
+			readDefault('postgresql.key'),
+		]);
+		if (defaultCert !== undefined && defaultKey !== undefined) {
+			cert = defaultCert;
+			key = defaultKey;
+		}
+	}
+	if ((cert === undefined) !== (key === undefined)) {
+		throw new ConnectionError(
+			'A client certificate needs both sslcert and sslkey',
+		);
+	}
 	return {
 		servername: isIp(host.host) ? undefined : host.host,
-		ca:
-			ssl.ca ??
-			(ssl.rootCertFile === undefined
-				? undefined
-				: await readText(ssl.rootCertFile)),
-		cert:
-			ssl.cert ??
-			(ssl.certFile === undefined ? undefined : await readText(ssl.certFile)),
-		key:
-			ssl.key ??
-			(ssl.keyFile === undefined ? undefined : await readText(ssl.keyFile)),
-		verifyChain: ssl.mode === 'verify-ca' || ssl.mode === 'verify-full',
+		ca,
+		cert,
+		key,
+		passphrase: ssl.passphrase,
+		verifyChain,
 		verifyHostname: ssl.mode === 'verify-full',
 		host: host.host,
 		alpn: direct ? ['postgresql'] : undefined,
@@ -235,7 +270,7 @@ async function attempt(
 	}
 }
 
-/** Whether a startup error means the server or pooler doesn't speak protocol 3.2. */
+/** Whether a startup error means the server or pooler rejected the requested protocol version. */
 function rejectsProtocol32(error: unknown): boolean {
 	if (error instanceof PostgresError) {
 		return (
@@ -261,12 +296,12 @@ async function connectHost(
 				: mode === 'prefer'
 					? ['tls-optional', 'plain']
 					: [config.ssl.negotiation === 'direct' ? 'direct' : 'tls'];
-	const versions =
-		config.protocol === '3.0'
-			? [fe.PROTOCOL_3_0]
-			: config.protocol === '3.2'
-				? [fe.PROTOCOL_3_2]
-				: [fe.PROTOCOL_3_2, fe.PROTOCOL_3_0];
+	// ask for the newest version; retry with the oldest accepted one when a
+	// pooler rejects the request outright instead of negotiating
+	const versions = [
+		config.protocol.max,
+		...(config.protocol.min < config.protocol.max ? [config.protocol.min] : []),
+	].map(fe.protocolVersion);
 
 	const state: Attempt = { socket: undefined };
 	const run = async (): Promise<Connection> => {

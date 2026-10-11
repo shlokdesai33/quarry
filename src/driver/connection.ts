@@ -5,7 +5,18 @@ import {
 	type ChannelBinding,
 } from './auth/scram.js';
 import {
+	describeFailure,
+	OAUTH_ERROR_ACK,
+	OAUTHBEARER,
+	OAuthError,
+	oauthInitialResponse,
+	parseOAuthFailure,
+	type OAuthFailure,
+} from './auth/oauth.js';
+import { detectCapabilities, type Capabilities } from './capabilities.js';
+import {
 	findPgpassPassword,
+	type AuthMethod,
 	type HostTarget,
 	type ResolvedConfig,
 } from './config.js';
@@ -116,7 +127,10 @@ export class Connection implements AsyncDisposable {
 	#startupError: ((error: Error) => void) | undefined;
 	#pid = 0;
 	#secretKey: Uint8Array = new Uint8Array(0);
-	#protocol: '3.0' | '3.2';
+	#protocolMinor: number;
+	#unrecognizedOptions: readonly string[] = [];
+	#saslMechanisms: readonly string[] = [];
+	#capabilities: Capabilities | undefined;
 	readonly #parameters = new Map<string, string>();
 	readonly #noticeListeners = new Set<Listener<Notice>>();
 	readonly #notificationListeners = new Set<Listener<Notification>>();
@@ -140,7 +154,7 @@ export class Connection implements AsyncDisposable {
 		this.#info = info;
 		this.#reader = new Reader(config.maxMessageSize);
 		this.#types = config.types ?? defaultTypes;
-		this.#protocol = info.version === fe.PROTOCOL_3_2 ? '3.2' : '3.0';
+		this.#protocolMinor = info.version & 0xffff;
 		this.#closedPromise = new Promise((resolve) => {
 			this.#resolveClosed = resolve;
 		});
@@ -195,9 +209,24 @@ export class Connection implements AsyncDisposable {
 		return this.#pid;
 	}
 
-	/** The protocol version in use. */
-	get protocol(): '3.0' | '3.2' {
-		return this.#protocol;
+	/** The negotiated protocol version, e.g. `3.2`. */
+	get protocol(): `3.${number}` {
+		return `3.${this.#protocolMinor}`;
+	}
+
+	/** What the server supports; see `Capabilities`. */
+	get capabilities(): Capabilities {
+		this.#capabilities ??= detectCapabilities(
+			this.#protocolMinor,
+			this.#parameters,
+			this.#saslMechanisms,
+		);
+		return this.#capabilities;
+	}
+
+	/** Protocol options (`_pq_.*`) the server did not recognize, from NegotiateProtocolVersion. */
+	get unrecognizedProtocolOptions(): readonly string[] {
+		return this.#unrecognizedOptions;
 	}
 
 	/** Run-time parameters the server reported (`server_version`, `TimeZone`, `in_hot_standby`, …). */
@@ -277,17 +306,24 @@ export class Connection implements AsyncDisposable {
 		this.#socket.write(
 			fe.startup(this.#writer, this.#info.version, params).take(),
 		);
+		let method: AuthMethod | undefined;
 		let scram: ScramClient | undefined;
+		let scramVerified = false;
+		let oauth:
+			| { token: string | undefined; failure: OAuthFailure | undefined }
+			| undefined;
 		for (;;) {
 			const msg = await this.#nextStartupMessage();
 			switch (msg.type) {
 				case 'AuthenticationCleartextPassword':
+					method = this.#allow('password', 'a cleartext password');
 					this.#refuseWithoutBinding('a cleartext password');
 					this.#socket.write(
 						fe.password(this.#writer, await this.#password()).take(),
 					);
 					break;
 				case 'AuthenticationMD5Password':
+					method = this.#allow('md5', 'an MD5 password');
 					this.#refuseWithoutBinding('an MD5 password');
 					this.#socket.write(
 						fe
@@ -299,15 +335,44 @@ export class Connection implements AsyncDisposable {
 					);
 					break;
 				case 'AuthenticationSASL': {
-					scram = await this.#scram(msg.mechanisms);
-					this.#socket.write(
-						fe
-							.saslInitialResponse(this.#writer, scram.mechanism, scram.first())
-							.take(),
-					);
+					this.#saslMechanisms = msg.mechanisms;
+					if (this.#chooseOAuth(msg.mechanisms)) {
+						method = this.#allow('oauth', 'OAuth');
+						this.#refuseWithoutBinding('an OAuth bearer token');
+						oauth = { token: await this.#oauthToken(), failure: undefined };
+						this.#socket.write(
+							fe
+								.saslInitialResponse(
+									this.#writer,
+									OAUTHBEARER,
+									oauthInitialResponse(oauth.token),
+								)
+								.take(),
+						);
+					} else {
+						method = this.#allow('scram-sha-256', 'SCRAM-SHA-256');
+						scram = await this.#scram(msg.mechanisms);
+						this.#socket.write(
+							fe
+								.saslInitialResponse(
+									this.#writer,
+									scram.mechanism,
+									scram.first(),
+								)
+								.take(),
+						);
+					}
 					break;
 				}
 				case 'AuthenticationSASLContinue':
+					if (oauth !== undefined) {
+						// the server's error and discovery document; acknowledge so it fails the exchange
+						oauth.failure = parseOAuthFailure(msg.data);
+						this.#socket.write(
+							fe.saslResponse(this.#writer, OAUTH_ERROR_ACK).take(),
+						);
+						break;
+					}
 					if (scram === undefined)
 						throw new ProtocolError('SASLContinue before SASL');
 					this.#socket.write(
@@ -315,28 +380,52 @@ export class Connection implements AsyncDisposable {
 					);
 					break;
 				case 'AuthenticationSASLFinal':
+					if (oauth !== undefined) break;
 					if (scram === undefined)
 						throw new ProtocolError('SASLFinal before SASL');
 					scram.verify(msg.data);
+					scramVerified = true;
 					break;
 				case 'AuthenticationOk':
-					if (scram === undefined) this.#refuseWithoutBinding('no password');
+					if (scram !== undefined && !scramVerified) {
+						throw new ConnectionError(
+							'The server ended SCRAM authentication without proving it knows the password',
+						);
+					}
+					if (method === undefined) {
+						this.#allow('none', 'no');
+						this.#refuseWithoutBinding('no password');
+					}
 					break;
 				case 'AuthenticationUnsupported':
-					throw new ConnectionError(
-						`The server requested an unsupported authentication method (code ${msg.code}); GSSAPI, SSPI and Kerberos are not supported`,
-					);
+					throw this.#unsupported(msg.code);
 				case 'NegotiateProtocolVersion':
-					this.#protocol = msg.minor >= 2 ? '3.2' : '3.0';
+					this.#negotiated(msg.minor, msg.unrecognized);
 					break;
 				case 'BackendKeyData':
 					this.#pid = msg.pid;
 					this.#secretKey = msg.key;
 					break;
-				case 'ErrorResponse':
-					throw postgresError(msg.fields);
+				case 'ErrorResponse': {
+					const error = postgresError(msg.fields);
+					if (oauth !== undefined) {
+						throw new OAuthError(
+							oauth.token === undefined
+								? `The server requires an OAuth bearer token${describeFailure(oauth.failure)}, but no oauthToken was given`
+								: `OAuth authentication failed${describeFailure(oauth.failure)}: ${error.message}`,
+							oauth.failure,
+							error,
+						);
+					}
+					throw error;
+				}
 				case 'ReadyForQuery':
 					this.#status = msg.status;
+					this.#capabilities = detectCapabilities(
+						this.#protocolMinor,
+						this.#parameters,
+						this.#saslMechanisms,
+					);
 					this.#starting = false;
 					this.#startupError = undefined;
 					return;
@@ -347,6 +436,82 @@ export class Connection implements AsyncDisposable {
 	}
 
 	/* oxlint-enable no-await-in-loop */
+
+	/** Applies NegotiateProtocolVersion: the server speaks at most 3.`minor`. */
+	#negotiated(minor: number, unrecognized: readonly string[]): void {
+		if (minor < this.#config.protocol.min) {
+			throw new ConnectionError(
+				`The server supports protocol 3.${minor} at most, but min_protocol_version is 3.${this.#config.protocol.min}`,
+				{ code: 'EPROTOCOL' },
+			);
+		}
+		this.#protocolMinor = Math.min(minor, this.#protocolMinor);
+		this.#unrecognizedOptions = unrecognized;
+	}
+
+	/** Checks a method against `require_auth`. */
+	#allow(method: AuthMethod, label: string): AuthMethod {
+		const allowed = this.#config.requireAuth;
+		if (allowed !== undefined && !allowed.has(method)) {
+			throw new ConnectionError(
+				`The server requested ${label} authentication (${method}), but require_auth allows only ${[...allowed].join(', ')}`,
+				{ code: 'EAUTHMETHOD' },
+			);
+		}
+		return method;
+	}
+
+	#unsupported(code: number): ConnectionError {
+		const names: Readonly<Record<number, [AuthMethod, string]>> = {
+			2: ['gss', 'Kerberos V5'],
+			7: ['gss', 'GSSAPI'],
+			8: ['gss', 'GSSAPI'],
+			9: ['sspi', 'SSPI'],
+		};
+		const known = names[code];
+		if (known === undefined) {
+			return new ConnectionError(
+				`The server requested an unknown authentication method (request code ${code})`,
+				{
+					code: 'EAUTHMETHOD',
+				},
+			);
+		}
+		this.#allow(known[0], known[1]);
+		return new ConnectionError(
+			`The server requested ${known[1]} authentication, which this driver does not support (GSSAPI, SSPI and Kerberos are out of scope)`,
+			{ code: 'EAUTHMETHOD' },
+		);
+	}
+
+	/** Whether to answer a SASL request with OAuth rather than SCRAM. */
+	#chooseOAuth(mechanisms: readonly string[]): boolean {
+		if (!mechanisms.includes(OAUTHBEARER)) return false;
+		const scram = mechanisms.some((m) => m.startsWith('SCRAM-SHA-256'));
+		if (!scram) return true;
+		const allowed = this.#config.requireAuth;
+		if (allowed !== undefined && !allowed.has('scram-sha-256')) return true;
+		return (
+			this.#config.oauthToken !== undefined &&
+			this.#config.password === undefined
+		);
+	}
+
+	async #oauthToken(): Promise<string | undefined> {
+		if (!this.#socket.encrypted && !isLocal(this.#info.host.host)) {
+			throw new ConnectionError(
+				'Refusing to send an OAuth bearer token over an unencrypted connection; use sslmode=require or stronger',
+			);
+		}
+		const hook = this.#config.oauthToken;
+		if (hook === undefined) return undefined;
+		return hook({
+			host: this.#info.host.host,
+			port: this.#info.host.port,
+			user: this.#config.user,
+			database: this.#config.database,
+		});
+	}
 
 	#refuseWithoutBinding(method: string): void {
 		if (this.#config.channelBinding === 'require') {
@@ -988,4 +1153,13 @@ async function readPgpass(
 	} catch {
 		return undefined;
 	}
+}
+
+function isLocal(host: string): boolean {
+	return (
+		host.startsWith('/') ||
+		host === 'localhost' ||
+		host === '::1' ||
+		/^127\.\d+\.\d+\.\d+$/.test(host)
+	);
 }

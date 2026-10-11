@@ -1,9 +1,20 @@
 import { Writer } from './writer.js';
 
+/**
+ * The newest protocol minor version (of major version 3) this driver
+ * speaks. Version 3.2 (PostgreSQL 18) has variable-length cancel keys; 3.1
+ * was never used. Supporting a future 3.3 means raising this and handling
+ * what it changes.
+ */
+export const LATEST_PROTOCOL_MINOR = 2;
+
+/** The startup message's version field for protocol 3.`minor`. */
+export const protocolVersion = (minor: number): number => (3 << 16) | minor;
+
 /** Protocol version 3.0, as sent in the startup message. */
-export const PROTOCOL_3_0 = 196608;
+export const PROTOCOL_3_0 = protocolVersion(0);
 /** Protocol version 3.2 (PostgreSQL 18+): variable-length cancel keys. */
-export const PROTOCOL_3_2 = 196610;
+export const PROTOCOL_3_2 = protocolVersion(2);
 
 const SSL_REQUEST_CODE = 80877103;
 const CANCEL_REQUEST_CODE = 80877102;

@@ -1,4 +1,5 @@
 import { DriverError } from './errors.js';
+import { LATEST_PROTOCOL_MINOR } from './protocol/frontend.js';
 import type { Notice, Notification } from './notice.js';
 import type { SocketFactory } from './socket.js';
 import type { TypeParsers } from './types.js';
@@ -24,16 +25,53 @@ export interface SslOptions {
 	readonly ca?: string | readonly string[] | undefined;
 	/** A file of trusted CA certificates, or `system` for the platform's store (implies `verify-full`). */
 	readonly rootCertFile?: string | undefined;
-	/** Client certificate and key (PEM), or files holding them. */
+	/**
+	 * Client certificate and key (PEM), or files holding them, for `cert`
+	 * authentication (mutual TLS). Without either, `~/.postgresql/postgresql.crt`
+	 * and `postgresql.key` are used when they exist, as libpq does.
+	 */
 	readonly cert?: string | undefined;
 	readonly key?: string | undefined;
 	readonly certFile?: string | undefined;
 	readonly keyFile?: string | undefined;
+	/** The passphrase of an encrypted client key (libpq's `sslpassword`). */
+	readonly passphrase?: string | undefined;
 	/**
 	 * `postgres` (default) sends an SSLRequest first; `direct` starts the
 	 * TLS handshake immediately (PostgreSQL 17+), saving a round trip.
 	 */
 	readonly negotiation?: 'postgres' | 'direct' | undefined;
+}
+
+/** A protocol version of major version 3, e.g. `3.2`. */
+export type ProtocolVersion = `3.${number}`;
+
+/** Authentication methods, as named by libpq's `require_auth`. */
+export type AuthMethod =
+	| 'password'
+	| 'md5'
+	| 'scram-sha-256'
+	| 'oauth'
+	| 'gss'
+	| 'sspi'
+	| 'none';
+
+const AUTH_METHODS: readonly AuthMethod[] = [
+	'password',
+	'md5',
+	'scram-sha-256',
+	'oauth',
+	'gss',
+	'sspi',
+	'none',
+];
+
+/** What `oauthToken` is told about the connection asking for a token. */
+export interface OAuthContext {
+	readonly host: string;
+	readonly port: number;
+	readonly user: string;
+	readonly database: string;
 }
 
 /** Which server to accept when several hosts are listed, as libpq's `target_session_attrs`. */
@@ -66,10 +104,32 @@ export interface ConnectionOptions {
 	readonly keepAlive?: boolean | undefined;
 	readonly keepAliveInitialDelay?: number | undefined;
 	/**
-	 * The protocol version to speak. `auto` (default) asks for 3.2 and falls
-	 * back to 3.0 for servers and poolers that don't support it.
+	 * The protocol version to speak. `auto` (default) asks for the newest
+	 * version the driver knows (3.2) and accepts whatever the server or
+	 * pooler negotiates down to; `3.x` insists on exactly that version.
 	 */
-	readonly protocol?: 'auto' | '3.0' | '3.2' | undefined;
+	readonly protocol?: 'auto' | ProtocolVersion | undefined;
+	/** The oldest protocol version to accept (default `3.0`), as libpq's `min_protocol_version`. */
+	readonly minProtocolVersion?: ProtocolVersion | 'latest' | undefined;
+	/** The newest protocol version to ask for (default `latest`), as libpq's `max_protocol_version`. */
+	readonly maxProtocolVersion?: ProtocolVersion | 'latest' | undefined;
+	/**
+	 * The authentication methods to accept, as libpq's `require_auth`: e.g.
+	 * `'scram-sha-256'`, `['scram-sha-256', 'oauth']`, or negated with `!`
+	 * (`'!password,!md5'`). Methods: `password`, `md5`, `scram-sha-256`,
+	 * `oauth`, `gss`, `sspi`, `none`. A server asking for anything else is
+	 * refused, so it can't downgrade the client to a weaker method.
+	 */
+	readonly requireAuth?: string | readonly string[] | undefined;
+	/**
+	 * Supplies a bearer token when the server asks for OAuth
+	 * (`OAUTHBEARER`, PostgreSQL 18+). Called once per connection attempt;
+	 * the token is never cached or logged. The driver does not run OAuth
+	 * login flows: get the token from your identity provider.
+	 */
+	readonly oauthToken?:
+		| ((context: OAuthContext) => string | Promise<string>)
+		| undefined;
 	/** Extra startup parameters (run-time settings), e.g. `{ search_path: 'app' }`. */
 	readonly params?: Readonly<Record<string, string>> | undefined;
 	/** Command-line options sent to the server, as `PGOPTIONS` (e.g. `-c statement_timeout=5s`). */
@@ -115,12 +175,19 @@ export interface ResolvedConfig {
 		readonly key: string | undefined;
 		readonly certFile: string | undefined;
 		readonly keyFile: string | undefined;
+		readonly passphrase: string | undefined;
 	};
 	readonly channelBinding: 'disable' | 'prefer' | 'require';
 	readonly connectTimeout: number;
 	readonly keepAlive: boolean;
 	readonly keepAliveInitialDelay: number;
-	readonly protocol: 'auto' | '3.0' | '3.2';
+	/** The protocol minor versions to accept: ask for `max`, accept down to `min`. */
+	readonly protocol: { readonly min: number; readonly max: number };
+	/** The authentication methods allowed, or undefined for any. */
+	readonly requireAuth: ReadonlySet<AuthMethod> | undefined;
+	readonly oauthToken:
+		| ((context: OAuthContext) => string | Promise<string>)
+		| undefined;
 	readonly params: Readonly<Record<string, string>>;
 	readonly targetSessionAttrs: TargetSessionAttrs;
 	readonly types: TypeParsers | undefined;
@@ -284,6 +351,8 @@ const KNOWN_KEYWORDS = new Set([
 	'target_session_attrs',
 	'max_protocol_version',
 	'min_protocol_version',
+	'require_auth',
+	'sslpassword',
 	'client_encoding',
 ]);
 
@@ -307,6 +376,7 @@ const ENV_KEYWORDS: Readonly<Record<string, string>> = {
 	PGTARGETSESSIONATTRS: 'target_session_attrs',
 	PGMAXPROTOCOLVERSION: 'max_protocol_version',
 	PGMINPROTOCOLVERSION: 'min_protocol_version',
+	PGREQUIREAUTH: 'require_auth',
 };
 
 function processEnv(): Readonly<Record<string, string | undefined>> {
@@ -340,6 +410,64 @@ function toMs(seconds: string): number {
 		throw new DriverError(`Invalid connect_timeout "${seconds}"`);
 	// libpq treats values below 2 seconds as 2
 	return n === 0 ? 0 : Math.max(2, n) * 1000;
+}
+
+function protocolMinor(version: string, what: string): number {
+	if (version === 'latest') return LATEST_PROTOCOL_MINOR;
+	const match = /^3\.(\d+)$/.exec(version);
+	const minor = match ? Number(match[1]) : Number.NaN;
+	if (!(minor >= 0 && minor <= LATEST_PROTOCOL_MINOR) || minor === 1) {
+		throw new DriverError(
+			`Unsupported ${what} "${version}"; this driver speaks 3.0 to 3.${LATEST_PROTOCOL_MINOR} (3.1 was never used)`,
+		);
+	}
+	return minor;
+}
+
+function protocolRange(
+	options: ConnectionOptions,
+	kw: (key: string) => string | undefined,
+): { min: number; max: number } {
+	if (options.protocol !== undefined && options.protocol !== 'auto') {
+		const exact = protocolMinor(options.protocol, 'protocol');
+		return { min: exact, max: exact };
+	}
+	const min = protocolMinor(
+		options.minProtocolVersion ?? kw('min_protocol_version') ?? '3.0',
+		'min_protocol_version',
+	);
+	const max = protocolMinor(
+		options.maxProtocolVersion ?? kw('max_protocol_version') ?? 'latest',
+		'max_protocol_version',
+	);
+	if (min > max)
+		throw new DriverError(
+			`min_protocol_version 3.${min} is above max_protocol_version 3.${max}`,
+		);
+	return { min, max };
+}
+
+/** Parses `require_auth`: a list of methods, or of negated methods (`!md5`), never mixed. */
+export function parseRequireAuth(
+	value: string | readonly string[] | undefined,
+): ReadonlySet<AuthMethod> | undefined {
+	if (value === undefined) return undefined;
+	const entries = (typeof value === 'string' ? value.split(',') : value)
+		.map((e) => e.trim())
+		.filter((e) => e !== '');
+	if (entries.length === 0) return undefined;
+	const negated = entries.map((e) => e.startsWith('!'));
+	if (negated.some((n) => n !== negated[0])) {
+		throw new DriverError(
+			'require_auth cannot mix negated (!method) and plain methods',
+		);
+	}
+	const methods = entries.map((e) =>
+		oneOf(e.replace(/^!/, ''), AUTH_METHODS, 'require_auth method'),
+	);
+	return new Set(
+		negated[0] ? AUTH_METHODS.filter((m) => !methods.includes(m)) : methods,
+	);
 }
 
 /** Unix sockets and loopback addresses, where `prefer` stays the default sslmode. */
@@ -428,13 +556,7 @@ export function resolveConfig(options: ConnectionOptions = {}): ResolvedConfig {
 	if (pgOptions) params['options'] = pgOptions;
 	Object.assign(params, options.params);
 
-	const maxProtocol = kw('max_protocol_version');
-	const minProtocol = kw('min_protocol_version');
-	let protocol: 'auto' | '3.0' | '3.2' = options.protocol ?? 'auto';
-	if (options.protocol === undefined) {
-		if (maxProtocol === '3.0') protocol = '3.0';
-		else if (minProtocol === '3.2') protocol = '3.2';
-	}
+	const protocol = protocolRange(options, kw);
 
 	const timeout =
 		options.connectTimeout ??
@@ -463,6 +585,7 @@ export function resolveConfig(options: ConnectionOptions = {}): ResolvedConfig {
 			key: sslOptions.key,
 			certFile: sslOptions.certFile ?? kw('sslcert'),
 			keyFile: sslOptions.keyFile ?? kw('sslkey'),
+			passphrase: sslOptions.passphrase ?? kw('sslpassword'),
 		},
 		channelBinding: oneOf(
 			options.channelBinding ?? kw('channel_binding') ?? 'prefer',
@@ -475,6 +598,8 @@ export function resolveConfig(options: ConnectionOptions = {}): ResolvedConfig {
 			options.keepAliveInitialDelay ??
 			(keepalivesIdle ? Number(keepalivesIdle) * 1000 : 0),
 		protocol,
+		requireAuth: parseRequireAuth(options.requireAuth ?? kw('require_auth')),
+		oauthToken: options.oauthToken,
 		params,
 		targetSessionAttrs: oneOf(
 			options.targetSessionAttrs ?? kw('target_session_attrs') ?? 'any',
