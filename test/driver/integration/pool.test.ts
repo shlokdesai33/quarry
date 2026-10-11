@@ -7,6 +7,7 @@ import {
 	DriverError,
 	QueryCanceled,
 	ReadOnlyTransaction,
+	TransactionTimeout,
 	UniqueViolation,
 } from '../../../src/driver/errors.js';
 import { createPool, type PoolOptions } from '../../../src/driver/pool.js';
@@ -199,6 +200,32 @@ describe.skipIf(noPg)('transactions', () => {
 		await Promise.all([work(a, 1), work(b, 2)]);
 		expect(await ids()).toEqual([1, 2]);
 		expect(attempts).toBeGreaterThan(2);
+	});
+
+	it('ends a transaction that outlives its timeout', async () => {
+		await using p = pool({ max: 1 });
+		const error = await rejection(
+			p.transaction(
+				async (tx) => {
+					await tx.query('select pg_sleep(0.1)');
+					await tx.query('select pg_sleep(0.3)');
+				},
+				{ timeout: 200 },
+			),
+			TransactionTimeout,
+		);
+		expect(error.code).toBe('25P04');
+		expect((await p.query('select 1 as x')).rows).toEqual([{ x: 1 }]);
+		const ok = await p.transaction(
+			async (tx) =>
+				(
+					await tx.query<{ t: string }>(
+						"select current_setting('transaction_timeout') as t",
+					)
+				).rows[0]?.t,
+			{ timeout: '5s' },
+		);
+		expect(ok).toBe('5s');
 	});
 
 	it('applies a per-query server-side statement timeout without leaking it', async () => {

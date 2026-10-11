@@ -30,7 +30,10 @@ export function parseTimestamptz(text: string): Date {
 	if (text === 'infinity') return new Date(MAX_DATE);
 	if (text === '-infinity') return new Date(-MAX_DATE);
 	const m = TIMESTAMPTZ.exec(text);
-	if (m === null) throw new DriverError(`Invalid timestamptz output: ${text}`);
+	if (m === null)
+		throw new DriverError(
+			`Invalid timestamptz output (${text.length} characters)`,
+		);
 	let year = Number(m[1]);
 	if (m[12] !== undefined) year = 1 - year;
 	const ms = m[7] === undefined ? 0 : Math.floor(Number(m[7]) * 1000);
@@ -125,7 +128,7 @@ export function parseRange<T>(
 	const open = text[0];
 	const close = text[text.length - 1];
 	if ((open !== '[' && open !== '(') || (close !== ']' && close !== ')')) {
-		throw new DriverError(`Invalid range output: ${text}`);
+		throw new DriverError(`Invalid range output (${text.length} characters)`);
 	}
 	const bounds: (string | null)[] = [];
 	let i = 1;
@@ -155,14 +158,19 @@ export function parseRange<T>(
 			bounds.push(value);
 		} else {
 			const stop = n === 0 ? text.indexOf(',', i) : end;
-			if (stop < 0) throw new DriverError(`Invalid range output: ${text}`);
+			if (stop < 0)
+				throw new DriverError(
+					`Invalid range output (${text.length} characters)`,
+				);
 			const token = text.slice(i, stop);
 			bounds.push(token === '' ? null : token);
 			i = stop;
 		}
 		if (n === 0) {
 			if (text[i] !== ',')
-				throw new DriverError(`Invalid range output: ${text}`);
+				throw new DriverError(
+					`Invalid range output (${text.length} characters)`,
+				);
 			i++;
 		}
 	}

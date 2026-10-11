@@ -54,6 +54,7 @@ import { Reader } from './protocol/reader.js';
 import { Writer } from './protocol/writer.js';
 import { asResult, asRows, type RowMode } from './rows.js';
 import type { DriverSocket } from './socket.js';
+import { startQuerySpan } from './telemetry.js';
 import { Transaction, type TransactionOptions } from './transaction.js';
 import {
 	copyChunks,
@@ -84,6 +85,8 @@ export interface QueryOptions {
 	readonly statementTimeout?: number | string;
 	/** Receives where the query spent its time once it settles. */
 	readonly onTiming?: (timing: OpTiming) => void;
+	/** A label for telemetry: the span name and `db.query.summary` (quarry's `tag()`). */
+	readonly tag?: string;
 	/**
 	 * Ask for binary results for columns whose parser has a binary twin
 	 * (default: the connection's `binaryResults`). Values decode the same;
@@ -797,6 +800,55 @@ export class Connection implements AsyncDisposable {
 		params: readonly unknown[] = [],
 		options?: QueryOptions,
 	): Promise<QueryResult<R>> {
+		if (this.#config.telemetry === undefined && !this.#config.captureStack)
+			return this.#query<R>(sql, params, options);
+		return this.#observe(
+			sql,
+			options?.tag,
+			() => this.#query<R>(sql, params, options),
+			(r) => r.rowCount,
+		);
+	}
+
+	/**
+	 * Runs `run`, reporting it as a span and adding the caller's stack to
+	 * its error, as configured.
+	 */
+	async #observe<T>(
+		sql: string,
+		tag: string | undefined,
+		run: () => Promise<T>,
+		rowCount: (result: T) => number | null | undefined,
+	): Promise<T> {
+		const callsite = this.#config.captureStack ? new Error() : undefined;
+		const telemetry = this.#config.telemetry;
+		const span =
+			telemetry === undefined
+				? undefined
+				: startQuerySpan(
+						telemetry,
+						{ database: this.#config.database, ...this.#info.host },
+						sql,
+						tag,
+					);
+		try {
+			const result = await run();
+			span?.finish({ rowCount: rowCount(result) });
+			return result;
+		} catch (error) {
+			span?.finish(undefined, error);
+			if (callsite?.stack && error instanceof Error && error.stack) {
+				error.stack = `${error.stack}\n    --- query issued at ---\n${callsite.stack.slice(callsite.stack.indexOf('\n') + 1)}`;
+			}
+			throw error;
+		}
+	}
+
+	#query<R>(
+		sql: string,
+		params: readonly unknown[],
+		options: QueryOptions | undefined,
+	): Promise<QueryResult<R>> {
 		if (options?.statementTimeout !== undefined) {
 			return this.#queryWithTimeout<R>(
 				sql,
@@ -838,10 +890,10 @@ export class Connection implements AsyncDisposable {
 		if (this.#status === 'I') {
 			// pipelined together, so they reach the server back to back
 			const settled = await Promise.allSettled([
-				this.query('begin'),
-				this.query(set, [value]),
-				this.query<R>(sql, params, rest),
-				this.query('commit'),
+				this.#query('begin', [], undefined),
+				this.#query(set, [value], undefined),
+				this.#query<R>(sql, params, rest),
+				this.#query('commit', [], undefined),
 			]);
 			const result = settled[2];
 			if (result?.status === 'rejected') throw result.reason;
@@ -851,16 +903,21 @@ export class Connection implements AsyncDisposable {
 				throw new ConnectionError('Query did not run');
 			return result.value;
 		}
-		const previous = this.query<{ previous: string }>(
+		const previous = this.#query<{ previous: string }>(
 			"select current_setting('statement_timeout') as previous, set_config('statement_timeout', $1, true)",
 			[value],
+			undefined,
 		);
 		const [before, result] = await Promise.allSettled([
 			previous,
-			this.query<R>(sql, params, rest),
+			this.#query<R>(sql, params, rest),
 		]);
 		if (before.status === 'fulfilled' && this.#status === 'T') {
-			this.query(set, [before.value.rows[0]?.previous ?? '0']).catch(() => {});
+			this.#query(
+				set,
+				[before.value.rows[0]?.previous ?? '0'],
+				undefined,
+			).catch(() => {});
 		}
 		if (result.status === 'rejected') throw result.reason;
 		if (before.status === 'rejected') throw before.reason;
@@ -886,7 +943,26 @@ export class Connection implements AsyncDisposable {
 	 */
 	simpleQuery<R = Record<string, unknown>>(
 		sql: string,
-		options?: Pick<QueryOptions, 'rowMode' | 'types' | 'signal' | 'timeout'>,
+		options?: Pick<
+			QueryOptions,
+			'rowMode' | 'types' | 'signal' | 'timeout' | 'tag'
+		>,
+	): Promise<QueryResult<R>[]> {
+		if (this.#config.telemetry === undefined && !this.#config.captureStack)
+			return this.#simpleQuery<R>(sql, options);
+		return this.#observe(
+			sql,
+			options?.tag,
+			() => this.#simpleQuery<R>(sql, options),
+			(r) => r.at(-1)?.rowCount,
+		);
+	}
+
+	#simpleQuery<R>(
+		sql: string,
+		options:
+			| Pick<QueryOptions, 'rowMode' | 'types' | 'signal' | 'timeout'>
+			| undefined,
 	): Promise<QueryResult<R>[]> {
 		return new Promise((resolve, reject) => {
 			const op = new SimpleQueryOp(
@@ -980,7 +1056,23 @@ export class Connection implements AsyncDisposable {
 	copyFrom(
 		sql: string,
 		source: AsyncIterable<Uint8Array | string> | Iterable<Uint8Array | string>,
-		options?: Pick<QueryOptions, 'signal' | 'timeout'>,
+		options?: Pick<QueryOptions, 'signal' | 'timeout' | 'tag'>,
+	): Promise<number> {
+		if (this.#config.telemetry !== undefined || this.#config.captureStack) {
+			return this.#observe(
+				sql,
+				options?.tag,
+				() => this.#copyFrom(sql, source, options),
+				(n) => n,
+			);
+		}
+		return this.#copyFrom(sql, source, options);
+	}
+
+	#copyFrom(
+		sql: string,
+		source: AsyncIterable<Uint8Array | string> | Iterable<Uint8Array | string>,
+		options: Pick<QueryOptions, 'signal' | 'timeout'> | undefined,
 	): Promise<number> {
 		return new Promise((resolve, reject) => {
 			this.#enqueue(

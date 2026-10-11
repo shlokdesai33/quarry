@@ -145,6 +145,13 @@ export class DeadlockDetected extends PostgresError {}
 export class LockNotAvailable extends PostgresError {}
 /** 25006: a write was attempted in a read-only transaction. */
 export class ReadOnlyTransaction extends PostgresError {}
+/**
+ * 25P04: the transaction ran longer than `transaction_timeout`. The server
+ * ends the session, so the connection is closed.
+ */
+export class TransactionTimeout extends PostgresError {}
+/** 25P03: the session sat idle in a transaction longer than `idle_in_transaction_session_timeout`; the connection is closed. */
+export class IdleInTransactionTimeout extends PostgresError {}
 /** 42P01: the table does not exist. */
 export class UndefinedTable extends PostgresError {}
 /** 42703: the column does not exist. */
@@ -194,6 +201,8 @@ const classes: Readonly<
 	'40P01': DeadlockDetected,
 	'55P03': LockNotAvailable,
 	'25006': ReadOnlyTransaction,
+	'25P04': TransactionTimeout,
+	'25P03': IdleInTransactionTimeout,
 	'42P01': UndefinedTable,
 	'42703': UndefinedColumn,
 	'57014': QueryCanceled,

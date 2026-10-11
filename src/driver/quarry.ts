@@ -238,6 +238,7 @@ export class PgExecutor implements Executor, AsyncDisposable {
 	#queryOptions(
 		options: ExecuteOptions,
 		onTiming: ((t: OpTiming) => void) | undefined,
+		tag?: string,
 	): Record<string, unknown> {
 		const rowMode: RowMode = options.rowMode ?? 'object';
 		return {
@@ -251,6 +252,7 @@ export class PgExecutor implements Executor, AsyncDisposable {
 				? {}
 				: { statementTimeout: options.timeout }),
 			...(onTiming === undefined ? {} : { onTiming }),
+			...(tag === undefined ? {} : { tag }),
 		};
 	}
 
@@ -300,7 +302,11 @@ export class PgExecutor implements Executor, AsyncDisposable {
 				return runner.query<unknown>(
 					query.sql,
 					query.params,
-					this.#queryOptions(merged, observe ? (t) => (timing = t) : undefined),
+					this.#queryOptions(
+						merged,
+						observe ? (t) => (timing = t) : undefined,
+						query.tag,
+					),
 				);
 			});
 			if (observe)
@@ -407,7 +413,7 @@ export class PgExecutor implements Executor, AsyncDisposable {
 				);
 			}
 			const cursorOptions = {
-				...this.#queryOptions(merged, undefined),
+				...this.#queryOptions(merged, undefined, query.tag),
 				...(merged.batchSize === undefined
 					? {}
 					: { batchSize: merged.batchSize }),

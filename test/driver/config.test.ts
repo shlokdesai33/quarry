@@ -384,3 +384,26 @@ describe('versions and policies', () => {
 		).toMatchObject({ certFile: '/e.crt', keyFile: '/e.key' });
 	});
 });
+
+const configError = (text: string) => {
+	try {
+		resolveConfig({ connectionString: text, env: {} });
+	} catch (error) {
+		return error instanceof Error
+			? `${error.message} ${error.stack ?? ''}`
+			: String(error);
+	}
+	return '';
+};
+
+describe('no secrets in errors', () => {
+	it('never echoes connection-string values that may hold the password', () => {
+		expect(configError('postgres://user:sec%ZZret@host/db')).not.toContain(
+			'sec',
+		);
+		expect(
+			configError('postgres://user:secret@host/db?sslmode=sometimes'),
+		).not.toContain('secret');
+		expect(configError("host=h password='secret")).not.toContain('secret');
+	});
+});

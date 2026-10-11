@@ -61,6 +61,12 @@ export interface TransactionOptions {
 	 * `{ 'app.tenant_id': id, statement_timeout: '5s' }` for row-level security.
 	 */
 	readonly settings?: Readonly<Record<string, SettingValue>> | undefined;
+	/**
+	 * Ends the transaction if it runs longer than this (milliseconds, or an
+	 * interval such as `'5s'`), with `transaction_timeout`. The server then
+	 * closes the session and the call fails with `TransactionTimeout`.
+	 */
+	readonly timeout?: number | string | undefined;
 	/** Throw if a transaction is already open, instead of nesting as a savepoint. */
 	readonly durable?: boolean | undefined;
 }
@@ -282,9 +288,16 @@ export class Transaction {
 			);
 		}
 		const retries = options.retries ?? 0;
-		const settings = options.settings
-			? settingsQuery(options.settings)
-			: undefined;
+		const timeout =
+			options.timeout === undefined
+				? undefined
+				: typeof options.timeout === 'number'
+					? `${options.timeout}ms`
+					: options.timeout;
+		const settings = settingsQuery({
+			...options.settings,
+			...(timeout === undefined ? {} : { transaction_timeout: timeout }),
+		});
 		for (let attempt = 0; ; attempt++) {
 			const tx = new Transaction(conn, 0);
 			// begin and settings are pipelined into one round trip

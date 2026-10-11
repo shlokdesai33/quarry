@@ -2,6 +2,7 @@ import { DriverError } from './errors.js';
 import { LATEST_PROTOCOL_MINOR } from './protocol/frontend.js';
 import type { Notice, Notification } from './notice.js';
 import type { SocketFactory } from './socket.js';
+import type { TelemetryOptions } from './telemetry.js';
 import type { TypeParsers } from './types.js';
 
 /** How hard to insist on TLS, with libpq's meanings. */
@@ -150,6 +151,18 @@ export interface ConnectionOptions {
 	 * identical either way; custom and raw types always stay text.
 	 */
 	readonly binaryResults?: boolean | undefined;
+	/**
+	 * Reports every query as an OpenTelemetry client span: pass a tracer
+	 * (`trace.getTracer('app')`). SQL text is recorded unless
+	 * `queryText: false`; parameters never are.
+	 */
+	readonly telemetry?: TelemetryOptions | undefined;
+	/**
+	 * Append the stack of the code that issued a query to its error (a few
+	 * hundred nanoseconds per query; default false — the quarry adapter does
+	 * its own).
+	 */
+	readonly captureStack?: boolean | undefined;
 	/** How sockets are opened; defaults to Node's `net`/`tls`. */
 	readonly socket?: SocketFactory | undefined;
 	readonly onNotice?: (notice: Notice) => void | undefined;
@@ -201,6 +214,8 @@ export interface ResolvedConfig {
 	readonly prepare: boolean;
 	readonly statementCacheSize: number;
 	readonly binaryResults: boolean;
+	readonly telemetry: TelemetryOptions | undefined;
+	readonly captureStack: boolean;
 	readonly socket: SocketFactory | undefined;
 	readonly onNotice: ((notice: Notice) => void) | undefined;
 	readonly onNotification: ((notification: Notification) => void) | undefined;
@@ -241,7 +256,8 @@ function decode(value: string): string {
 		return decodeURIComponent(value);
 	} catch {
 		throw new DriverError(
-			`Invalid percent-encoding in connection string: ${value}`,
+			// never echo the value: it may be the password
+			'Invalid percent-encoding in the connection string',
 		);
 	}
 }
@@ -618,6 +634,8 @@ export function resolveConfig(options: ConnectionOptions = {}): ResolvedConfig {
 		prepare: options.prepare ?? true,
 		statementCacheSize: options.statementCacheSize ?? 100,
 		binaryResults: options.binaryResults ?? true,
+		telemetry: options.telemetry,
+		captureStack: options.captureStack ?? false,
 		socket: options.socket,
 		onNotice: options.onNotice,
 		onNotification: options.onNotification,

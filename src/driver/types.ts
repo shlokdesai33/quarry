@@ -132,7 +132,7 @@ export function parseArray(
 		if (i === 0) throw new DriverError('Invalid array output');
 	}
 	const fail = (): never => {
-		throw new DriverError(`Invalid array output: ${text.slice(0, 100)}`);
+		throw new DriverError(`Invalid array output (${text.length} characters)`);
 	};
 	const level = (): unknown[] => {
 		if (text[i] !== '{') fail();

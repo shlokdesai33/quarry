@@ -79,3 +79,4 @@ export {
 } from './capabilities.js';
 export type { AuthMethod, OAuthContext, ProtocolVersion } from './config.js';
 export { LATEST_PROTOCOL_MINOR } from './protocol/frontend.js';
+export type { SpanLike, TelemetryOptions, TracerLike } from './telemetry.js';
