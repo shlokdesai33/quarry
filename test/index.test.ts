@@ -13,6 +13,8 @@ describe('the package entry point', () => {
 			'update',
 			'updateMany',
 			'deleteFrom',
+			'formatVerifyReport',
+			'defineConfig',
 			'compile',
 			'expressionBuilder',
 			'integer',

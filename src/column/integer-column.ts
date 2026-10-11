@@ -20,7 +20,10 @@ export class IntegerColumn<D extends DataType, S, I = S, U = I>
 	 * @example integer<UserId>().identity()
 	 */
 	identity() {
-		return new IdentityColumn<D, S, never, never>(this._quarry);
+		return new IdentityColumn<D, S, never, never>({
+			...this._quarry,
+			fill: 'identity',
+		});
 	}
 
 	override name(columnName: string) {

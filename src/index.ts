@@ -56,3 +56,4 @@ export type {
 	InferSelectType,
 	InferUpdateType,
 } from './types.js';
+export * from './verify/index.js';

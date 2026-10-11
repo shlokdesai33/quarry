@@ -11,6 +11,7 @@
 		// language level
 		"target": "es2024",
 		"lib": ["es2024"],
+		"types": ["node"],
 
 		// type checking
 		"strict": true,

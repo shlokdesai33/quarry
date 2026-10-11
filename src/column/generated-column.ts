@@ -15,7 +15,10 @@ export class GeneratedColumn<D extends DataType, S, I, U>
 	 * @example text().generated().nullable()
 	 */
 	nullable() {
-		return new GeneratedColumn<D, S | null, I, U>(this._quarry);
+		return new GeneratedColumn<D, S | null, I, U>({
+			...this._quarry,
+			nullable: true,
+		});
 	}
 
 	/**
