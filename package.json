@@ -3,6 +3,9 @@
 	"version": "0.0.0",
 	"description": "A type-safe SQL query builder for PostgreSQL.",
 	"license": "MIT",
+	"bin": {
+		"quarry": "./dist/cli.js"
+	},
 	"files": [
 		"dist",
 		"src"
@@ -34,9 +37,11 @@
 	},
 	"devDependencies": {
 		"@types/node": "^26.4.0",
+		"@types/pg": "^8.23.1",
 		"oxfmt": "^0.65.0",
 		"oxlint": "^1.80.0",
 		"oxlint-tsgolint": "^7.0.2001",
+		"pg": "^8.23.1",
 		"tsdown": "^0.22.14",
 		"typescript": "^7.0.2",
 		"vitest": "^4.1.11"
