@@ -595,7 +595,8 @@ export class CursorOp extends Op {
 		this.#batch = [];
 		this.#fetching = false;
 		if (last) this.#exhausted = true;
-		this.#ready.push({ rows, last });
+		// a portal whose size is a multiple of the batch size ends with an empty batch
+		if (!last || rows.length > 0) this.#ready.push({ rows, last });
 		this.#pump();
 	}
 

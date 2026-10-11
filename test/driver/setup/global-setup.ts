@@ -9,7 +9,10 @@ declare module 'vitest' {
 }
 
 export default async function setup(project: TestProject) {
-	const binDir = process.env['QUARRY_SKIP_PG'] ? undefined : findBinDir();
+	const typesOnly =
+		project.config.typecheck.enabled && project.config.typecheck.only;
+	const binDir =
+		process.env['QUARRY_SKIP_PG'] || typesOnly ? undefined : findBinDir();
 	if (binDir === undefined) {
 		project.provide('pg', null);
 		return;
