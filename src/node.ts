@@ -31,6 +31,8 @@ export type ReferenceNode = {
 export type ValueNode = {
 	readonly kind: 'value';
 	readonly value: unknown;
+	/** The type OID declared for the parameter; the server infers it when absent. */
+	readonly typeOid?: number;
 };
 
 /**
@@ -157,7 +159,11 @@ export type SetNode = {
  */
 export type RowsNode = {
 	readonly columns: readonly string[];
-	/** The columns' SQL types as DDL writes them, for `unnest`'s array casts. */
+	/**
+	 * The columns' SQL types as DDL writes them, for `unnest`'s array casts,
+	 * without modifiers: a cast to `varchar(3)` would truncate, where the
+	 * assignment to the column rejects a value too long.
+	 */
 	readonly types: readonly string[];
 	readonly rows: readonly (readonly (OperationNode | undefined)[])[];
 	readonly strategy: 'values' | 'unnest';

@@ -325,6 +325,7 @@ describe('compiling write queries', () => {
 				['a', 'b'],
 				['A', null],
 			],
+			paramTypes: [1009, 1009],
 		});
 		// a row that leaves a column to its default can't go through unnest
 		const ragged = compile(
@@ -373,6 +374,7 @@ describe('compiling write queries', () => {
 				[1, 2],
 				['A', 'B'],
 			],
+			paramTypes: [1007, 1009],
 		});
 		expect(() =>
 			compile(

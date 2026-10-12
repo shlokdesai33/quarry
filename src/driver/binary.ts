@@ -1,11 +1,17 @@
+import { DriverError } from './errors.js';
 import type { Field } from './protocol/messages.js';
-import { parseTimestamptz } from './parsers.js';
+import { NodeBuffer, utf8 } from './protocol/text.js';
+import { parseTimestamptz, parseVector } from './parsers.js';
 import {
+	arrayOids,
+	arrayParserInfo,
 	oids,
+	parseBigInt,
 	parseBool,
 	parseBytea,
 	parseFloat,
 	parseInteger,
+	parseJson,
 	type TextParser,
 	type TypeParsers,
 } from './types.js';
@@ -51,16 +57,156 @@ const timestamptz: BinaryParser = (b, s) => {
 	return new Date(ms + PG_EPOCH_MS);
 };
 
+const TWO_32 = 4294967296;
+const int8BigInt: BinaryParser = (b, s) => {
+	const hi = int32(b, s);
+	const lo = int32(b, s + 4) >>> 0;
+	// exact as a double below 2^53
+	if (hi >= -0x200000 && hi < 0x200000) return BigInt(hi * TWO_32 + lo);
+	return BigInt.asIntN(64, (BigInt(hi) << 32n) | BigInt(lo));
+};
+const json: BinaryParser = (b, s, e) => JSON.parse(utf8(b, s, e));
+/** jsonb's binary format: a version byte (1), then the text. */
+const jsonb: BinaryParser = (b, s, e) => {
+	if (b[s] !== 1) throw new DriverError('Unsupported jsonb binary version');
+	return JSON.parse(utf8(b, s + 1, e));
+};
+
+/** pgvector's binary format: Int16 dimensions, Int16 unused, then float4s. */
+const vector: BinaryParser = (b, s, e) => {
+	const dim = ((b[s] ?? 0) << 8) | (b[s + 1] ?? 0);
+	if (e - s !== 4 + dim * 4)
+		throw new DriverError('Invalid vector binary value');
+	const view = new DataView(b.buffer, b.byteOffset + s + 4, dim * 4);
+	const out: number[] = [];
+	for (let i = 0; i < dim; i++) out.push(view.getFloat32(i * 4));
+	return out;
+};
+
+const invalidArray = (): DriverError =>
+	new DriverError('Invalid array binary value');
+
+/** PostgreSQL's MAXDIM. */
+const MAX_DIMENSIONS = 6;
+
+type Latin1Buffer = Uint8Array & {
+	latin1Slice(start: number, end: number): string;
+};
+const hasLatin1Slice = (b: Uint8Array): b is Latin1Buffer =>
+	NodeBuffer !== undefined && b instanceof NodeBuffer;
+
+/** Elements whose binary format is their UTF-8 text. */
+const TEXT = 'text';
+
+/**
+ * Decodes a binary array into nested arrays, as `parseArray` does its text:
+ * lower bounds are dropped and NULL elements are `null`. Text elements are
+ * sliced from one latin1 string of the whole value where they are ASCII: a
+ * substring costs far less than a native UTF-8 decode per element.
+ */
+function arrayDecoder(
+	elementOid: number,
+	element: BinaryParser | typeof TEXT,
+): BinaryParser {
+	return (b, s, e) => {
+		const ndim = int32(b, s);
+		if (e - s < 12 || int32(b, s + 8) !== elementOid) throw invalidArray();
+		if (ndim === 0) return [];
+		let pos = s + 12 + ndim * 8;
+		if (ndim < 0 || ndim > MAX_DIMENSIONS || pos > e) throw invalidArray();
+		const latin1 =
+			element === TEXT && hasLatin1Slice(b) ? b.latin1Slice(s, e) : undefined;
+		const decode = (start: number, end: number): unknown => {
+			if (element !== TEXT) return element(b, start, end);
+			if (latin1 !== undefined) {
+				let ascii = true;
+				for (let i = start; i < end && ascii; i++) ascii = (b[i] ?? 0) < 0x80;
+				if (ascii) return latin1.slice(start - s, end - s);
+			}
+			return utf8(b, start, end);
+		};
+		const level = (dim: number): unknown[] => {
+			const n = int32(b, s + 12 + dim * 8);
+			const out: unknown[] = [];
+			if (dim < ndim - 1) {
+				for (let i = 0; i < n; i++) out.push(level(dim + 1));
+				return out;
+			}
+			for (let i = 0; i < n; i++) {
+				if (pos + 4 > e) throw invalidArray();
+				const length = int32(b, pos);
+				pos += 4;
+				if (length === -1) {
+					out.push(null);
+					continue;
+				}
+				const next = pos + length;
+				if (length < 0 || next > e) throw invalidArray();
+				out.push(decode(pos, next));
+				pos = next;
+			}
+			return out;
+		};
+		const out = level(0);
+		if (pos !== e) throw invalidArray();
+		return out;
+	};
+}
+
+const oidsByName: Readonly<Record<string, number>> = oids;
+/** The element type of each built-in array type. */
+const arrayElements: Readonly<Record<number, number>> = Object.fromEntries(
+	Object.entries(arrayOids).flatMap(([name, oid]) => {
+		const element = oidsByName[name];
+		return element === undefined ? [] : [[oid, element]];
+	}),
+);
+
+/** Element types whose binary format is their text. */
+const textLike = new Set<number>([
+	oids.text,
+	oids.varchar,
+	oids.bpchar,
+	oids.name,
+]);
+
+/**
+ * The binary decoder of an array element giving the same value as
+ * `parser`: the scalar decoders, plus text-like types, int8 as a bigint and
+ * json, which stay text as scalars (binary only pays off inside an array).
+ */
+function elementParser(
+	oid: number,
+	parser: TextParser | undefined,
+): BinaryParser | typeof TEXT | undefined {
+	// without a parser int8 stays text: building its digits costs more than slicing them
+	if (parser === undefined) return textLike.has(oid) ? TEXT : undefined;
+	if (oid === oids.int8) return parser === parseBigInt ? int8BigInt : undefined;
+	if (oid === oids.json) return parser === parseJson ? json : undefined;
+	if (oid === oids.jsonb) return parser === parseJson ? jsonb : undefined;
+	return binaryParser(oid, parser);
+}
+
 /**
  * The binary decoder that gives the same value as `parser` for type `oid`,
  * or undefined. Binary format is only used where this exists, so custom
- * parsers and raw types always get the server's text.
+ * parsers and raw types always get the server's text. Arrays qualify when
+ * their parser is the driver's own (`arrayParser`) and their element has
+ * a decoder.
  */
 export function binaryParser(
 	oid: number,
 	parser: TextParser | undefined,
 ): BinaryParser | undefined {
 	if (parser === undefined) return undefined;
+	if (parser === parseVector) return vector;
+	const array = arrayParserInfo(parser);
+	if (array !== undefined) {
+		const elementOid = array.elementOid ?? arrayElements[oid];
+		if (elementOid === undefined || array.delimiter !== ',') return undefined;
+		const element = elementParser(elementOid, array.element);
+		return element && arrayDecoder(elementOid, element);
+	}
 	switch (oid) {
 		case oids.bool:
 			return parser === parseBool ? bool : undefined;

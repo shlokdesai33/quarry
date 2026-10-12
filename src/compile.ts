@@ -10,10 +10,17 @@ import type {
 	TableNode,
 	UpdateNode,
 } from './node.js';
+import { arrayOids } from './driver/types.js';
 
 export interface CompiledQuery {
 	readonly sql: string;
 	readonly params: readonly unknown[];
+	/**
+	 * Type OIDs declared for the parameters, 0 where the server infers the
+	 * type; absent when none is declared. Only arrays are declared, where
+	 * the type is certain, so the driver can send them in binary.
+	 */
+	readonly paramTypes?: readonly number[];
 	/** The query's label from `tag()`, if any. It is not part of `sql`. */
 	readonly tag?: string;
 }
@@ -31,7 +38,7 @@ export type StatementNode =
  * is carried over as is.
  */
 export function compile(node: StatementNode): CompiledQuery {
-	const params: unknown[] = [];
+	const params: Params = { values: [], types: [] };
 	let sql: string;
 	switch (node.kind) {
 		case 'insert':
@@ -47,8 +54,43 @@ export function compile(node: StatementNode): CompiledQuery {
 			sql = render(node, params);
 	}
 	const tag = 'tag' in node ? node.tag : undefined;
-	return tag === undefined ? { sql, params } : { sql, params, tag };
+	return {
+		sql,
+		params: params.values,
+		...(params.types.some((type) => type !== 0)
+			? { paramTypes: params.types }
+			: {}),
+		...(tag === undefined ? {} : { tag }),
+	};
 }
+
+/** The parameters rendered so far, and the type OID declared for each (0 for none). */
+interface Params {
+	readonly values: unknown[];
+	readonly types: number[];
+}
+
+/** Adds a parameter and returns its placeholder. */
+function param(params: Params, value: unknown, type = 0): string {
+	params.values.push(value);
+	params.types.push(type);
+	return `$${params.values.length}`;
+}
+
+/** The array types `unnest` declares, by the cast's element type: those the driver sends in binary. */
+const unnestTypes: Readonly<Record<string, number>> = {
+	smallint: arrayOids.int2,
+	integer: arrayOids.int4,
+	bigint: arrayOids.int8,
+	'double precision': arrayOids.float8,
+	boolean: arrayOids.bool,
+	timestamptz: arrayOids.timestamptz,
+	text: arrayOids.text,
+	varchar: arrayOids.varchar,
+	uuid: arrayOids.uuid,
+	jsonb: arrayOids.jsonb,
+	bytea: arrayOids.bytea,
+};
 
 /** Whether rows can go as one array parameter per column: plain values only, no defaults, no array columns. */
 function unnestable(rows: RowsNode): boolean {
@@ -60,20 +102,23 @@ function unnestable(rows: RowsNode): boolean {
 }
 
 /** `unnest($1::integer[], $2::text[])`, one array parameter per column. */
-function renderUnnest(rows: RowsNode, params: unknown[]): string {
+function renderUnnest(rows: RowsNode, params: Params): string {
 	const arrays = rows.columns.map((_, i) => {
-		params.push(
+		const type = rows.types[i] ?? '';
+		const placeholder = param(
+			params,
 			rows.rows.map((row) => {
 				const cell = row[i];
 				return cell?.kind === 'value' ? cell.value : null;
 			}),
+			unnestTypes[type],
 		);
-		return `$${params.length}::${rows.types[i]}[]`;
+		return `${placeholder}::${type}[]`;
 	});
 	return `unnest(${arrays.join(', ')})`;
 }
 
-function renderSets(sets: readonly SetNode[], params: unknown[]): string {
+function renderSets(sets: readonly SetNode[], params: Params): string {
 	return sets
 		.map((set) => `${identifier(set.column)} = ${render(set.value, params)}`)
 		.join(', ');
@@ -81,7 +126,7 @@ function renderSets(sets: readonly SetNode[], params: unknown[]): string {
 
 function renderReturning(
 	returning: readonly SelectionNode[],
-	params: unknown[],
+	params: Params,
 ): string {
 	if (returning.length === 0) return '';
 	return ` returning ${returning.map((s) => `${render(s.expression, params)} as ${identifier(s.alias)}`).join(', ')}`;
@@ -90,7 +135,7 @@ function renderReturning(
 function renderOnConflict(
 	onConflict: OnConflictNode,
 	inserted: readonly string[],
-	params: unknown[],
+	params: Params,
 ): string {
 	let sql = ` on conflict (${onConflict.target.map(identifier).join(', ')})`;
 	if (onConflict.where !== undefined)
@@ -111,7 +156,7 @@ function renderOnConflict(
 	return sql;
 }
 
-function renderInsert(node: InsertNode, params: unknown[]): string {
+function renderInsert(node: InsertNode, params: Params): string {
 	const { columns, rows } = node.values;
 	if (rows.length === 0) throw new Error('An insert needs at least one row');
 	let sql = `insert into ${renderTable(node.table)}`;
@@ -138,7 +183,7 @@ function renderInsert(node: InsertNode, params: unknown[]): string {
 /** The alias `updateMany`'s rows are joined under. */
 const MANY = 'quarry_rows';
 
-function renderUpdate(node: UpdateNode, params: unknown[]): string {
+function renderUpdate(node: UpdateNode, params: Params): string {
 	const target = identifier(node.table.alias ?? node.table.name);
 	const sets: string[] = [];
 	if (node.set.length > 0) sets.push(renderSets(node.set, params));
@@ -177,7 +222,7 @@ function renderUpdate(node: UpdateNode, params: unknown[]): string {
 	return sql + renderReturning(node.returning, params);
 }
 
-function renderDelete(node: DeleteNode, params: unknown[]): string {
+function renderDelete(node: DeleteNode, params: Params): string {
 	let sql = `delete from ${renderTable(node.table)}`;
 	if (node.where !== undefined) sql += ` where ${render(node.where, params)}`;
 	else if (!node.allRows)
@@ -185,13 +230,12 @@ function renderDelete(node: DeleteNode, params: unknown[]): string {
 	return sql + renderReturning(node.returning, params);
 }
 
-function render(node: OperationNode, params: unknown[]): string {
+function render(node: OperationNode, params: Params): string {
 	switch (node.kind) {
 		case 'reference':
 			return `${identifier(node.table)}.${identifier(node.column)}`;
 		case 'value':
-			params.push(node.value);
-			return `$${params.length}`;
+			return param(params, node.value, node.typeOid);
 		case 'value_list':
 			return `(${node.values.map((value) => render(value, params)).join(', ')})`;
 		case 'literal':
@@ -219,7 +263,7 @@ function render(node: OperationNode, params: unknown[]): string {
 	}
 }
 
-function renderSelect(node: SelectNode, params: unknown[]): string {
+function renderSelect(node: SelectNode, params: Params): string {
 	const selections = node.selections.map(
 		(selection) =>
 			`${render(selection.expression, params)} as ${identifier(selection.alias)}`,
@@ -234,8 +278,7 @@ function renderSelect(node: SelectNode, params: unknown[]): string {
 		sql += ` where ${render(node.where, params)}`;
 	}
 	if (node.limit !== undefined) {
-		params.push(node.limit);
-		sql += ` limit $${params.length}`;
+		sql += ` limit ${param(params, node.limit)}`;
 	}
 	return sql;
 }
@@ -247,7 +290,7 @@ function renderTable(table: TableNode): string {
 }
 
 /** Nested comparisons are parenthesised so postgres precedence cannot regroup them. */
-function renderOperand(node: OperationNode, params: unknown[]): string {
+function renderOperand(node: OperationNode, params: Params): string {
 	const sql = render(node, params);
 	return rendersAsBinary(node) ? `(${sql})` : sql;
 }
@@ -265,7 +308,7 @@ function renderLogical(
 	operands: readonly OperationNode[],
 	operator: 'and' | 'or',
 	empty: 'true' | 'false',
-	params: unknown[],
+	params: Params,
 ): string {
 	const [first, ...rest] = operands;
 	if (first === undefined) return empty;

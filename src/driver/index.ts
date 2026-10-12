@@ -33,6 +33,7 @@ export { cloudflareSockets } from './cloudflare-socket.js';
 export {
 	arrayLiteral,
 	arrayOids,
+	arrayParser,
 	copyChunks,
 	copyLine,
 	defaultTypes,
@@ -69,6 +70,7 @@ export {
 	catalogTypes,
 	parseRange,
 	parseTimestamptz,
+	parseHalfvec,
 	parseVector,
 	type CatalogType,
 	type RangeValue,
