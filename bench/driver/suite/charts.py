@@ -332,22 +332,22 @@ if len(sys.argv) > 4:
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.2))
     for pool, color in zip([1, 5, 10], ["#1f77b4", "#2ca02c", "#d62728"]):
         xs = [1, 10, 50, 100, 500, 1000]
-        axes[0].plot(xs, [base.get(("conc", pool, c, None, None)) for c in xs], color=color, ls="--", marker="o", ms=3, label=f"pool {pool}, main")
-        axes[0].plot(xs, [cand.get(("conc", pool, c, None, None)) for c in xs], color=color, marker="o", ms=3, label=f"pool {pool}, with fix")
+        axes[0].plot(xs, [base.get(("conc", pool, c, None, None)) for c in xs], color=color, ls="--", marker="o", ms=3, label=f"pool {pool}, before")
+        axes[0].plot(xs, [cand.get(("conc", pool, c, None, None)) for c in xs], color=color, marker="o", ms=3, label=f"pool {pool}, after")
     axes[0].set_xscale("log")
     axes[0].set_xlabel("concurrent callers")
     axes[0].set_ylabel("point lookups/s")
-    axes[0].set_title("quarry concurrency sweep: main vs pool fix (Node)")
+    axes[0].set_title("quarry concurrency sweep, before vs after the pool fix (Node)")
     axes[0].legend(fontsize=7)
     depths = [1, 2, 4, 8, 16, 32, 64, 100]
     for rtt, color in [(0, "#9467bd"), (5, "#ff7f0e")]:
-        axes[1].plot(depths, [base.get(("pipeline", 1, 100, p, rtt)) for p in depths], color=color, ls="--", marker="o", ms=3, label=f"RTT {rtt} ms, main")
-        axes[1].plot(depths, [cand.get(("pipeline", 1, 100, p, rtt)) for p in depths], color=color, marker="o", ms=3, label=f"RTT {rtt} ms, with fix")
+        axes[1].plot(depths, [base.get(("pipeline", 1, 100, p, rtt)) for p in depths], color=color, ls="--", marker="o", ms=3, label=f"RTT {rtt} ms, before")
+        axes[1].plot(depths, [cand.get(("pipeline", 1, 100, p, rtt)) for p in depths], color=color, marker="o", ms=3, label=f"RTT {rtt} ms, after")
     axes[1].set_xscale("log")
     axes[1].set_yscale("log")
     axes[1].set_xlabel("`pipeline` option")
     axes[1].set_ylabel("point lookups/s (log)")
-    axes[1].set_title("1 connection, 100 callers: main vs pool fix")
+    axes[1].set_title("1 connection, 100 callers, before vs after the pool fix")
     axes[1].legend(fontsize=7)
     save(fig, "pool-fix-ab.png")
     print(written[-1])

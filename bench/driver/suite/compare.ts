@@ -37,7 +37,10 @@ const load = (id: string) =>
 		.map((l) => JSON.parse(l) as Raw)
 		.filter(
 			(r) =>
-				r.result.ok && r.cell.driver === driver && r.cell.runtime === runtime,
+				r.result.ok &&
+				r.result.lat !== undefined &&
+				r.cell.driver === driver &&
+				r.cell.runtime === runtime,
 		);
 const median = (v: number[]) => {
 	const s = v.toSorted((a, b) => a - b);

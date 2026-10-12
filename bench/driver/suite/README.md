@@ -52,7 +52,7 @@ Useful options for `orchestrate.ts`:
 - `--quick` uses 150 ms measurements, as a smoke test.
 - `--parallel 3` runs cells concurrently. Use it only with `--quick`, since the timings are then meaningless.
 
-Results append to `results/<id>/raw.jsonl` as each cell finishes, so re-running with the same `--id` resumes where it stopped.
+Results append to `results/<id>/raw.jsonl` as each cell finishes, so re-running with the same `--id` resumes where it stopped. `results/` is gitignored; `results-snapshots/` keeps the tables, footprint figures and metadata of the published runs.
 
 To compare a change to the driver, build it somewhere else and point `QUARRY_DIST` at its `driver/index.js`; every quarry configuration then uses that build:
 
