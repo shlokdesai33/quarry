@@ -488,7 +488,7 @@ async function main(): Promise<void> {
 		const { outcomes } = JSON.parse(readFileSync(saved, 'utf8')) as {
 			outcomes: (Outcome & { target: string })[];
 		};
-		report(outcomes, json);
+		summarize(outcomes, json);
 		return;
 	}
 
@@ -587,7 +587,7 @@ async function main(): Promise<void> {
 	} finally {
 		await cluster.stop();
 	}
-	report(all, json);
+	summarize(all, json);
 }
 
 /** Classifies outcomes against the expectations, prints the totals and, with `json`, writes them. */
