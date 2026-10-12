@@ -26,6 +26,8 @@ describe('the package entry point', () => {
 			'array',
 			'NoRowError',
 			'TooManyRowsError',
+			'violatedColumns',
+			'UndefinedParameterError',
 		]) {
 			expect(typeof Reflect.get(quarry, name), name).toBe('function');
 		}

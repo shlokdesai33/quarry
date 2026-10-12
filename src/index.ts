@@ -54,11 +54,13 @@ export {
 	TransactionRolledBack,
 	TransactionTimeout,
 	UndefinedColumn,
+	UndefinedParameterError,
 	UndefinedTable,
 	UniqueViolation,
 	type PoolOptions,
 } from './driver/index.js';
 export type { DatabaseOptions, QueryEvent } from './driver-executor.js';
+export { violatedColumns } from './errors.js';
 export { defineEnum } from './define-enum.js';
 export { defineTable } from './define-table.js';
 export {

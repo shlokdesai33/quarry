@@ -1,3 +1,4 @@
+import { inspect } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import { integer, text } from '../src/column-factories.js';
 import { databaseWith } from '../src/database.js';
@@ -141,7 +142,26 @@ describe('one', () => {
 		const failure = fake([]).db.selectFrom(users).one();
 		await expect(failure).rejects.toBeInstanceOf(NoRowError);
 		await expect(failure).rejects.toMatchObject({
+			table: 'users',
+			message:
+				'The query on "users" returned no row, where exactly one was expected',
 			query: { sql: 'select from "users" limit $1', params: [2] },
+		});
+	});
+
+	it('keeps the params out of logs and JSON', async () => {
+		const error = await fake([])
+			.db.selectFrom(users)
+			.where('users.email', 'secret-param')
+			.one()
+			.catch((e: unknown) => e);
+		if (!(error instanceof NoRowError)) throw new Error('expected NoRowError');
+		expect(error.query.params).toContain('secret-param');
+		expect(inspect(error)).not.toContain('secret-param');
+		expect(JSON.stringify(error)).not.toContain('secret-param');
+		expect(JSON.parse(JSON.stringify(error))).toEqual({
+			name: 'NoRowError',
+			table: 'users',
 		});
 	});
 
@@ -152,11 +172,11 @@ describe('one', () => {
 	});
 
 	it('throws when there are several', async () => {
-		await expect(
-			fake([{ id: 1 }, { id: 2 }])
-				.db.selectFrom(users)
-				.one(),
-		).rejects.toBeInstanceOf(TooManyRowsError);
+		const failure = fake([{ id: 1 }, { id: 2 }])
+			.db.selectFrom(users)
+			.one();
+		await expect(failure).rejects.toBeInstanceOf(TooManyRowsError);
+		await expect(failure).rejects.toMatchObject({ table: 'users' });
 	});
 });
 

@@ -6,6 +6,7 @@ import {
 	ForeignKeyViolation,
 	NotNullViolation,
 	PostgresError,
+	UndefinedParameterError,
 	UndefinedTable,
 	UniqueViolation,
 	CheckViolation,
@@ -22,6 +23,23 @@ describe.skipIf(noPg)('queries', () => {
 	});
 	afterAll(async () => {
 		await conn?.close();
+	});
+
+	it('refuses undefined parameters before sending, and stays usable', async () => {
+		const error = await rejection(
+			conn.query('select $1::int as a, $2::int[] as b', [1, [2, undefined]]),
+			UndefinedParameterError,
+		);
+		expect(error).toMatchObject({ position: 2, element: [2] });
+		await expect(
+			conn.query('select $1::text as a', [undefined]),
+		).rejects.toThrow('Parameter $1 is undefined');
+		await expect(async () => {
+			for await (const _ of conn.cursor('select $1::int as a', [undefined]))
+				break;
+		}).rejects.toBeInstanceOf(UndefinedParameterError);
+		const { rows } = await conn.query('select $1::int as a', [null]);
+		expect(rows).toEqual([{ a: null }]);
 	});
 
 	it('runs parameterised queries and decodes common types', async () => {

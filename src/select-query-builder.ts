@@ -362,10 +362,10 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 		const { query, rows } = await this.#execute(2, options);
 		const [row, ...rest] = rows;
 		if (row === undefined) {
-			throw new NoRowError(query);
+			throw new NoRowError(query, this.#state.from.name);
 		}
 		if (rest.length > 0) {
-			throw new TooManyRowsError(query);
+			throw new TooManyRowsError(query, this.#state.from.name);
 		}
 		return row;
 	}
@@ -378,7 +378,7 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 		const { query, rows } = await this.#execute(2, options);
 		const [row, ...rest] = rows;
 		if (rest.length > 0) {
-			throw new TooManyRowsError(query);
+			throw new TooManyRowsError(query, this.#state.from.name);
 		}
 		return row;
 	}

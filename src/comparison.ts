@@ -1,6 +1,35 @@
 import { Expression, Param, Quantified } from './expression.js';
 import type { OperationNode } from './node.js';
 
+/** The reference each `eb.ref` node was made from, as written (`users.firstName`), for errors. */
+const references = new WeakMap<OperationNode, string>();
+
+/** Records that `node` is the column reference `reference`, to name it in errors. */
+export function nameReference(node: OperationNode, reference: string): void {
+	references.set(node, reference);
+}
+
+/**
+ * The error for comparing `left` with `undefined`: never sent as NULL, which
+ * would quietly match nothing, so an optional filter has to be explicit.
+ */
+export function undefinedComparison(
+	left: OperationNode | undefined,
+): TypeError {
+	const name =
+		left === undefined
+			? undefined
+			: (references.get(left) ??
+				(left.kind === 'reference'
+					? `${left.table}.${left.column}`
+					: undefined));
+	const subject = name ?? 'An expression';
+	const where = name === undefined ? '…' : `'${name}', value`;
+	return new TypeError(
+		`${subject} is compared with undefined. For an optional filter, use .when(): .when(value !== undefined, (qb) => qb.where(${where})). For SQL NULL, use isNull().`,
+	);
+}
+
 /** `x in arr` is `x = any(arr)`, and `x not in arr` is `x <> all(arr)`. */
 const QUANTIFIED = {
 	in: ['=', 'any'],
@@ -13,14 +42,18 @@ const QUANTIFIED = {
  * operator-specific rendering. Plain values and parameters go through
  * `serialize`; other expressions are used as-is. An array of operands, as `in`
  * against an array and `any` / `all` take, is one parameter whose items are
- * each encoded.
+ * each encoded. `undefined`, as the value or one of the items, throws.
  */
 export function comparison(
 	left: OperationNode,
 	operator: string,
 	value: unknown,
-	serialize: (value: unknown) => unknown,
+	encode: (value: unknown) => unknown,
 ): OperationNode {
+	const serialize = (item: unknown): unknown => {
+		if (item === undefined) throw undefinedComparison(left);
+		return encode(item);
+	};
 	const operand = (item: unknown): OperationNode => {
 		if (item instanceof Param) {
 			return { kind: 'value', value: serialize(item._quarry.value) };
