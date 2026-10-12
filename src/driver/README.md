@@ -128,7 +128,8 @@ await pool.transaction(async (tx) => {
 - `max`, `min`
 - `idleTimeout` (30 s), `maxLifetime` (1 h, with jitter)
 - `acquireTimeout` (30 s), `maxWaiting`
-- `pipeline` (50): once every connection is busy, `query`, `simpleQuery` and `describe` are pipelined onto shared connections, up to this many in flight on each; `false` gives every query a connection to itself
+- `pipeline` (50): once every connection is busy, `query`, `simpleQuery` and `describe` are pipelined onto shared connections, up to this many in flight on each. Further queries wait in line and take the next free slot. `false` gives every query a connection to itself.
+  - Reserved clients, transactions, cursors and COPY always get a connection of their own. While one waits, one shared connection per waiter takes no new queries, and it is handed over once the queries already in flight on it finish, so a steady stream of queries can't hold it back.
 - `onConnect`
 
 `pool.acquire()` reserves a client; release it with `release()` or `await using`. Connections that die, or are released mid-transaction, are discarded.
