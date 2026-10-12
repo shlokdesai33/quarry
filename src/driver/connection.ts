@@ -18,6 +18,7 @@ import {
 import {
 	AbortError,
 	ConnectionError,
+	DriverError,
 	PostgresError,
 	ProtocolError,
 	postgresError,
@@ -619,7 +620,19 @@ export class Connection implements AsyncDisposable {
 			if (op === undefined) break;
 			this.#written++;
 			if (op.onTiming !== undefined) op.writtenAt = performance.now();
-			op.write(this.#ctx);
+			const before = this.#writer.length;
+			try {
+				op.write(this.#ctx);
+			} catch (error) {
+				// a request that can't be encoded fails alone; nothing of it is sent
+				this.#writer.truncate(before);
+				this.#written--;
+				this.#queue.splice(this.#written, 1);
+				op.fail(
+					error instanceof Error ? error : new DriverError(String(error)),
+				);
+				continue;
+			}
 			op.written = true;
 			if (op.exclusive) this.#blocking = op;
 		}
@@ -792,6 +805,11 @@ export class Connection implements AsyncDisposable {
 			);
 		}
 		return new Promise((resolve, reject) => {
+			const invalid = invalidSql(sql);
+			if (invalid) {
+				reject(invalid);
+				return;
+			}
 			let values;
 			try {
 				values = encodeParams(sql, params);
@@ -899,6 +917,11 @@ export class Connection implements AsyncDisposable {
 			| undefined,
 	): Promise<QueryResult<R>[]> {
 		return new Promise((resolve, reject) => {
+			const invalid = invalidSql(sql);
+			if (invalid) {
+				reject(invalid);
+				return;
+			}
 			const op = new SimpleQueryOp(
 				sql,
 				options?.types,
@@ -916,6 +939,11 @@ export class Connection implements AsyncDisposable {
 		options?: Pick<QueryOptions, 'paramTypes' | 'signal' | 'timeout'>,
 	): Promise<Description> {
 		return new Promise((resolve, reject) => {
+			const invalid = invalidSql(sql);
+			if (invalid) {
+				reject(invalid);
+				return;
+			}
 			this.#enqueue(
 				new DescribeOp(sql, options?.paramTypes ?? [], resolve, reject),
 				options?.signal,
@@ -934,6 +962,14 @@ export class Connection implements AsyncDisposable {
 		params: readonly unknown[] = [],
 		options?: CursorOptions,
 	): AsyncIterable<R[]> {
+		const invalid = invalidSql(sql);
+		if (invalid) {
+			return {
+				[Symbol.asyncIterator]: () => ({
+					next: () => Promise.reject(invalid),
+				}),
+			};
+		}
 		return {
 			[Symbol.asyncIterator]: () => {
 				const op = new CursorOp(
@@ -1009,6 +1045,11 @@ export class Connection implements AsyncDisposable {
 		options: Pick<QueryOptions, 'signal' | 'timeout'> | undefined,
 	): Promise<number> {
 		return new Promise((resolve, reject) => {
+			const invalid = invalidSql(sql);
+			if (invalid) {
+				reject(invalid);
+				return;
+			}
 			this.#enqueue(
 				new CopyFromOp(sql, source, resolve, reject),
 				options?.signal,
@@ -1041,6 +1082,14 @@ export class Connection implements AsyncDisposable {
 			highWaterMark?: number;
 		},
 	): AsyncIterable<Uint8Array> {
+		const invalid = invalidSql(sql);
+		if (invalid) {
+			return {
+				[Symbol.asyncIterator]: () => ({
+					next: () => Promise.reject(invalid),
+				}),
+			};
+		}
 		return {
 			[Symbol.asyncIterator]: () => {
 				const op = new CopyToOp(sql, options?.highWaterMark ?? 1 << 20);
@@ -1223,6 +1272,18 @@ export class Connection implements AsyncDisposable {
 		this.#resolveClosed();
 		this.#emit(this.#closeListeners, error);
 	}
+}
+
+/** Why `sql` can't be sent, if it can't: Postgres takes text without NUL bytes. */
+function invalidSql(sql: unknown): DriverError | undefined {
+	if (typeof sql !== 'string')
+		return new DriverError(`The SQL text must be a string, not ${typeof sql}`);
+	const nul = sql.indexOf('\0');
+	if (nul >= 0)
+		return new DriverError(
+			`The SQL text contains a NUL byte (at character ${nul + 1}), which PostgreSQL does not accept`,
+		);
+	return undefined;
 }
 
 export function quoteIdentifier(name: string): string {

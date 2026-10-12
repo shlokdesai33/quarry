@@ -25,6 +25,27 @@ describe.skipIf(noPg)('queries', () => {
 		await conn?.close();
 	});
 
+	// found by postgres.js's "Catches query format errors"
+	it('rejects SQL it cannot send, without crashing or breaking the connection', async () => {
+		const pending = conn.query('select 1 as before');
+		const nul = conn.query('select 1\0');
+		const simple = conn.simpleQuery('select 1;\0');
+		const notText = conn.query({} as string);
+		const after = conn.query<{ n: number }>('select 2 as n');
+		await expect(nul).rejects.toThrow(/NUL byte \(at character 9\)/);
+		await expect(simple).rejects.toThrow(/NUL byte/);
+		await expect(notText).rejects.toThrow(/must be a string/);
+		await expect(conn.describe('select\0')).rejects.toThrow(/NUL byte/);
+		await expect(async () => {
+			for await (const _ of conn.cursor('select\0')) break;
+		}).rejects.toThrow(/NUL byte/);
+		await expect(conn.copyFrom('copy t from stdin\0', [])).rejects.toThrow(
+			/NUL byte/,
+		);
+		expect((await pending).rows).toEqual([{ before: 1 }]);
+		expect((await after).rows).toEqual([{ n: 2 }]);
+	});
+
 	it('refuses undefined parameters before sending, and stays usable', async () => {
 		const error = await rejection(
 			conn.query('select $1::int as a, $2::int[] as b', [1, [2, undefined]]),
