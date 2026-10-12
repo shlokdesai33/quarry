@@ -559,6 +559,13 @@ const throughBouncer: Record<string, Table> = {
 				reason: 'PgBouncer here listens on TCP only',
 				target: 'bouncer',
 			},
+			'connect_timeout throws proper error': {
+				category: 'not-applicable',
+				reason:
+					'timing: expects a 1 ms connect timeout to fire, but a local PgBouncer with trust authentication can complete the connection sooner',
+				target: 'bouncer',
+				flaky: true,
+			},
 			'Connection destroyed': {
 				category: 'not-applicable',
 				reason:
