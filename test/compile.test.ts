@@ -106,13 +106,16 @@ describe('comparisons', () => {
 	});
 
 	it('renders `in` against an array expression as `= any` / `<> all`', () => {
+		// an integer column's array is declared int4[], so it goes in binary
 		expect(compiled(eb.ref('users.age').in(eb.val([1, 2])))).toEqual({
 			sql: '"users"."age" = any($1)',
 			params: [[1, 2]],
+			paramTypes: [1007],
 		});
 		expect(compiled(eb.ref('users.age').notIn(eb.val([1, 2])))).toEqual({
 			sql: '"users"."age" <> all($1)',
 			params: [[1, 2]],
+			paramTypes: [1007],
 		});
 		expect(
 			compiled(eb.ref('users.firstName').in(eb.ref('users.tags'))),
@@ -210,6 +213,7 @@ describe('comparisons', () => {
 			{
 				sql: '"users"."age" > any($1)',
 				params: [[1, 2]],
+				paramTypes: [1007],
 			},
 		);
 	});

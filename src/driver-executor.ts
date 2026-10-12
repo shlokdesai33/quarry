@@ -177,11 +177,12 @@ export class DriverExecutor implements TransactionExecutor {
 	#queryOptions(
 		options: ExecuteOptions,
 		onTiming: ((t: OpTiming) => void) | undefined,
-		tag: string | undefined,
+		{ tag, paramTypes }: CompiledQuery,
 	) {
 		return {
 			types: this.#types.parsers,
 			rowMode: options.rowMode ?? 'object',
+			...(paramTypes === undefined ? {} : { paramTypes }),
 			...(this.#options.prepare === undefined
 				? {}
 				: { prepare: this.#options.prepare }),
@@ -279,7 +280,7 @@ export class DriverExecutor implements TransactionExecutor {
 					this.#queryOptions(
 						options,
 						observe ? (t) => (timing = t) : undefined,
-						query.tag,
+						query,
 					),
 				);
 			});
@@ -359,7 +360,7 @@ export class DriverExecutor implements TransactionExecutor {
 				...this.#queryOptions(
 					{ ...options, timeout: undefined },
 					undefined,
-					query.tag,
+					query,
 				),
 				...(options.batchSize === undefined
 					? {}

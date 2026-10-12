@@ -1,4 +1,8 @@
-import { comparison, undefinedComparison } from './comparison.js';
+import {
+	comparison,
+	quantifiedType,
+	undefinedComparison,
+} from './comparison.js';
 import { DataType } from './data-type/data-type.js';
 import {
 	type Expression,
@@ -94,9 +98,14 @@ export function compare(
 		throw new TypeError('Only an expression of known SQL type is compared');
 	}
 	const type: DataType = left._quarry.dataType;
+	const node = left._quarry.node;
 	return predicate(
-		comparison(left._quarry.node, operator, value, (item) =>
-			type.serialize(item),
+		comparison(
+			node,
+			operator,
+			value,
+			(item) => type.serialize(item),
+			quantifiedType(node, type.kind),
 		),
 	);
 }

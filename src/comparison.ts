@@ -1,5 +1,7 @@
 import { Expression, Param, Quantified } from './expression.js';
+import { arrayOids } from './driver/types.js';
 import type { OperationNode } from './node.js';
+import type { Kind } from './operators.js';
 
 /** The reference each `eb.ref` node was made from, as written (`users.firstName`), for errors. */
 const references = new WeakMap<OperationNode, string>();
@@ -37,6 +39,30 @@ const QUANTIFIED = {
 } as const;
 
 /**
+ * The array type declared for `column op any($1)` by the column's type, so
+ * the driver can send it in binary. Only types that compare the same if the
+ * column is really of a related type (an `integer()` column that is a
+ * bigint or numeric): text declared against a uuid or citext column would
+ * fail or compare differently, float8 against a real column compares the
+ * widened value, and timestamptz against a timestamp column depends on the
+ * session time zone. Those are left to the server to infer.
+ */
+const quantifiedTypes: Readonly<Partial<Record<Kind, number>>> = {
+	smallint: arrayOids.int2,
+	integer: arrayOids.int4,
+	bigint: arrayOids.int8,
+	boolean: arrayOids.bool,
+};
+
+/** The array type to declare for `left op any($1)`, if any. */
+export function quantifiedType(
+	left: OperationNode,
+	kind: Kind,
+): number | undefined {
+	return left.kind === 'reference' ? quantifiedTypes[kind] : undefined;
+}
+
+/**
  * Builds the node for `left operator value`. Operators whose right-hand side
  * is not a single value are lowered to generic nodes, so `compile` needs no
  * operator-specific rendering. Plain values and parameters go through
@@ -49,6 +75,7 @@ export function comparison(
 	operator: string,
 	value: unknown,
 	encode: (value: unknown) => unknown,
+	arrayType?: number,
 ): OperationNode {
 	const serialize = (item: unknown): unknown => {
 		if (item === undefined) throw undefinedComparison(left);
@@ -65,9 +92,11 @@ export function comparison(
 
 	const array = (items: unknown): OperationNode => {
 		const values = items instanceof Param ? items._quarry.value : items;
-		return Array.isArray(values)
-			? { kind: 'value', value: values.map(serialize) }
-			: operand(items);
+		if (!Array.isArray(values)) return operand(items);
+		const encoded = values.map(serialize);
+		return arrayType === undefined
+			? { kind: 'value', value: encoded }
+			: { kind: 'value', value: encoded, typeOid: arrayType };
 	};
 
 	if (value instanceof Quantified) {
