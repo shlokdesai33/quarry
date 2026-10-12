@@ -78,12 +78,15 @@ function unref(timer: ReturnType<typeof setTimeout>): void {
 /** The adaptive pipeline depth's starting point and floor, and its ceiling. */
 const PIPELINE_FLOOR = 100;
 const PIPELINE_CEILING = 1000;
+/** One shared query in this many is timed for the adaptive depth (a power of two). */
+const SAMPLE_EVERY = 8;
 
 /**
  * The adaptive pipeline depth of one connection. A query's latency is at
  * least one round trip, which the fastest one seen estimates. Each round
  * (about `limit` queries, one round trip's worth once the pipeline is
- * full) compares the average latency with it:
+ * full) compares the average latency of the queries timed in it (one in
+ * `SAMPLE_EVERY`) with it:
  *
  * - near it, queries aren't queueing on the server, so the round trip
  *   caps throughput; if callers are waiting, a deeper pipeline helps;
@@ -103,7 +106,7 @@ class Depth {
 	sample(latency: number, waiting: boolean): void {
 		if (latency < this.#fastest) this.#fastest = latency;
 		this.#sum += latency;
-		if (++this.#count < this.limit) return;
+		if (++this.#count * SAMPLE_EVERY < this.limit) return;
 		const ratio = this.#sum / this.#count / this.#fastest;
 		this.#sum = 0;
 		this.#count = 0;
@@ -221,6 +224,7 @@ export class Pool implements AsyncDisposable {
 	readonly #pipeline: number;
 	/** Each connection's adaptive depth, unless `pipeline` was given. */
 	readonly #depths: WeakMap<Connection, Depth> | undefined;
+	#timed = 0;
 	/** Queries in flight on each connection lent out for `query` (shareable). */
 	readonly #shared = new Map<Connection, number>();
 	readonly #idle: Idle[] = [];
@@ -454,6 +458,7 @@ export class Pool implements AsyncDisposable {
 
 	/** Gives free pipeline slots on a shared connection to queued queries, up to `limit` in flight. */
 	#fillShared(connection: Connection, limit = Number.POSITIVE_INFINITY): void {
+		if (this.#sharedWaiters.length === 0) return;
 		let count = this.#shared.get(connection) ?? 0;
 		const cap = Math.min(limit, this.#depth(connection));
 		while (
@@ -658,7 +663,8 @@ export class Pool implements AsyncDisposable {
 		for (const [connection, count] of this.#shared) {
 			if (
 				count < fewest &&
-				count < this.#depth(connection) &&
+				// below the floor, without a lookup: this runs per connection per query
+				(count < this.#pipeline || count < this.#depth(connection)) &&
 				!this.#draining.has(connection) &&
 				this.#shareable(connection)
 			) {
@@ -689,7 +695,10 @@ export class Pool implements AsyncDisposable {
 			this.#serveWaiters();
 			connection = await waiting;
 		}
-		const started = this.#depths === undefined ? 0 : performance.now();
+		const started =
+			this.#depths !== undefined && (++this.#timed & (SAMPLE_EVERY - 1)) === 0
+				? performance.now()
+				: -1;
 		try {
 			return await fn(connection);
 		} finally {
@@ -701,7 +710,7 @@ export class Pool implements AsyncDisposable {
 	#done(connection: Connection, started: number): void {
 		const left = (this.#shared.get(connection) ?? 1) - 1;
 		this.#shared.set(connection, left);
-		if (this.#depths !== undefined) {
+		if (started >= 0 && this.#depths !== undefined) {
 			let depth = this.#depths.get(connection);
 			if (depth === undefined) {
 				depth = new Depth();
