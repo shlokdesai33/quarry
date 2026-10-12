@@ -44,7 +44,7 @@ describe.skipIf(noPg)('queries', () => {
 		const error = await rejection(bad, DecodeError);
 		expect(error).toMatchObject({ column: 'n', typeOid: oids.int4 });
 		expect(error.message).not.toContain('777');
-		expect((error.cause as Error).message).toBe('bad int');
+		expect(error.cause).toMatchObject({ message: 'bad int' });
 		expect((await before).rows).toEqual([{ n: 1 }]);
 		expect((await after).rows).toEqual([{ n: 3 }]);
 		await expect(
