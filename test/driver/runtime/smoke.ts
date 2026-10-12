@@ -15,6 +15,11 @@ import { connect } from '../../../src/driver/connect.js';
 import { QueryCanceled } from '../../../src/driver/errors.js';
 import { createPool } from '../../../src/driver/pool.js';
 import type { ConnectionOptions } from '../../../src/driver/config.js';
+import { nodeSockets } from '../../../src/driver/node-socket.js';
+import type {
+	DriverSocket,
+	SocketFactory,
+} from '../../../src/driver/socket.js';
 import {
 	findBinDir,
 	startCluster,
@@ -159,6 +164,156 @@ await check('pool with pipelining', async () => {
 		'wrong results',
 	);
 	assert(pool.stats.total <= 2, String(pool.stats.total));
+});
+
+/**
+ * Wraps the runtime's sockets to watch backpressure (writes made while the
+ * buffer is full) and, with `delay`, to simulate a round trip and count the
+ * queries in flight.
+ */
+function watched(delay = 0) {
+	const stats = {
+		full: 0,
+		drains: 0,
+		writtenWhileFull: 0,
+		largestWrite: 0,
+		maxInFlight: 0,
+	};
+	const factory: SocketFactory = {
+		async connect(o) {
+			const socket = await nodeSockets.connect(o);
+			let started = false;
+			let ready = false;
+			let full = false;
+			let inFlight = 0;
+			let pending = new Uint8Array(0);
+			const wrapped: DriverSocket = {
+				get encrypted() {
+					return socket.encrypted;
+				},
+				write(data) {
+					if (full) stats.writtenWhileFull += data.length;
+					stats.largestWrite = Math.max(stats.largestWrite, data.length);
+					// the startup message has no type byte
+					if (started)
+						messageTypes(data, (type) => {
+							if (type === 0x53) inFlight++;
+						});
+					started = true;
+					stats.maxInFlight = Math.max(stats.maxInFlight, inFlight);
+					const ok = socket.write(data);
+					if (!ok) {
+						full = true;
+						stats.full++;
+					}
+					return ok;
+				},
+				startTls: (t) => socket.startTls(t),
+				peerCertificate: () => socket.peerCertificate(),
+				pause: () => socket.pause(),
+				resume: () => socket.resume(),
+				end: () => socket.end(),
+				destroy: () => socket.destroy(),
+				onData: (h) =>
+					socket.onData((data) => {
+						const copy = data.slice();
+						const deliver = () => {
+							const all = new Uint8Array(pending.length + copy.length);
+							all.set(pending);
+							all.set(copy, pending.length);
+							pending = all.slice(
+								messageTypes(all, (type) => {
+									if (type !== 0x5a) return;
+									if (ready) inFlight--;
+									ready = true;
+								}),
+							);
+							h(copy);
+						};
+						if (delay > 0) setTimeout(deliver, delay);
+						else deliver();
+					}),
+				onClose: (h) => socket.onClose(() => setTimeout(h, delay)),
+				onError: (h) => socket.onError(h),
+				onDrain: (h) =>
+					socket.onDrain(() => {
+						full = false;
+						stats.drains++;
+						h();
+					}),
+			};
+			return wrapped;
+		},
+	};
+	return { factory, stats };
+}
+
+/** Calls `visit` with each complete message's type; returns where the incomplete tail starts. */
+function messageTypes(data: Uint8Array, visit: (type: number) => void): number {
+	let i = 0;
+	while (i + 5 <= data.length) {
+		const length = new DataView(
+			data.buffer,
+			data.byteOffset + i + 1,
+			4,
+		).getUint32(0);
+		if (i + 1 + length > data.length) break;
+		visit(data[i]!);
+		i += 1 + length;
+	}
+	return i;
+}
+
+await check(
+	'backpressure: nothing written while the socket is full',
+	async () => {
+		const { factory, stats } = watched();
+		await using conn = await connect({ ...base, socket: factory });
+		const big = 'x'.repeat(512 * 1024);
+		// one query per tick, so most are issued while earlier ones fill the buffer
+		const pending: Promise<{ rows: { n: number; i: number }[] }>[] = [];
+		for (let i = 0; i < 32; i++) {
+			pending.push(
+				conn.query<{ n: number; i: number }>(
+					'select length($1)::int as n, $2::int as i',
+					[big, i],
+				),
+			);
+			await Promise.resolve();
+		}
+		const results = await Promise.all(pending);
+		assert(
+			results.every((r, i) => r.rows[0]?.n === big.length && r.rows[0].i === i),
+			'wrong results',
+		);
+		assert(stats.full > 0 && stats.drains > 0, JSON.stringify(stats));
+		assert(stats.writtenWhileFull === 0, JSON.stringify(stats));
+		assert(stats.largestWrite < 1024 * 1024, JSON.stringify(stats));
+	},
+);
+
+await check('pool deepens its pipeline at a simulated round trip', async () => {
+	const { factory, stats } = watched(10);
+	await using pool = createPool({ ...base, max: 1, socket: factory });
+	const values = await Promise.all(
+		Array.from({ length: 600 }, async (_, caller) => {
+			const seen: (number | undefined)[] = [];
+			for (let k = 0; k < 4; k++) {
+				const v = caller * 4 + k;
+				const { rows } = await pool.query<{ v: number }>(
+					'select $1::int as v',
+					[v],
+				);
+				seen.push(rows[0]?.v);
+			}
+			return seen;
+		}),
+	);
+	assert(
+		values.flat().every((v, i) => v === i),
+		'wrong results',
+	);
+	assert(stats.maxInFlight > 300, JSON.stringify(stats));
 });
 
 await check('LISTEN / NOTIFY', async () => {
