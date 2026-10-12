@@ -715,4 +715,44 @@ describe.skipIf(noPg)('pool', () => {
 		expect(received).toEqual(['one', 'two']);
 		await unlisten();
 	});
+
+	it('re-subscribes every channel after the listen connection drops', async () => {
+		const applicationName = 'quarry relisten test';
+		await using p = pool({ applicationName });
+		const channels = ['pool_a', 'pool_b', 'pool c', 'pool_é'];
+		const received: string[] = [];
+		const unlistens = [];
+		for (const channel of channels) {
+			unlistens.push(
+				await p.listen(channel, (n) =>
+					received.push(`${n.channel}:${n.payload}`),
+				),
+			);
+		}
+		await using admin = await open();
+		const listening = async () =>
+			(
+				await admin.query<{ pid: number }>(
+					`select pid from pg_stat_activity
+					where application_name = $1 and query like 'listen %' and state = 'idle'`,
+					[applicationName],
+				)
+			).rows.map((r) => r.pid);
+		const [before] = await listening();
+		expect(before).toBeDefined();
+		await admin.query('select pg_terminate_backend($1)', [before]);
+		let after: number[] = [];
+		for (let i = 0; i < 60; i++) {
+			after = (await listening()).filter((pid) => pid !== before);
+			if (after.length > 0) break;
+			await sleep(50);
+		}
+		expect(after).toHaveLength(1);
+		await sleep(100);
+		for (const channel of channels)
+			await p.query('select pg_notify($1, $2)', [channel, 'back']);
+		await sleep(100);
+		expect(received).toEqual(channels.map((c) => `${c}:back`));
+		for (const unlisten of unlistens) await unlisten();
+	});
 });

@@ -1,4 +1,5 @@
 import { ProtocolError } from '../errors.js';
+import type { Notification } from '../notice.js';
 import type { BackendMessage, Field, NoticeFields } from './messages.js';
 import { allocate, asBuffer, utf8 } from './text.js';
 
@@ -289,16 +290,11 @@ function parseMessage(
 			}
 			return { type: 'BackendKeyData', pid, key };
 		}
-		case 0x41: {
-			// A
-			const cursor = new Cursor(bytes, view, start, end);
+		case 0x41: // A
 			return {
 				type: 'NotificationResponse',
-				pid: cursor.int32(),
-				channel: cursor.cstring(),
-				payload: cursor.cstring(),
+				...decodeNotification(bytes, start, end),
 			};
-		}
 		case 0x52: // R
 			return authentication(new Cursor(bytes, view, start, end));
 		case 0x47: // G
@@ -394,6 +390,91 @@ function authentication(cursor: Cursor): BackendMessage {
 		default:
 			return { type: 'AuthenticationUnsupported', code };
 	}
+}
+
+/** How many channel names `ChannelNames` remembers. */
+const CHANNEL_NAMES = 8;
+
+/**
+ * The channel names of recent notifications, so a notification on a known
+ * channel reuses its string: comparing a few bytes is cheaper than decoding
+ * them, and Map lookups by that string reuse its cached hash.
+ */
+export class ChannelNames {
+	readonly #bytes: Uint8Array[] = [];
+	readonly #names: string[] = [];
+	#evict = 0;
+
+	get(bytes: Uint8Array, start: number, end: number): string {
+		const length = end - start;
+		const known = this.#bytes;
+		for (let i = 0; i < known.length; i++) {
+			const candidate = known[i] ?? EMPTY;
+			if (candidate.length !== length) continue;
+			let j = 0;
+			while (j < length && candidate[j] === bytes[start + j]) j++;
+			if (j === length) return this.#names[i] ?? '';
+		}
+		const name = utf8(bytes, start, end);
+		let slot = known.length;
+		if (slot === CHANNEL_NAMES) {
+			slot = this.#evict;
+			this.#evict = (slot + 1) % CHANNEL_NAMES;
+		}
+		// a copy: a view would keep the whole read buffer alive
+		known[slot] = new Uint8Array(bytes.subarray(start, end));
+		this.#names[slot] = name;
+		return name;
+	}
+}
+
+/** Where the NUL ending the string at `from` is, before `end`. */
+function nulAt(bytes: Uint8Array, from: number, end: number): number {
+	let i = from;
+	while (i < end && bytes[i] !== 0) i++;
+	if (i >= end) throw new ProtocolError('Unterminated string in message');
+	return i;
+}
+
+/** Decodes UTF-8 like `utf8`, building strings of a few ASCII bytes in JS: a native call costs more there. */
+function shortText(bytes: Uint8Array, start: number, end: number): string {
+	if (end - start > 6) return utf8(bytes, start, end);
+	let out = '';
+	for (let i = start; i < end; i++) {
+		const byte = bytes[i] ?? 0;
+		if (byte >= 0x80) return utf8(bytes, start, end);
+		out += String.fromCharCode(byte);
+	}
+	return out;
+}
+
+/**
+ * Decodes a NotificationResponse body in `[start, end)` straight from the
+ * read buffer. With `names`, a recently seen channel name is reused rather
+ * than decoded again.
+ */
+export function decodeNotification(
+	bytes: Uint8Array,
+	start: number,
+	end: number,
+	names?: ChannelNames,
+): Notification {
+	if (end - start < 6) throw new ProtocolError('Message too short');
+	const pid =
+		((bytes[start] ?? 0) << 24) |
+		((bytes[start + 1] ?? 0) << 16) |
+		((bytes[start + 2] ?? 0) << 8) |
+		(bytes[start + 3] ?? 0);
+	const channelEnd = nulAt(bytes, start + 4, end);
+	const payloadEnd = nulAt(bytes, channelEnd + 1, end);
+	return {
+		pid,
+		channel:
+			names === undefined
+				? utf8(bytes, start + 4, channelEnd)
+				: names.get(bytes, start + 4, channelEnd),
+		payload: shortText(bytes, channelEnd + 1, payloadEnd),
+	};
 }
 
 /**

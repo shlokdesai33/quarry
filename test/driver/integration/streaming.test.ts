@@ -103,6 +103,56 @@ describe.skipIf(noPg)('LISTEN / NOTIFY', () => {
 		await sleep(100);
 		expect(received).toHaveLength(2);
 	});
+
+	it('delivers a burst across channels in order, past a throwing listener', async () => {
+		await using listener = await open();
+		await using notifier = await open();
+		const N = 5000;
+		const channels = ['a', 'b', 'Quarry Events', 'é😀'];
+		const perChannel = new Map<string, string[]>();
+		const all: Notification[] = [];
+		const errors: unknown[] = [];
+		const onError = (error: unknown) => errors.push(error);
+		process.on('uncaughtException', onError);
+		try {
+			listener.onNotification(() => {
+				throw new Error('listener failed');
+			});
+			listener.onNotification((n) => all.push(n));
+			for (const channel of channels) {
+				const got: string[] = [];
+				perChannel.set(channel, got);
+				await listener.listen(channel, (n) => got.push(n.payload));
+			}
+			const done = new Promise<void>((resolve) =>
+				listener.onNotification(() => {
+					if (all.length === N) resolve();
+				}),
+			);
+			await notifier.query(
+				`select pg_notify(($1::text[])[1 + g % 4], repeat('é', g % 9) || g)
+				from generate_series(1, ${N}) g`,
+				[channels],
+			);
+			await done;
+			expect(all.map((n) => n.payload)).toEqual(
+				Array.from({ length: N }, (_, i) => 'é'.repeat((i + 1) % 9) + (i + 1)),
+			);
+			expect(new Set(all.map((n) => n.pid))).toEqual(
+				new Set([notifier.processId]),
+			);
+			for (const [i, channel] of channels.entries()) {
+				expect(perChannel.get(channel)).toEqual(
+					all.filter((_, j) => (j + 1) % 4 === i).map((n) => n.payload),
+				);
+			}
+			await sleep(10);
+			expect(errors).toHaveLength(N);
+			expect((await listener.query('select 1 as x')).rows).toEqual([{ x: 1 }]);
+		} finally {
+			process.off('uncaughtException', onError);
+		}
+	});
 });
 
 describe.skipIf(noPg)('cursors', () => {
