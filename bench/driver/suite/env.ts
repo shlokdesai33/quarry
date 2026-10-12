@@ -113,29 +113,81 @@ function certificates(dir: string): void {
 	if (existsSync(join(dir, 'server.crt'))) return;
 	const ssl = (args: string[]) =>
 		execFileSync('openssl', args, { cwd: dir, stdio: 'pipe' });
-	ssl(['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '30']
-		.concat(['-subj', '/CN=bench-ca', '-keyout', 'ca.key', '-out', 'ca.crt']));
-	ssl(['req', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=localhost']
-		.concat(['-keyout', 'server.key', '-out', 'server.csr']));
+	ssl(
+		['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '30'].concat([
+			'-subj',
+			'/CN=bench-ca',
+			'-keyout',
+			'ca.key',
+			'-out',
+			'ca.crt',
+		]),
+	);
+	ssl(
+		['req', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=localhost'].concat([
+			'-keyout',
+			'server.key',
+			'-out',
+			'server.csr',
+		]),
+	);
 	writeFileSync(
 		join(dir, 'server.ext'),
 		'subjectAltName=DNS:localhost,IP:127.0.0.1\n',
 	);
-	ssl(['x509', '-req', '-in', 'server.csr', '-CA', 'ca.crt', '-CAkey', 'ca.key']
-		.concat(['-CAcreateserial', '-days', '30', '-sha256', '-extfile', 'server.ext', '-out', 'server.crt']));
+	ssl(
+		[
+			'x509',
+			'-req',
+			'-in',
+			'server.csr',
+			'-CA',
+			'ca.crt',
+			'-CAkey',
+			'ca.key',
+		].concat([
+			'-CAcreateserial',
+			'-days',
+			'30',
+			'-sha256',
+			'-extfile',
+			'server.ext',
+			'-out',
+			'server.crt',
+		]),
+	);
 	execFileSync('chmod', ['600', join(dir, 'server.key')]);
 }
 
-export function psql(env: { binDir: string; dir: string }, sql: string): string {
+export function psql(
+	env: { binDir: string; dir: string },
+	sql: string,
+): string {
 	return sh(join(env.binDir, 'psql'), [
-		'-h', env.dir, '-p', String(PORTS.postgres), '-U', 'postgres', '-d', USERS.database,
-		'-v', 'ON_ERROR_STOP=1', '-qAt', '-c', sql,
+		'-h',
+		env.dir,
+		'-p',
+		String(PORTS.postgres),
+		'-U',
+		'postgres',
+		'-d',
+		USERS.database,
+		'-v',
+		'ON_ERROR_STOP=1',
+		'-qAt',
+		'-c',
+		sql,
 	]);
 }
 
 const children: ChildProcess[] = [];
 
-function pinned(cpus: string, cmd: string, args: string[], env: NodeJS.ProcessEnv = {}): ChildProcess {
+function pinned(
+	cpus: string,
+	cmd: string,
+	args: string[],
+	env: NodeJS.ProcessEnv = {},
+): ChildProcess {
 	const child = spawn('taskset', ['-c', cpus, cmd, ...args], {
 		stdio: 'ignore',
 		env: { ...process.env, ...env },
@@ -144,10 +196,23 @@ function pinned(cpus: string, cmd: string, args: string[], env: NodeJS.ProcessEn
 	return child;
 }
 
-export function startPostgres(binDir: string, dataDir: string, dir: string): void {
+export function startPostgres(
+	binDir: string,
+	dataDir: string,
+	dir: string,
+): void {
 	sh('taskset', [
-		'-c', CPUS.server, join(binDir, 'pg_ctl'), 'start', '-w', '-D', dataDir,
-		'-l', join(dir, 'postgres.log'), '-o', `-k ${dir}`,
+		'-c',
+		CPUS.server,
+		join(binDir, 'pg_ctl'),
+		'start',
+		'-w',
+		'-D',
+		dataDir,
+		'-l',
+		join(dir, 'postgres.log'),
+		'-o',
+		`-k ${dir}`,
 	]);
 }
 
@@ -162,19 +227,36 @@ export function stopPostgres(binDir: string, dataDir: string): void {
 /** Restarts the server (fast shutdown), returning when it accepts connections again. */
 export function restartPostgres(env: BenchEnv): { down: number; up: number } {
 	const down = Date.now();
-	sh(join(env.binDir, 'pg_ctl'), ['stop', '-w', '-m', 'fast', '-D', env.dataDir]);
+	sh(join(env.binDir, 'pg_ctl'), [
+		'stop',
+		'-w',
+		'-m',
+		'fast',
+		'-D',
+		env.dataDir,
+	]);
 	startPostgres(env.binDir, env.dataDir, env.dir);
 	return { down, up: Date.now() };
 }
 
-export async function startEnv(dir = join(homedir(), '.cache', 'quarry-driver-bench')): Promise<BenchEnv> {
+export async function startEnv(
+	dir = join(homedir(), '.cache', 'quarry-driver-bench'),
+): Promise<BenchEnv> {
 	mkdirSync(dir, { recursive: true });
 	const binDir = findBinDir();
 	const dataDir = join(dir, 'data');
 	certificates(dir);
 	if (!existsSync(join(dataDir, 'PG_VERSION'))) {
 		sh(join(binDir, 'initdb'), [
-			'-D', dataDir, '-U', 'postgres', '--auth=trust', '-E', 'UTF8', '--locale=C.UTF-8', '--no-sync',
+			'-D',
+			dataDir,
+			'-U',
+			'postgres',
+			'--auth=trust',
+			'-E',
+			'UTF8',
+			'--locale=C.UTF-8',
+			'--no-sync',
 		]);
 		const conf = join(dataDir, 'postgresql.conf');
 		writeFileSync(
@@ -204,11 +286,38 @@ export async function startEnv(dir = join(homedir(), '.cache', 'quarry-driver-be
 	stopPostgres(binDir, dataDir);
 	startPostgres(binDir, dataDir, dir);
 	const base = { binDir, dir };
-	if (!sh(join(binDir, 'psql'), ['-h', dir, '-p', String(PORTS.postgres), '-U', 'postgres', '-d', 'postgres', '-qAt', '-c', `select 1 from pg_database where datname = '${USERS.database}'`]).trim()) {
-		sh(join(binDir, 'psql'), ['-h', dir, '-p', String(PORTS.postgres), '-U', 'postgres', '-d', 'postgres', '-q',
-			'-c', `create user ${USERS.trust} superuser`,
-			'-c', `create user ${USERS.scram} superuser password '${USERS.scramPassword}'`,
-			'-c', `create database ${USERS.database} owner ${USERS.trust}`]);
+	if (
+		!sh(join(binDir, 'psql'), [
+			'-h',
+			dir,
+			'-p',
+			String(PORTS.postgres),
+			'-U',
+			'postgres',
+			'-d',
+			'postgres',
+			'-qAt',
+			'-c',
+			`select 1 from pg_database where datname = '${USERS.database}'`,
+		]).trim()
+	) {
+		sh(join(binDir, 'psql'), [
+			'-h',
+			dir,
+			'-p',
+			String(PORTS.postgres),
+			'-U',
+			'postgres',
+			'-d',
+			'postgres',
+			'-q',
+			'-c',
+			`create user ${USERS.trust} superuser`,
+			'-c',
+			`create user ${USERS.scram} superuser password '${USERS.scramPassword}'`,
+			'-c',
+			`create database ${USERS.database} owner ${USERS.trust}`,
+		]);
 	}
 	loadData(base);
 
@@ -221,7 +330,10 @@ export async function startEnv(dir = join(homedir(), '.cache', 'quarry-driver-be
 		'auth_type = trust',
 		'ignore_startup_parameters = extra_float_digits,options',
 	];
-	writeFileSync(join(dir, 'userlist.txt'), `"${USERS.trust}" ""\n"postgres" ""\n`);
+	writeFileSync(
+		join(dir, 'userlist.txt'),
+		`"${USERS.trust}" ""\n"postgres" ""\n`,
+	);
 	writeFileSync(
 		join(dir, 'pgbouncer.ini'),
 		[
@@ -244,7 +356,12 @@ export async function startEnv(dir = join(homedir(), '.cache', 'quarry-driver-be
 
 	const bin = process.env['BENCH_BIN'] ?? join(homedir(), 'benchbin');
 	await killPort(PORTS.toxiproxyApi);
-	pinned(CPUS.proxies, join(bin, 'toxiproxy-server'), ['-host', '127.0.0.1', '-port', String(PORTS.toxiproxyApi)]);
+	pinned(CPUS.proxies, join(bin, 'toxiproxy-server'), [
+		'-host',
+		'127.0.0.1',
+		'-port',
+		String(PORTS.toxiproxyApi),
+	]);
 	await killPort(PORTS.wsproxy);
 	pinned(CPUS.proxies, join(bin, 'wsproxy'), [], {
 		LISTEN_PORT: `127.0.0.1:${PORTS.wsproxy}`,
@@ -252,7 +369,11 @@ export async function startEnv(dir = join(homedir(), '.cache', 'quarry-driver-be
 		ALLOW_ADDR_REGEX: '',
 		LOG_CONN_INFO: 'false',
 	});
-	await Promise.all([waitForPort(PORTS.bouncer), waitForPort(PORTS.toxiproxyApi), waitForPort(PORTS.wsproxy)]);
+	await Promise.all([
+		waitForPort(PORTS.bouncer),
+		waitForPort(PORTS.toxiproxyApi),
+		waitForPort(PORTS.wsproxy),
+	]);
 	await toxiproxy('POST', '/proxies', {
 		name: 'pg',
 		listen: `127.0.0.1:${PORTS.toxiproxy}`,
@@ -262,13 +383,18 @@ export async function startEnv(dir = join(homedir(), '.cache', 'quarry-driver-be
 	await setLatency(0);
 	await waitForPort(PORTS.toxiproxy);
 
-	const url = (port: number) => `postgres://${USERS.trust}@127.0.0.1:${port}/${USERS.database}`;
+	const url = (port: number) =>
+		`postgres://${USERS.trust}@127.0.0.1:${port}/${USERS.database}`;
 	return {
 		dir,
 		binDir,
 		dataDir,
 		caFile: join(dir, 'ca.crt'),
-		urls: { direct: url(PORTS.postgres), bouncer: url(PORTS.bouncer), toxiproxy: url(PORTS.toxiproxy) },
+		urls: {
+			direct: url(PORTS.postgres),
+			bouncer: url(PORTS.bouncer),
+			toxiproxy: url(PORTS.toxiproxy),
+		},
 		serverConfig: SERVER_CONFIG,
 		bouncerConfig,
 	};
@@ -283,13 +409,20 @@ async function killPort(port: number): Promise<void> {
 	}
 }
 
-async function toxiproxy(method: string, path: string, body?: unknown): Promise<unknown> {
+async function toxiproxy(
+	method: string,
+	path: string,
+	body?: unknown,
+): Promise<unknown> {
 	const res = await fetch(`http://127.0.0.1:${PORTS.toxiproxyApi}${path}`, {
 		method,
 		headers: { 'content-type': 'application/json' },
 		...(body === undefined ? {} : { body: JSON.stringify(body) }),
 	});
-	if (!res.ok && res.status !== 404) throw new Error(`toxiproxy ${method} ${path}: ${res.status} ${await res.text()}`);
+	if (!res.ok && res.status !== 404)
+		throw new Error(
+			`toxiproxy ${method} ${path}: ${res.status} ${await res.text()}`,
+		);
 	return res.status === 204 ? undefined : res.json().catch(() => undefined);
 }
 
@@ -318,6 +451,9 @@ export function stopChildren(): void {
 	for (const child of children) child.kill('SIGTERM');
 }
 
+const md5s = (n: number) =>
+	`(select string_agg(md5(random()::text || g::text), '') from generate_series(1, ${n}) g)`;
+
 /** Generates the data set once; a marker table records the version. */
 function loadData(env: { binDir: string; dir: string }): void {
 	const VERSION = '3';
@@ -327,8 +463,9 @@ function loadData(env: { binDir: string; dir: string }): void {
 		// first run
 	}
 	console.error('loading benchmark data (once)…');
-	const md5s = (n: number) => `(select string_agg(md5(random()::text || g::text), '') from generate_series(1, ${n}) g)`;
-	psql(env, `
+	psql(
+		env,
+		`
 		drop table if exists bench_meta, bench_users, bench_wide, bench_large, bench_arrays, bench_types, bench_writes, bench_kv, bench_upd, bench_del cascade;
 		select setseed(0.42);
 		create table bench_users (id int primary key, name text not null, email text not null, score float8 not null, created timestamptz not null, active bool not null);
@@ -345,7 +482,11 @@ function loadData(env: { binDir: string; dir: string }): void {
 			...Array.from({ length: 25 }, (_, i) => `'text value ${i} ' || g`),
 			...Array.from({ length: 25 }, (_, i) => `g / ${i + 3}.0`),
 			...Array.from({ length: 14 }, (_, i) => `(g + ${i}) % 3 = 0`),
-			...Array.from({ length: 10 }, (_, i) => `'2024-01-01'::timestamptz + (g * ${i + 1}) * interval '1 second'`),
+			...Array.from(
+				{ length: 10 },
+				(_, i) =>
+					`'2024-01-01'::timestamptz + (g * ${i + 1}) * interval '1 second'`,
+			),
 		].join(', ')} from generate_series(1, 1000) g;
 		create table bench_large (id int primary key, kind text not null, t text, b bytea, j jsonb);
 		alter table bench_large alter column t set storage external, alter column b set storage external, alter column j set storage external;
@@ -364,7 +505,8 @@ function loadData(env: { binDir: string; dir: string }): void {
 		create table bench_del (id bigint primary key);
 		create table bench_meta (v text);
 		insert into bench_meta values ('${VERSION}');
-	`);
+	`,
+	);
 	psql(env, 'vacuum (analyze, freeze)');
 	psql(env, 'checkpoint');
 }

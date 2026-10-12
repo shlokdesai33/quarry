@@ -1,8 +1,8 @@
 {
 	"name": "quarry-driver-bench",
 	"private": true,
-	"type": "module",
 	"description": "Comprehensive benchmark of quarry/driver against other PostgreSQL clients; see README.md.",
+	"type": "module",
 	"scripts": {
 		"bench": "node orchestrate.ts",
 		"report": "node analyze.ts",

@@ -23,10 +23,20 @@ export interface Driver {
 	/** COPY … FROM STDIN with pre-encoded text chunks. */
 	copyFrom?(sql: string, chunks: readonly string[]): Promise<void>;
 	/** Cursor streaming: calls `onBatch` per batch, awaiting it (backpressure). */
-	stream?(sql: string, params: unknown[], batchSize: number, onBatch: (rows: readonly Row[]) => unknown): Promise<void>;
-	listen?(channel: string, handler: (payload: string) => void): Promise<() => Promise<void>>;
+	stream?(
+		sql: string,
+		params: unknown[],
+		batchSize: number,
+		onBatch: (rows: readonly Row[]) => unknown,
+	): Promise<void>;
+	listen?(
+		channel: string,
+		handler: (payload: string) => void,
+	): Promise<() => Promise<void>>;
 	/** Starts `sql` on its own connection; `cancel()` uses the client's cancel API. */
-	cancellable?(sql: string): Promise<{ done: Promise<unknown>; cancel(): void }>;
+	cancellable?(
+		sql: string,
+	): Promise<{ done: Promise<unknown>; cancel(): void }>;
 	end(): Promise<void>;
 }
 
@@ -51,45 +61,58 @@ export interface DriverOptions {
 export const targetUrl = (t: Target, params = '') =>
 	`postgres://${t.user}${t.password ? `:${t.password}` : ''}@${t.host}:${t.port}/${t.database}${params}`;
 
-const QUARRY_DIST = new URL('../../../dist/driver/index.js', import.meta.url).href;
+/** `QUARRY_DIST` points at another build of the driver, for A/B runs of a change. */
+const QUARRY_DIST =
+	process.env['QUARRY_DIST'] ??
+	new URL('../../../dist/driver/index.js', import.meta.url).href;
 
 export type DriverFactory = (o: DriverOptions) => Promise<Driver>;
 
 /** Client configurations, by name. `runtimes` lists where each runs. */
-export const DRIVERS: Record<string, { runtimes: readonly string[]; describe: string; make: DriverFactory }> = {
+export const DRIVERS: Record<
+	string,
+	{ runtimes: readonly string[]; describe: string; make: DriverFactory }
+> = {
 	quarry: {
 		runtimes: ['node', 'bun', 'deno'],
-		describe: 'quarry/driver (built dist). Like-for-like decoding (int8/numeric as string, timestamptz as Date, as pg does; quarry\'s own adapter config). Defaults: prepared statements (LRU 100), binary results for hot types, pipelining onto shared connections when the pool is busy (50 per connection).',
+		describe:
+			"quarry/driver (built dist). Like-for-like decoding (int8/numeric as string, timestamptz as Date, as pg does; quarry's own adapter config). Defaults: prepared statements (LRU 100), binary results for hot types, pipelining onto shared connections when the pool is busy (50 per connection).",
 		make: (o) => quarry(o, { decode: 'compat' }),
 	},
 	'quarry-lossless': {
 		runtimes: ['node', 'bun', 'deno'],
-		describe: 'quarry/driver with its standalone lossless defaults: int8 as bigint, timestamptz/date as text (no Date construction).',
+		describe:
+			'quarry/driver with its standalone lossless defaults: int8 as bigint, timestamptz/date as text (no Date construction).',
 		make: (o) => quarry(o, { decode: 'lossless' }),
 	},
 	'quarry-noprep': {
 		runtimes: ['node', 'bun', 'deno'],
-		describe: 'quarry/driver with `prepare: false` (unnamed statements; text results).',
+		describe:
+			'quarry/driver with `prepare: false` (unnamed statements; text results).',
 		make: (o) => quarry(o, { decode: 'compat', prepare: false }),
 	},
 	'quarry-nopipe': {
 		runtimes: ['node'],
-		describe: 'quarry/driver with `pipeline: false` (exclusive connection checkout, like pg).',
+		describe:
+			'quarry/driver with `pipeline: false` (exclusive connection checkout, like pg).',
 		make: (o) => quarry({ ...o, pipeline: false }, { decode: 'compat' }),
 	},
 	pg: {
 		runtimes: ['node', 'bun', 'deno'],
-		describe: 'node-postgres 8.23 Pool, `pool.query(text, values)`: unnamed statements (Parse every time), text results, default type parsers.',
+		describe:
+			'node-postgres 8.23 Pool, `pool.query(text, values)`: unnamed statements (Parse every time), text results, default type parsers.',
 		make: (o) => pgDriver(o, { named: false }),
 	},
 	'pg-named': {
 		runtimes: ['node', 'bun', 'deno'],
-		describe: 'node-postgres 8.23 Pool with named prepared statements (`{ name, text, values }`, one name per distinct SQL text): its fastest documented mode for repeated queries.',
+		describe:
+			'node-postgres 8.23 Pool with named prepared statements (`{ name, text, values }`, one name per distinct SQL text): its fastest documented mode for repeated queries.',
 		make: (o) => pgDriver(o, { named: true }),
 	},
 	'pg-native': {
 		runtimes: ['node'],
-		describe: 'node-postgres 8.23 `pg.native` Pool over libpq (pg-native 3.9, libpq 18 client), unnamed statements.',
+		describe:
+			'node-postgres 8.23 `pg.native` Pool over libpq (pg-native 3.9, libpq 18 client), unnamed statements.',
 		make: (o) => pgDriver(o, { named: false, native: true }),
 	},
 	'pg-native-named': {
@@ -99,17 +122,20 @@ export const DRIVERS: Record<string, { runtimes: readonly string[]; describe: st
 	},
 	'postgres.js': {
 		runtimes: ['node', 'bun', 'deno'],
-		describe: 'postgres.js 3.4.9 defaults: `prepare: true` (named statements), `sql.unsafe(text, params)`, implicit pipelining on each connection, `fetch_types: true`.',
+		describe:
+			'postgres.js 3.4.9 defaults: `prepare: true` (named statements), `sql.unsafe(text, params)`, implicit pipelining on each connection, `fetch_types: true`.',
 		make: (o) => postgresJs(o, { prepare: true }),
 	},
 	'postgres.js-noprep': {
 		runtimes: ['node', 'bun', 'deno'],
-		describe: 'postgres.js 3.4.9 with `prepare: false` (unnamed statements, for transaction poolers without prepared-statement support).',
+		describe:
+			'postgres.js 3.4.9 with `prepare: false` (unnamed statements, for transaction poolers without prepared-statement support).',
 		make: (o) => postgresJs(o, { prepare: false }),
 	},
 	'bun.sql': {
 		runtimes: ['bun'],
-		describe: 'Bun.sql (built-in Zig client) defaults: `prepare: true`, `sql.unsafe(text, params)`, pipelining.',
+		describe:
+			'Bun.sql (built-in Zig client) defaults: `prepare: true`, `sql.unsafe(text, params)`, pipelining.',
 		make: (o) => bunSql(o, { prepare: true }),
 	},
 	'bun.sql-noprep': {
@@ -119,22 +145,26 @@ export const DRIVERS: Record<string, { runtimes: readonly string[]; describe: st
 	},
 	neon: {
 		runtimes: ['node'],
-		describe: '@neondatabase/serverless 1.2 Pool (bundled pg over WebSocket) through Neon\'s Go wsproxy on localhost; unnamed statements; `coalesceWrites: false` (the default batches writes with setTimeout(0), ≥1 ms per round trip on Node); `pipelineConnect: false` (needs cleartext password auth).',
+		describe:
+			"@neondatabase/serverless 1.2 Pool (bundled pg over WebSocket) through Neon's Go wsproxy on localhost; unnamed statements; `coalesceWrites: false` (the default batches writes with setTimeout(0), ≥1 ms per round trip on Node); `pipelineConnect: false` (needs cleartext password auth).",
 		make: (o) => neon(o, { coalesceWrites: false }),
 	},
 	'neon-default': {
 		runtimes: ['node'],
-		describe: '@neondatabase/serverless 1.2 Pool with its default `coalesceWrites: true`.',
+		describe:
+			'@neondatabase/serverless 1.2 Pool with its default `coalesceWrites: true`.',
 		make: (o) => neon(o, { coalesceWrites: true }),
 	},
 	'deno-postgres': {
 		runtimes: ['deno'],
-		describe: 'deno-postgres (jsr:@db/postgres 0.19.5) Pool, lazy connections, `queryObject(text, args)`, as shipped: it writes Parse/Bind/Describe/Execute/Sync as separate socket writes without TCP_NODELAY, so each query waits for a delayed ACK (~40 ms on Linux).',
+		describe:
+			'deno-postgres (jsr:@db/postgres 0.19.5) Pool, lazy connections, `queryObject(text, args)`, as shipped: it writes Parse/Bind/Describe/Execute/Sync as separate socket writes without TCP_NODELAY, so each query waits for a delayed ACK (~40 ms on Linux).',
 		make: (o) => denoPostgres(o),
 	},
 	'deno-postgres-nodelay': {
 		runtimes: ['deno'],
-		describe: 'deno-postgres with `Deno.connect` patched to call `setNoDelay(true)` on every socket: its best case (not configurable through its API).',
+		describe:
+			'deno-postgres with `Deno.connect` patched to call `setNoDelay(true)` on every socket: its best case (not configurable through its API).',
 		make: (o) => {
 			noDelayDenoConnect();
 			return denoPostgres(o);
@@ -144,9 +174,18 @@ export const DRIVERS: Record<string, { runtimes: readonly string[]; describe: st
 
 // ---------------------------------------------------------------- quarry
 
-async function quarry(o: DriverOptions, v: { decode: 'compat' | 'lossless'; prepare?: boolean }): Promise<Driver> {
+const quarryTx = (tx: any): Tx => ({
+	query: async (sql, params) => (await tx.query(sql, params)).rows,
+	savepoint: (fn) => tx.transaction((sp: any) => fn(quarryTx(sp))),
+});
+
+async function quarry(
+	o: DriverOptions,
+	v: { decode: 'compat' | 'lossless'; prepare?: boolean },
+): Promise<Driver> {
 	const d = await import(QUARRY_DIST);
-	const array = (parse?: (t: string) => unknown) => (t: string) => d.parseArray(t, parse);
+	const array = (parse?: (t: string) => unknown) => (t: string) =>
+		d.parseArray(t, parse);
 	// the parsers quarry's own adapter uses (src/decode.ts quarryTypes), for int8/numeric-as-string, timestamptz-as-Date parity with pg
 	const compat = {
 		...d.defaultTypes,
@@ -162,31 +201,34 @@ async function quarry(o: DriverOptions, v: { decode: 'compat' | 'lossless'; prep
 		user: t.user,
 		password: t.password,
 		database: t.database,
-		ssl: t.caFile ? { mode: 'verify-full', ca: readFileSync(t.caFile, 'utf8') } : 'disable',
+		ssl: t.caFile
+			? { mode: 'verify-full', ca: readFileSync(t.caFile, 'utf8') }
+			: 'disable',
 		env: {},
 		max: o.max,
 		...(o.pipeline === undefined ? {} : { pipeline: o.pipeline }),
 		...(v.decode === 'compat' ? { types: compat } : {}),
 		...(v.prepare === undefined ? {} : { prepare: v.prepare }),
 	});
-	const wrap = (tx: any): Tx => ({
-		query: async (sql, params) => (await tx.query(sql, params)).rows,
-		savepoint: (fn) => tx.transaction((sp: any) => fn(wrap(sp))),
-	});
 	return {
 		name: 'quarry',
 		query: async (sql, params) => (await pool.query(sql, params)).rows,
-		transaction: (fn) => pool.transaction((tx: any) => fn(wrap(tx))),
+		transaction: (fn) => pool.transaction((tx: any) => fn(quarryTx(tx))),
 		copyFrom: async (sql, chunks) => {
 			await pool.copyFrom(sql, chunks);
 		},
 		stream: async (sql, params, batchSize, onBatch) => {
-			for await (const batch of pool.cursor(sql, params, { batchSize })) await onBatch(batch);
+			for await (const batch of pool.cursor(sql, params, { batchSize }))
+				await onBatch(batch);
 		},
-		listen: async (channel, handler) => pool.listen(channel, (n: { payload: string }) => handler(n.payload)),
+		listen: async (channel, handler) =>
+			pool.listen(channel, (n: { payload: string }) => handler(n.payload)),
 		cancellable: async (sql) => {
 			const ac = new AbortController();
-			return { done: pool.query(sql, [], { signal: ac.signal }), cancel: () => ac.abort() };
+			return {
+				done: pool.query(sql, [], { signal: ac.signal }),
+				cancel: () => ac.abort(),
+			};
 		},
 		end: () => pool.end(),
 	};
@@ -194,12 +236,22 @@ async function quarry(o: DriverOptions, v: { decode: 'compat' | 'lossless'; prep
 
 // ---------------------------------------------------------------- pg, pg-native
 
-async function pgDriver(o: DriverOptions, v: { named: boolean; native?: boolean }): Promise<Driver> {
+async function pgDriver(
+	o: DriverOptions,
+	v: { named: boolean; native?: boolean },
+): Promise<Driver> {
 	const pg = (await import('pg')).default;
 	const Pool = v.native ? pg.native!.Pool : pg.Pool;
 	const t = o.target;
 	const config: Record<string, unknown> = v.native
-		? { connectionString: targetUrl(t, t.caFile ? `?sslmode=verify-full&sslrootcert=${t.caFile}` : '?sslmode=disable') }
+		? {
+				connectionString: targetUrl(
+					t,
+					t.caFile
+						? `?sslmode=verify-full&sslrootcert=${t.caFile}`
+						: '?sslmode=disable',
+				),
+			}
 		: {
 				host: t.host,
 				port: t.port,
@@ -211,7 +263,11 @@ async function pgDriver(o: DriverOptions, v: { named: boolean; native?: boolean 
 	const pool = new Pool({ ...config, max: o.max });
 	pool.on('error', () => {});
 	const names = new Map<string, string>();
-	const q = (client: { query: (...a: any[]) => Promise<any> }, text: string, values?: unknown[]) => {
+	const q = (
+		client: { query: (...a: any[]) => Promise<any> },
+		text: string,
+		values?: unknown[],
+	) => {
 		if (!v.named) return client.query(text, values);
 		let name = names.get(text);
 		if (name === undefined) names.set(text, (name = `q${names.size}`));
@@ -250,7 +306,9 @@ async function pgDriver(o: DriverOptions, v: { named: boolean; native?: boolean 
 		},
 		listen: async (channel, handler) => {
 			const client = await pool.connect();
-			client.on('notification', (n: { payload?: string }) => handler(n.payload ?? ''));
+			client.on('notification', (n: { payload?: string }) =>
+				handler(n.payload ?? ''),
+			);
 			await client.query(`listen ${channel}`);
 			return async () => {
 				await client.query(`unlisten ${channel}`);
@@ -299,14 +357,20 @@ async function pgDriver(o: DriverOptions, v: { named: boolean; native?: boolean 
 			const client: any = await pool.connect();
 			const done = client.query(sql).finally(() => client.release());
 			// pg's cancel API: Client#cancel(client, query) opens a connection and sends CancelRequest
-			return { done, cancel: () => new pg.Client(config).cancel(client, client.activeQuery) };
+			return {
+				done,
+				cancel: () => new pg.Client(config).cancel(client, client.activeQuery),
+			};
 		},
 	};
 }
 
 // ---------------------------------------------------------------- postgres.js
 
-async function postgresJs(o: DriverOptions, v: { prepare: boolean }): Promise<Driver> {
+async function postgresJs(
+	o: DriverOptions,
+	v: { prepare: boolean },
+): Promise<Driver> {
 	const postgres = (await import('postgres')).default;
 	const t = o.target;
 	const sql = postgres({
@@ -326,7 +390,10 @@ async function postgresJs(o: DriverOptions, v: { prepare: boolean }): Promise<Dr
 	});
 	return {
 		name: 'postgres.js',
-		query: (s, p) => sql.unsafe(s, (p ?? []) as never[], { prepare: v.prepare }) as unknown as Promise<Row[]>,
+		query: (s, p) =>
+			sql.unsafe(s, (p ?? []) as never[], {
+				prepare: v.prepare,
+			}) as unknown as Promise<Row[]>,
 		transaction: async (fn) => {
 			await sql.begin((tx) => fn(wrap(tx)));
 		},
@@ -335,16 +402,26 @@ async function postgresJs(o: DriverOptions, v: { prepare: boolean }): Promise<Dr
 			await pipeline(Readable.from(chunks), writable);
 		},
 		stream: async (s, params, batchSize, onBatch) => {
-			for await (const rows of sql.unsafe(s, params as never[], { prepare: v.prepare }).cursor(batchSize)) await onBatch(rows);
+			for await (const rows of sql
+				.unsafe(s, params as never[], { prepare: v.prepare })
+				.cursor(batchSize))
+				await onBatch(rows);
 		},
 		listen: async (channel, handler) => {
-			const { unlisten } = await sql.listen(channel, (payload) => handler(payload));
-			return unlisten;
+			const subscription = await sql.listen(channel, (payload) =>
+				handler(payload),
+			);
+			return () => subscription.unlisten();
 		},
 		cancellable: async (s) => {
 			const query = sql.unsafe(s);
 			const done = query.then((r) => r);
-			return { done, cancel: () => void query.cancel() };
+			return {
+				done,
+				cancel: () => {
+					query.cancel();
+				},
+			};
 		},
 		end: () => sql.end({ timeout: 5 }),
 	};
@@ -352,7 +429,15 @@ async function postgresJs(o: DriverOptions, v: { prepare: boolean }): Promise<Dr
 
 // ---------------------------------------------------------------- Bun.sql
 
-async function bunSql(o: DriverOptions, v: { prepare: boolean }): Promise<Driver> {
+const bunTx = (tx: any): Tx => ({
+	query: (s, p) => tx.unsafe(s, p ?? []),
+	savepoint: (fn) => tx.savepoint((sp: any) => fn(bunTx(sp))),
+});
+
+async function bunSql(
+	o: DriverOptions,
+	v: { prepare: boolean },
+): Promise<Driver> {
 	const { SQL } = Reflect.get(globalThis, 'Bun') as { SQL: any };
 	const t = o.target;
 	const sql = new SQL({
@@ -361,22 +446,24 @@ async function bunSql(o: DriverOptions, v: { prepare: boolean }): Promise<Driver
 		username: t.user,
 		...(t.password ? { password: t.password } : {}),
 		database: t.database,
-		...(t.caFile ? { tls: { ca: readFileSync(t.caFile, 'utf8'), rejectUnauthorized: true } } : { tls: false }),
+		...(t.caFile
+			? {
+					tls: { ca: readFileSync(t.caFile, 'utf8'), rejectUnauthorized: true },
+				}
+			: { tls: false }),
 		max: o.max,
 		prepare: v.prepare,
-	});
-	const wrap = (tx: any): Tx => ({
-		query: (s, p) => tx.unsafe(s, p ?? []),
-		savepoint: (fn) => tx.savepoint((sp: any) => fn(wrap(sp))),
 	});
 	const driver: Driver = {
 		name: 'bun.sql',
 		query: (s, p) => sql.unsafe(s, p ?? []),
 		transaction: async (fn) => {
-			await sql.begin((tx: any) => fn(wrap(tx)));
+			await sql.begin((tx: any) => fn(bunTx(tx)));
 		},
 		listen: async (channel, handler) => {
-			const subscription = await sql.listen(channel, (payload: string) => handler(payload));
+			const subscription = await sql.listen(channel, (payload: string) =>
+				handler(payload),
+			);
 			return () => subscription.unlisten();
 		},
 		cancellable: async (s) => {
@@ -391,18 +478,29 @@ async function bunSql(o: DriverOptions, v: { prepare: boolean }): Promise<Driver
 
 // ---------------------------------------------------------------- @neondatabase/serverless
 
-async function neon(o: DriverOptions, v: { coalesceWrites: boolean }): Promise<Driver> {
+async function neon(
+	o: DriverOptions,
+	v: { coalesceWrites: boolean },
+): Promise<Driver> {
 	const { Pool, neonConfig } = await import('@neondatabase/serverless');
 	const ws = (await import('ws')).default;
 	neonConfig.webSocketConstructor = ws;
 	neonConfig.coalesceWrites = v.coalesceWrites;
-	neonConfig.wsProxy = (host: string, port: number | string) => `127.0.0.1:${PORTS.wsproxy}/v1?address=${host}:${port}`;
+	neonConfig.wsProxy = (host: string, port: number | string) =>
+		`127.0.0.1:${PORTS.wsproxy}/v1?address=${host}:${port}`;
 	neonConfig.useSecureWebSocket = false;
 	neonConfig.pipelineTLS = false;
 	neonConfig.pipelineConnect = false;
 	neonConfig.forceDisablePgSSL = true;
 	const t = o.target;
-	const pool = new Pool({ host: t.host, port: t.port, user: t.user, password: t.password ?? '', database: t.database, max: o.max });
+	const pool = new Pool({
+		host: t.host,
+		port: t.port,
+		user: t.user,
+		password: t.password ?? '',
+		database: t.database,
+		max: o.max,
+	});
 	pool.on('error', () => {});
 	let sp = 0;
 	const wrap = (client: any): Tx => ({
@@ -432,7 +530,9 @@ async function neon(o: DriverOptions, v: { coalesceWrites: boolean }): Promise<D
 		},
 		listen: async (channel, handler) => {
 			const client = await pool.connect();
-			client.on('notification', (n: { payload?: string }) => handler(n.payload ?? ''));
+			client.on('notification', (n: { payload?: string }) =>
+				handler(n.payload ?? ''),
+			);
 			await client.query(`listen ${channel}`);
 			return async () => {
 				await client.query(`unlisten ${channel}`);
@@ -446,7 +546,9 @@ async function neon(o: DriverOptions, v: { coalesceWrites: boolean }): Promise<D
 // ---------------------------------------------------------------- deno-postgres
 
 function noDelayDenoConnect(): void {
-	const deno = Reflect.get(globalThis, 'Deno') as { connect: (o: unknown) => Promise<{ setNoDelay(on: boolean): void }> };
+	const deno = Reflect.get(globalThis, 'Deno') as {
+		connect: (o: unknown) => Promise<{ setNoDelay(on: boolean): void }>;
+	};
 	const original = deno.connect.bind(deno);
 	Object.defineProperty(deno, 'connect', {
 		configurable: true,
@@ -469,7 +571,13 @@ async function denoPostgres(o: DriverOptions): Promise<Driver> {
 			user: t.user,
 			password: t.password,
 			database: t.database,
-			tls: t.caFile ? { enabled: true, enforce: true, caCertificates: [readFileSync(t.caFile, 'utf8')] } : { enabled: false },
+			tls: t.caFile
+				? {
+						enabled: true,
+						enforce: true,
+						caCertificates: [readFileSync(t.caFile, 'utf8')],
+					}
+				: { enabled: false },
 		},
 		o.max,
 		true,
@@ -518,7 +626,12 @@ export async function connectOnce(name: string, t: Target): Promise<void> {
 		case 'quarry': {
 			const d = await import(QUARRY_DIST);
 			const conn = await d.connect({
-				host: t.host, port: t.port, user: t.user, password: t.password, database: t.database, env: {},
+				host: t.host,
+				port: t.port,
+				user: t.user,
+				password: t.password,
+				database: t.database,
+				env: {},
 				ssl: ca ? { mode: 'verify-full', ca } : 'disable',
 			});
 			await conn.query('select 1');
@@ -529,9 +642,24 @@ export async function connectOnce(name: string, t: Target): Promise<void> {
 		case 'pg-native': {
 			const pg = (await import('pg')).default;
 			const Client = base === 'pg-native' ? pg.native!.Client : pg.Client;
-			const client = base === 'pg-native'
-				? new Client({ connectionString: targetUrl(t, ca ? `?sslmode=verify-full&sslrootcert=${t.caFile}` : '?sslmode=disable') })
-				: new Client({ host: t.host, port: t.port, user: t.user, password: t.password, database: t.database, ssl: ca ? { ca } : false });
+			const client =
+				base === 'pg-native'
+					? new Client({
+							connectionString: targetUrl(
+								t,
+								ca
+									? `?sslmode=verify-full&sslrootcert=${t.caFile}`
+									: '?sslmode=disable',
+							),
+						})
+					: new Client({
+							host: t.host,
+							port: t.port,
+							user: t.user,
+							password: t.password,
+							database: t.database,
+							ssl: ca ? { ca } : false,
+						});
 			await client.connect();
 			await client.query('select 1');
 			await client.end();
@@ -539,14 +667,31 @@ export async function connectOnce(name: string, t: Target): Promise<void> {
 		}
 		case 'postgres.js': {
 			const postgres = (await import('postgres')).default;
-			const sql = postgres({ host: t.host, port: t.port, user: t.user, ...(t.password ? { password: t.password } : {}), database: t.database, ssl: ca ? { ca } : false, max: 1, onnotice: () => {} });
+			const sql = postgres({
+				host: t.host,
+				port: t.port,
+				user: t.user,
+				...(t.password ? { password: t.password } : {}),
+				database: t.database,
+				ssl: ca ? { ca } : false,
+				max: 1,
+				onnotice: () => {},
+			});
 			await sql`select 1`;
 			await sql.end();
 			return;
 		}
 		case 'bun.sql': {
 			const { SQL } = Reflect.get(globalThis, 'Bun') as { SQL: any };
-			const sql = new SQL({ hostname: t.host, port: t.port, username: t.user, ...(t.password ? { password: t.password } : {}), database: t.database, ...(ca ? { tls: { ca, rejectUnauthorized: true } } : { tls: false }), max: 1 });
+			const sql = new SQL({
+				hostname: t.host,
+				port: t.port,
+				username: t.user,
+				...(t.password ? { password: t.password } : {}),
+				database: t.database,
+				...(ca ? { tls: { ca, rejectUnauthorized: true } } : { tls: false }),
+				max: 1,
+			});
 			await sql`select 1`;
 			await sql.close();
 			return;
@@ -554,12 +699,19 @@ export async function connectOnce(name: string, t: Target): Promise<void> {
 		case 'neon': {
 			const { Client, neonConfig } = await import('@neondatabase/serverless');
 			neonConfig.webSocketConstructor = (await import('ws')).default;
-			neonConfig.wsProxy = (host: string, port: number | string) => `127.0.0.1:${PORTS.wsproxy}/v1?address=${host}:${port}`;
+			neonConfig.wsProxy = (host: string, port: number | string) =>
+				`127.0.0.1:${PORTS.wsproxy}/v1?address=${host}:${port}`;
 			neonConfig.useSecureWebSocket = false;
 			neonConfig.coalesceWrites = false;
 			neonConfig.pipelineConnect = false;
 			neonConfig.forceDisablePgSSL = true;
-			const client = new Client({ host: t.host, port: t.port, user: t.user, password: t.password ?? '', database: t.database });
+			const client = new Client({
+				host: t.host,
+				port: t.port,
+				user: t.user,
+				password: t.password ?? '',
+				database: t.database,
+			});
 			await client.connect();
 			await client.query('select 1');
 			await client.end();
@@ -570,7 +722,16 @@ export async function connectOnce(name: string, t: Target): Promise<void> {
 			if (base === 'deno-postgres-nodelay') noDelayDenoConnect();
 			const spec = 'jsr:@db/postgres@0.19.5';
 			const { Client } = await import(spec);
-			const client = new Client({ hostname: t.host, port: t.port, user: t.user, password: t.password, database: t.database, tls: ca ? { enabled: true, enforce: true, caCertificates: [ca] } : { enabled: false } });
+			const client = new Client({
+				hostname: t.host,
+				port: t.port,
+				user: t.user,
+				password: t.password,
+				database: t.database,
+				tls: ca
+					? { enabled: true, enforce: true, caCertificates: [ca] }
+					: { enabled: false },
+			});
 			await client.connect();
 			await client.queryArray('select 1');
 			await client.end();

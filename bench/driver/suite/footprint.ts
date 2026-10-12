@@ -9,7 +9,14 @@
  *   node footprint.ts [--id name] [--reps 15]
  */
 import { execFileSync, execSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
@@ -27,7 +34,9 @@ const OUT = join(import.meta.dirname, 'results', ID);
 const ROOT = join(import.meta.dirname, '..', '..', '..');
 
 function duBytes(dir: string): number {
-	return Number(execFileSync('du', ['-sb', dir], { encoding: 'utf8' }).split('\t')[0]);
+	return Number(
+		execFileSync('du', ['-sb', dir], { encoding: 'utf8' }).split('\t')[0],
+	);
 }
 
 function countPackages(nodeModules: string): number {
@@ -62,7 +71,18 @@ function install(specs: string[]): { bytes: number; packages: number } {
 	const dir = mkdtempSync(join(tmpdir(), 'bench-install-'));
 	try {
 		writeFileSync(join(dir, 'package.json'), '{"name":"x","private":true}');
-		execFileSync('npm', ['install', '--omit=dev', '--no-audit', '--no-fund', '--no-package-lock', ...specs], { cwd: dir, stdio: 'pipe' });
+		execFileSync(
+			'npm',
+			[
+				'install',
+				'--omit=dev',
+				'--no-audit',
+				'--no-fund',
+				'--no-package-lock',
+				...specs,
+			],
+			{ cwd: dir, stdio: 'pipe' },
+		);
 		const nm = join(dir, 'node_modules');
 		return { bytes: duBytes(nm), packages: countPackages(nm) };
 	} finally {
@@ -70,7 +90,11 @@ function install(specs: string[]): { bytes: number; packages: number } {
 	}
 }
 
-async function bundle(name: string, source: string, external: string[] = []): Promise<{ bytes: number; gzip: number }> {
+async function bundle(
+	name: string,
+	source: string,
+	external: string[] = [],
+): Promise<{ bytes: number; gzip: number }> {
 	const result = await build({
 		stdin: { contents: source, resolveDir: import.meta.dirname, loader: 'js' },
 		bundle: true,
@@ -83,10 +107,14 @@ async function bundle(name: string, source: string, external: string[] = []): Pr
 	});
 	const code = result.outputFiles[0]!.contents;
 	writeFileSync(join(OUT, `bundle-${name}.js`), code);
-	return { bytes: code.byteLength, gzip: gzipSync(code, { level: 9 }).byteLength };
+	return {
+		bytes: code.byteLength,
+		gzip: gzipSync(code, { level: 9 }).byteLength,
+	};
 }
 
-const median = (v: number[]) => v.toSorted((a, b) => a - b)[Math.floor(v.length / 2)] ?? Number.NaN;
+const median = (v: number[]) =>
+	v.toSorted((a, b) => a - b)[Math.floor(v.length / 2)] ?? Number.NaN;
 
 async function main() {
 	mkdirSync(OUT, { recursive: true });
@@ -95,19 +123,40 @@ async function main() {
 
 	// ---- install size (published packages, production deps only)
 	execSync('pnpm pack --pack-destination ' + OUT, { cwd: ROOT, stdio: 'pipe' });
-	const tarball = readdirSync(OUT).find((f) => f.startsWith('quarry-') && f.endsWith('.tgz'))!;
+	const tarball = readdirSync(OUT).find(
+		(f) => f.startsWith('quarry-') && f.endsWith('.tgz'),
+	)!;
 	const installs: Record<string, unknown> = {
-		'quarry (whole package: query builder + driver + src)': install([join(OUT, tarball)]),
+		'quarry (whole package: query builder + driver + src)': install([
+			join(OUT, tarball),
+		]),
 		pg: install(['pg@8.23.1']),
-		'pg + pg-native (libpq addon, built)': install(['pg@8.23.1', 'pg-native@3.9.1']),
+		'pg + pg-native (libpq addon, built)': install([
+			'pg@8.23.1',
+			'pg-native@3.9.1',
+		]),
 		'postgres.js': install(['postgres@3.4.9']),
-		'@neondatabase/serverless (+ ws on Node)': install(['@neondatabase/serverless@1.2.0', 'ws@8.22.0']),
+		'@neondatabase/serverless (+ ws on Node)': install([
+			'@neondatabase/serverless@1.2.0',
+			'ws@8.22.0',
+		]),
 	};
 	try {
-		const info = JSON.parse(execFileSync('deno', ['info', '--json', 'jsr:@db/postgres@0.19.5'], { encoding: 'utf8' }));
+		const info = JSON.parse(
+			execFileSync('deno', ['info', '--json', 'jsr:@db/postgres@0.19.5'], {
+				encoding: 'utf8',
+			}),
+		);
 		const modules = info.modules as { size?: number; specifier: string }[];
-		const pkgs = new Set(modules.map((m) => /jsr\.io\/(@[^/]+\/[^/]+)\//.exec(m.specifier)?.[1]).filter(Boolean));
-		installs['deno-postgres (jsr, source modules)'] = { bytes: modules.reduce((a, m) => a + (m.size ?? 0), 0), packages: pkgs.size };
+		const pkgs = new Set(
+			modules
+				.map((m) => /jsr\.io\/(@[^/]+\/[^/]+)\//.exec(m.specifier)?.[1])
+				.filter(Boolean),
+		);
+		installs['deno-postgres (jsr, source modules)'] = {
+			bytes: modules.reduce((a, m) => a + (m.size ?? 0), 0),
+			packages: pkgs.size,
+		};
 	} catch (error) {
 		installs['deno-postgres (jsr, source modules)'] = { error: String(error) };
 	}
@@ -117,11 +166,26 @@ async function main() {
 
 	// ---- bundle size: an app that creates a pool and runs a query
 	out['bundle'] = {
-		'quarry/driver': await bundle('quarry', `import { createPool } from '${join(ROOT, 'dist/driver/index.js')}'; const p = createPool(process.env.DATABASE_URL); console.log((await p.query('select 1')).rows);`),
-		pg: await bundle('pg', `import pg from 'pg'; const p = new pg.Pool(); console.log((await p.query('select 1')).rows);`, ['pg-native']),
-		'postgres.js': await bundle('postgres', `import postgres from 'postgres'; const sql = postgres(); console.log(await sql\`select 1\`);`),
-		'@neondatabase/serverless': await bundle('neon', `import { Pool } from '@neondatabase/serverless'; const p = new Pool(); console.log((await p.query('select 1')).rows);`),
-		'pg-native': { note: 'native addon (libpq .node + libpq.so): not bundleable' },
+		'quarry/driver': await bundle(
+			'quarry',
+			`import { createPool } from '${join(ROOT, 'dist/driver/index.js')}'; const p = createPool(process.env.DATABASE_URL); console.log((await p.query('select 1')).rows);`,
+		),
+		pg: await bundle(
+			'pg',
+			`import pg from 'pg'; const p = new pg.Pool(); console.log((await p.query('select 1')).rows);`,
+			['pg-native'],
+		),
+		'postgres.js': await bundle(
+			'postgres',
+			`import postgres from 'postgres'; const sql = postgres(); console.log(await sql\`select 1\`);`,
+		),
+		'@neondatabase/serverless': await bundle(
+			'neon',
+			`import { Pool } from '@neondatabase/serverless'; const p = new Pool(); console.log((await p.query('select 1')).rows);`,
+		),
+		'pg-native': {
+			note: 'native addon (libpq .node + libpq.so): not bundleable',
+		},
 	};
 	console.error('bundles done');
 
@@ -139,15 +203,27 @@ async function main() {
 	const cold: Record<string, unknown> = {};
 	for (const [runtime, cmd] of Object.entries(runtimes)) {
 		for (const driver of support[runtime]!) {
-			const samples: { importMs: number; firstQueryMs: number; sinceStartMs: number; wallMs: number }[] = [];
+			const samples: {
+				importMs: number;
+				firstQueryMs: number;
+				sinceStartMs: number;
+				wallMs: number;
+			}[] = [];
 			for (let r = 0; r < REPS + 2; r++) {
 				const t = performance.now();
-				const line = execFileSync('taskset', ['-c', CPUS.client, ...cmd(driver)], {
-					cwd: import.meta.dirname,
-					encoding: 'utf8',
-					env: { ...process.env, NO_COLOR: '1' },
-					stdio: ['ignore', 'pipe', 'ignore'],
-				}).trim().split('\n').pop()!;
+				const line = execFileSync(
+					'taskset',
+					['-c', CPUS.client, ...cmd(driver)],
+					{
+						cwd: import.meta.dirname,
+						encoding: 'utf8',
+						env: { ...process.env, NO_COLOR: '1' },
+						stdio: ['ignore', 'pipe', 'ignore'],
+					},
+				)
+					.trim()
+					.split('\n')
+					.pop()!;
 				const wallMs = performance.now() - t;
 				if (r >= 2) samples.push({ ...JSON.parse(line), wallMs });
 			}

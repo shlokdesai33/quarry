@@ -5,7 +5,10 @@
  *
  *   node cold.ts <driver> <port>
  */
-const [driver = 'quarry', portArg = '55432'] = process.argv.slice(2).filter((a) => !a.startsWith('-')).slice(-2);
+const [driver = 'quarry', portArg = '55432'] = process.argv
+	.slice(2)
+	.filter((a) => !a.startsWith('-'))
+	.slice(-2);
 const port = Number(portArg);
 const url = `postgres://bench_trust@127.0.0.1:${port}/bench`;
 
@@ -15,7 +18,12 @@ let end: () => Promise<unknown>;
 switch (driver) {
 	case 'quarry': {
 		const { createPool } = await import('../../../dist/driver/index.js');
-		const pool = createPool({ connectionString: url, ssl: 'disable', env: {}, max: 1 });
+		const pool = createPool({
+			connectionString: url,
+			ssl: 'disable',
+			env: {},
+			max: 1,
+		});
 		query = () => pool.query('select 1');
 		end = () => pool.end();
 		break;
@@ -44,7 +52,8 @@ switch (driver) {
 	case 'neon': {
 		const { Pool, neonConfig } = await import('@neondatabase/serverless');
 		neonConfig.webSocketConstructor = (await import('ws')).default;
-		neonConfig.wsProxy = (host: string, p: number | string) => `127.0.0.1:59432/v1?address=${host}:${p}`;
+		neonConfig.wsProxy = (host: string, p: number | string) =>
+			`127.0.0.1:59432/v1?address=${host}:${p}`;
 		neonConfig.useSecureWebSocket = false;
 		neonConfig.coalesceWrites = false;
 		neonConfig.pipelineConnect = false;
@@ -64,7 +73,17 @@ switch (driver) {
 	case 'deno-postgres': {
 		const spec = 'jsr:@db/postgres@0.19.5';
 		const { Pool } = await import(spec);
-		const pool = new Pool({ hostname: '127.0.0.1', port, user: 'bench_trust', database: 'bench', tls: { enabled: false } }, 1, true);
+		const pool = new Pool(
+			{
+				hostname: '127.0.0.1',
+				port,
+				user: 'bench_trust',
+				database: 'bench',
+				tls: { enabled: false },
+			},
+			1,
+			true,
+		);
 		query = async () => {
 			const c = await pool.connect();
 			try {
@@ -83,6 +102,13 @@ switch (driver) {
 const imported = performance.now();
 await query();
 const firstQuery = performance.now();
-console.log(JSON.stringify({ driver, importMs: imported - t0, firstQueryMs: firstQuery - imported, sinceStartMs: firstQuery }));
+console.log(
+	JSON.stringify({
+		driver,
+		importMs: imported - t0,
+		firstQueryMs: firstQuery - imported,
+		sinceStartMs: firstQuery,
+	}),
+);
 await end();
 process.exit(0);

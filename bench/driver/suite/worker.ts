@@ -10,7 +10,12 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { digest } from './canon.ts';
 import { DRIVERS, type Driver, type Target } from './drivers.ts';
-import { byId, type Ctx, type CustomResult, type OpsScenario } from './scenarios.ts';
+import {
+	byId,
+	type Ctx,
+	type CustomResult,
+	type OpsScenario,
+} from './scenarios.ts';
 
 export interface Job {
 	readonly driver: string;
@@ -30,7 +35,15 @@ export interface CellResult {
 	readonly ops: number;
 	readonly elapsedMs: number;
 	readonly throughput: number;
-	readonly lat: { p50: number; p90: number; p99: number; p999: number; max: number; mean: number; n: number };
+	readonly lat: {
+		p50: number;
+		p90: number;
+		p99: number;
+		p999: number;
+		max: number;
+		mean: number;
+		n: number;
+	};
 	readonly cpuUsPerOp: number;
 	readonly serverCpuUsPerOp: number | null;
 	readonly rssBaseMB: number;
@@ -41,11 +54,19 @@ export interface CellResult {
 	readonly extra?: Record<string, unknown> | undefined;
 }
 
-const job: Job = JSON.parse(process.argv[2] ?? process.argv[process.argv.length - 1]!);
-const runtime = Reflect.has(globalThis, 'Bun') ? 'bun' : Reflect.has(globalThis, 'Deno') ? 'deno' : 'node';
+const job: Job = JSON.parse(
+	process.argv[2] ?? process.argv[process.argv.length - 1]!,
+);
+const runtime = Reflect.has(globalThis, 'Bun')
+	? 'bun'
+	: Reflect.has(globalThis, 'Deno')
+		? 'deno'
+		: 'node';
 
 function gcNow(): void {
-	const bun = Reflect.get(globalThis, 'Bun') as { gc?: (sync: boolean) => void } | undefined;
+	const bun = Reflect.get(globalThis, 'Bun') as
+		| { gc?: (sync: boolean) => void }
+		| undefined;
 	if (bun?.gc) bun.gc(true);
 	else (Reflect.get(globalThis, 'gc') as (() => void) | undefined)?.();
 }
@@ -63,7 +84,8 @@ function serverCpuUs(): number | null {
 				continue;
 			}
 			const close = stat.lastIndexOf(')');
-			if (!stat.slice(stat.indexOf('(') + 1, close).startsWith('postgres')) continue;
+			if (!stat.slice(stat.indexOf('(') + 1, close).startsWith('postgres'))
+				continue;
 			const fields = stat.slice(close + 2).split(' ');
 			ticks += Number(fields[11]) + Number(fields[12]);
 		}
@@ -75,23 +97,32 @@ function serverCpuUs(): number | null {
 
 function percentile(sorted: Float64Array, p: number): number {
 	if (sorted.length === 0) return Number.NaN;
-	const i = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
+	const i = Math.min(
+		sorted.length - 1,
+		Math.max(0, Math.ceil((p / 100) * sorted.length) - 1),
+	);
 	return sorted[i]!;
 }
 
 function summarize(latencies: Float64Array) {
-	const s = latencies.slice().sort();
+	const s = latencies.toSorted();
 	let sum = 0;
 	for (const v of s) sum += v;
 	return {
-		p50: percentile(s, 50), p90: percentile(s, 90), p99: percentile(s, 99), p999: percentile(s, 99.9),
-		max: s[s.length - 1] ?? Number.NaN, mean: sum / Math.max(1, s.length), n: s.length,
+		p50: percentile(s, 50),
+		p90: percentile(s, 90),
+		p99: percentile(s, 99),
+		p999: percentile(s, 99.9),
+		max: s[s.length - 1] ?? Number.NaN,
+		mean: sum / Math.max(1, s.length),
+		n: s.length,
 	};
 }
 
 /** RSS, heap and event-loop lag, sampled every 10 ms; GC pauses where the runtime reports them. */
+const mb = (b: number) => b / 1048576;
+
 async function monitor() {
-	const mb = (b: number) => b / 1048576;
 	let rssPeak = 0;
 	let heapPeak = 0;
 	const lags: number[] = [];
@@ -112,7 +143,10 @@ async function monitor() {
 	let observer: { disconnect(): void } | undefined;
 	try {
 		const { PerformanceObserver } = await import('node:perf_hooks');
-		if (runtime === 'node' && PerformanceObserver.supportedEntryTypes.includes('gc')) {
+		if (
+			runtime === 'node' &&
+			PerformanceObserver.supportedEntryTypes.includes('gc')
+		) {
 			gc = { count: 0, totalMs: 0, maxMs: 0 };
 			const g = gc;
 			const o = new PerformanceObserver((list) => {
@@ -135,18 +169,26 @@ async function monitor() {
 			const m = process.memoryUsage();
 			rssPeak = Math.max(rssPeak, m.rss);
 			heapPeak = Math.max(heapPeak, m.heapUsed);
-			const sorted = Float64Array.from(lags).sort();
+			const sorted = Float64Array.from(lags).toSorted();
 			return {
 				rssPeakMB: mb(rssPeak),
 				heapPeakMB: mb(heapPeak),
 				gc,
-				loopLag: { p50: percentile(sorted, 50), p99: percentile(sorted, 99), max: sorted[sorted.length - 1] ?? 0 },
+				loopLag: {
+					p50: percentile(sorted, 50),
+					p99: percentile(sorted, 99),
+					max: sorted[sorted.length - 1] ?? 0,
+				},
 			};
 		},
 	};
 }
 
-async function runOps(s: OpsScenario, d: Driver, ctx: Ctx): Promise<CellResult> {
+async function runOps(
+	s: OpsScenario,
+	d: Driver,
+	ctx: Ctx,
+): Promise<CellResult> {
 	const concurrency = job.concurrency ?? s.concurrency ?? 1;
 	const durationMs = job.durationMs ?? s.durationMs ?? 1000;
 	const warmupMs = job.warmupMs ?? s.warmupMs ?? 500;
@@ -154,7 +196,11 @@ async function runOps(s: OpsScenario, d: Driver, ctx: Ctx): Promise<CellResult> 
 	const maxOps = s.maxOps ?? Number.POSITIVE_INFINITY;
 	await s.setup?.(d, ctx);
 	let seq = 0;
-	const loopFor = async (ms: number, min: number, record?: (ms: number) => void) => {
+	const loopFor = async (
+		ms: number,
+		min: number,
+		record?: (ms: number) => void,
+	) => {
 		const start = performance.now();
 		let done = 0;
 		await Promise.all(
@@ -200,7 +246,8 @@ async function runOps(s: OpsScenario, d: Driver, ctx: Ctx): Promise<CellResult> 
 		throughput: (done / elapsed) * 1000,
 		lat: summarize(lat.subarray(0, n)),
 		cpuUsPerOp: (cpu.user + cpu.system) / done,
-		serverCpuUsPerOp: srv0 === null || srv1 === null ? null : (srv1 - srv0) / done,
+		serverCpuUsPerOp:
+			srv0 === null || srv1 === null ? null : (srv1 - srv0) / done,
 		rssBaseMB: rssBase,
 		...m,
 	};
@@ -211,8 +258,13 @@ async function main() {
 	if (!scenario) throw new Error(`unknown scenario ${job.scenario}`);
 	const factory = DRIVERS[job.driver];
 	if (!factory) throw new Error(`unknown driver ${job.driver}`);
-	const make = (max: number) => factory.make({ target: job.target, max, pipeline: job.pipeline });
-	const ctx: Ctx = { data: { caFile: job.caFile, make }, target: job.target, driverName: job.driver };
+	const make = (max: number) =>
+		factory.make({ target: job.target, max, pipeline: job.pipeline });
+	const ctx: Ctx = {
+		data: { caFile: job.caFile, make },
+		target: job.target,
+		driverName: job.driver,
+	};
 	const needsPool = scenario.kind === 'ops' || !scenario.noPool;
 	const d = needsPool ? await make(job.max) : undefined;
 	if (scenario.needs && d && d[scenario.needs] === undefined) {
@@ -221,19 +273,36 @@ async function main() {
 		process.exit(0);
 	}
 	if (job.verify) {
-		if (scenario.kind !== 'ops' || !scenario.verify) throw new Error('nothing to verify');
+		if (scenario.kind !== 'ops' || !scenario.verify)
+			throw new Error('nothing to verify');
 		const value = await scenario.verify(d!, ctx);
 		const n = Array.isArray(value) ? value.length : 0;
-		console.log(JSON.stringify({ ok: true, digest: digest(value), n, sample: JSON.stringify(Array.isArray(value) ? value[0] : value).slice(0, 300) }));
+		console.log(
+			JSON.stringify({
+				ok: true,
+				digest: digest(value),
+				n,
+				sample: JSON.stringify(Array.isArray(value) ? value[0] : value).slice(
+					0,
+					300,
+				),
+			}),
+		);
 	} else if (scenario.kind === 'ops') {
 		console.log(JSON.stringify(await runOps(scenario, d!, ctx)));
 	} else {
-		const stdin = scenario.id === 'reconnect' ? createInterface({ input: process.stdin })[Symbol.asyncIterator]() : undefined;
+		const stdin =
+			scenario.id === 'reconnect'
+				? createInterface({ input: process.stdin })[Symbol.asyncIterator]()
+				: undefined;
 		gcNow();
 		const rssBase = process.memoryUsage().rss / 1048576;
 		const mon = await monitor();
 		const cpu0 = process.cpuUsage();
-		const r: CustomResult = await scenario.run(d, ctx, { durationMs: job.durationMs ?? 1500, stdin });
+		const r: CustomResult = await scenario.run(d, ctx, {
+			durationMs: job.durationMs ?? 1500,
+			stdin,
+		});
 		const cpu = process.cpuUsage(cpu0);
 		const m = mon.stop();
 		const result: CellResult = {
@@ -255,6 +324,11 @@ async function main() {
 }
 
 main().catch((error: unknown) => {
-	console.log(JSON.stringify({ ok: false, error: String((error as Error)?.stack ?? error).slice(0, 2000) }));
+	console.log(
+		JSON.stringify({
+			ok: false,
+			error: String((error as Error)?.stack ?? error).slice(0, 2000),
+		}),
+	);
 	process.exit(1);
 });

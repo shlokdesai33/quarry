@@ -14,7 +14,8 @@ export function canonValue(value: unknown): unknown {
 	if (typeof value === 'bigint') return value.toString();
 	if (typeof value === 'number') return String(value);
 	if (value instanceof Date) return value.toISOString();
-	if (value instanceof Uint8Array) return `\\x${Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString('hex')}`;
+	if (value instanceof Uint8Array)
+		return `\\x${Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString('hex')}`;
 	if (typeof value === 'string') {
 		const ts = TIMESTAMPTZ.exec(value);
 		if (ts) return new Date(`${ts[1]}T${ts[2]}Z`).toISOString();
@@ -24,7 +25,8 @@ export function canonValue(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(canonValue);
 	if (typeof value === 'object') {
 		const out: Record<string, unknown> = {};
-		for (const key of Object.keys(value).sort()) out[key] = canonValue((value as Record<string, unknown>)[key]);
+		for (const key of Object.keys(value).toSorted())
+			out[key] = canonValue((value as Record<string, unknown>)[key]);
 		return out;
 	}
 	return value;
@@ -36,5 +38,8 @@ export function canonRows(rows: readonly unknown[]): unknown[] {
 }
 
 export function digest(value: unknown): string {
-	return createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 16);
+	return createHash('sha256')
+		.update(JSON.stringify(value))
+		.digest('hex')
+		.slice(0, 16);
 }
