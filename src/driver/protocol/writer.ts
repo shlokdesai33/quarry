@@ -115,6 +115,12 @@ export class Writer {
 		return this;
 	}
 
+	/** Drops everything written after `length`, e.g. a message that failed halfway. */
+	truncate(length: number): void {
+		this.#pos = length;
+		this.#start = -1;
+	}
+
 	/** Takes the bytes written so far and resets the writer. */
 	take(): Uint8Array {
 		const out = this.#buf.slice(0, this.#pos);

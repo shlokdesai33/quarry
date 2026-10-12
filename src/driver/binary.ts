@@ -45,7 +45,10 @@ const timestamptz: BinaryParser = (b, s) => {
 	const lo = int32(b, s + 4) >>> 0;
 	if (hi === 0x7fffffff && lo === 0xffffffff) return new Date(MAX_DATE);
 	if (hi === -0x80000000 && lo === 0) return new Date(-MAX_DATE);
-	return new Date(Math.floor((hi * 4294967296 + lo) / 1000) + PG_EPOCH_MS);
+	// floor((hi * 2^32 + lo) / 1000) without the sum, which loses precision
+	// beyond 2^53 µs (285 years from 2000): 2^32 = 4294967 * 1000 + 296
+	const ms = hi * 4294967 + Math.floor((hi * 296 + lo) / 1000);
+	return new Date(ms + PG_EPOCH_MS);
 };
 
 /**

@@ -186,6 +186,11 @@ export class Pool implements AsyncDisposable {
 	readonly #draining = new Set<Connection>();
 	#opening = 0;
 	#ended = false;
+	#ending: Promise<void> | undefined;
+	/** Resolved once an ending pool has no waiters and no connections lent out. */
+	readonly #drainWaiters: (() => void)[] = [];
+	/** Connections closed after being given back to an ending pool. */
+	readonly #closing: Promise<void>[] = [];
 	#listener: Listener | undefined;
 
 	constructor(options: PoolOptions | string = {}) {
@@ -264,6 +269,7 @@ export class Pool implements AsyncDisposable {
 		this.#serveWaiters();
 		this.#rebalance();
 		this.#fillMin();
+		this.#checkDrained();
 	}
 
 	#fillMin(): void {
@@ -280,12 +286,14 @@ export class Pool implements AsyncDisposable {
 
 	/**
 	 * Hands an available connection to the first caller waiting for one of
-	 * their own, else to queries waiting for a slot, or parks it idle.
+	 * their own, else to queries waiting for a slot, or parks it idle. Once
+	 * the pool is ending, waiters are still served, and connections nobody
+	 * waits for are closed.
 	 */
 	#giveBack(connection: Connection): void {
-		if (this.#ended || connection.closed) {
-			connection.destroy();
+		if (connection.closed) {
 			this.#serveWaiters();
+			this.#checkDrained();
 			return;
 		}
 		const waiter = this.#waiters.shift();
@@ -306,25 +314,57 @@ export class Pool implements AsyncDisposable {
 			);
 			return;
 		}
-		const timer =
-			this.#idleTimeout > 0
-				? setTimeout(() => {
-						const index = this.#idle.findIndex(
-							(idle) => idle.connection === connection,
-						);
-						if (index < 0 || this.#total() <= this.#min) return;
-						this.#idle.splice(index, 1);
+		if (this.#ended) {
+			this.#closing.push(connection.close().catch(() => {}));
+			this.#checkDrained();
+			return;
+		}
+		// the idle timeout, or the end of the connection's lifetime if that comes first
+		const expiresAt = this.#expiresAt.get(connection);
+		const delay = Math.min(
+			this.#idleTimeout > 0 ? this.#idleTimeout : Number.POSITIVE_INFINITY,
+			expiresAt === undefined
+				? Number.POSITIVE_INFINITY
+				: Math.max(0, expiresAt - Date.now()),
+		);
+		const timer = Number.isFinite(delay)
+			? setTimeout(() => {
+					const index = this.#idle.findIndex(
+						(idle) => idle.connection === connection,
+					);
+					if (index < 0) return;
+					this.#idle.splice(index, 1);
+					if (this.#expired(connection)) {
+						// replaced even when that leaves fewer than min
 						void connection.close();
-					}, this.#idleTimeout)
-				: undefined;
+						this.#fillMin();
+					} else if (this.#total() < this.#min) {
+						this.#giveBack(connection);
+					} else {
+						void connection.close();
+					}
+				}, delay)
+			: undefined;
 		if (timer !== undefined) unref(timer);
 		this.#idle.push({ connection, timer });
+	}
+
+	/** Lets `end` finish once nothing is waiting and nothing is lent out. */
+	#checkDrained(): void {
+		if (
+			!this.#ended ||
+			this.#waiters.length > 0 ||
+			this.#sharedWaiters.length > 0 ||
+			this.#busy.size > 0 ||
+			this.#opening > 0
+		)
+			return;
+		for (const resolve of this.#drainWaiters.splice(0)) resolve();
 	}
 
 	/** Opens connections for waiters while there is room. */
 	#serveWaiters(): void {
 		while (
-			!this.#ended &&
 			this.#waiters.length + this.#sharedWaiters.length > this.#opening &&
 			this.#total() < this.#max
 		) {
@@ -341,6 +381,9 @@ export class Pool implements AsyncDisposable {
 						);
 					}
 					this.#rebalance();
+					// one failed attempt per waiter: the others get attempts of their own
+					this.#serveWaiters();
+					this.#checkDrained();
 				},
 			);
 		}
@@ -464,6 +507,7 @@ export class Pool implements AsyncDisposable {
 				waiter.cleanup();
 				reject(error);
 				this.#rebalance();
+				this.#checkDrained();
 			};
 			const onAbort = () =>
 				remove(
@@ -489,31 +533,37 @@ export class Pool implements AsyncDisposable {
 	}
 
 	#release = (connection: Connection, discard: boolean): void => {
-		if (!this.#busy.delete(connection)) return;
+		if (!this.#busy.has(connection)) return;
 		const reusable =
 			!discard && !connection.closed && !this.#expired(connection);
 		if (!reusable) {
-			void connection.close().catch(() => {});
+			this.#busy.delete(connection);
+			const closing = connection.close().catch(() => {});
+			if (this.#ended) this.#closing.push(closing);
 			this.#serveWaiters();
 			this.#fillMin();
+			this.#checkDrained();
 			return;
 		}
 		if (connection.pending > 0 || connection.transactionStatus !== 'idle') {
-			// queries still running, or a transaction left open: never hand that to someone else
+			// queries still running, or a transaction left open: never hand that
+			// to someone else; it stays lent out until its queries finish
 			void connection.idle().then(() => {
 				if (connection.transactionStatus === 'idle') {
-					this.#busy.add(connection);
 					this.#release(connection, false);
 				} else {
+					this.#busy.delete(connection);
 					connection.destroy(
 						new DriverError('Released with a transaction open'),
 					);
 					this.#serveWaiters();
+					this.#checkDrained();
 				}
 				return undefined;
 			});
 			return;
 		}
+		this.#busy.delete(connection);
 		this.#giveBack(connection);
 	};
 
@@ -711,28 +761,56 @@ export class Pool implements AsyncDisposable {
 	}
 
 	/**
-	 * Fails waiters and closes every connection once its queries finish (or,
-	 * with `timeout` in milliseconds, after at most that long, failing
-	 * whatever is still running).
+	 * Stops taking new work and closes the pool once the work already issued
+	 * is done: queries and callers already waiting for a connection still get
+	 * one, and reserved clients and transactions keep theirs until they are
+	 * released. With `timeout` (milliseconds), whatever is still waiting or
+	 * running after that long is failed and its connection closed.
 	 */
-	async end(options: { timeout?: number } = {}): Promise<void> {
-		if (this.#ended) return;
-		this.#ended = true;
-		for (const waiter of [
-			...this.#waiters.splice(0),
-			...this.#sharedWaiters.splice(0),
-		]) {
-			waiter.cleanup();
-			waiter.reject(new DriverError('The pool has ended'));
+	end(options: { timeout?: number } = {}): Promise<void> {
+		if (this.#ending === undefined) {
+			this.#ended = true;
+			this.#ending = this.#end(options.timeout);
 		}
-		this.#draining.clear();
-		const idle = this.#idle.splice(0);
+		return this.#ending;
+	}
+
+	async #end(timeout: number | undefined): Promise<void> {
+		const closing = this.#idle.splice(0).map(({ connection, timer }) => {
+			if (timer !== undefined) clearTimeout(timer);
+			return connection.close();
+		});
+		const drained = new Promise<void>((resolve) => {
+			this.#drainWaiters.push(resolve);
+			this.#checkDrained();
+		});
+		if (timeout === undefined) {
+			await drained;
+		} else {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const expired = await Promise.race([
+				drained.then(() => false),
+				new Promise<boolean>((resolve) => {
+					timer = setTimeout(() => resolve(true), timeout);
+				}),
+			]);
+			clearTimeout(timer);
+			if (expired) {
+				this.#draining.clear();
+				for (const waiter of [
+					...this.#waiters.splice(0),
+					...this.#sharedWaiters.splice(0),
+				]) {
+					waiter.cleanup();
+					waiter.reject(new DriverError('The pool has ended'));
+				}
+				for (const connection of this.#busy)
+					closing.push(connection.close({ timeout: 0 }));
+			}
+		}
 		await Promise.all([
-			...idle.map(async ({ connection, timer }) => {
-				if (timer !== undefined) clearTimeout(timer);
-				await connection.close(options);
-			}),
-			...[...this.#busy].map((connection) => connection.close(options)),
+			...closing,
+			...this.#closing.splice(0),
 			this.#listener?.close(),
 		]);
 	}

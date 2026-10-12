@@ -219,7 +219,8 @@ export interface RunningCluster {
 export async function startCluster(binDir: string): Promise<RunningCluster> {
 	const dir = mkdtempSync(join(tmpdir(), 'quarry-pg-'));
 	const dataDir = join(dir, 'data');
-	const port = await freePort();
+	// QUARRY_PG_PORT pins the port (the compatibility suites expect 5432)
+	const port = Number(process.env['QUARRY_PG_PORT'] ?? 0) || (await freePort());
 	makeCertificates(dir);
 	const versionNum = serverVersionNum(binDir);
 	if (versionNum < 180000) {

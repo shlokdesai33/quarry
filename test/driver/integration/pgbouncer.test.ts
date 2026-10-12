@@ -111,4 +111,22 @@ describe.skipIf(!pg?.bouncerPort)('PgBouncer in transaction mode', () => {
 		).rejects.toThrow(/cancel/);
 		expect((await conn.query('select 1 as x')).rows).toEqual([{ x: 1 }]);
 	});
+
+	it.skipIf(!prepare)(
+		'recovers when a schema change makes the pooler’s prepared statements stale',
+		async () => {
+			const name = table('bounce');
+			await using conn = await open(bouncer());
+			const select = () => conn.query<{ x: unknown }>(`select x from ${name}`);
+			await conn.query(`create table ${name} (x int)`);
+			await conn.query(`insert into ${name} values (1)`);
+			expect((await select()).rows).toEqual([{ x: 1 }]);
+			expect((await select()).rows).toEqual([{ x: 1 }]);
+			await conn.query(`alter table ${name} alter column x type text`);
+			// PgBouncer maps a new Parse of the same text to its stale statement
+			for (let i = 0; i < 3; i++)
+				expect((await select()).rows).toEqual([{ x: '1' }]);
+			await conn.query(`drop table ${name}`);
+		},
+	);
 });

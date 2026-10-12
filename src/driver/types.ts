@@ -343,6 +343,9 @@ function encodeDefined(value: unknown): WireValue {
 	return textOf(value);
 }
 
+/** The protocol counts parameters in 16 bits. */
+const MAX_PARAMETERS = 65535;
+
 /**
  * Encodes a query's parameters with `encodeParam`, refusing `undefined`
  * (or an undefined array element) instead of sending it as NULL.
@@ -351,6 +354,11 @@ export function encodeParams(
 	sql: string,
 	params: readonly unknown[],
 ): WireValue[] {
+	if (params.length > MAX_PARAMETERS) {
+		throw new DriverError(
+			`A query can have at most ${MAX_PARAMETERS} parameters; this one has ${params.length}`,
+		);
+	}
 	const values: WireValue[] = [];
 	for (let i = 0; i < params.length; i++) {
 		const value = params[i];

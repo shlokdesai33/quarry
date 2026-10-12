@@ -38,6 +38,7 @@ export {
 	connect,
 	createPool,
 	DeadlockDetected,
+	DecodeError,
 	DriverError,
 	ExclusionViolation,
 	ForeignKeyViolation,

@@ -3,9 +3,11 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Connection } from '../../../src/driver/connection.js';
 import {
 	ConnectionError,
+	DecodeError,
 	ForeignKeyViolation,
 	NotNullViolation,
 	PostgresError,
+	QueryCanceled,
 	UndefinedParameterError,
 	UndefinedTable,
 	UniqueViolation,
@@ -23,6 +25,95 @@ describe.skipIf(noPg)('queries', () => {
 	});
 	afterAll(async () => {
 		await conn?.close();
+	});
+
+	it('fails only the query whose value a parser cannot decode', async () => {
+		const types = {
+			...rawTypes,
+			[oids.int4]: (text: string) => {
+				if (text === '777') throw new Error('bad int');
+				return Number(text);
+			},
+		};
+		const before = conn.query('select 1 as n', [], { types });
+		const bad = conn.query('select n from (values (1), (777), (3)) v (n)', [], {
+			types,
+		});
+		const after = conn.query('select 3 as n', [], { types });
+		const error = await rejection(bad, DecodeError);
+		expect(error).toMatchObject({ column: 'n', typeOid: oids.int4 });
+		expect(error.message).not.toContain('777');
+		expect(error.cause).toMatchObject({ message: 'bad int' });
+		expect((await before).rows).toEqual([{ n: 1 }]);
+		expect((await after).rows).toEqual([{ n: 3 }]);
+		await expect(
+			conn.simpleQuery('select 777 as n; select 1 as m', { types }),
+		).rejects.toBeInstanceOf(DecodeError);
+		await expect(async () => {
+			for await (const _ of conn.cursor(
+				'select generate_series(770, 1000) as n',
+				[],
+				{ types, batchSize: 1 },
+			));
+		}).rejects.toBeInstanceOf(DecodeError);
+		expect(conn.closed).toBe(false);
+		expect((await conn.query('select 4 as n', [], { types })).rows).toEqual([
+			{ n: 4 },
+		]);
+	});
+
+	it('takes up to 65535 parameters, and refuses more before sending', async () => {
+		const n = 40_000;
+		const placeholders = Array.from({ length: n }, (_, i) => `($${i + 1})`);
+		const values = Array.from({ length: n }, (_, i) => String(i));
+		const sql = `select count(*)::int as n from (values ${placeholders.join(',')}) v`;
+		const { rows } = await conn.query(sql, values);
+		expect(rows).toEqual([{ n }]);
+		expect((await conn.describe(sql)).paramTypes).toHaveLength(n);
+		await expect(
+			conn.query(
+				'select 1',
+				Array.from({ length: 65_536 }, () => 1),
+			),
+		).rejects.toThrow(/at most 65535 parameters/);
+		expect((await conn.query('select 1 as n')).rows).toEqual([{ n: 1 }]);
+	});
+
+	it('cancels a pipelined query once it runs, never the query ahead of it', async () => {
+		const controller = new AbortController();
+		const first = conn.query('select pg_sleep(0.4) as a');
+		const second = conn.query('select pg_sleep(5) as b', [], {
+			signal: controller.signal,
+		});
+		const third = conn.query('select pg_sleep(5) as c', [], { timeout: 100 });
+		setTimeout(() => controller.abort(), 100);
+		const started = Date.now();
+		await expect(first).resolves.toMatchObject({ rowCount: 1 });
+		expect((await rejection(second, QueryCanceled)).reason).toBe('abort');
+		expect((await rejection(third, QueryCanceled)).reason).toBe('timeout');
+		expect(Date.now() - started).toBeLessThan(3000);
+		expect((await conn.query('select 1 as n')).rows).toEqual([{ n: 1 }]);
+	});
+
+	it('rejects SQL it cannot send, without crashing or breaking the connection', async () => {
+		const pending = conn.query('select 1 as before');
+		const nul = conn.query('select 1\0');
+		const simple = conn.simpleQuery('select 1;\0');
+		// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- deliberately not a string
+		const notText = conn.query({} as string);
+		const after = conn.query<{ n: number }>('select 2 as n');
+		await expect(nul).rejects.toThrow(/NUL byte \(at character 9\)/);
+		await expect(simple).rejects.toThrow(/NUL byte/);
+		await expect(notText).rejects.toThrow(/must be a string/);
+		await expect(conn.describe('select\0')).rejects.toThrow(/NUL byte/);
+		await expect(async () => {
+			for await (const _ of conn.cursor('select\0')) break;
+		}).rejects.toThrow(/NUL byte/);
+		await expect(conn.copyFrom('copy t from stdin\0', [])).rejects.toThrow(
+			/NUL byte/,
+		);
+		expect((await pending).rows).toEqual([{ before: 1 }]);
+		expect((await after).rows).toEqual([{ n: 2 }]);
 	});
 
 	it('refuses undefined parameters before sending, and stays usable', async () => {
@@ -116,7 +207,11 @@ describe.skipIf(noPg)('queries', () => {
 			(false, 32767::int2, 2147483647::int4, 0::oid, 'Infinity'::float4, '1e-310'::float8, ''::bytea, 'infinity'::timestamptz),
 			(null, 1::int2, 0::int4, 26::oid, '-1.5'::float4, '-Infinity'::float8, null, '0044-03-15 12:00:00.123456+00 BC'::timestamptz),
 			(true, 0::int2, 7::int4, 1::oid, '3.4e38'::float4, '0.1'::float8, '\\xdeadbeef'::bytea, '1969-12-31 23:59:59.9995+00'::timestamptz),
-			(true, 0::int2, 7::int4, 1::oid, '1'::float4, 'NaN'::float8, '\\x'::bytea, '2024-02-29 13:45:01.000999+05:30'::timestamptz)
+			(true, 0::int2, 7::int4, 1::oid, '1'::float4, 'NaN'::float8, '\\x'::bytea, '2024-02-29 13:45:01.000999+05:30'::timestamptz),
+			-- more than 2^53 microseconds from 2000, just below a millisecond
+			(true, 0::int2, 7::int4, 1::oid, '1'::float4, '1'::float8, '\\x'::bytea, '1700-01-01 00:00:00.999999+00'::timestamptz),
+			(true, 0::int2, 7::int4, 1::oid, '1'::float4, '1'::float8, '\\x'::bytea, '3000-06-15 12:34:56.789999+00'::timestamptz),
+			(true, 0::int2, 7::int4, 1::oid, '1'::float4, '1'::float8, '\\x'::bytea, '4000-01-01 00:00:00.999999+00 BC'::timestamptz)
 		) as t(b, i2, i4, o, f4, f8, bytes, ts)`;
 		await using c = await open({ types: quarryTypes });
 		const text = await c.query(sql, [], { binary: false });
@@ -353,6 +448,39 @@ describe.skipIf(noPg)('queries', () => {
 			{ a: 1, b: 'x' },
 		]);
 		await conn.query(`drop table ${name}`);
+	});
+
+	it('re-prepares a cached statement whose inferred parameter type no longer fits', async () => {
+		const name = table();
+		const insert = () =>
+			conn.query<{ v: unknown }>(
+				`insert into ${name} (v) values ($1) returning v`,
+				['1'],
+			);
+		await conn.query(`create table ${name} (v text)`);
+		expect((await insert()).rows).toEqual([{ v: '1' }]);
+		await conn.query(
+			`alter table ${name} alter column v type int using v::integer`,
+		);
+		expect((await insert()).rows).toEqual([{ v: 1 }]);
+		expect((await insert()).rows).toEqual([{ v: 1 }]);
+		// inside a transaction the error stands: retrying there isn't safe
+		await expect(
+			conn.transaction(async (tx) => {
+				await tx.query(`alter table ${name} alter column v type text`);
+				await tx.query(`insert into ${name} (v) values ($1) returning v`, [
+					'2',
+				]);
+			}),
+		).rejects.toBeInstanceOf(PostgresError);
+		await conn.query(`drop table ${name}`);
+	});
+
+	it('re-prepares a cached statement the server no longer has', async () => {
+		const select = () => conn.query<{ n: number }>('select 7 as n');
+		expect((await select()).rows).toEqual([{ n: 7 }]);
+		await conn.simpleQuery('deallocate all');
+		expect((await select()).rows).toEqual([{ n: 7 }]);
 	});
 
 	it('runs multi-statement scripts through the simple protocol', async () => {
