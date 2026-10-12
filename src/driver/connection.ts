@@ -33,6 +33,7 @@ import {
 	Op,
 	QueryOp,
 	SimpleQueryOp,
+	SyncGroupOp,
 	closedError,
 	type Description,
 	type OpContext,
@@ -89,6 +90,16 @@ export interface QueryOptions {
 	 * only cached statements, from their second run, use it.
 	 */
 	readonly binary?: boolean;
+}
+
+/** A statement of `Connection.queryGroup`; per-query cancellation and timing don't apply. */
+export interface GroupStatement {
+	readonly sql: string;
+	readonly params?: readonly unknown[];
+	readonly options?: Omit<
+		QueryOptions,
+		'signal' | 'timeout' | 'statementTimeout' | 'onTiming'
+	>;
 }
 
 export interface CursorOptions extends QueryOptions {
@@ -918,6 +929,62 @@ export class Connection implements AsyncDisposable {
 			op.onTiming = options?.onTiming;
 			this.#enqueue(op, options?.signal, options?.timeout);
 		});
+	}
+
+	/**
+	 * @internal Runs statements under one Sync: once one fails, the server
+	 * skips the rest, and they reject with its error. One that can't be
+	 * sent skips the rest the same way.
+	 */
+	queryGroup(
+		statements: readonly GroupStatement[],
+	): Promise<QueryResult<unknown>>[] {
+		const ops: QueryOp[] = [];
+		let invalid: { error: unknown } | undefined;
+		const results = statements.map(
+			({ sql, params = [], options }) =>
+				new Promise<QueryResult<unknown>>((resolve, reject) => {
+					let values;
+					if (invalid === undefined) {
+						const error = invalidSql(sql);
+						if (error) invalid = { error };
+						else {
+							try {
+								values = encodeParams(sql, params);
+							} catch (caught) {
+								invalid = { error: caught };
+							}
+						}
+					}
+					if (invalid !== undefined || values === undefined) {
+						reject(invalid?.error);
+						return;
+					}
+					ops.push(
+						new QueryOp(
+							sql,
+							params,
+							values,
+							this.#options(options),
+							(result) => resolve(asResult(result)),
+							reject,
+							// a stale statement can't be retried alone: the ones after it were skipped
+							true,
+						),
+					);
+				}),
+		);
+		if (ops.length > 0) this.#enqueue(new SyncGroupOp(ops));
+		if (this.#config.telemetry === undefined && !this.#config.captureStack)
+			return results;
+		return results.map((result, i) =>
+			this.#observe(
+				statements[i]?.sql ?? '',
+				statements[i]?.options?.tag,
+				() => result,
+				(r) => r.rowCount,
+			),
+		);
 	}
 
 	async #queryWithTimeout<R>(

@@ -28,6 +28,14 @@ export interface TransactionConnection {
 		source: AsyncIterable<Uint8Array | string> | Iterable<Uint8Array | string>,
 	): Promise<number>;
 	copyTo(sql: string): AsyncIterable<Uint8Array>;
+	/** Runs statements under one Sync; once one fails the rest are skipped and reject with its error. */
+	queryGroup(
+		statements: readonly {
+			sql: string;
+			params?: readonly unknown[];
+			options?: TxQueryOptions;
+		}[],
+	): Promise<QueryResult<unknown>>[];
 }
 
 /** Query options accepted inside a transaction (the connection's own options). */
@@ -124,13 +132,206 @@ type Callback = () => unknown;
 const finishedError = () =>
 	new DriverError('This transaction has already finished');
 
+const noop = () => {};
+
+type GroupStatement = Parameters<
+	TransactionConnection['queryGroup']
+>[0][number];
+
+/** Query options that need the statement's own Sync, so BEGIN can't share it. */
+const OWN_SYNC = ['signal', 'timeout', 'statementTimeout', 'onTiming'];
+
+interface Waiter {
+	readonly run: () => void;
+	readonly fail: (error: unknown) => void;
+}
+
+/** Connections running `Transaction.run`, which may not have sent BEGIN yet. */
+const running = new WeakSet<TransactionConnection>();
+
+/**
+ * The connection as one transaction and its savepoints use it, saving
+ * round trips without changing what runs:
+ *
+ * - BEGIN and the settings wait for the first statement and share its
+ *   Sync, so a failed BEGIN makes the server skip that statement instead
+ *   of running it outside the transaction. Statements issued before BEGIN's
+ *   outcome is known wait for it, and fail with its error.
+ * - `sendDeferred` sends a statement (`release savepoint`) without waiting
+ *   for its answer; the next statement reports its error.
+ *
+ * @internal
+ */
+export class Session {
+	readonly #conn: TransactionConnection;
+	/** BEGIN and the settings, until sent. */
+	#opening: readonly GroupStatement[] | undefined;
+	/** Sends waiting for BEGIN's outcome, while it is in flight. */
+	#waiting: Waiter[] | undefined;
+	/** Settles (never rejects) once BEGIN's outcome is known. */
+	#opened: Promise<void> = Promise.resolve();
+	/** Why the transaction never began. */
+	#failure: { error: unknown } | undefined;
+	/** A statement sent without waiting for its answer; the next one reports its error. */
+	#deferred: Promise<unknown> | undefined;
+
+	constructor(conn: TransactionConnection, opening: readonly GroupStatement[]) {
+		this.#conn = conn;
+		this.#opening = opening;
+	}
+
+	/** `transaction` from the start: BEGIN may not have been sent or answered yet. */
+	get transactionStatus(): 'idle' | 'transaction' | 'failed' {
+		return this.#opening !== undefined || this.#waiting !== undefined
+			? 'transaction'
+			: this.#conn.transactionStatus;
+	}
+
+	query<R>(
+		sql: string,
+		params?: readonly unknown[],
+		options?: TxQueryOptions,
+	): Promise<QueryResult<R>> {
+		if (
+			this.#opening !== undefined &&
+			(options === undefined ||
+				OWN_SYNC.every((key) => options[key] === undefined))
+		) {
+			// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- rows are typed by the caller, as in `asResult`
+			return this.#begin({
+				sql,
+				...(params === undefined ? {} : { params }),
+				...(options === undefined ? {} : { options }),
+			}) as Promise<QueryResult<R>>;
+		}
+		return this.#send(() => this.#conn.query<R>(sql, params, options));
+	}
+
+	/** Sends `sql` without waiting for its answer: the next statement reports its error. */
+	sendDeferred(sql: string): void {
+		const result = this.query(sql);
+		result.catch(noop);
+		this.#deferred = result;
+	}
+
+	cursor<R>(
+		sql: string,
+		params?: readonly unknown[],
+		options?: TxQueryOptions & { batchSize?: number },
+	): AsyncIterable<R[]> {
+		return this.#iterate(() => this.#conn.cursor<R>(sql, params, options));
+	}
+
+	stream<R>(
+		sql: string,
+		params?: readonly unknown[],
+		options?: TxQueryOptions & { batchSize?: number },
+	): AsyncIterable<R> {
+		return this.#iterate(() => this.#conn.stream<R>(sql, params, options));
+	}
+
+	describe(
+		sql: string,
+		options?: { paramTypes?: readonly number[] },
+	): Promise<Description> {
+		return this.#send(() => this.#conn.describe(sql, options));
+	}
+
+	copyFrom(
+		sql: string,
+		source: AsyncIterable<Uint8Array | string> | Iterable<Uint8Array | string>,
+	): Promise<number> {
+		return this.#send(() => this.#conn.copyFrom(sql, source));
+	}
+
+	copyTo(sql: string): AsyncIterable<Uint8Array> {
+		return this.#iterate(() => this.#conn.copyTo(sql));
+	}
+
+	/** Waits for BEGIN's outcome (dropping it if never sent); its error, if it failed. */
+	async end(): Promise<{ error: unknown } | undefined> {
+		this.#opening = undefined;
+		await this.#opened;
+		return this.#failure;
+	}
+
+	/** Sends BEGIN and the settings, with `first` under the same Sync; `first`'s result. */
+	#begin(first?: GroupStatement): Promise<QueryResult<unknown>> | undefined {
+		const opening = this.#opening ?? [];
+		this.#opening = undefined;
+		const results = this.#conn.queryGroup(
+			first === undefined ? opening : [...opening, first],
+		);
+		const waiting: Waiter[] = [];
+		this.#waiting = waiting;
+		this.#opened = this.#open(
+			Promise.all(results.slice(0, opening.length)),
+			waiting,
+		);
+		return results[opening.length];
+	}
+
+	/** Once BEGIN's outcome is known, sends what waited for it, in order, or fails it. */
+	async #open(begun: Promise<unknown>, waiting: Waiter[]): Promise<void> {
+		try {
+			await begun;
+		} catch (error) {
+			this.#waiting = undefined;
+			this.#failure = { error };
+			for (const { fail } of waiting) fail(error);
+			return;
+		}
+		this.#waiting = undefined;
+		for (const { run } of waiting) run();
+	}
+
+	/** Sends once BEGIN succeeded, reporting a deferred statement's error instead of the result. */
+	#send<T>(send: () => Promise<T>): Promise<T> {
+		if (this.#opening !== undefined) void this.#begin();
+		if (this.#failure !== undefined) return Promise.reject(this.#failure.error);
+		const waiting = this.#waiting;
+		const result =
+			waiting === undefined
+				? send()
+				: new Promise<T>((resolve, reject) => {
+						waiting.push({
+							run: () => void send().then(resolve, reject),
+							fail: reject,
+						});
+					});
+		const deferred = this.#deferred;
+		if (deferred === undefined) return result;
+		this.#deferred = undefined;
+		result.catch(noop);
+		return deferred.then(() => result);
+	}
+
+	#iterate<T>(make: () => AsyncIterable<T>): AsyncIterable<T> {
+		if (
+			this.#opening === undefined &&
+			this.#waiting === undefined &&
+			this.#failure === undefined &&
+			this.#deferred === undefined
+		)
+			return make();
+		const ready = this.#send(() => Promise.resolve());
+		ready.catch(noop);
+		return {
+			async *[Symbol.asyncIterator]() {
+				await ready;
+				yield* make();
+			},
+		};
+	}
+}
+
 /**
  * A transaction in progress. Queries go to its connection; `transaction`
  * nests a savepoint. It is finished when the callback that received it
  * settles, and must not be used afterwards.
  */
 export class Transaction {
-	readonly #conn: TransactionConnection;
+	readonly #conn: Session;
 	readonly #depth: number;
 	#finished = false;
 	readonly #afterCommit: Callback[] = [];
@@ -138,7 +339,7 @@ export class Transaction {
 	#savepoints = 0;
 
 	/** @internal */
-	constructor(conn: TransactionConnection, depth: number) {
+	constructor(conn: Session, depth: number) {
 		this.#conn = conn;
 		this.#depth = depth;
 	}
@@ -254,7 +455,12 @@ export class Transaction {
 				if (query) await this.#conn.query(query.sql, query.params);
 			}
 			const result = await fn(inner);
-			await this.#conn.query(`release savepoint ${name}`);
+			if (this.#conn.transactionStatus === 'failed') {
+				// fails, so the savepoint is rolled back to, as when fn throws
+				await this.#conn.query(`release savepoint ${name}`);
+			} else {
+				this.#conn.sendDeferred(`release savepoint ${name}`);
+			}
 			inner.#finished = true;
 			this.#afterCommit.push(...inner.#afterCommit);
 			this.#afterRollback.push(...inner.#afterRollback);
@@ -262,8 +468,10 @@ export class Transaction {
 		} catch (error) {
 			inner.#finished = true;
 			if (this.#conn.transactionStatus !== 'idle') {
-				await this.#conn.query(`rollback to savepoint ${name}`).catch(() => {});
-				await this.#conn.query(`release savepoint ${name}`).catch(() => {});
+				await Promise.all([
+					this.#conn.query(`rollback to savepoint ${name}`).catch(noop),
+					this.#conn.query(`release savepoint ${name}`).catch(noop),
+				]);
 			}
 			runCallbacks(inner.#afterRollback);
 			throw error;
@@ -285,14 +493,13 @@ export class Transaction {
 				`Invalid isolation level ${JSON.stringify(options.isolation)}`,
 			);
 		}
-		if (conn.transactionStatus !== 'idle') {
+		if (conn.transactionStatus !== 'idle' || running.has(conn)) {
 			throw new DriverError(
 				options.durable
 					? 'A durable transaction cannot run inside another transaction'
 					: 'The connection is already in a transaction; use tx.transaction() to nest',
 			);
 		}
-		const retries = options.retries ?? 0;
 		const timeout =
 			options.timeout === undefined
 				? undefined
@@ -303,25 +510,40 @@ export class Transaction {
 			...options.settings,
 			...(timeout === undefined ? {} : { transaction_timeout: timeout }),
 		});
+		// unprepared: they run once per transaction, and can't go stale
+		const opening: GroupStatement[] = [
+			{ sql: beginStatement(options), options: { prepare: false } },
+		];
+		if (settings) opening.push({ ...settings, options: { prepare: false } });
+		running.add(conn);
+		try {
+			return await Transaction.#attempts(conn, fn, options, opening);
+		} finally {
+			running.delete(conn);
+		}
+	}
+
+	static async #attempts<T>(
+		conn: TransactionConnection,
+		fn: (tx: Transaction) => Promise<T>,
+		options: TransactionOptions,
+		opening: readonly GroupStatement[],
+	): Promise<T> {
+		const retries = options.retries ?? 0;
 		for (let attempt = 0; ; attempt++) {
-			const tx = new Transaction(conn, 0);
-			// begin and settings are pipelined into one round trip
-			const begin = conn.query(beginStatement(options));
-			const applied = settings
-				? conn.query(settings.sql, settings.params)
-				: undefined;
-			// a failed begin is the error to report, and leaves applied unawaited
-			applied?.catch(() => {});
+			const session = new Session(conn, opening);
+			const tx = new Transaction(session, 0);
 			let result: T;
 			try {
-				await begin;
-				await applied;
 				result = await fn(tx);
 				tx.#finished = true;
-				const commit = await conn.query('commit');
+				const commit = await session.query('commit');
 				if (commit.command === 'ROLLBACK') throw new TransactionRolledBack();
-			} catch (error) {
+			} catch (caught) {
 				tx.#finished = true;
+				// when BEGIN or the settings failed, fn's statements were skipped: that error is the one to report
+				const failure = await session.end();
+				const error = failure === undefined ? caught : failure.error;
 				if (conn.transactionStatus !== 'idle')
 					await conn.query('rollback').catch(() => {});
 				runCallbacks(tx.#afterRollback);

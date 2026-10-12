@@ -5,6 +5,7 @@ import {
 	AbortError,
 	ConnectionError,
 	DriverError,
+	PostgresError,
 	QueryCanceled,
 	ReadOnlyTransaction,
 	TransactionTimeout,
@@ -12,12 +13,16 @@ import {
 } from '../../../src/driver/errors.js';
 import { connect } from '../../../src/driver/connect.js';
 import { createPool, type PoolOptions } from '../../../src/driver/pool.js';
-import { TransactionRolledBack } from '../../../src/driver/transaction.js';
+import {
+	TransactionRolledBack,
+	type Transaction,
+} from '../../../src/driver/transaction.js';
 import {
 	noPg,
 	open,
 	options,
 	rejection,
+	roundTripSockets,
 	slowSockets,
 	table,
 } from './helpers.js';
@@ -29,6 +34,9 @@ const waited = async (work: () => Promise<unknown>) => {
 	await work();
 	return performance.now() - started;
 };
+/** Releases the savepoint from inside it, so the driver's own release fails. */
+const releaseInside = (tx: Transaction) =>
+	tx.transaction((sp) => sp.query('release savepoint quarry_sp_1_1'));
 const pool = (overrides: PoolOptions = {}) =>
 	createPool({ ...options(), ...overrides });
 
@@ -190,20 +198,189 @@ describe.skipIf(noPg)('transactions', () => {
 				{ settings: { 'app.tenant_id': 1 } },
 				{ timeout: 1000 },
 			]) {
-				let ran = false;
 				await rejection(
-					c.transaction(async () => {
-						ran = true;
-					}, txOptions),
+					c.transaction((tx) => tx.query('select 1'), txOptions),
 					ConnectionError,
 				);
-				expect(ran).toBe(false);
 			}
 			await sleep(20);
 			expect(unhandled).toEqual([]);
 		} finally {
 			process.off('unhandledRejection', onUnhandled);
 		}
+	});
+
+	it('sends BEGIN with the first statement and releases savepoints without waiting', async () => {
+		const net = roundTripSockets();
+		await using c = await open({ socket: net.factory });
+		const trips = async (work: () => Promise<unknown>) => {
+			const before = net.roundTrips();
+			await work();
+			return net.roundTrips() - before;
+		};
+		expect(await trips(() => c.transaction((tx) => tx.query('select 1')))).toBe(
+			2,
+		);
+		expect(
+			await trips(() =>
+				c.transaction((tx) => tx.query('select 1'), {
+					isolation: 'repeatable read',
+					settings: { 'app.tenant_id': 1 },
+					timeout: '5s',
+				}),
+			),
+		).toBe(2);
+		expect(await trips(() => c.transaction(async () => {}))).toBe(1);
+		// begin+savepoint, select, 4 × (release+savepoint, select), release+commit
+		expect(
+			await trips(() =>
+				c.transaction(async (tx) => {
+					for (let k = 0; k < 5; k++)
+						await tx.transaction((sp) => sp.query('select 1'));
+				}),
+			),
+		).toBe(11);
+		expect(
+			await trips(() =>
+				c
+					.transaction(async () => {
+						throw new Error('before any statement');
+					})
+					.catch(() => {}),
+			),
+		).toBe(0);
+		expect(c.transactionStatus).toBe('idle');
+	});
+
+	it('reports a failed first statement as itself and rolls back', async () => {
+		await conn.query(`truncate ${name}`);
+		await conn.query(`insert into ${name} values (1, 'a')`);
+		await rejection(
+			conn.transaction(async (tx) => {
+				await tx.query(`insert into ${name} values (1, 'dup')`);
+			}),
+			UniqueViolation,
+		);
+		await rejection(
+			conn.transaction((tx) => tx.query('selec 1')),
+			PostgresError,
+		);
+		expect(conn.transactionStatus).toBe('idle');
+		expect(await ids()).toEqual([1]);
+	});
+
+	it('skips the first statement, and sends nothing more, when the settings fail', async () => {
+		await conn.query(`truncate ${name}`);
+		let later: unknown;
+		const error = await rejection(
+			conn.transaction(
+				async (tx) => {
+					const first = await tx
+						.query(`insert into ${name} values (1, 'a')`)
+						.catch((e: unknown) => e);
+					later = await tx
+						.query(`insert into ${name} values (2, 'b')`)
+						.catch((e: unknown) => e);
+					return first;
+				},
+				{ settings: { statement_timeout: 'not a duration' } },
+			),
+			PostgresError,
+		);
+		expect(error.code).toBe('22023');
+		expect(later).toBe(error);
+		expect(conn.transactionStatus).toBe('idle');
+		expect(await ids()).toEqual([]);
+	});
+
+	it('keeps statement order while BEGIN is in flight', async () => {
+		await conn.query(`truncate ${name}`);
+		const order = await conn.transaction(async (tx) => {
+			const a = tx.query(`insert into ${name} values (1, 'a')`);
+			const b = tx.query(`insert into ${name} values (2, 'b')`);
+			await a;
+			const c = tx.query<{ ids: number[] }>(
+				`select array_agg(id order by id) as ids from ${name}`,
+			);
+			await b;
+			return (await c).rows[0]?.ids;
+		});
+		expect(order).toEqual([1, 2]);
+	});
+
+	it('runs a first statement that needs its own Sync after BEGIN', async () => {
+		const ctl = new AbortController();
+		const viaSignal = await conn.transaction(
+			async (tx) =>
+				(
+					await tx.query<{ s: string }>(
+						"select current_setting('app.x') as s",
+						[],
+						{ signal: ctl.signal },
+					)
+				).rows[0]?.s,
+			{ settings: { 'app.x': 'signal' } },
+		);
+		expect(viaSignal).toBe('signal');
+		const batches: unknown[] = [];
+		await conn.transaction(async (tx) => {
+			expect(tx.transactionStatus).toBe('transaction');
+			for await (const batch of tx.cursor('select generate_series(1, 3) as n'))
+				batches.push(batch);
+		});
+		expect(batches).toEqual([[{ n: 1 }, { n: 2 }, { n: 3 }]]);
+		expect(conn.transactionStatus).toBe('idle');
+	});
+
+	it('refuses a nested conn.transaction() before BEGIN was sent', async () => {
+		await expect(
+			conn.transaction(() => conn.transaction(async () => {})),
+		).rejects.toThrow(/already in a transaction/);
+		await expect(
+			conn.transaction(() =>
+				conn.transaction(async () => {}, { durable: true }),
+			),
+		).rejects.toThrow(/durable/);
+		expect(conn.transactionStatus).toBe('idle');
+	});
+
+	it('reports a failed savepoint release at the next statement, or at commit', async () => {
+		await conn.query(`truncate ${name}`);
+		const next = await rejection(
+			conn.transaction(async (tx) => {
+				await tx.query(`insert into ${name} values (1, 'a')`);
+				await releaseInside(tx);
+				await tx.query('select 1');
+			}),
+			PostgresError,
+		);
+		expect(next.code).toBe('3B001');
+		const atCommit = await rejection(
+			conn.transaction(async (tx) => {
+				await tx.query(`insert into ${name} values (2, 'b')`);
+				await releaseInside(tx);
+			}),
+			PostgresError,
+		);
+		expect(atCommit.code).toBe('3B001');
+		expect(conn.transactionStatus).toBe('idle');
+		expect(await ids()).toEqual([]);
+	});
+
+	it('still rolls a savepoint back when its callback swallowed an error', async () => {
+		await conn.query(`truncate ${name}`);
+		await conn.transaction(async (tx) => {
+			await tx.query(`insert into ${name} values (1, 'a')`);
+			await rejection(
+				tx.transaction(async (sp) => {
+					await sp.query(`insert into ${name} values (2, 'b')`);
+					await sp.query('select 1/0').catch(() => {});
+				}),
+				PostgresError,
+			);
+			await tx.query(`insert into ${name} values (3, 'c')`);
+		});
+		expect(await ids()).toEqual([1, 3]);
 	});
 
 	it('refuses use after the transaction finished', async () => {
