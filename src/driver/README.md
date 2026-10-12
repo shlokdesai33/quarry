@@ -141,6 +141,8 @@ await pool.transaction(async (tx) => {
 - Retries cover serialization failures and deadlocks only.
 - `settings` are applied with bound parameters.
 - A COMMIT that the server turned into a ROLLBACK (because an error was swallowed inside) throws `TransactionRolledBack`.
+- BEGIN (with the settings) is sent with the callback's first statement, under one Sync, so a transaction takes 2 round trips. If BEGIN fails, the server skips that statement, and the transaction rejects with BEGIN's error. The callback has already started by then.
+- A savepoint's `release` isn't waited for; if it fails, the next statement in the transaction, or the COMMIT, reports its error.
 
 ## Pool
 

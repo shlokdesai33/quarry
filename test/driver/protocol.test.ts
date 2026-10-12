@@ -495,6 +495,108 @@ describe('NotificationResponse decoding', () => {
 	});
 });
 
+const row = (value: string) =>
+	encodeBackend({ type: 'DataRow', payload: dataRowPayload([value]) });
+
+describe('buffer memory', () => {
+	it('copies only a message split across chunks, and reads the rest in place', () => {
+		const [a, b, c] = [row('first'), row('second'), row('third')];
+		const stream = concat([a, b, c]);
+		const cut = a.length + 4;
+		const first = new Uint8Array(stream.subarray(0, cut));
+		const second = new Uint8Array(stream.subarray(cut));
+		const reader = new Reader();
+		reader.push(first);
+		expect(reader.nextType()).toBe(0x44);
+		expect(reader.bytes.buffer).toBe(first.buffer);
+		expect(reader.nextType()).toBe(-1);
+		reader.push(second);
+		const split = reader.next();
+		expect(reader.bytes.buffer).not.toBe(second.buffer);
+		expect(reader.bytes.length).toBe(b.length);
+		expect(reader.nextType()).toBe(0x44);
+		expect(reader.bytes.buffer).toBe(second.buffer);
+		expect(textValues(reader.bytes.subarray(reader.start, reader.end))).toEqual(
+			['third'],
+		);
+		// drained: nothing is held while the connection is idle
+		expect(reader.nextType()).toBe(-1);
+		expect(reader.bytes.length).toBe(0);
+		expect(reader.buffered).toBe(0);
+		// messages handed out stay valid after later chunks
+		reader.push(row('fourth'));
+		reader.next();
+		if (split?.type === 'DataRow')
+			expect(textValues(split.payload)).toEqual(['second']);
+	});
+
+	it('splits a header across chunks, byte by byte', () => {
+		const stream = concat([
+			encodeBackend({ type: 'ParseComplete' }),
+			encodeBackend({ type: 'CommandComplete', tag: 'SELECT 1' }),
+			encodeBackend({ type: 'ReadyForQuery', status: 'I' }),
+		]);
+		const reader = new Reader();
+		const out: BackendMessage[] = [];
+		for (let i = 0; i < stream.length; i++) {
+			reader.push(stream.subarray(i, i + 1));
+			out.push(...readAll(reader));
+		}
+		expect(out.map((m) => m.type)).toEqual([
+			'ParseComplete',
+			'CommandComplete',
+			'ReadyForQuery',
+		]);
+		expect(reader.buffered).toBe(0);
+	});
+
+	it('keeps unread messages ahead of a chunk pushed before reading them', () => {
+		const a = encodeBackend({ type: 'CommandComplete', tag: 'A' });
+		const b = encodeBackend({ type: 'CommandComplete', tag: 'B' });
+		const reader = new Reader();
+		reader.push(a);
+		reader.push(b.subarray(0, 3));
+		reader.push(b.subarray(3));
+		expect(readAll(reader)).toEqual([
+			{ type: 'CommandComplete', tag: 'A' },
+			{ type: 'CommandComplete', tag: 'B' },
+		]);
+	});
+
+	it('reserves about a byte per character for large strings', () => {
+		const w = new Writer();
+		const value = `${'x'.repeat(3_000_000)}é😀`;
+		w.begin(0x51).cstring(value).end();
+		expect(w.capacity).toBeLessThanOrEqual(4 << 20);
+		const out = w.take();
+		expect(Buffer.from(out.subarray(5, -1)).toString()).toBe(value);
+		expect(new DataView(out.buffer, out.byteOffset).getInt32(1)).toBe(
+			out.length - 1,
+		);
+		// a buffer grown for one large message isn't kept
+		expect(w.capacity).toBe(4096);
+		w.int8(1);
+		expect([...w.take()]).toEqual([1]);
+	});
+
+	it('encodes multi-byte text that overflows the free space', () => {
+		for (const value of [
+			'é'.repeat(5000),
+			'😀'.repeat(3000),
+			`a${'中'.repeat(2000)}`,
+		]) {
+			const w = new Writer(16);
+			w.int8(7).value(value);
+			const out = w.take();
+			const expected = Buffer.from(value);
+			expect(new DataView(out.buffer, out.byteOffset).getInt32(1)).toBe(
+				expected.length,
+			);
+			expect(Buffer.from(out.subarray(5)).equals(expected)).toBe(true);
+		}
+	});
+});
+
 /** Parses everything; returns normally or throws ProtocolError, never anything else. */
 function parseOrProtocolError(stream: Uint8Array, rand: () => number) {
 	const reader = new Reader(1 << 20);

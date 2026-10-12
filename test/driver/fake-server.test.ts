@@ -358,3 +358,71 @@ describe('server version', () => {
 		}
 	});
 });
+
+/** Splits client data into messages: type and, for Parse, the SQL. */
+const messages = (data: Buffer) => {
+	const out: { type: string; sql?: string }[] = [];
+	for (let i = 0; i + 5 <= data.length;) {
+		const type = String.fromCharCode(data[i] ?? 0);
+		const end = i + 1 + data.readInt32BE(i + 1);
+		if (type === 'P') {
+			const name = data.indexOf(0, i + 5);
+			out.push({
+				type,
+				sql: data.toString('utf8', name + 1, data.indexOf(0, name + 1)),
+			});
+		} else out.push({ type });
+		i = end;
+	}
+	return out;
+};
+
+describe('transactions', () => {
+	it('skips the first statement when the server rejects BEGIN, and sends nothing more', async () => {
+		const segments: string[][] = [];
+		const port = await fakeServer((socket, _version, send) => {
+			send(...ready);
+			let segment: string[] = [];
+			socket.on('data', (chunk: Buffer) => {
+				for (const m of messages(chunk)) {
+					if (m.sql !== undefined) segment.push(m.sql);
+					if (m.type !== 'S') continue;
+					segments.push(segment);
+					segment = [];
+					send(
+						{
+							type: 'ErrorResponse',
+							fields: {
+								S: 'ERROR',
+								V: 'ERROR',
+								C: '25001',
+								M: 'begin refused',
+							},
+						},
+						{ type: 'ReadyForQuery', status: 'I' },
+					);
+				}
+			});
+		});
+		await using conn = await connect(options(port));
+		let first: unknown;
+		let second: unknown;
+		const error = await conn
+			.transaction(async (tx) => {
+				first = await tx
+					.query('insert into t values (1)')
+					.catch((e: unknown) => e);
+				second = await tx
+					.query('insert into t values (2)')
+					.catch((e: unknown) => e);
+			})
+			.catch((e: unknown) => e);
+		await new Promise((r) => setTimeout(r, 20));
+		expect(error).toBeInstanceOf(PostgresError);
+		expect(error).toMatchObject({ code: '25001', message: 'begin refused' });
+		expect(first).toBe(error);
+		expect(second).toBe(error);
+		// one Sync for both, and neither the second insert, COMMIT nor ROLLBACK sent
+		expect(segments).toEqual([['begin', 'insert into t values (1)']]);
+	});
+});

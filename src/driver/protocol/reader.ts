@@ -4,6 +4,7 @@ import type { BackendMessage, Field, NoticeFields } from './messages.js';
 import { allocate, asBuffer, utf8 } from './text.js';
 
 const EMPTY = new Uint8Array(0);
+const EMPTY_VIEW = new DataView(EMPTY.buffer);
 
 /** The largest backend message accepted, by default: 1 GiB, Postgres's own field limit. */
 export const DEFAULT_MAX_MESSAGE_SIZE = 0x40000000;
@@ -13,18 +14,24 @@ export const DEFAULT_MAX_MESSAGE_SIZE = 0x40000000;
  * pushed as they arrive; `next` returns each complete message in order, or
  * `undefined` when more bytes are needed.
  *
- * A message that spans several chunks is collected without re-copying the
- * buffered bytes on every chunk, so large rows and COPY data stay linear.
+ * Messages are read in place from the pushed chunks. Only a message split
+ * across chunks is copied, into a buffer of its own size, so a chunk is never
+ * re-copied to join its tail to the next one, and large rows and COPY data
+ * stay linear. Consumed chunks are released, not kept while the connection
+ * is idle.
  */
 export class Reader {
+	/** The chunk being read, from `#pos`. Empty while a split message is collected. */
 	#buf: Uint8Array = EMPTY;
-	#view: DataView = new DataView(EMPTY.buffer);
+	#view: DataView = EMPTY_VIEW;
 	#pos = 0;
-	/** Chunks held back until the message they complete is whole. */
-	#pending: Uint8Array[] = [];
-	#pendingLength = 0;
-	/** The bytes needed before the pending chunks are joined. */
+	/** A message split across chunks: its first `#partLength` bytes so far. */
+	#part: Uint8Array = EMPTY;
+	#partLength = 0;
+	/** The split message's size, or 5 (the header) until its length is known; 0 when there is none. */
 	#needed = 0;
+	/** Whether `#part` holds a whole message, returned before the rest of `#buf`. */
+	#partReady = false;
 	readonly #maxMessageSize: number;
 
 	constructor(maxMessageSize = DEFAULT_MAX_MESSAGE_SIZE) {
@@ -33,49 +40,88 @@ export class Reader {
 
 	/** Bytes received but not yet returned as messages. */
 	get buffered(): number {
-		return this.#buf.length - this.#pos + this.#pendingLength;
+		return this.#buf.length - this.#pos + this.#partLength;
 	}
 
 	push(bytes: Uint8Array): void {
 		if (bytes.length === 0) return;
 		const chunk = asBuffer(bytes);
-		if (this.#needed > 0) {
-			this.#pending.push(chunk);
-			this.#pendingLength += chunk.length;
-			if (this.#buf.length - this.#pos + this.#pendingLength < this.#needed) {
-				return;
+		let at = 0;
+		if (this.#needed > 0 && !this.#partReady) {
+			at = this.#fill(chunk, 0);
+			if (this.#needed === 5 && this.#partLength === 5) {
+				this.#sizePart();
+				at = this.#fill(chunk, at);
 			}
-			this.#join();
+			if (this.#partLength < this.#needed) return;
+			this.#partReady = true;
+			if (at === chunk.length) return;
+		} else if (this.#pos < this.#buf.length) {
+			// messages not yet read: keep them ahead of the new bytes
+			const rest = this.#buf.length - this.#pos;
+			const joined = allocate(rest + chunk.length);
+			joined.set(this.#buf.subarray(this.#pos));
+			joined.set(chunk, rest);
+			this.#set(joined, 0);
 			return;
 		}
-		if (this.#pos >= this.#buf.length) {
-			this.#set(chunk);
-			return;
-		}
-		this.#pending.push(chunk);
-		this.#pendingLength += chunk.length;
-		this.#join();
+		this.#set(chunk, at);
 	}
 
-	#join(): void {
-		const rest = this.#buf.length - this.#pos;
-		const next = allocate(rest + this.#pendingLength);
-		next.set(this.#buf.subarray(this.#pos));
-		let at = rest;
-		for (const chunk of this.#pending) {
-			next.set(chunk, at);
-			at += chunk.length;
-		}
-		this.#pending = [];
-		this.#pendingLength = 0;
-		this.#needed = 0;
-		this.#set(next);
-	}
-
-	#set(buf: Uint8Array): void {
+	#set(buf: Uint8Array, pos: number): void {
 		this.#buf = buf;
 		this.#view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+		this.#pos = pos;
+	}
+
+	/** Copies bytes of `chunk` from `at` into the split message, up to its known size; returns where it stopped. */
+	#fill(chunk: Uint8Array, at: number): number {
+		const n = Math.min(this.#needed - this.#partLength, chunk.length - at);
+		this.#part.set(chunk.subarray(at, at + n), this.#partLength);
+		this.#partLength += n;
+		return at + n;
+	}
+
+	/** Reads the split message's length from its now complete header, and makes room for all of it. */
+	#sizePart(): void {
+		const part = this.#part;
+		const length = this.#length(part, 0);
+		const whole = allocate(length + 1);
+		whole.set(part.subarray(0, 5));
+		this.#part = whole;
+		this.#needed = length + 1;
+	}
+
+	#length(buf: Uint8Array, pos: number): number {
+		const length =
+			((buf[pos + 1] ?? 0) << 24) |
+			((buf[pos + 2] ?? 0) << 16) |
+			((buf[pos + 3] ?? 0) << 8) |
+			(buf[pos + 4] ?? 0);
+		if (length < 4 || length > this.#maxMessageSize) {
+			throw new ProtocolError(
+				`Invalid length ${length} for message type 0x${(buf[pos] ?? 0).toString(16)}`,
+			);
+		}
+		return length;
+	}
+
+	/** Moves the incomplete message at the end of the chunk into a buffer of its own, `needed` bytes long (5 if its length is unknown). */
+	#stash(needed: number): void {
+		const tail = this.#buf.subarray(this.#pos);
+		this.#part = allocate(needed);
+		this.#part.set(tail);
+		this.#partLength = tail.length;
+		this.#needed = needed;
+		this.#release();
+	}
+
+	#release(): void {
+		this.#buf = EMPTY;
+		this.#view = EMPTY_VIEW;
 		this.#pos = 0;
+		this.bytes = EMPTY;
+		this.#bytesView = EMPTY_VIEW;
 	}
 
 	/** The buffer holding the message found by the latest `nextType`. */
@@ -84,6 +130,7 @@ export class Reader {
 	start = 0;
 	end = 0;
 	#type = -1;
+	#bytesView: DataView = this.#view;
 
 	/**
 	 * Finds the next complete message without decoding it: returns its type
@@ -92,35 +139,44 @@ export class Reader {
 	 * which is how rows avoid allocating a message object each.
 	 */
 	nextType(): number {
-		if (this.#needed > 0) return -1;
-		const available = this.#buf.length - this.#pos;
-		if (available < 5) {
-			if (available > 0) this.#needed = 5;
-			return -1;
+		if (this.#partReady) {
+			const part = this.#part;
+			this.#part = EMPTY;
+			this.#partReady = false;
+			this.#partLength = 0;
+			this.#needed = 0;
+			this.bytes = part;
+			this.#bytesView = new DataView(
+				part.buffer,
+				part.byteOffset,
+				part.byteLength,
+			);
+			this.start = 5;
+			this.end = part.length;
+			this.#type = part[0] ?? 0;
+			return this.#type;
 		}
+		if (this.#needed > 0) return -1;
 		const buf = this.#buf;
 		const pos = this.#pos;
-		const type = buf[pos] ?? 0;
-		const length =
-			((buf[pos + 1] ?? 0) << 24) |
-			((buf[pos + 2] ?? 0) << 16) |
-			((buf[pos + 3] ?? 0) << 8) |
-			(buf[pos + 4] ?? 0);
-		if (length < 4 || length > this.#maxMessageSize) {
-			throw new ProtocolError(
-				`Invalid length ${length} for message type 0x${type.toString(16)}`,
-			);
+		const available = buf.length - pos;
+		if (available < 5) {
+			if (available > 0) this.#stash(5);
+			else if (buf !== EMPTY) this.#release();
+			return -1;
 		}
+		const length = this.#length(buf, pos);
 		if (available < length + 1) {
-			this.#needed = length + 1;
+			this.#stash(length + 1);
 			return -1;
 		}
 		this.bytes = buf;
+		this.#bytesView = this.#view;
 		this.start = pos + 5;
 		this.end = pos + 1 + length;
 		this.#pos = this.end;
-		this.#type = type;
-		return type;
+		this.#type = buf[pos] ?? 0;
+		return this.#type;
 	}
 
 	/** Decodes the message found by the latest `nextType`. */
@@ -128,7 +184,7 @@ export class Reader {
 		return parseMessage(
 			this.#type,
 			this.bytes,
-			this.#view,
+			this.#bytesView,
 			this.start,
 			this.end,
 		);
