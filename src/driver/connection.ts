@@ -62,7 +62,10 @@ export interface QueryOptions {
 	readonly types?: TypeParsers;
 	/** Use a cached named prepared statement (default: the connection's `prepare` option). */
 	readonly prepare?: boolean;
-	/** Parameter type OIDs; 0 or missing entries let the server infer. */
+	/**
+	 * Parameter type OIDs; 0 or missing entries let the server infer. An
+	 * array whose type is declared here is sent in binary where it can be.
+	 */
 	readonly paramTypes?: readonly number[];
 	/** Cancels the query when aborted. A query not yet sent is dropped without contacting the server. */
 	readonly signal?: AbortSignal;

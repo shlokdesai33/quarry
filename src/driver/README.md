@@ -72,6 +72,17 @@ Parameters:
 - Numbers, bigints, booleans and `Date`s become their Postgres text. A `Date` is sent as a UTC timestamp, so a `timestamp without time zone` column receives the UTC wall-clock time whatever the process's time zone.
 - Arrays become array literals and other objects JSON.
 - `Uint8Array` is sent in binary.
+- An array whose type is declared in `paramTypes` is sent in binary when its elements fit the type, which is much cheaper for the server to read than a literal. This applies to bool, int2/int4/int8, float8, timestamptz (`Date`s), uuid, text/varchar/char, jsonb (JSON text) and bytea arrays. Anything else is sent as a literal, as before. Quarry declares the types of its `unnest` arrays (multi-row insert, `updateMany`) and of `column = any($1)` for integer and boolean columns.
+
+  ```ts
+  await conn.query(
+  	'select * from unnest($1::int4[], $2::text[])',
+  	[ids, names],
+  	{
+  		paramTypes: [arrayOids.int4, arrayOids.text],
+  	},
+  );
+  ```
 
 Queries issued concurrently on one connection are pipelined into shared socket writes. Each still gets its own Sync, so one failing query doesn't fail its neighbours (outside a transaction).
 
@@ -79,7 +90,15 @@ A query takes at most 65535 parameters, the protocol's limit; more are refused b
 
 Statements are prepared and cached per connection (100 by default; `statementCacheSize`, `prepare: false`). This is safe behind PgBouncer 1.21+ with `max_prepared_statements`. A cached statement that a schema change made stale (its result type or an inferred parameter type changed), or that the server no longer has (`DEALLOCATE`, `DISCARD ALL`), is retried once as an unnamed statement, outside a transaction. Behind PgBouncer, which maps a new Parse of the same text back to the statement it already prepared, SQL that still comes back stale is no longer prepared on that connection.
 
-From a cached statement's second run, columns whose parser has a binary twin (int2/int4/oid, float8, bool, bytea, and timestamptz decoded to `Date`) are received in binary, which is cheaper to decode and gives identical values. Custom parsers and raw types always get text. Turn it off with `binaryResults: false`.
+From a cached statement's second run, columns whose parser has a binary twin are received in binary, which is cheaper to decode and gives identical values. These are:
+
+- int2/int4/oid, float8, bool, bytea, and timestamptz decoded to `Date`;
+- arrays of those, and of text-like types, json/jsonb and int8 as `bigint`, when the array parser is the driver's own (`defaultTypes`, quarry's, the catalog's, or one built with `arrayParser`);
+- pgvector's `vector`.
+
+Custom parsers and raw types always get text. Turn it off with `binaryResults: false`.
+
+`parseVector` returns the float32 values stored, on every path: `[0.1]` reads as `[0.10000000149011612]`, the value pgvector holds and the value its binary format carries.
 
 ### Decoding
 
