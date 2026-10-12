@@ -171,4 +171,4 @@ await db.transaction(async (tx) => {
 ## Development
 
 - `pnpm test` starts a throwaway cluster (TLS, a role per auth method, an OAuth test validator, PgBouncer) when PostgreSQL is installed; otherwise the integration tests skip. `PG_VERSION=17`, `PG_BIN` and `PGBOUNCER_BIN` pick other versions.
-- `pnpm bench:driver` compares against `pg` and postgres.js.
+- `pnpm bench:driver` is a quick comparison with `pg` and postgres.js. `bench/driver/suite` is the full, reproducible comparison: every client on Node, Bun and Deno, PgBouncer, simulated network latency, resources and footprint (see its README).
