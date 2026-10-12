@@ -310,6 +310,8 @@ export class Transaction {
 			const applied = settings
 				? conn.query(settings.sql, settings.params)
 				: undefined;
+			// a failed begin is the error to report, and leaves applied unawaited
+			applied?.catch(() => {});
 			let result: T;
 			try {
 				await begin;
