@@ -8,20 +8,24 @@ import type {
 	TlsConnectOptions,
 } from './socket.js';
 
-interface NodeModules {
-	readonly net: typeof Net;
-	readonly tls: typeof Tls;
+/**
+ * Node's built-in module `id`, through `process.getBuiltinModule` where the
+ * runtime has it: much cheaper than `import()` on a cold start.
+ */
+function builtin<const I extends 'node:net' | 'node:tls'>(id: I) {
+	return typeof process === 'object' &&
+		typeof process.getBuiltinModule === 'function'
+		? process.getBuiltinModule(id)
+		: undefined;
 }
 
-let modules: Promise<NodeModules> | undefined;
+let netModule: typeof Net | Promise<typeof Net> | undefined;
+let tlsModule: typeof Tls | Promise<typeof Tls> | undefined;
 
-/** Loads `node:net` and `node:tls` on first use, so the core stays importable elsewhere. */
-function load(): Promise<NodeModules> {
-	modules ??= Promise.all([import('node:net'), import('node:tls')]).then(
-		([net, tls]) => ({ net, tls }),
-	);
-	return modules;
-}
+// Loaded on first use, so the core stays importable elsewhere. `node:tls`
+// loads the whole crypto stack (~3 ms), so plain connections never load it.
+const loadNet = () => (netModule ??= builtin('node:net') ?? import('node:net'));
+const loadTls = () => (tlsModule ??= builtin('node:tls') ?? import('node:tls'));
 
 function tlsOptions(
 	tls: typeof Tls,
@@ -74,15 +78,13 @@ function connectionError(error: Error & { code?: string }): ConnectionError {
 
 class NodeSocket implements DriverSocket {
 	#socket: Net.Socket;
-	readonly #tls: typeof Tls;
 	#onData: (chunk: Uint8Array) => void = () => {};
 	#onClose: () => void = () => {};
 	#onError: (error: Error) => void = () => {};
 	#onDrain: () => void = () => {};
 
-	constructor(socket: Net.Socket, tls: typeof Tls) {
+	constructor(socket: Net.Socket) {
 		this.#socket = socket;
-		this.#tls = tls;
 		this.#attach(socket);
 	}
 
@@ -102,6 +104,7 @@ class NodeSocket implements DriverSocket {
 	}
 
 	async startTls(options: TlsConnectOptions): Promise<void> {
+		const tls = await loadTls();
 		const raw = this.#socket;
 		raw.removeAllListeners('data');
 		raw.removeAllListeners('close');
@@ -109,8 +112,8 @@ class NodeSocket implements DriverSocket {
 		raw.removeAllListeners('drain');
 		let secure: Tls.TLSSocket;
 		try {
-			secure = this.#tls.connect({
-				...tlsOptions(this.#tls, options),
+			secure = tls.connect({
+				...tlsOptions(tls, options),
 				socket: raw,
 			});
 		} catch (error) {
@@ -136,9 +139,12 @@ class NodeSocket implements DriverSocket {
 	}
 
 	peerCertificate(): Uint8Array | undefined {
-		const socket = this.#socket;
-		if (!(socket instanceof this.#tls.TLSSocket)) return undefined;
-		const raw = socket.getPeerCertificate(false)?.raw;
+		if (!this.encrypted) return undefined;
+		const socket = this.#socket as Partial<Tls.TLSSocket>;
+		// an X509Certificate is parsed lazily; getPeerCertificate() decodes every field
+		const raw =
+			socket.getPeerX509Certificate?.()?.raw ??
+			socket.getPeerCertificate?.(false)?.raw;
 		return raw === undefined ? undefined : new Uint8Array(raw);
 	}
 
@@ -178,19 +184,24 @@ class NodeSocket implements DriverSocket {
 /** Sockets from Node's `net` and `tls` modules. Also works on Bun and Deno's Node compatibility. */
 export const nodeSockets: SocketFactory = {
 	async connect(options: SocketConnectOptions): Promise<DriverSocket> {
-		const { net, tls } = await load();
 		const { target } = options;
+		const base =
+			target.kind === 'unix'
+				? { path: target.path }
+				: { host: target.host, port: target.port };
+		let open: () => Net.Socket;
+		if (options.tls === undefined) {
+			const net = await loadNet();
+			open = () => net.connect(base);
+		} else {
+			const [tls, direct] = [await loadTls(), options.tls];
+			open = () => tls.connect({ ...base, ...tlsOptions(tls, direct) });
+		}
 		const socket = await new Promise<Net.Socket>((resolve, reject) => {
 			const event = options.tls ? 'secureConnect' : 'connect';
-			const base =
-				target.kind === 'unix'
-					? { path: target.path }
-					: { host: target.host, port: target.port };
 			let s: Net.Socket;
 			try {
-				s = options.tls
-					? tls.connect({ ...base, ...tlsOptions(tls, options.tls) })
-					: net.connect(base);
+				s = open();
 			} catch (error) {
 				reject(
 					connectionError(
@@ -215,6 +226,6 @@ export const nodeSockets: SocketFactory = {
 				socket.setKeepAlive(true, options.keepAliveInitialDelay);
 			}
 		}
-		return new NodeSocket(socket, tls);
+		return new NodeSocket(socket);
 	},
 };
