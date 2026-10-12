@@ -265,7 +265,13 @@ export class QueryOp extends Op {
 		this.#retried = retried;
 	}
 
-	write(ctx: OpContext): void {
+	/** The server's error for this statement, once it arrived. */
+	get error(): PostgresError | undefined {
+		return this.#error;
+	}
+
+	/** Writes the statement; without `sync` it ends with the next one's Sync (see `SyncGroupOp`). */
+	write(ctx: OpContext, sync = true): void {
 		const w = ctx.writer;
 		this.#types = this.#options.types ?? ctx.types;
 		if (
@@ -297,7 +303,7 @@ export class QueryOp extends Op {
 			fe.describe(w, 'P', '');
 		}
 		fe.execute(w, '', 0);
-		fe.sync(w);
+		if (sync) fe.sync(w);
 	}
 
 	#setFields(fields: readonly Field[]): void {
@@ -364,7 +370,8 @@ export class QueryOp extends Op {
 			case 'NoData':
 				if (this.#statement && this.#createdStatement)
 					this.#statement.fields = [];
-				this.#setFields([]);
+				// no rows follow, so no decoder (building one compiles a function)
+				this.#fields = [];
 				return false;
 			case 'CommandComplete':
 				this.#tag = msg.tag;
@@ -460,6 +467,62 @@ export class QueryOp extends Op {
 	fail(error: Error): void {
 		this.settle();
 		this.#reject(this.#error?.isFatal ? this.#error : error);
+	}
+}
+
+/**
+ * Statements written under one Sync, so that once one fails the server
+ * skips the rest: a BEGIN sent with a transaction's first statement can't
+ * let that statement run outside the transaction. Each settles at the
+ * ReadyForQuery; the skipped ones reject with the error that skipped them.
+ */
+export class SyncGroupOp extends Op {
+	readonly #ops: readonly QueryOp[];
+	/** The statement receiving messages: each ends with CommandComplete, EmptyQueryResponse or ErrorResponse. */
+	#current = 0;
+	#failed = false;
+
+	constructor(ops: readonly QueryOp[]) {
+		super();
+		this.#ops = ops;
+	}
+
+	write(ctx: OpContext): void {
+		for (const op of this.#ops) op.write(ctx, false);
+		fe.sync(ctx.writer);
+	}
+
+	override dataRow(bytes: Uint8Array, start: number, end: number): boolean {
+		return this.#ops[this.#current]?.dataRow(bytes, start, end) ?? false;
+	}
+
+	handle(msg: BackendMessage, ctx: OpContext): boolean {
+		if (msg.type === 'ReadyForQuery') {
+			this.settle();
+			const skipped = this.#failed
+				? this.#ops[this.#current]?.error
+				: undefined;
+			for (const [i, op] of this.#ops.entries()) {
+				if (i <= this.#current) op.handle(msg, ctx);
+				else op.fail(skipped ?? new ProtocolError('A statement was skipped'));
+			}
+			return true;
+		}
+		const op = this.#ops[this.#current];
+		if (op === undefined || this.#failed) return this.unexpected(msg);
+		op.handle(msg, ctx);
+		if (msg.type === 'ErrorResponse') this.#failed = true;
+		else if (
+			msg.type === 'CommandComplete' ||
+			msg.type === 'EmptyQueryResponse'
+		)
+			this.#current++;
+		return false;
+	}
+
+	fail(error: Error): void {
+		this.settle();
+		for (const op of this.#ops) if (!op.done) op.fail(error);
 	}
 }
 

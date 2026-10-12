@@ -128,6 +128,49 @@ export function meteredSockets(): {
 	};
 }
 
+/**
+ * A socket factory that counts round trips: writes that follow data from
+ * the server. Writes with no answer in between are pipelined into one.
+ */
+export function roundTripSockets(): {
+	factory: SocketFactory;
+	roundTrips(): number;
+} {
+	let count = 0;
+	const factory: SocketFactory = {
+		async connect(o) {
+			const socket = await nodeSockets.connect(o);
+			let answered = true;
+			const wrapped: DriverSocket = {
+				get encrypted() {
+					return socket.encrypted;
+				},
+				write: (data) => {
+					if (answered) count++;
+					answered = false;
+					return socket.write(data);
+				},
+				startTls: (t) => socket.startTls(t),
+				peerCertificate: () => socket.peerCertificate(),
+				pause: () => socket.pause(),
+				resume: () => socket.resume(),
+				end: () => socket.end(),
+				destroy: () => socket.destroy(),
+				onData: (h) =>
+					socket.onData((data) => {
+						answered = true;
+						h(data);
+					}),
+				onClose: (h) => socket.onClose(h),
+				onError: (h) => socket.onError(h),
+				onDrain: (h) => socket.onDrain(h),
+			};
+			return wrapped;
+		},
+	};
+	return { factory, roundTrips: () => count };
+}
+
 /** Calls `visit` with the type of each complete message in `data` from `offset`; returns where the incomplete tail starts. */
 function eachMessage(
 	data: Uint8Array,
