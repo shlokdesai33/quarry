@@ -242,21 +242,21 @@ async function attempt(
 ): Promise<Connection> {
 	const factory = config.socket ?? defaultSockets();
 	const target = socketTarget(host);
+	// certificate files are read while the TCP connection and SSLRequest are under way
 	const tls =
-		plan === 'plain'
-			? undefined
-			: await tlsOptions(config, host, plan === 'direct');
+		plan === 'plain' ? undefined : tlsOptions(config, host, plan === 'direct');
+	tls?.catch(() => {});
 	const socket = await factory.connect({
 		target,
-		tls: plan === 'direct' ? tls : undefined,
+		tls: plan === 'direct' ? await tls : undefined,
 		keepAlive: config.keepAlive,
 		keepAliveInitialDelay: config.keepAliveInitialDelay,
 	});
 	state.socket = socket;
 	try {
 		if ((plan === 'tls' || plan === 'tls-optional') && tls !== undefined) {
-			const answer = await requestSsl(socket);
-			if (answer === 'S') await socket.startTls(tls);
+			const [answer, options] = await Promise.all([requestSsl(socket), tls]);
+			if (answer === 'S') await socket.startTls(options);
 			else if (plan === 'tls') {
 				throw new ConnectionError(
 					`The server does not support TLS, but sslmode=${config.ssl.mode} requires it`,

@@ -27,11 +27,49 @@ let tlsModule: typeof Tls | Promise<typeof Tls> | undefined;
 const loadNet = () => (netModule ??= builtin('node:net') ?? import('node:net'));
 const loadTls = () => (tlsModule ??= builtin('node:tls') ?? import('node:tls'));
 
+const contexts = new Map<string, Tls.SecureContext>();
+const CONTEXT_CACHE_SIZE = 16;
+
+/**
+ * The secure context for a CA, certificate and key, reused across
+ * connections: `tls.connect` would otherwise build one, parsing the
+ * certificates, for every connection.
+ */
+function secureContext(
+	tls: typeof Tls,
+	options: TlsConnectOptions,
+): Tls.SecureContext {
+	const id = JSON.stringify([
+		options.ca,
+		options.cert,
+		options.key,
+		options.passphrase,
+	]);
+	let context = contexts.get(id);
+	if (context === undefined) {
+		context = tls.createSecureContext({
+			...(options.ca === undefined ? {} : { ca: [options.ca].flat() }),
+			...(options.cert === undefined ? {} : { cert: options.cert }),
+			...(options.key === undefined ? {} : { key: options.key }),
+			...(options.passphrase === undefined
+				? {}
+				: { passphrase: options.passphrase }),
+		});
+		if (contexts.size >= CONTEXT_CACHE_SIZE) {
+			const oldest = contexts.keys().next();
+			if (!oldest.done) contexts.delete(oldest.value);
+		}
+		contexts.set(id, context);
+	}
+	return context;
+}
+
 function tlsOptions(
 	tls: typeof Tls,
 	options: TlsConnectOptions,
 ): Tls.ConnectionOptions {
 	return {
+		secureContext: secureContext(tls, options),
 		rejectUnauthorized: options.verifyChain,
 		checkServerIdentity: options.verifyHostname
 			? (_host, cert) => tls.checkServerIdentity(options.host, cert)
@@ -39,12 +77,6 @@ function tlsOptions(
 		...(options.servername === undefined
 			? {}
 			: { servername: options.servername }),
-		...(options.ca === undefined ? {} : { ca: [options.ca].flat() }),
-		...(options.cert === undefined ? {} : { cert: options.cert }),
-		...(options.key === undefined ? {} : { key: options.key }),
-		...(options.passphrase === undefined
-			? {}
-			: { passphrase: options.passphrase }),
 		...(options.alpn === undefined ? {} : { ALPNProtocols: [...options.alpn] }),
 	};
 }
@@ -78,13 +110,15 @@ function connectionError(error: Error & { code?: string }): ConnectionError {
 
 class NodeSocket implements DriverSocket {
 	#socket: Net.Socket;
+	#secure: Tls.TLSSocket | undefined;
 	#onData: (chunk: Uint8Array) => void = () => {};
 	#onClose: () => void = () => {};
 	#onError: (error: Error) => void = () => {};
 	#onDrain: () => void = () => {};
 
-	constructor(socket: Net.Socket) {
+	constructor(socket: Net.Socket, secure: Tls.TLSSocket | undefined) {
 		this.#socket = socket;
+		this.#secure = secure;
 		this.#attach(socket);
 	}
 
@@ -135,16 +169,18 @@ class NodeSocket implements DriverSocket {
 			secure.once('error', fail);
 		});
 		this.#socket = secure;
+		this.#secure = secure;
 		this.#attach(secure);
 	}
 
 	peerCertificate(): Uint8Array | undefined {
-		if (!this.encrypted) return undefined;
-		const socket = this.#socket as Partial<Tls.TLSSocket>;
+		const socket = this.#secure;
+		if (socket === undefined) return undefined;
 		// an X509Certificate is parsed lazily; getPeerCertificate() decodes every field
 		const raw =
-			socket.getPeerX509Certificate?.()?.raw ??
-			socket.getPeerCertificate?.(false)?.raw;
+			typeof socket.getPeerX509Certificate === 'function'
+				? socket.getPeerX509Certificate()?.raw
+				: socket.getPeerCertificate(false)?.raw;
 		return raw === undefined ? undefined : new Uint8Array(raw);
 	}
 
@@ -190,12 +226,14 @@ export const nodeSockets: SocketFactory = {
 				? { path: target.path }
 				: { host: target.host, port: target.port };
 		let open: () => Net.Socket;
+		let secure: Tls.TLSSocket | undefined;
 		if (options.tls === undefined) {
 			const net = await loadNet();
 			open = () => net.connect(base);
 		} else {
 			const [tls, direct] = [await loadTls(), options.tls];
-			open = () => tls.connect({ ...base, ...tlsOptions(tls, direct) });
+			open = () =>
+				(secure = tls.connect({ ...base, ...tlsOptions(tls, direct) }));
 		}
 		const socket = await new Promise<Net.Socket>((resolve, reject) => {
 			const event = options.tls ? 'secureConnect' : 'connect';
@@ -226,6 +264,6 @@ export const nodeSockets: SocketFactory = {
 				socket.setKeepAlive(true, options.keepAliveInitialDelay);
 			}
 		}
-		return new NodeSocket(socket);
+		return new NodeSocket(socket, secure);
 	},
 };
