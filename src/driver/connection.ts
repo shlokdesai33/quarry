@@ -103,9 +103,16 @@ export interface OpenInfo {
 type Listener<T> = (value: T) => void;
 
 /**
+ * Encoded bytes handed to the socket at a time when a flush covers many
+ * queries, so a long queue is encoded only as fast as the socket takes it.
+ */
+const FLUSH_BYTES = 65_536;
+
+/**
  * One session with the server. Queries can be issued concurrently: they
- * are pipelined, written together in one socket write per tick, and their
- * results come back in order. An error in one query does not affect the
+ * are pipelined, written together in one socket write per tick (in 64 KiB
+ * chunks, pausing while the socket's buffer is full), and their results
+ * come back in order. An error in one query does not affect the
  * others (each has its own Sync), except inside a transaction, where
  * Postgres aborts the transaction as usual.
  */
@@ -120,6 +127,8 @@ export class Connection implements AsyncDisposable {
 	/** How many operations at the front of the queue have been written. */
 	#written = 0;
 	#flushScheduled = false;
+	/** The socket's write buffer is full: nothing more is encoded until it drains. */
+	#backpressure = false;
 	/** An exclusive operation that has been written: nothing more is written until it completes. */
 	#blocking: Op | undefined;
 	/** An operation this client asked the server to cancel: nothing more is written until it completes. */
@@ -179,7 +188,9 @@ export class Connection implements AsyncDisposable {
 		socket.onClose(() => this.#onSocketClose());
 		socket.onError((error) => this.#fail(error));
 		socket.onDrain(() => {
+			this.#backpressure = false;
 			for (const resolve of this.#drainWaiters.splice(0)) resolve();
+			if (this.#written < this.#queue.length) this.#schedule();
 		});
 		this.#ctx = {
 			writer: this.#writer,
@@ -193,7 +204,7 @@ export class Connection implements AsyncDisposable {
 				if (this.#statements.get(statement.key) === statement)
 					this.#statements.delete(statement.key);
 			},
-			send: (bytes) => this.#socket.write(bytes),
+			send: (bytes) => this.#send(bytes),
 			drain: () => new Promise((resolve) => this.#drainWaiters.push(resolve)),
 			pause: () => this.#socket.pause(),
 			resume: () => this.#socket.resume(),
@@ -620,10 +631,14 @@ export class Connection implements AsyncDisposable {
 		queueMicrotask(() => this.#flush());
 	}
 
-	/** Writes every queued operation that may go out now, in one socket write. */
+	/**
+	 * Writes the queued operations that may go out now: in one socket write,
+	 * or in chunks of `FLUSH_BYTES` for a long queue. Once the socket's
+	 * buffer is full, the rest stay queued, unencoded, until it drains.
+	 */
 	#flush(): void {
 		this.#flushScheduled = false;
-		if (this.#closed) return;
+		if (this.#closed || this.#backpressure) return;
 		while (
 			this.#written < this.#queue.length &&
 			this.#blocking === undefined &&
@@ -648,8 +663,19 @@ export class Connection implements AsyncDisposable {
 			}
 			op.written = true;
 			if (op.exclusive) this.#blocking = op;
+			if (
+				this.#writer.length >= FLUSH_BYTES &&
+				!this.#send(this.#writer.take())
+			)
+				return;
 		}
-		if (this.#writer.length > 0) this.#socket.write(this.#writer.take());
+		if (this.#writer.length > 0) this.#send(this.#writer.take());
+	}
+
+	#send(bytes: Uint8Array): boolean {
+		if (this.#socket.write(bytes)) return true;
+		this.#backpressure = true;
+		return false;
 	}
 
 	#statement(

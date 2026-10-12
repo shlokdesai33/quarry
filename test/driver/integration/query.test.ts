@@ -16,7 +16,7 @@ import {
 import type { Notice } from '../../../src/driver/notice.js';
 import { quarryTypes } from '../../../src/decode.js';
 import { oids, rawTypes } from '../../../src/driver/types.js';
-import { noPg, open, rejection, table } from './helpers.js';
+import { meteredSockets, noPg, open, rejection, table } from './helpers.js';
 
 describe.skipIf(noPg)('queries', () => {
 	let conn: Connection;
@@ -343,6 +343,40 @@ describe.skipIf(noPg)('queries', () => {
 		expect(results.map((r) => r.rows[0]?.v)).toEqual(
 			Array.from({ length: 2000 }, (_, i) => i),
 		);
+	});
+
+	it('encodes no more queries while the socket buffer is full', async () => {
+		const net = meteredSockets();
+		await using c = await open({ socket: net.factory });
+		const big = 'x'.repeat(512 * 1024);
+		const results = await Promise.all(
+			Array.from({ length: 64 }, (_, i) =>
+				c.query<{ n: number; i: number }>(
+					'select length($1)::int as n, $2::int as i',
+					[big, i],
+				),
+			),
+		);
+		expect(results.map((r) => r.rows[0])).toEqual(
+			Array.from({ length: 64 }, (_, i) => ({ n: big.length, i })),
+		);
+		// 32 MiB of queries, but only about one at a time past the socket's buffer
+		expect(net.mostBetweenDrains()).toBeLessThan(2 * 1024 * 1024);
+	});
+
+	it('writes a long queue in bounded chunks', async () => {
+		const net = meteredSockets();
+		await using c = await open({ socket: net.factory });
+		const values = await Promise.all(
+			Array.from({ length: 10_000 }, async (_, i) => {
+				const { rows } = await c.query<{ v: number }>('select $1::int as v', [
+					i,
+				]);
+				return rows[0]?.v;
+			}),
+		);
+		expect(values).toEqual(Array.from({ length: 10_000 }, (_, i) => i));
+		expect(net.largestWrite()).toBeLessThan(80 * 1024);
 	});
 
 	it('isolates errors between pipelined queries', async () => {

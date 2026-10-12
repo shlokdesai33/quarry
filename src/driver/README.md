@@ -73,7 +73,7 @@ Parameters:
 - Arrays become array literals and other objects JSON.
 - `Uint8Array` is sent in binary.
 
-Queries issued concurrently on one connection are pipelined into shared socket writes. Each still gets its own Sync, so one failing query doesn't fail its neighbours (outside a transaction).
+Queries issued concurrently on one connection are pipelined into shared socket writes. Each still gets its own Sync, so one failing query doesn't fail its neighbours (outside a transaction). Writes respect backpressure: a long queue goes out in 64 KiB chunks, and once the socket's buffer is full, the remaining queries wait unencoded until it drains, so a deep pipeline or large parameters can't pile up in memory.
 
 A query takes at most 65535 parameters, the protocol's limit; more are refused before anything is sent.
 

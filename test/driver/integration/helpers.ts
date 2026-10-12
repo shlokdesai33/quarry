@@ -74,6 +74,60 @@ export function recordingSockets(): {
 	};
 }
 
+/**
+ * A socket factory that measures what the driver hands the socket: the
+ * largest single write, and the most bytes written between two drain
+ * events (what can pile up in the socket's buffer when the driver ignores
+ * backpressure).
+ */
+export function meteredSockets(): {
+	factory: SocketFactory;
+	largestWrite(): number;
+	mostBetweenDrains(): number;
+} {
+	let largest = 0;
+	let most = 0;
+	const factory: SocketFactory = {
+		async connect(o) {
+			const socket = await nodeSockets.connect(o);
+			let sinceDrain = 0;
+			const wrapped: DriverSocket = {
+				get encrypted() {
+					return socket.encrypted;
+				},
+				write: (data) => {
+					largest = Math.max(largest, data.length);
+					sinceDrain += data.length;
+					most = Math.max(most, sinceDrain);
+					const ok = socket.write(data);
+					if (ok) sinceDrain = 0;
+					return ok;
+				},
+				startTls: (t) => socket.startTls(t),
+				peerCertificate: () => socket.peerCertificate(),
+				pause: () => socket.pause(),
+				resume: () => socket.resume(),
+				end: () => socket.end(),
+				destroy: () => socket.destroy(),
+				onData: (h) => socket.onData(h),
+				onClose: (h) => socket.onClose(h),
+				onError: (h) => socket.onError(h),
+				onDrain: (h) =>
+					socket.onDrain(() => {
+						sinceDrain = 0;
+						h();
+					}),
+			};
+			return wrapped;
+		},
+	};
+	return {
+		factory,
+		largestWrite: () => largest,
+		mostBetweenDrains: () => most,
+	};
+}
+
 /** Calls `visit` with the type of each complete message in `data` from `offset`; returns where the incomplete tail starts. */
 function eachMessage(
 	data: Uint8Array,
