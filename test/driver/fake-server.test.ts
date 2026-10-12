@@ -125,6 +125,26 @@ describe('protocol negotiation with older servers and poolers', () => {
 	});
 });
 
+describe('closing', () => {
+	it('finishes once the Terminate is sent, without waiting for the server to close', async () => {
+		let client: Socket | undefined;
+		const received = Promise.withResolvers<Buffer>();
+		const port = await fakeServer((socket, _version, send) => {
+			client = socket;
+			socket.on('data', (chunk: Buffer) => received.resolve(chunk));
+			send(...ready);
+		});
+		const conn = await connect(options(port));
+		const closeEvent = new Promise((resolve) => conn.onClose(resolve));
+		// the server keeps its side open
+		await conn.close();
+		expect(conn.closed).toBe(true);
+		expect([...(await received.promise)]).toEqual([0x58, 0, 0, 0, 4]);
+		client?.end();
+		await expect(closeEvent).resolves.toBeUndefined();
+	});
+});
+
 describe('a misbehaving server', () => {
 	it('closes the connection on garbage and fails pending queries', async () => {
 		let client: Socket | undefined;

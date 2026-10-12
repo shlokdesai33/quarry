@@ -51,8 +51,11 @@ export interface DriverSocket {
 	/** Stops and resumes delivering data, for backpressure. */
 	pause(): void;
 	resume(): void;
-	/** Half-closes after flushing queued bytes. */
-	end(): void;
+	/**
+	 * Half-closes after flushing queued bytes. A returned promise resolves
+	 * once they are flushed; without one, closing waits for the socket to close.
+	 */
+	end(): void | Promise<void>;
 	/** Closes immediately. */
 	destroy(): void;
 	/** Registers the single data, close, error and drain handlers. */

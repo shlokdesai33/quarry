@@ -192,8 +192,8 @@ class NodeSocket implements DriverSocket {
 		this.#socket.resume();
 	}
 
-	end(): void {
-		this.#socket.end();
+	end(): Promise<void> {
+		return new Promise((resolve) => this.#socket.end(resolve));
 	}
 
 	destroy(): void {
