@@ -2,8 +2,9 @@
 /**
  * Runs the built driver (dist/driver/index.js) inside workerd, Cloudflare
  * Workers' runtime, through Miniflare, against the test cluster. Needs
- * `pnpm build` first and Miniflare installed somewhere (MINIFLARE_FROM, a
- * directory where `miniflare` is installed):
+ * `pnpm build` first and Miniflare 4 installed somewhere (MINIFLARE_FROM, a
+ * directory where `miniflare@4` is installed; the 5.x alphas take
+ * different options):
  *
  *   MINIFLARE_FROM=/tmp/cf node test/driver/runtime/workers.mjs [info.json]
  */
@@ -33,13 +34,76 @@ if (process.argv[2]) {
 }
 
 const worker = `
-import { connect, createPool, QueryCanceled } from './driver/index.js';
+import { cloudflareSockets, connect, createPool, QueryCanceled } from './driver/index.js';
 
 async function check(results, name, fn) {
 	try { await fn(); results.push(['ok', name]); }
 	catch (error) { results.push(['FAIL', name, String(error && error.stack || error)]); }
 }
 function assert(c, m) { if (!c) throw new Error(m); }
+
+// message types in data, calling visit for each complete one; returns where the incomplete tail starts
+function messageTypes(data, visit) {
+	let i = 0;
+	while (i + 5 <= data.length) {
+		const length = new DataView(data.buffer, data.byteOffset + i + 1, 4).getUint32(0);
+		if (i + 1 + length > data.length) break;
+		visit(data[i]);
+		i += 1 + length;
+	}
+	return i;
+}
+
+// cloudflare:sockets, watched for writes made while the buffer is full and, with delay, a simulated round trip
+function watched(delay = 0) {
+	const stats = { full: 0, drains: 0, writtenWhileFull: 0, largestWrite: 0, maxInFlight: 0 };
+	const factory = {
+		async connect(o) {
+			const socket = await cloudflareSockets.connect(o);
+			let started = false, ready = false, full = false, inFlight = 0;
+			let pending = new Uint8Array(0);
+			return {
+				get encrypted() { return socket.encrypted; },
+				write(data) {
+					if (full) stats.writtenWhileFull += data.length;
+					stats.largestWrite = Math.max(stats.largestWrite, data.length);
+					if (started) messageTypes(data, (type) => { if (type === 0x53) inFlight++; });
+					started = true;
+					stats.maxInFlight = Math.max(stats.maxInFlight, inFlight);
+					const ok = socket.write(data);
+					if (!ok) { full = true; stats.full++; }
+					return ok;
+				},
+				startTls: (t) => socket.startTls(t),
+				peerCertificate: () => socket.peerCertificate(),
+				pause: () => socket.pause(),
+				resume: () => socket.resume(),
+				end: () => socket.end(),
+				destroy: () => socket.destroy(),
+				onData: (h) => socket.onData((data) => {
+					const copy = data.slice();
+					const deliver = () => {
+						const all = new Uint8Array(pending.length + copy.length);
+						all.set(pending);
+						all.set(copy, pending.length);
+						pending = all.slice(messageTypes(all, (type) => {
+							if (type !== 0x5a) return;
+							if (ready) inFlight--;
+							ready = true;
+						}));
+						h(copy);
+					};
+					if (delay > 0) setTimeout(deliver, delay);
+					else deliver();
+				}),
+				onClose: (h) => socket.onClose(() => setTimeout(h, delay)),
+				onError: (h) => socket.onError(h),
+				onDrain: (h) => socket.onDrain(() => { full = false; stats.drains++; h(); }),
+			};
+		},
+	};
+	return { factory, stats };
+}
 
 export default {
 	async fetch(request) {
@@ -60,6 +124,34 @@ export default {
 			const pool = createPool({ ...base, max: 2 });
 			const all = await Promise.all(Array.from({ length: 100 }, (_, i) => pool.query('select $1::int as v', [i])));
 			assert(all.every((r, i) => r.rows[0].v === i), 'wrong rows');
+			await pool.end();
+		});
+		await check(results, 'backpressure: nothing written while the socket is full', async () => {
+			const { factory, stats } = watched();
+			const conn = await connect({ ...base, socket: factory });
+			const big = 'x'.repeat(512 * 1024);
+			const pending = [];
+			for (let i = 0; i < 32; i++) {
+				pending.push(conn.query('select length($1)::int as n, $2::int as i', [big, i]));
+				await Promise.resolve();
+			}
+			const rows = (await Promise.all(pending)).map((r) => r.rows[0]);
+			assert(rows.every((r, i) => r.n === big.length && r.i === i), 'wrong rows');
+			assert(stats.full > 0 && stats.drains > 0, JSON.stringify(stats));
+			assert(stats.writtenWhileFull === 0, JSON.stringify(stats));
+			assert(stats.largestWrite < 1024 * 1024, JSON.stringify(stats));
+			await conn.close();
+		});
+		await check(results, 'pool deepens its pipeline at a simulated round trip', async () => {
+			const { factory, stats } = watched(10);
+			const pool = createPool({ ...base, max: 1, socket: factory });
+			const values = await Promise.all(Array.from({ length: 600 }, async (_, caller) => {
+				const seen = [];
+				for (let k = 0; k < 4; k++) seen.push((await pool.query('select $1::int as v', [caller * 4 + k])).rows[0].v);
+				return seen;
+			}));
+			assert(values.flat().every((v, i) => v === i), 'wrong rows');
+			assert(stats.maxInFlight > 300, JSON.stringify(stats));
 			await pool.end();
 		});
 		await check(results, 'cursor and COPY', async () => {
