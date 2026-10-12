@@ -1,4 +1,5 @@
 /* oxlint-disable no-await-in-loop -- tests run their steps in order */
+import { inspect } from 'node:util';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
 	array,
@@ -18,7 +19,13 @@ import { defineEnum } from '../../../src/define-enum.js';
 import { defineTable } from '../../../src/define-table.js';
 import type { QueryEvent } from '../../../src/driver-executor.js';
 import { createPool, type Pool } from '../../../src/driver/pool.js';
-import { QueryCanceled, UniqueViolation } from '../../../src/driver/errors.js';
+import {
+	DriverError,
+	NotNullViolation,
+	QueryCanceled,
+	UniqueViolation,
+} from '../../../src/driver/errors.js';
+import { violatedColumns } from '../../../src/errors.js';
 import { NoRowError, RowCountError } from '../../../src/executor.js';
 import { noPg, options, pg, rejection, table } from './helpers.js';
 
@@ -334,6 +341,39 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 			expect(events.at(-1)?.error).toBe(error);
 		});
 
+		it('keeps params out of logged and serialized server errors', async () => {
+			const error = await rejection(
+				db
+					.selectFrom(slow)
+					.select(['slow.done'])
+					.where('slow.done', 'secret-param')
+					.all({ timeout: '50ms' }),
+				QueryCanceled,
+			);
+			expect(error.query?.params).toEqual(['secret-param']);
+			expect(error.query?.sql).toContain('"slow"."done" = $1');
+			expect(inspect(error)).not.toContain('secret-param');
+			expect(JSON.stringify(error)).not.toContain('secret-param');
+		});
+
+		it('maps constraint errors to the keys the tables declare', async () => {
+			const unique = await rejection(
+				db
+					.insertInto(users)
+					.values({ email: 'a@x', firstName: null, embedding: null })
+					.execute(),
+				UniqueViolation,
+			);
+			expect(violatedColumns(unique, users)).toEqual(['email']);
+			expect(violatedColumns(unique, posts)).toBeUndefined();
+			const notNull = await rejection(
+				pool.query('insert into posts (title) values ($1)', ['t']),
+				NotNullViolation,
+			);
+			expect(notNull.column).toBe('user_id');
+			expect(violatedColumns(notNull, posts)).toEqual(['userId']);
+		});
+
 		it('runs transactions with savepoints, settings and after-commit hooks', async () => {
 			const committed: string[] = [];
 			const titles = await db.transaction(
@@ -386,6 +426,36 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					.where('posts.title', 'never')
 					.maybeOne(),
 			).toBeUndefined();
+		});
+
+		it('refuses to nest a durable transaction', async () => {
+			let ran = false;
+			await expect(
+				db.transaction(async (tx) => {
+					await tx.transaction(
+						async () => {
+							ran = true;
+						},
+						{ durable: true },
+					);
+				}),
+			).rejects.toThrow(
+				new DriverError(
+					'A durable transaction cannot run inside another transaction',
+				),
+			);
+			expect(ran).toBe(false);
+			expect(
+				await db.transaction(
+					(tx) =>
+						tx
+							.selectFrom(posts)
+							.select(['posts.id'])
+							.where('posts.title', 'first')
+							.one(),
+					{ durable: true },
+				),
+			).toMatchObject({ id: expect.any(Number) });
 		});
 
 		it('leaves opted-in types as text', async () => {

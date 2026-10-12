@@ -187,12 +187,9 @@ export class DeleteQueryBuilder<T extends AnyTable, O, M extends 'where'> {
 		this: DeleteQueryBuilder<T, O & object, never>,
 		options?: RunOptions,
 	): Promise<O> {
-		const { query, rows } = await writeRows<O>(
-			this.#state.executor,
-			this.toNode(),
-			options,
+		return exactlyOne(
+			await writeRows<O>(this.#state.executor, this.toNode(), options),
 		);
-		return exactlyOne(query, rows);
 	}
 
 	/** Runs the query and returns its `returning` row, if any: throws `TooManyRowsError` when there are several. */
@@ -200,12 +197,9 @@ export class DeleteQueryBuilder<T extends AnyTable, O, M extends 'where'> {
 		this: DeleteQueryBuilder<T, O & object, never>,
 		options?: RunOptions,
 	): Promise<O | undefined> {
-		const { query, rows } = await writeRows<O>(
-			this.#state.executor,
-			this.toNode(),
-			options,
+		return atMostOne(
+			await writeRows<O>(this.#state.executor, this.toNode(), options),
 		);
-		return atMostOne(query, rows);
 	}
 
 	/** The whole query as one node. */

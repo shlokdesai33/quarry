@@ -5,12 +5,17 @@ import {
 	parseTimestamptz,
 } from '../../src/driver/parsers.js';
 import { initialTypes, quarryTypes } from '../../src/decode.js';
+import {
+	DriverError,
+	UndefinedParameterError,
+} from '../../src/driver/errors.js';
 import { parseTag } from '../../src/driver/ops.js';
 import {
 	arrayLiteral,
 	copyLine,
 	defaultTypes,
 	encodeParam,
+	encodeParams,
 	formatTimestamp,
 	oids,
 	parseArray,
@@ -90,7 +95,8 @@ describe('parseArray and arrayLiteral', () => {
 describe('parameters', () => {
 	it('encodes JavaScript values as Postgres input', () => {
 		expect(encodeParam(null)).toBeNull();
-		expect(encodeParam(undefined)).toBeNull();
+		expect(() => encodeParam(undefined)).toThrow(/undefined.*pass null/);
+		expect(() => encodeParam([1, [undefined]])).toThrow(/undefined/);
 		expect(encodeParam('x')).toBe('x');
 		expect(encodeParam(1.5)).toBe('1.5');
 		expect(encodeParam(Number.NaN)).toBe('NaN');
@@ -103,6 +109,36 @@ describe('parameters', () => {
 		expect(encodeParam([new Uint8Array([1, 255])])).toBe('{"\\\\x01ff"}');
 		expect(encodeParam(new Uint16Array([1]))).toEqual(new Uint8Array([1, 0]));
 		expect(() => encodeParam(() => 1)).toThrow(/function/);
+	});
+
+	it('refuses undefined parameters and array elements, naming the position', () => {
+		const sql = 'select $1::int, $2::text[]';
+		expect(encodeParams(sql, [1, ['a', null]])).toEqual(['1', '{"a",NULL}']);
+		const error = (params: unknown[]) => {
+			try {
+				encodeParams(sql, params);
+			} catch (e) {
+				if (e instanceof UndefinedParameterError) return e;
+				throw e;
+			}
+			throw new Error('expected UndefinedParameterError');
+		};
+		const top = error([1, undefined]);
+		expect(top).toMatchObject({ position: 2, element: [], sql });
+		expect(top.message).toBe(
+			'Parameter $2 is undefined; pass null for SQL NULL. In query: select $1::int, $2::text[]',
+		);
+		expect(error([undefined, 'secret']).message).not.toContain('secret');
+		expect(error([1, ['a', undefined]]).message).toContain('Parameter $2[2]');
+		expect(error([1, [['a'], ['b', undefined]]])).toMatchObject({
+			position: 2,
+			element: [2, 2],
+		});
+		// a hole in a sparse array is undefined too
+		const sparse: unknown[] = ['a'];
+		sparse.length = 2;
+		expect(error([1, sparse])).toMatchObject({ element: [2] });
+		expect(error([1, undefined])).toBeInstanceOf(DriverError);
 	});
 
 	it('formats timestamps that Postgres accepts, including BC and far-future years', () => {

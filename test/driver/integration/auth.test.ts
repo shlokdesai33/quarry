@@ -1,20 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { OAuthError } from '../../../src/driver/auth/oauth.js';
 import { connect } from '../../../src/driver/connect.js';
 import { ConnectionError, PostgresError } from '../../../src/driver/errors.js';
 import { createPool } from '../../../src/driver/pool.js';
-import { cluster, noPg, open, options, pg, rejection } from './helpers.js';
+import { cluster, noPg, open, options, rejection } from './helpers.js';
 
 const certUser = () => ({
 	user: cluster().users.cert.user,
 	password: undefined,
 });
-const oauthUser = () => ({
-	user: cluster().users.oauth.user,
-	password: undefined,
-	ssl: 'require' as const,
-});
-
 describe.skipIf(noPg)('require_auth', () => {
 	it('accepts an allowed method', async () => {
 		await using conn = await open({ requireAuth: 'scram-sha-256' });
@@ -58,6 +51,12 @@ describe.skipIf(noPg)('require_auth', () => {
 		await expect(
 			connect({ ...options(), ...c.users.md5, env: { PGREQUIREAUTH: '!md5' } }),
 		).rejects.toThrow(/require_auth/);
+	});
+
+	it('refuses require_auth=oauth as unsupported', async () => {
+		await expect(open({ requireAuth: 'oauth' })).rejects.toThrow(
+			/require_auth method "oauth" is not supported/,
+		);
 	});
 });
 
@@ -201,91 +200,6 @@ describe.skipIf(noPg)('TLS client certificates', () => {
 		).rejects.toThrow(/both sslcert and sslkey/);
 	});
 });
-
-describe.skipIf(!pg?.oauth)(
-	'OAuth (OAUTHBEARER) against a test validator',
-	() => {
-		it('authenticates with a token from the hook, called once per connection', async () => {
-			const contexts: unknown[] = [];
-			const oauthToken = (context: unknown) => {
-				contexts.push(context);
-				return 'good.oauth_user';
-			};
-			await using conn = await open({
-				...oauthUser(),
-				oauthToken,
-				requireAuth: 'oauth',
-			});
-			expect(
-				(await conn.query('select current_user as u, system_user as s')).rows,
-			).toEqual([{ u: 'oauth_user', s: 'oauth:oauth_user' }]);
-			expect(conn.capabilities.saslMechanisms).toEqual(['OAUTHBEARER']);
-			await using second = await open({ ...oauthUser(), oauthToken });
-			expect(second.processId).toBeGreaterThan(0);
-			expect(contexts).toEqual([
-				{
-					host: cluster().host,
-					port: cluster().port,
-					user: 'oauth_user',
-					database: cluster().database,
-				},
-				{
-					host: cluster().host,
-					port: cluster().port,
-					user: 'oauth_user',
-					database: cluster().database,
-				},
-			]);
-		});
-
-		it('surfaces the server’s error and discovery information for a rejected token', async () => {
-			const error = await rejection(
-				open({ ...oauthUser(), oauthToken: () => 'bad.token' }),
-				OAuthError,
-			);
-			expect(error.status).toBe('invalid_token');
-			expect(error.openidConfiguration).toBe(
-				'https://issuer.example.com/.well-known/openid-configuration',
-			);
-			expect(error.scope).toBe('openid postgres');
-			expect(error.message).toMatch(
-				/OAuth authentication failed .*issuer discovery https:\/\/issuer\.example\.com/,
-			);
-			expect(error.cause).toBeInstanceOf(PostgresError);
-			expect(error.message).not.toContain('bad.token');
-		});
-
-		it('explains what the server needs when no token hook is given', async () => {
-			const error = await rejection(open(oauthUser()), OAuthError);
-			expect(error.message).toMatch(
-				/requires an OAuth bearer token .*scope "openid postgres".*no oauthToken/,
-			);
-		});
-
-		it('rejects tokens with characters a bearer token cannot contain', async () => {
-			await expect(
-				open({ ...oauthUser(), oauthToken: () => 'has\u0001separator' }),
-			).rejects.toThrow(/characters a bearer token cannot have/);
-		});
-
-		it('refuses OAuth under require_auth or channel_binding=require', async () => {
-			await expect(
-				open({
-					...oauthUser(),
-					oauthToken: () => 'good.oauth_user',
-					requireAuth: 'scram-sha-256',
-				}),
-			).rejects.toThrow(/require_auth/);
-			await expect(
-				open({
-					...oauthUser(),
-					oauthToken: () => 'good.oauth_user',
-					channelBinding: 'require',
-				}),
-			).rejects.toThrow(/channel_binding/);
-		});
-	},
-);
 
 describe.skipIf(noPg)('capabilities', () => {
 	it('reports what the connection supports', async () => {

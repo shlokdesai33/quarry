@@ -7,6 +7,10 @@ const commands: Record<Severity, string> = {
 	info: 'notice',
 };
 
+function plural(count: number, word: string): string {
+	return `${count} ${word}${count === 1 ? '' : 's'}`;
+}
+
 /** A workflow command's message, escaped as the runner unescapes it. */
 function escapeData(text: string): string {
 	return text
@@ -46,7 +50,7 @@ export function formatGithub(report: VerifyReport, root: string): string {
 	});
 	const { errors, warnings, infos, tables, columns } = report.summary;
 	lines.push(
-		`quarry verify: ${errors} errors, ${warnings} warnings, ${infos} notes in ${tables} tables, ${columns} columns`,
+		`quarry verify: ${plural(errors, 'error')}, ${plural(warnings, 'warning')}, ${plural(infos, 'note')} in ${plural(tables, 'table')}, ${plural(columns, 'column')}`,
 	);
 	return `${lines.join('\n')}\n`;
 }

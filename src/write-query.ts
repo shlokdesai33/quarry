@@ -95,7 +95,8 @@ export function valueNode(column: AnyColumn, value: unknown): OperationNode {
 
 /**
  * The assignments of `values` merged over `set`: a column set again keeps its
- * place and takes the new value.
+ * place and takes the new value, and an undefined value is left out. Throws
+ * when that leaves nothing to set.
  */
 export function setNodes(
 	table: AnyTable,
@@ -108,7 +109,13 @@ export function setNodes(
 		const { column, name } = columnOf(table, key);
 		merged.set(name, valueNode(column, value));
 	}
-	return [...merged].map(([column, value]) => ({ column, value }));
+	const nodes = [...merged].map(([column, value]) => ({ column, value }));
+	if (nodes.length === 0) {
+		throw new Error(
+			`The update of "${table.name}" sets no columns: an undefined value leaves its column out, and every value given was undefined (or none was given)`,
+		);
+	}
+	return nodes;
 }
 
 /**
@@ -185,7 +192,7 @@ async function runWrite(
 	const result = await executor.execute(query, options);
 	const count = result.rowCount ?? 0;
 	if (node.expectRows !== undefined && count !== node.expectRows) {
-		throw new RowCountError(query, node.expectRows, count);
+		throw new RowCountError(query, node.expectRows, count, node.table.name);
 	}
 	return { query, result };
 }
@@ -206,26 +213,34 @@ export async function writeRows<O>(
 	executor: Executor | undefined,
 	node: InsertNode | UpdateNode | DeleteNode,
 	options: RunOptions | undefined,
-): Promise<{ readonly query: CompiledQuery; readonly rows: O[] }> {
+): Promise<WrittenRows<O>> {
 	const { query, result } = await runWrite(executor, node, options);
 	// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the returning list supplies the row type
-	return { query, rows: result.rows as O[] };
+	return { query, rows: result.rows as O[], table: node.table.name };
+}
+
+/** A write query's `returning` rows, with the query and the table it wrote. */
+interface WrittenRows<O> {
+	readonly query: CompiledQuery;
+	readonly rows: O[];
+	readonly table: string;
 }
 
 /** The one row: throws `NoRowError` or `TooManyRowsError` otherwise. */
-export function exactlyOne<O>(query: CompiledQuery, rows: readonly O[]): O {
+export function exactlyOne<O>({ query, rows, table }: WrittenRows<O>): O {
 	const [row, ...rest] = rows;
-	if (row === undefined) throw new NoRowError(query);
-	if (rest.length > 0) throw new TooManyRowsError(query);
+	if (row === undefined) throw new NoRowError(query, table);
+	if (rest.length > 0) throw new TooManyRowsError(query, table);
 	return row;
 }
 
 /** The row, if any: throws `TooManyRowsError` for several. */
-export function atMostOne<O>(
-	query: CompiledQuery,
-	rows: readonly O[],
-): O | undefined {
+export function atMostOne<O>({
+	query,
+	rows,
+	table,
+}: WrittenRows<O>): O | undefined {
 	const [row, ...rest] = rows;
-	if (rest.length > 0) throw new TooManyRowsError(query);
+	if (rest.length > 0) throw new TooManyRowsError(query, table);
 	return row;
 }

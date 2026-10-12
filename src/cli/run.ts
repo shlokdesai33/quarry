@@ -59,6 +59,17 @@ function isFormat(value: string): value is ReportFormat {
 }
 
 /**
+ * An error as one line, e.g. `ConnectionError: connect ECONNREFUSED
+ * 127.0.0.1:5432`, or its stack trace with `QUARRY_DEBUG` set.
+ */
+function describeError(error: unknown, env: Io['env']): string {
+	if (!(error instanceof Error)) return String(error);
+	if (env['QUARRY_DEBUG']) return error.stack ?? error.message;
+	const message = `${error.name}: ${error.message}`;
+	return `${message}\n  (set QUARRY_DEBUG=1 for the stack trace)`;
+}
+
+/**
  * Runs `quarry <argv>`, returning the exit code: 0 when the schema matches
  * (warnings allowed), 1 when there are errors, 2 when the command or config
  * is wrong.
@@ -118,10 +129,16 @@ export async function runCli(argv: readonly string[], io: Io): Promise<number> {
 	}
 
 	try {
-		const report = await config.db.verify(schemaTables(config.schema), {
-			strict: values.strict,
-			schema: values.schema,
-		});
+		let report;
+		try {
+			report = await config.db.verify(schemaTables(config.schema), {
+				strict: values.strict,
+				schema: values.schema,
+			});
+		} catch (error) {
+			io.stderr.write(`quarry verify: ${describeError(error, io.env)}\n`);
+			return 2;
+		}
 		const terminal = detectTerminal(io.stdout, io.env);
 		io.stdout.write(
 			formatVerifyReport(report, {

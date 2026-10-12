@@ -1,4 +1,5 @@
 import type { AnyColumn } from './column/any-column.js';
+import { nameReference } from './comparison.js';
 import type { DataType } from './data-type/data-type.js';
 import type { Expression, TypedExpression } from './expression.js';
 import { param, predicate, typedExpression } from './expression-methods.js';
@@ -143,6 +144,7 @@ export function expressionBuilder<const T extends readonly AnyTable[]>(
 	return {
 		ref: (column: string) => {
 			const resolved = resolve(column);
+			nameReference(resolved.node, column);
 			return typedExpression(resolved.node, resolved.column._quarry.dataType);
 		},
 		val: (value: unknown) => param(value),

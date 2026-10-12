@@ -29,6 +29,57 @@ const where = (query: {
 	return node === undefined ? undefined : compile(node);
 };
 
+// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the undefined a plain JS caller, or an `as` cast, can pass
+const missing = undefined as never;
+const message = (reference: string) =>
+	`${reference} is compared with undefined. For an optional filter, use .when(): .when(value !== undefined, (qb) => qb.where('${reference}', value)). For SQL NULL, use isNull().`;
+
+describe('undefined in a comparison', () => {
+	it('throws for `where(column, undefined)`, naming the column as written', () => {
+		expect(() => selectFrom(users).where('users.email', missing)).toThrow(
+			new TypeError(message('users.email')),
+		);
+		expect(() =>
+			selectFrom(contacts).where('contacts.userId', missing),
+		).toThrow(message('contacts.userId'));
+	});
+
+	it('throws for comparison methods, lists, ranges and arrays', () => {
+		const eb = expressionBuilder(users);
+		expect(() => eb.ref('users.age').gt(missing)).toThrow(message('users.age'));
+		expect(() => eb.ref('users.age').in([1, missing])).toThrow(
+			message('users.age'),
+		);
+		expect(() => eb.ref('users.age').in(eb.val([1, missing]))).toThrow(
+			message('users.age'),
+		);
+		expect(() => eb.ref('users.age').between([1, missing])).toThrow(
+			message('users.age'),
+		);
+		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the types only take an array parameter here
+		expect(() => eb.ref('users.age').eq(eb.val(missing) as never)).toThrow(
+			message('users.age'),
+		);
+		expect(() => eb.fn.lower('users.email').eq(missing)).toThrow(
+			/^An expression is compared with undefined\. .*qb\.where\(…\)/,
+		);
+	});
+
+	it('still compares with null, and skips an optional filter through `when`', () => {
+		const role = missing as 'admin' | undefined;
+		expect(
+			where(
+				selectFrom(users)
+					.where('users.age', 1)
+					.when(role !== undefined, (qb) => qb.where('users.role', role!)),
+			),
+		).toEqual({ sql: '"users"."age" = $1', params: [1] });
+		expect(
+			where(selectFrom(users).where((eb) => eb.ref('users.email').isNull())),
+		).toEqual({ sql: '"users"."email" is null', params: [] });
+	});
+});
+
 describe('where', () => {
 	it('starts empty', () => {
 		expect(selectFrom(users).toWhereNode()).toBeUndefined();

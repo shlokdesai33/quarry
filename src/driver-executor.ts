@@ -442,10 +442,12 @@ export class DriverExecutor implements TransactionExecutor {
 					);
 				}
 			}
-			return source.transaction(
-				run,
-				options.settings === undefined ? {} : { settings: options.settings },
-			);
+			return source.transaction(run, {
+				...(options.durable === undefined ? {} : { durable: options.durable }),
+				...(options.settings === undefined
+					? {}
+					: { settings: options.settings }),
+			});
 		}
 		return source.transaction(run, options);
 	}

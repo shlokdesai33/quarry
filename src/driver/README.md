@@ -47,8 +47,7 @@ Verify modes use `ca`, `rootCertFile`, `~/.postgresql/root.crt`, or the platform
 - **Passwords:** SCRAM-SHA-256 (with `tls-server-end-point` channel binding over TLS), md5 and cleartext. `password` can be a function, called for every new connection; use this for short-lived cloud IAM tokens.
 - **`requireAuth`:** refuses methods the server shouldn't ask for, e.g. `'scram-sha-256'` or `'!password,!md5,!none'`. `channelBinding: 'require'` insists on SCRAM-SHA-256-PLUS.
 - **Client certificates** (`cert` auth): `ssl: { cert, key }` (PEM) or `certFile`/`keyFile`, with `passphrase` for encrypted keys. Also `sslcert`/`sslkey`/`sslpassword`, `PGSSLCERT`/`PGSSLKEY`, or `~/.postgresql/postgresql.crt`/`.key`.
-- **OAuth** (PG 18 `OAUTHBEARER`): `oauthToken: (ctx) => token` supplies a bearer token. A rejection throws `OAuthError` with the server's `status`, `scope` and `openidConfiguration`. The driver doesn't run login flows.
-- **Not supported:** GSSAPI, SSPI and Kerberos.
+- **Not supported:** OAuth (PG 18 `OAUTHBEARER`), GSSAPI, SSPI and Kerberos. A server or pooler that offers only one of these fails with a `ConnectionError` (`code: 'EAUTHMETHOD'`) naming the method, and `requireAuth: 'oauth'` is rejected as unsupported.
 
 ## Queries
 
@@ -129,7 +128,8 @@ await pool.transaction(async (tx) => {
 - `max`, `min`
 - `idleTimeout` (30 s), `maxLifetime` (1 h, with jitter)
 - `acquireTimeout` (30 s), `maxWaiting`
-- `pipeline` (50): once every connection is busy, `query`, `simpleQuery` and `describe` are pipelined onto shared connections, up to this many in flight on each; `false` gives every query a connection to itself
+- `pipeline` (50): once every connection is busy, `query`, `simpleQuery` and `describe` are pipelined onto shared connections, up to this many in flight on each. Further queries wait in line and take the next free slot. `false` gives every query a connection to itself.
+  - Reserved clients, transactions, cursors and COPY always get a connection of their own. While one waits, one shared connection per waiter takes no new queries, and it is handed over once the queries already in flight on it finish, so a steady stream of queries can't hold it back.
 - `onConnect`
 
 `pool.acquire()` reserves a client; release it with `release()` or `await using`. Connections that die, or are released mid-transaction, are discarded.
@@ -146,7 +146,7 @@ await pool.transaction(async (tx) => {
 
 - Server errors are `PostgresError`s carrying every field the server sent, plus `query` (non-enumerable, so parameters don't leak into logs).
 - Common SQLSTATEs have their own classes: `UniqueViolation`, `ForeignKeyViolation`, `NotNullViolation`, `CheckViolation`, `ExclusionViolation` (with `columns`), `SerializationFailure`, `DeadlockDetected` (`isRetryable`), `QueryCanceled`, `LockNotAvailable`, `ReadOnlyTransaction`, `UndefinedTable`, `UndefinedColumn`.
-- Client-side failures are `ConnectionError`, `ProtocolError`, `AbortError` or `OAuthError`.
+- Client-side failures are `ConnectionError`, `ProtocolError` or `AbortError`.
 
 ## With quarry
 
@@ -170,5 +170,5 @@ await db.transaction(async (tx) => {
 
 ## Development
 
-- `pnpm test` starts a throwaway cluster (TLS, a role per auth method, an OAuth test validator, PgBouncer) when PostgreSQL is installed; otherwise the integration tests skip. `PG_VERSION=17`, `PG_BIN` and `PGBOUNCER_BIN` pick other versions.
+- `pnpm test` starts a throwaway cluster (TLS, a role per auth method, PgBouncer) when PostgreSQL is installed; otherwise the integration tests skip. `PG_VERSION=17`, `PG_BIN` and `PGBOUNCER_BIN` pick other versions.
 - `pnpm bench:driver` is a quick comparison with `pg` and postgres.js. `bench/driver/suite` is the full, reproducible comparison: every client on Node, Bun and Deno, PgBouncer, simulated network latency, resources and footprint (see its README).

@@ -39,6 +39,34 @@ export class AbortError extends DriverError {
 	}
 }
 
+const SQL_IN_MESSAGE = 500;
+
+/**
+ * A query was given `undefined` as a parameter, or inside an array
+ * parameter. It is never sent as NULL: pass `null` for that.
+ */
+export class UndefinedParameterError extends DriverError {
+	/** The parameter's 1-based position, as in `$n`. */
+	readonly position: number;
+	/** The 1-based indexes of the undefined element within an array parameter, outermost first; empty for the parameter itself. */
+	readonly element: readonly number[];
+	/** The query's SQL, with placeholders and no parameter values. */
+	readonly sql: string;
+
+	constructor(sql: string, position: number, element: readonly number[]) {
+		const where = `$${position}${element.map((i) => `[${i}]`).join('')}`;
+		const shown =
+			sql.length > SQL_IN_MESSAGE ? `${sql.slice(0, SQL_IN_MESSAGE)}…` : sql;
+		super(
+			`Parameter ${where} is undefined; pass null for SQL NULL. In query: ${shown}`,
+		);
+		this.name = 'UndefinedParameterError';
+		this.position = position;
+		this.element = element;
+		this.sql = sql;
+	}
+}
+
 /** Where a query error came from, kept off the enumerable properties so params don't leak into logs. */
 export interface ErrorQuery {
 	readonly sql: string;

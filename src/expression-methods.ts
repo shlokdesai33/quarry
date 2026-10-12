@@ -1,4 +1,4 @@
-import { comparison } from './comparison.js';
+import { comparison, undefinedComparison } from './comparison.js';
 import { DataType } from './data-type/data-type.js';
 import {
 	type Expression,
@@ -80,6 +80,7 @@ export function compare(
 			);
 		}
 		const serialize = (item: unknown) => element.serialize(item);
+		if (left._quarry.value === undefined) throw undefinedComparison(undefined);
 		return predicate(
 			comparison(
 				{ kind: 'value', value: serialize(left._quarry.value) },

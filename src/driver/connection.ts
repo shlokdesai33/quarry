@@ -5,15 +5,6 @@ import {
 	type ChannelBinding,
 } from './auth/scram.js';
 import {
-	describeFailure,
-	OAUTH_ERROR_ACK,
-	OAUTHBEARER,
-	OAuthError,
-	oauthInitialResponse,
-	parseOAuthFailure,
-	type OAuthFailure,
-} from './auth/oauth.js';
-import {
 	checkServerVersion,
 	detectCapabilities,
 	type Capabilities,
@@ -59,7 +50,7 @@ import { Transaction, type TransactionOptions } from './transaction.js';
 import {
 	copyChunks,
 	defaultTypes,
-	encodeParam,
+	encodeParams,
 	type TypeParsers,
 } from './types.js';
 
@@ -327,9 +318,6 @@ export class Connection implements AsyncDisposable {
 		let method: AuthMethod | undefined;
 		let scram: ScramClient | undefined;
 		let scramVerified = false;
-		let oauth:
-			| { token: string | undefined; failure: OAuthFailure | undefined }
-			| undefined;
 		for (;;) {
 			const msg = await this.#nextStartupMessage();
 			switch (msg.type) {
@@ -354,43 +342,19 @@ export class Connection implements AsyncDisposable {
 					break;
 				case 'AuthenticationSASL': {
 					this.#saslMechanisms = msg.mechanisms;
-					if (this.#chooseOAuth(msg.mechanisms)) {
-						method = this.#allow('oauth', 'OAuth');
-						this.#refuseWithoutBinding('an OAuth bearer token');
-						oauth = { token: await this.#oauthToken(), failure: undefined };
-						this.#socket.write(
-							fe
-								.saslInitialResponse(
-									this.#writer,
-									OAUTHBEARER,
-									oauthInitialResponse(oauth.token),
-								)
-								.take(),
-						);
-					} else {
-						method = this.#allow('scram-sha-256', 'SCRAM-SHA-256');
-						scram = await this.#scram(msg.mechanisms);
-						this.#socket.write(
-							fe
-								.saslInitialResponse(
-									this.#writer,
-									scram.mechanism,
-									scram.first(),
-								)
-								.take(),
-						);
+					if (!msg.mechanisms.some((m) => m.startsWith('SCRAM-SHA-256'))) {
+						throw this.#unsupportedSasl(msg.mechanisms);
 					}
+					method = this.#allow('scram-sha-256', 'SCRAM-SHA-256');
+					scram = await this.#scram(msg.mechanisms);
+					this.#socket.write(
+						fe
+							.saslInitialResponse(this.#writer, scram.mechanism, scram.first())
+							.take(),
+					);
 					break;
 				}
 				case 'AuthenticationSASLContinue':
-					if (oauth !== undefined) {
-						// the server's error and discovery document; acknowledge so it fails the exchange
-						oauth.failure = parseOAuthFailure(msg.data);
-						this.#socket.write(
-							fe.saslResponse(this.#writer, OAUTH_ERROR_ACK).take(),
-						);
-						break;
-					}
 					if (scram === undefined)
 						throw new ProtocolError('SASLContinue before SASL');
 					this.#socket.write(
@@ -398,7 +362,6 @@ export class Connection implements AsyncDisposable {
 					);
 					break;
 				case 'AuthenticationSASLFinal':
-					if (oauth !== undefined) break;
 					if (scram === undefined)
 						throw new ProtocolError('SASLFinal before SASL');
 					scram.verify(msg.data);
@@ -424,19 +387,8 @@ export class Connection implements AsyncDisposable {
 					this.#pid = msg.pid;
 					this.#secretKey = msg.key;
 					break;
-				case 'ErrorResponse': {
-					const error = postgresError(msg.fields);
-					if (oauth !== undefined) {
-						throw new OAuthError(
-							oauth.token === undefined
-								? `The server requires an OAuth bearer token${describeFailure(oauth.failure)}, but no oauthToken was given`
-								: `OAuth authentication failed${describeFailure(oauth.failure)}: ${error.message}`,
-							oauth.failure,
-							error,
-						);
-					}
-					throw error;
-				}
+				case 'ErrorResponse':
+					throw postgresError(msg.fields);
 				case 'ReadyForQuery':
 					this.#status = msg.status;
 					checkServerVersion(this.#parameters.get('server_version'));
@@ -503,33 +455,13 @@ export class Connection implements AsyncDisposable {
 		);
 	}
 
-	/** Whether to answer a SASL request with OAuth rather than SCRAM. */
-	#chooseOAuth(mechanisms: readonly string[]): boolean {
-		if (!mechanisms.includes(OAUTHBEARER)) return false;
-		const scram = mechanisms.some((m) => m.startsWith('SCRAM-SHA-256'));
-		if (!scram) return true;
-		const allowed = this.#config.requireAuth;
-		if (allowed !== undefined && !allowed.has('scram-sha-256')) return true;
-		return (
-			this.#config.oauthToken !== undefined &&
-			this.#config.password === undefined
+	/** A SASL request offering no SCRAM mechanism, e.g. only `OAUTHBEARER`. */
+	#unsupportedSasl(mechanisms: readonly string[]): ConnectionError {
+		const offered = mechanisms.length > 0 ? mechanisms.join(', ') : 'none';
+		return new ConnectionError(
+			`The server requested SASL authentication with ${offered}, an authentication method this driver does not support (it supports SCRAM-SHA-256 and SCRAM-SHA-256-PLUS)`,
+			{ code: 'EAUTHMETHOD' },
 		);
-	}
-
-	async #oauthToken(): Promise<string | undefined> {
-		if (!this.#socket.encrypted && !isLocal(this.#info.host.host)) {
-			throw new ConnectionError(
-				'Refusing to send an OAuth bearer token over an unencrypted connection; use sslmode=require or stronger',
-			);
-		}
-		const hook = this.#config.oauthToken;
-		if (hook === undefined) return undefined;
-		return hook({
-			host: this.#info.host.host,
-			port: this.#info.host.port,
-			user: this.#config.user,
-			database: this.#config.database,
-		});
 	}
 
 	#refuseWithoutBinding(method: string): void {
@@ -793,7 +725,9 @@ export class Connection implements AsyncDisposable {
 	/**
 	 * Runs one statement with parameters through the extended protocol.
 	 * Parameters are encoded by `encodeParam`: strings pass through as they
-	 * are, which is how quarry sends values it has encoded itself.
+	 * are, which is how quarry sends values it has encoded itself. An
+	 * `undefined` parameter or array element rejects with
+	 * `UndefinedParameterError`; pass `null` for NULL.
 	 */
 	query<R = Record<string, unknown>>(
 		sql: string,
@@ -860,7 +794,7 @@ export class Connection implements AsyncDisposable {
 		return new Promise((resolve, reject) => {
 			let values;
 			try {
-				values = params.map(encodeParam);
+				values = encodeParams(sql, params);
 			} catch (error) {
 				reject(error);
 				return;
@@ -1005,7 +939,7 @@ export class Connection implements AsyncDisposable {
 				const op = new CursorOp(
 					sql,
 					params,
-					params.map(encodeParam),
+					encodeParams(sql, params),
 					this.#options(options),
 					options?.batchSize ?? 1000,
 				);
@@ -1308,13 +1242,4 @@ async function readPgpass(
 	} catch {
 		return undefined;
 	}
-}
-
-function isLocal(host: string): boolean {
-	return (
-		host.startsWith('/') ||
-		host === 'localhost' ||
-		host === '::1' ||
-		/^127\.\d+\.\d+\.\d+$/.test(host)
-	);
 }
