@@ -81,12 +81,14 @@ export const webScramCrypto: ScramCrypto = {
  * PBKDF2 still runs off the main thread.
  */
 export function nodeScramCrypto(crypto: typeof NodeCrypto): ScramCrypto {
-	const name = (hash: Hash) => hash.replace('-', '').toLowerCase();
 	return {
 		hmac: async (key, data) =>
 			crypto.createHmac('sha256', key).update(data).digest(),
 		digest: async (hash, data) =>
-			crypto.createHash(name(hash)).update(data).digest(),
+			crypto
+				.createHash(hash.replace('-', '').toLowerCase())
+				.update(data)
+				.digest(),
 		pbkdf2: (password, salt, iterations) =>
 			new Promise((resolve, reject) => {
 				crypto.pbkdf2(password, salt, iterations, 32, 'sha256', (error, key) =>
