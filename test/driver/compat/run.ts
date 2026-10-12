@@ -591,7 +591,7 @@ async function main(): Promise<void> {
 }
 
 /** Classifies outcomes against the expectations, prints the totals and, with `json`, writes them. */
-function report(
+function summarize(
 	all: (Outcome & { target: string })[],
 	json: string | undefined,
 ): void {
