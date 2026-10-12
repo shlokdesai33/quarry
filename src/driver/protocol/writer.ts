@@ -1,17 +1,22 @@
 const encoder = new TextEncoder();
 
+/** A buffer grown past this is handed to `take`'s caller rather than copied and kept. */
+const MAX_RETAINED = 1 << 20;
+
 /**
  * Builds frontend messages into one growable buffer, so a pipeline of
  * messages goes out in a single socket write. Each message is opened with
  * `begin`, filled, and closed with `end`, which back-fills its length.
  */
 export class Writer {
+	readonly #size: number;
 	#buf: Uint8Array;
 	#view: DataView;
 	#pos = 0;
 	#start = -1;
 
 	constructor(size = 4096) {
+		this.#size = size;
 		this.#buf = new Uint8Array(size);
 		this.#view = new DataView(this.#buf.buffer);
 	}
@@ -87,25 +92,43 @@ export class Writer {
 	string(value: string): this {
 		const length = value.length;
 		if (length === 0) return this;
-		this.#ensure(length * 3);
-		// short ASCII strings (most parameters) are copied directly: a view
-		// for encodeInto costs more than the copy
-		if (length <= 64) {
-			const buf = this.#buf;
-			const pos = this.#pos;
-			let i = 0;
-			for (; i < length; i++) {
-				const code = value.charCodeAt(i);
-				if (code > 0x7f) break;
-				buf[pos + i] = code;
+		if (length <= 64 || this.#pos + length * 3 <= this.#buf.length) {
+			this.#ensure(length * 3);
+			// short ASCII strings (most parameters) are copied directly: a view
+			// for encodeInto costs more than the copy
+			if (length <= 64) {
+				const buf = this.#buf;
+				const pos = this.#pos;
+				let i = 0;
+				for (; i < length; i++) {
+					const code = value.charCodeAt(i);
+					if (code > 0x7f) break;
+					buf[pos + i] = code;
+				}
+				if (i === length) {
+					this.#pos = pos + length;
+					return this;
+				}
 			}
-			if (i === length) {
-				this.#pos = pos + length;
-				return this;
-			}
+			this.#pos += encoder.encodeInto(
+				value,
+				this.#buf.subarray(this.#pos),
+			).written;
+			return this;
 		}
-		this.#pos += encoder.encodeInto(
+		// reserve a byte per character first, and 3 only for what didn't fit:
+		// most text is ASCII, and 3× would triple the buffer for large values
+		this.#ensure(length);
+		const { read, written } = encoder.encodeInto(
 			value,
+			this.#buf.subarray(this.#pos),
+		);
+		this.#pos += written;
+		if (read === length) return this;
+		const rest = value.slice(read);
+		this.#ensure(rest.length * 3);
+		this.#pos += encoder.encodeInto(
+			rest,
 			this.#buf.subarray(this.#pos),
 		).written;
 		return this;
@@ -138,10 +161,26 @@ export class Writer {
 		this.#start = -1;
 	}
 
-	/** Takes the bytes written so far and resets the writer. */
+	/**
+	 * Takes the bytes written so far and resets the writer. A buffer that
+	 * grew large for one message goes with them, so it isn't copied or kept
+	 * for the connection's lifetime.
+	 */
 	take(): Uint8Array {
-		const out = this.#buf.slice(0, this.#pos);
+		let out: Uint8Array;
+		if (this.#buf.length > MAX_RETAINED) {
+			out = this.#buf.subarray(0, this.#pos);
+			this.#buf = new Uint8Array(this.#size);
+			this.#view = new DataView(this.#buf.buffer);
+		} else {
+			out = this.#buf.slice(0, this.#pos);
+		}
 		this.#pos = 0;
 		return out;
+	}
+
+	/** The buffer's current size. */
+	get capacity(): number {
+		return this.#buf.length;
 	}
 }
