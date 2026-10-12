@@ -26,6 +26,21 @@ describe.skipIf(noPg)('queries', () => {
 		await conn?.close();
 	});
 
+	// found by postgres.js's "big query body"
+	it('takes up to 65535 parameters, and refuses more before sending', async () => {
+		const n = 40_000;
+		const placeholders = Array.from({ length: n }, (_, i) => `($${i + 1})`);
+		const values = Array.from({ length: n }, (_, i) => String(i));
+		const sql = `select count(*)::int as n from (values ${placeholders.join(',')}) v`;
+		const { rows } = await conn.query(sql, values);
+		expect(rows).toEqual([{ n }]);
+		expect((await conn.describe(sql)).paramTypes).toHaveLength(n);
+		await expect(
+			conn.query('select 1', Array.from({ length: 65_536 }, () => 1)),
+		).rejects.toThrow(/at most 65535 parameters/);
+		expect((await conn.query('select 1 as n')).rows).toEqual([{ n: 1 }]);
+	});
+
 	// found by postgres.js's "Cancel piped query"
 	it('cancels a pipelined query once it runs, never the query ahead of it', async () => {
 		const controller = new AbortController();
