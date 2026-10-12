@@ -85,8 +85,25 @@ export class Writer {
 
 	/** UTF-8 text, without a terminator. */
 	string(value: string): this {
-		if (value.length === 0) return this;
-		this.#ensure(value.length * 3);
+		const length = value.length;
+		if (length === 0) return this;
+		this.#ensure(length * 3);
+		// short ASCII strings (most parameters) are copied directly: a view
+		// for encodeInto costs more than the copy
+		if (length <= 64) {
+			const buf = this.#buf;
+			const pos = this.#pos;
+			let i = 0;
+			for (; i < length; i++) {
+				const code = value.charCodeAt(i);
+				if (code > 0x7f) break;
+				buf[pos + i] = code;
+			}
+			if (i === length) {
+				this.#pos = pos + length;
+				return this;
+			}
+		}
 		this.#pos += encoder.encodeInto(
 			value,
 			this.#buf.subarray(this.#pos),
