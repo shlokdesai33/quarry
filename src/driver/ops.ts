@@ -370,7 +370,8 @@ export class QueryOp extends Op {
 			case 'NoData':
 				if (this.#statement && this.#createdStatement)
 					this.#statement.fields = [];
-				this.#setFields([]);
+				// no rows follow, so no decoder (building one compiles a function)
+				this.#fields = [];
 				return false;
 			case 'CommandComplete':
 				this.#tag = msg.tag;
@@ -498,12 +499,12 @@ export class SyncGroupOp extends Op {
 	handle(msg: BackendMessage, ctx: OpContext): boolean {
 		if (msg.type === 'ReadyForQuery') {
 			this.settle();
-			const failed = this.#failed ? this.#ops[this.#current] : undefined;
-			const skipped =
-				failed?.error ?? new ProtocolError('A statement was skipped');
+			const skipped = this.#failed
+				? this.#ops[this.#current]?.error
+				: undefined;
 			for (const [i, op] of this.#ops.entries()) {
 				if (i <= this.#current) op.handle(msg, ctx);
-				else op.fail(skipped);
+				else op.fail(skipped ?? new ProtocolError('A statement was skipped'));
 			}
 			return true;
 		}

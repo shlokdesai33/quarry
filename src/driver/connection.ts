@@ -95,11 +95,10 @@ export interface QueryOptions {
 /** A statement of `Connection.queryGroup`; per-query cancellation and timing don't apply. */
 export interface GroupStatement {
 	readonly sql: string;
-	readonly params?: readonly unknown[];
-	readonly options?: Omit<
-		QueryOptions,
-		'signal' | 'timeout' | 'statementTimeout' | 'onTiming'
-	>;
+	readonly params?: readonly unknown[] | undefined;
+	readonly options?:
+		| Omit<QueryOptions, 'signal' | 'timeout' | 'statementTimeout' | 'onTiming'>
+		| undefined;
 }
 
 export interface CursorOptions extends QueryOptions {

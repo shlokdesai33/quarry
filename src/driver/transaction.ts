@@ -32,8 +32,8 @@ export interface TransactionConnection {
 	queryGroup(
 		statements: readonly {
 			sql: string;
-			params?: readonly unknown[];
-			options?: TxQueryOptions;
+			params?: readonly unknown[] | undefined;
+			options?: TxQueryOptions | undefined;
 		}[],
 	): Promise<QueryResult<unknown>>[];
 }
@@ -166,10 +166,12 @@ export class Session {
 	readonly #conn: TransactionConnection;
 	/** BEGIN and the settings, until sent. */
 	#opening: readonly GroupStatement[] | undefined;
-	/** Sends waiting for BEGIN's outcome, while it is in flight. */
+	/** Whether BEGIN is in flight. */
+	#beginning = false;
+	/** Sends waiting for BEGIN's outcome. */
 	#waiting: Waiter[] | undefined;
 	/** Settles (never rejects) once BEGIN's outcome is known. */
-	#opened: Promise<void> = Promise.resolve();
+	#opened: Promise<void> | undefined;
 	/** Why the transaction never began. */
 	#failure: { error: unknown } | undefined;
 	/** A statement sent without waiting for its answer; the next one reports its error. */
@@ -182,7 +184,7 @@ export class Session {
 
 	/** `transaction` from the start: BEGIN may not have been sent or answered yet. */
 	get transactionStatus(): 'idle' | 'transaction' | 'failed' {
-		return this.#opening !== undefined || this.#waiting !== undefined
+		return this.#opening !== undefined || this.#beginning
 			? 'transaction'
 			: this.#conn.transactionStatus;
 	}
@@ -198,11 +200,7 @@ export class Session {
 				OWN_SYNC.every((key) => options[key] === undefined))
 		) {
 			// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- rows are typed by the caller, as in `asResult`
-			return this.#begin({
-				sql,
-				...(params === undefined ? {} : { params }),
-				...(options === undefined ? {} : { options }),
-			}) as Promise<QueryResult<R>>;
+			return this.#begin({ sql, params, options }) as Promise<QueryResult<R>>;
 		}
 		return this.#send(() => this.#conn.query<R>(sql, params, options));
 	}
@@ -251,7 +249,7 @@ export class Session {
 	/** Waits for BEGIN's outcome (dropping it if never sent); its error, if it failed. */
 	async end(): Promise<{ error: unknown } | undefined> {
 		this.#opening = undefined;
-		await this.#opened;
+		if (this.#opened !== undefined) await this.#opened;
 		return this.#failure;
 	}
 
@@ -262,43 +260,41 @@ export class Session {
 		const results = this.#conn.queryGroup(
 			first === undefined ? opening : [...opening, first],
 		);
-		const waiting: Waiter[] = [];
-		this.#waiting = waiting;
-		this.#opened = this.#open(
-			Promise.all(results.slice(0, opening.length)),
-			waiting,
+		// a failed statement skips the rest, so the last opening one reports for all
+		for (let i = 0; i < opening.length - 1; i++) results[i]?.catch(noop);
+		this.#beginning = true;
+		this.#opened = (results[opening.length - 1] ?? Promise.resolve()).then(
+			() => this.#began(undefined),
+			(error: unknown) => this.#began({ error }),
 		);
 		return results[opening.length];
 	}
 
-	/** Once BEGIN's outcome is known, sends what waited for it, in order, or fails it. */
-	async #open(begun: Promise<unknown>, waiting: Waiter[]): Promise<void> {
-		try {
-			await begun;
-		} catch (error) {
-			this.#waiting = undefined;
-			this.#failure = { error };
-			for (const { fail } of waiting) fail(error);
-			return;
-		}
+	/** Sends what waited for BEGIN, in order, or fails it with BEGIN's error. */
+	#began(failure: { error: unknown } | undefined): void {
+		this.#beginning = false;
+		this.#failure = failure;
+		const waiting = this.#waiting;
 		this.#waiting = undefined;
-		for (const { run } of waiting) run();
+		if (waiting === undefined) return;
+		for (const { run, fail } of waiting) {
+			if (failure === undefined) run();
+			else fail(failure.error);
+		}
 	}
 
 	/** Sends once BEGIN succeeded, reporting a deferred statement's error instead of the result. */
 	#send<T>(send: () => Promise<T>): Promise<T> {
 		if (this.#opening !== undefined) void this.#begin();
 		if (this.#failure !== undefined) return Promise.reject(this.#failure.error);
-		const waiting = this.#waiting;
-		const result =
-			waiting === undefined
-				? send()
-				: new Promise<T>((resolve, reject) => {
-						waiting.push({
-							run: () => void send().then(resolve, reject),
-							fail: reject,
-						});
+		const result = !this.#beginning
+			? send()
+			: new Promise<T>((resolve, reject) => {
+					(this.#waiting ??= []).push({
+						run: () => void send().then(resolve, reject),
+						fail: reject,
 					});
+				});
 		const deferred = this.#deferred;
 		if (deferred === undefined) return result;
 		this.#deferred = undefined;
@@ -309,7 +305,7 @@ export class Session {
 	#iterate<T>(make: () => AsyncIterable<T>): AsyncIterable<T> {
 		if (
 			this.#opening === undefined &&
-			this.#waiting === undefined &&
+			!this.#beginning &&
 			this.#failure === undefined &&
 			this.#deferred === undefined
 		)
@@ -515,55 +511,46 @@ export class Transaction {
 			{ sql: beginStatement(options), options: { prepare: false } },
 		];
 		if (settings) opening.push({ ...settings, options: { prepare: false } });
+		const retries = options.retries ?? 0;
 		running.add(conn);
 		try {
-			return await Transaction.#attempts(conn, fn, options, opening);
+			for (let attempt = 0; ; attempt++) {
+				const session = new Session(conn, opening);
+				const tx = new Transaction(session, 0);
+				let result: T;
+				try {
+					result = await fn(tx);
+					tx.#finished = true;
+					const commit = await session.query('commit');
+					if (commit.command === 'ROLLBACK') throw new TransactionRolledBack();
+				} catch (caught) {
+					tx.#finished = true;
+					// when BEGIN or the settings failed, fn's statements were skipped: that error is the one to report
+					const failure = await session.end();
+					const error = failure === undefined ? caught : failure.error;
+					if (conn.transactionStatus !== 'idle')
+						await conn.query('rollback').catch(() => {});
+					runCallbacks(tx.#afterRollback);
+					if (
+						error instanceof PostgresError &&
+						error.isRetryable &&
+						attempt < retries
+					) {
+						await new Promise((resolve) =>
+							setTimeout(
+								resolve,
+								(options.retryDelay ?? defaultDelay)(attempt + 1),
+							),
+						);
+						continue;
+					}
+					throw error;
+				}
+				runCallbacks(tx.#afterCommit);
+				return result;
+			}
 		} finally {
 			running.delete(conn);
-		}
-	}
-
-	static async #attempts<T>(
-		conn: TransactionConnection,
-		fn: (tx: Transaction) => Promise<T>,
-		options: TransactionOptions,
-		opening: readonly GroupStatement[],
-	): Promise<T> {
-		const retries = options.retries ?? 0;
-		for (let attempt = 0; ; attempt++) {
-			const session = new Session(conn, opening);
-			const tx = new Transaction(session, 0);
-			let result: T;
-			try {
-				result = await fn(tx);
-				tx.#finished = true;
-				const commit = await session.query('commit');
-				if (commit.command === 'ROLLBACK') throw new TransactionRolledBack();
-			} catch (caught) {
-				tx.#finished = true;
-				// when BEGIN or the settings failed, fn's statements were skipped: that error is the one to report
-				const failure = await session.end();
-				const error = failure === undefined ? caught : failure.error;
-				if (conn.transactionStatus !== 'idle')
-					await conn.query('rollback').catch(() => {});
-				runCallbacks(tx.#afterRollback);
-				if (
-					error instanceof PostgresError &&
-					error.isRetryable &&
-					attempt < retries
-				) {
-					await new Promise((resolve) =>
-						setTimeout(
-							resolve,
-							(options.retryDelay ?? defaultDelay)(attempt + 1),
-						),
-					);
-					continue;
-				}
-				throw error;
-			}
-			runCallbacks(tx.#afterCommit);
-			return result;
 		}
 	}
 	/* oxlint-enable no-await-in-loop */
