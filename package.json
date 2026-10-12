@@ -7,8 +7,7 @@
 		"quarry": "./dist/cli.js"
 	},
 	"files": [
-		"dist",
-		"src"
+		"dist"
 	],
 	"type": "module",
 	"sideEffects": false,
