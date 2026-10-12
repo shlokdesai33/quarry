@@ -54,6 +54,7 @@ export {
 	TransactionRolledBack,
 	TransactionTimeout,
 	UndefinedColumn,
+	UndefinedParameterError,
 	UndefinedTable,
 	UniqueViolation,
 	type PoolOptions,

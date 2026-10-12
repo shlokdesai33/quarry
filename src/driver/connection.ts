@@ -59,7 +59,7 @@ import { Transaction, type TransactionOptions } from './transaction.js';
 import {
 	copyChunks,
 	defaultTypes,
-	encodeParam,
+	encodeParams,
 	type TypeParsers,
 } from './types.js';
 
@@ -793,7 +793,9 @@ export class Connection implements AsyncDisposable {
 	/**
 	 * Runs one statement with parameters through the extended protocol.
 	 * Parameters are encoded by `encodeParam`: strings pass through as they
-	 * are, which is how quarry sends values it has encoded itself.
+	 * are, which is how quarry sends values it has encoded itself. An
+	 * `undefined` parameter or array element rejects with
+	 * `UndefinedParameterError`; pass `null` for NULL.
 	 */
 	query<R = Record<string, unknown>>(
 		sql: string,
@@ -860,7 +862,7 @@ export class Connection implements AsyncDisposable {
 		return new Promise((resolve, reject) => {
 			let values;
 			try {
-				values = params.map(encodeParam);
+				values = encodeParams(sql, params);
 			} catch (error) {
 				reject(error);
 				return;
@@ -1005,7 +1007,7 @@ export class Connection implements AsyncDisposable {
 				const op = new CursorOp(
 					sql,
 					params,
-					params.map(encodeParam),
+					encodeParams(sql, params),
 					this.#options(options),
 					options?.batchSize ?? 1000,
 				);

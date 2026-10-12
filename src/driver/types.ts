@@ -1,4 +1,4 @@
-import { DriverError } from './errors.js';
+import { DriverError, UndefinedParameterError } from './errors.js';
 import type { WireValue } from './protocol/frontend.js';
 
 /** Turns one value's text output into a JavaScript value. */
@@ -322,8 +322,17 @@ export function arrayLiteral(values: readonly unknown[]): string {
  * unchanged, which is how quarry sends values it has already encoded.
  * Byte arrays are sent in binary; numbers, bigints, booleans, Dates, arrays
  * (as array literals) and other objects (as JSON) are sent as text.
+ * `undefined`, alone or as an array element, is refused rather than sent as
+ * NULL.
  */
 export function encodeParam(value: unknown): WireValue {
+	if (undefinedAt(value) !== undefined)
+		throw new DriverError('Cannot send undefined as a parameter; pass null');
+	return encodeDefined(value);
+}
+
+/** `encodeParam` for a value already checked for `undefined`. */
+function encodeDefined(value: unknown): WireValue {
 	if (value === null || value === undefined) return null;
 	if (typeof value === 'string') return value;
 	if (value instanceof Uint8Array) return value;
@@ -332,6 +341,40 @@ export function encodeParam(value: unknown): WireValue {
 	}
 	if (Array.isArray(value)) return arrayLiteral(value);
 	return textOf(value);
+}
+
+/**
+ * Encodes a query's parameters with `encodeParam`, refusing `undefined`
+ * (or an undefined array element) instead of sending it as NULL.
+ */
+export function encodeParams(
+	sql: string,
+	params: readonly unknown[],
+): WireValue[] {
+	const values: WireValue[] = [];
+	for (let i = 0; i < params.length; i++) {
+		const value = params[i];
+		const element = undefinedAt(value);
+		if (element !== undefined)
+			throw new UndefinedParameterError(sql, i + 1, element);
+		values.push(encodeDefined(value));
+	}
+	return values;
+}
+
+/**
+ * Where `value` is `undefined`: `[]` for the value itself, the 1-based
+ * indexes of an element within (nested) arrays, or `undefined` if nowhere.
+ * Holes in sparse arrays count as undefined.
+ */
+function undefinedAt(value: unknown): number[] | undefined {
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) return undefined;
+	for (let i = 0; i < value.length; i++) {
+		const inner = undefinedAt(value[i]);
+		if (inner !== undefined) return [i + 1, ...inner];
+	}
+	return undefined;
 }
 
 const COPY_SPECIAL = /[\\\t\n\r]/;
