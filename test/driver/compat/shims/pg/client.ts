@@ -4,9 +4,11 @@
 // queries, decoding, errors and timing come from quarry.
 import { EventEmitter } from 'node:events';
 import {
+	AbortError,
 	connect,
 	ConnectionError,
 	PostgresError,
+	QueryCanceled,
 	quoteIdentifier,
 	resolveConfig,
 	type Connection,
@@ -110,6 +112,12 @@ export function callback(
 
 /** quarry's errors in pg's shape: server errors become DatabaseErrors, the rest pass through. */
 export function toPgError(error: unknown): Error {
+	// pg's query_timeout reports this message (quarry cancels the query on the server)
+	if (
+		(error instanceof QueryCanceled && error.reason === 'timeout') ||
+		(error instanceof AbortError && error.message.includes('timed out'))
+	)
+		return new Error('Query read timeout', { cause: error });
 	if (error instanceof PostgresError) {
 		const converted = assignFields(
 			new DatabaseError(error.message, 0, 'error'),

@@ -12,6 +12,8 @@ type Action =
 	| undefined;
 
 let current: { fail: (error: unknown) => void } | undefined;
+/** How long after a failure stray exceptions are still put down to the failed test. */
+const GRACE = 6000;
 let uncaught: unknown;
 // registered before the helper's own handler, which then calls process.exit
 process.on('uncaughtException', (error) => {
@@ -100,6 +102,10 @@ class Suite {
 					outcome: 'fail',
 					error: describeError(error),
 				});
+				// a failed test's callbacks may still fire: their exceptions are its, not the next test's
+				current = { fail: () => {} };
+				await new Promise((resolve) => setTimeout(resolve, GRACE));
+				current = undefined;
 			}
 		});
 	}

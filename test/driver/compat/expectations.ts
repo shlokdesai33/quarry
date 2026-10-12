@@ -24,6 +24,8 @@ export interface Expectation {
 	readonly flaky?: boolean;
 	/** Only through PgBouncer (or only directly). */
 	readonly target?: 'bouncer' | 'direct';
+	/** Matched a whole file (`*`): its tests that pass aren't flagged. */
+	readonly wildcard?: boolean;
 }
 
 type Table = Record<string, Record<string, Expectation>>;
@@ -63,7 +65,7 @@ const PIPELINE_MODE: Expectation = {
 const HANGS_AFTER_FAILURE: Expectation = {
 	category: 'not-applicable',
 	reason:
-		'the file never exits once one of its tests failed (that test leaves a client open); every test in it has its own outcome',
+		'the file ends abnormally (it hangs, or a late callback throws) only because of a failed test listed here, which leaves a client or query behind; every test in it has its own outcome',
 };
 const PROTOCOL_LAYOUT: Expectation = {
 	category: 'not-applicable',
@@ -79,9 +81,26 @@ const expectations: Record<string, Table> = {
 	pg: {
 		'test/integration/client/api-tests.js': {
 			'null and undefined are both inserted as NULL': UNDEFINED_REFUSED,
+			'raises error if cannot connect': {
+				category: 'intentional',
+				reason:
+					"connection strings follow libpq, which takes only postgres:// and postgresql:// URIs, and a malformed one throws when the pool is created instead of at connect (here 'pg://…')",
+			},
+			'(file)': HANGS_AFTER_FAILURE,
+		},
+		'test/integration/client/async-stack-trace-tests.js': {
+			'promise API async stack trace in pool': {
+				category: 'shim',
+				reason:
+					"the pool shim settles pg's promise from a callback, which cuts V8's async stack; quarry's own pool.query keeps the caller's frames (integration/compat.test.ts: keeps the caller's async frames in a pooled query's error)",
+			},
 		},
 		'test/integration/client/error-handling-tests.js': {
 			'query receives error on client shutdown': GRACEFUL_CLOSE,
+			'connected, idle client error': PG_CONNECTION_INTERNALS(
+				'integration/pool.test.ts: replaces connections that die while idle (the test emits an error on client.connection)',
+			),
+			'(file)': HANGS_AFTER_FAILURE,
 		},
 		'test/integration/client/pipeline-portal-tests.js': {
 			'rejects a custom query class': PIPELINE_MODE,
@@ -129,6 +148,7 @@ const expectations: Record<string, Table> = {
 			'can connect with direct SSL negotiation': PG_CONNECTION_INTERNALS(
 				'integration/connect.test.ts: direct TLS (sslnegotiation=direct); the connection and query here pass, only the ALPN check on pg’s socket cannot run',
 			),
+			'(file)': HANGS_AFTER_FAILURE,
 		},
 		'test/integration/client/timezone-tests.js': {
 			'timestamp without time zone': {
@@ -145,6 +165,11 @@ const expectations: Record<string, Table> = {
 			},
 		},
 		'test/integration/connection-pool/error-tests.js': {
+			'handles socket error during pool.query and destroys it immediately':
+				PG_CONNECTION_INTERNALS(
+					'integration/compat.test.ts: fails a pooled query whose connection dies, then carries on (the test emits an error on pool._clients[0].connection.stream)',
+				),
+			'(file)': HANGS_AFTER_FAILURE,
 			'connection-level errors cause queued queries to fail': {
 				category: 'intentional',
 				reason:
@@ -162,6 +187,7 @@ const expectations: Record<string, Table> = {
 				reason:
 					"the connection to a non-Postgres server fails as it should; the test matches pg-protocol's message text ('invalid response')",
 			},
+			'(file)': HANGS_AFTER_FAILURE,
 		},
 		'test/integration/gh-issues/3772-tests.js': {
 			'a real extended-protocol query does not mark the connection as ending':
@@ -186,6 +212,11 @@ const expectations: Record<string, Table> = {
 				{
 					category: 'not-applicable',
 					reason: 'needs pg-native',
+				},
+			'connection timeout "after all" hook for "should connect if timeout is passed, but native client in connected state"':
+				{
+					category: 'not-applicable',
+					reason: 'fails because the pg-native test before it could not run',
 				},
 		},
 		'test/ending.js': {
@@ -311,34 +342,24 @@ const expectations: Record<string, Table> = {
 			},
 		},
 	},
-	'pg-query-stream': {
-		'test/error.ts': {
-			'error recovery does not crash when closing a connection with a queued stream':
-				GRACEFUL_CLOSE,
-			'error recovery does not crash when query_timeout fires without callback':
-				{
-					category: 'not-applicable',
-					reason:
-						"the timeout fires and the stream fails; the test matches pg's message ('Query read timeout'), while quarry cancels the query and reports QueryCanceled",
-				},
-		},
-	},
+	'pg-query-stream': {},
 	'pg-protocol': {
 		'dist/inbound-parser.test.js': {
 			'PgPacketStream cleans up the reader after handling a packet': {
 				category: 'not-applicable',
 				reason: "inspects pg-protocol's Parser buffer",
 			},
-			'PgPacketStream receives and parses replicationStart': NO_REPLICATION,
+			'PgPacketStream parses replication start message receives and parses replicationStart':
+				NO_REPLICATION,
 		},
 		'dist/outbound-serializer.test.js': {
 			'serializer with custom valueMapper': PROTOCOL_LAYOUT,
 			'serializer with named statement, portal, and buffer value':
 				PROTOCOL_LAYOUT,
-			'serializer bind message with no values': PROTOCOL_LAYOUT,
-			'serializer bind message with named statement, portal, and values':
+			'serializer bind messages with no values': PROTOCOL_LAYOUT,
+			'serializer bind messages with named statement, portal, and values':
 				PROTOCOL_LAYOUT,
-			'serializer bind message encodes a multi-byte string param with its UTF-8 byte length, not char length':
+			'serializer bind messages encodes a multi-byte string param with its UTF-8 byte length, not char length':
 				PROTOCOL_LAYOUT,
 			'serializer bind error recovery produces correct bind output after a valueMapper exception':
 				PROTOCOL_LAYOUT,
@@ -427,6 +448,12 @@ const expectations: Record<string, Table> = {
 				reason: 'a cached INSERT after the column type changed',
 				fixed: 'B7',
 			},
+			'Point type array': {
+				reason:
+					'through PgBouncer, re-preparing after the table changed hit PgBouncer’s stale statement',
+				fixed: 'B10',
+				target: 'bouncer',
+			},
 			'Catches query format errors': {
 				reason: 'SQL that is not a string',
 				fixed: 'B4',
@@ -472,7 +499,60 @@ const BACKEND_PID: Expectation = {
 	target: 'bouncer',
 };
 
-const throughBouncer: Record<string, Table> = {};
+const throughBouncer: Record<string, Table> = {
+	pg: {
+		'test/integration/client/big-simple-query-tests.js': { '*': SESSION_STATE },
+		'test/integration/client/connection-parameter-tests.js': {
+			'*': STARTUP_PARAMETERS,
+		},
+		'test/integration/client/error-handling-tests.js': { '*': SESSION_STATE },
+		'test/integration/client/idle_in_transaction_session_timeout-tests.js': {
+			'*': STARTUP_PARAMETERS,
+		},
+		'test/integration/client/notice-tests.js': { '*': SESSION_STATE },
+		'test/integration/client/prepared-statement-tests.js': {
+			'*': SESSION_STATE,
+		},
+		'test/integration/client/sasl-scram-tests.js': { '*': POOLER_AUTH },
+		'test/integration/client/simple-query-tests.js': { '*': SESSION_STATE },
+		'test/integration/client/ssl-tests.js': { '*': POOLER_TLS },
+		'test/integration/client/statement_timeout-tests.js': {
+			'*': STARTUP_PARAMETERS,
+		},
+		'test/integration/client/transaction-tests.js': { '*': SESSION_STATE },
+		'test/integration/client/type-coercion-tests.js': { '*': SESSION_STATE },
+		'test/integration/client/type-parser-override-tests.js': {
+			'*': SESSION_STATE,
+		},
+		'test/integration/connection-pool/error-tests.js': { '*': BACKEND_PID },
+		'test/integration/gh-issues/130-tests.js': { '*': BACKEND_PID },
+		'test/integration/gh-issues/2085-tests.js': { '*': POOLER_TLS },
+		'test/integration/gh-issues/2862-tests.js': { '*': SESSION_STATE },
+	},
+	postgres: {
+		'tests/index.js': {
+			'Connect using SSL': POOLER_TLS,
+			'Connect using SSL require': POOLER_TLS,
+			'Connect using SSL direct': POOLER_TLS,
+			'Reconnect using SSL': POOLER_TLS,
+			'listen and notify': SESSION_STATE,
+			'double listen': SESSION_STATE,
+			'multiple listeners work after a reconnect': SESSION_STATE,
+			'listen and notify with weird name': SESSION_STATE,
+			'listen and notify with upper case': SESSION_STATE,
+			'unlisten removes subscription': SESSION_STATE,
+			'listen after unlisten': SESSION_STATE,
+			'multiple listeners and unlisten one': SESSION_STATE,
+			'connection parameters': STARTUP_PARAMETERS,
+			'throws correct error when authentication fails': POOLER_AUTH,
+			'Unix socket': {
+				category: 'not-applicable',
+				reason: 'PgBouncer here listens on TCP only',
+				target: 'bouncer',
+			},
+		},
+	},
+};
 
 /** Files not run at all, with why: their whole subject is the upstream library's own machinery. */
 export const skippedFiles: Record<string, Record<string, string>> = {};
@@ -488,10 +568,17 @@ export function classify(
 	target: string,
 ): Expectation | undefined {
 	const bouncer = target.startsWith('PgBouncer');
-	const lookup = (table: Record<string, Expectation> | undefined) =>
-		table?.[name] ?? table?.['*'];
+	const lookup = (
+		table: Record<string, Expectation> | undefined,
+	): Expectation | undefined => {
+		const exact = table?.[name];
+		if (exact !== undefined) return exact;
+		const any = table?.['*'];
+		return any === undefined ? undefined : { ...any, wildcard: true };
+	};
 	const found = lookup(expectations[suite]?.[file]);
-	if (found !== undefined) return found;
+	if (found !== undefined && !(found.target === 'bouncer' && !bouncer))
+		return found;
 	return bouncer ? lookup(throughBouncer[suite]?.[file]) : undefined;
 }
 

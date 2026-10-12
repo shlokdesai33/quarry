@@ -27,7 +27,13 @@ export function exec(cmd: string, args: string[]): void {
 }
 
 exec('dropdb', ['--force', 'postgres_js_test']);
-exec('createdb', ['-O', 'postgres_js_test', 'postgres_js_test']);
+exec('createdb', [
+	'-T',
+	'template0',
+	'-O',
+	'postgres_js_test',
+	'postgres_js_test',
+]);
 exec('psql', [
 	'-c',
 	'grant all on database postgres_js_test to postgres_js_test',

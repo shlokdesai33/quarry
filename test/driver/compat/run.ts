@@ -601,7 +601,11 @@ async function main(): Promise<void> {
 		if (o.passed) {
 			t.passed++;
 			if (expectation?.fixed) t.fixed++;
-			if (expectation?.category && !expectation.flaky) {
+			if (
+				expectation?.category &&
+				!expectation.flaky &&
+				!expectation.wildcard
+			) {
 				t.unexpectedPasses++;
 				problems.push(
 					`PASSES but expected ${expectation.category}: [${o.suite}] ${o.file} › ${o.name} (${o.target})`,

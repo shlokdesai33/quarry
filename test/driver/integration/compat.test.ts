@@ -149,6 +149,18 @@ describe.skipIf(noPg)('COPY, as pg-copy-streams tests it', () => {
 	});
 });
 
+async function queryMissingTable(): Promise<void> {
+	await using pool = createPool({ ...options(), captureStack: true });
+	await pool.query('select test from nonexistent');
+}
+
+describe.skipIf(noPg)('errors, as node-postgres tests them', () => {
+	it("keeps the caller's async frames in a pooled query's error", async () => {
+		const error = await rejection(queryMissingTable(), PostgresError);
+		expect(error.stack).toContain('queryMissingTable');
+	});
+});
+
 describe.skipIf(noPg)('lost connections, as node-postgres tests them', () => {
 	it('fails a running query with the server’s error when the backend is terminated', async () => {
 		const conn = await open();
