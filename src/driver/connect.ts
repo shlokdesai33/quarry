@@ -9,7 +9,7 @@ import {
 import { Connection } from './connection.js';
 import { ConnectionError, PostgresError } from './errors.js';
 import { cloudflareSockets, isCloudflareWorkers } from './cloudflare-socket.js';
-import { nodeSockets } from './node-socket.js';
+import { nodeSockets, preloadNodeSockets } from './node-socket.js';
 import * as fe from './protocol/frontend.js';
 import type {
 	DriverSocket,
@@ -41,6 +41,15 @@ export async function connect(
 /** `cloudflare:sockets` on Cloudflare Workers; Node's `net`/`tls` elsewhere (Node, Bun, Deno). */
 function defaultSockets(): SocketFactory {
 	return isCloudflareWorkers() ? cloudflareSockets : nodeSockets;
+}
+
+/** Loads the socket modules a configuration's connections will need, ahead of its first connect. */
+export function preloadSockets(config: ResolvedConfig): void {
+	if (config.socket !== undefined || isCloudflareWorkers()) return;
+	preloadNodeSockets(
+		config.ssl.mode !== 'disable' &&
+			config.hosts.some((host) => !host.host.startsWith('/')),
+	);
 }
 
 /** Opens a connection from a resolved configuration, trying each host in turn. */
@@ -242,21 +251,26 @@ async function attempt(
 ): Promise<Connection> {
 	const factory = config.socket ?? defaultSockets();
 	const target = socketTarget(host);
+	// certificate files are read while the TCP connection and SSLRequest are under way
 	const tls =
-		plan === 'plain'
-			? undefined
-			: await tlsOptions(config, host, plan === 'direct');
-	const socket = await factory.connect({
+		plan === 'plain' ? undefined : tlsOptions(config, host, plan === 'direct');
+	tls?.catch(() => {});
+	const connecting = factory.connect({
 		target,
-		tls: plan === 'direct' ? tls : undefined,
+		tls: plan === 'direct' ? await tls : undefined,
 		keepAlive: config.keepAlive,
 		keepAliveInitialDelay: config.keepAliveInitialDelay,
 	});
+	// node:tls loads (~3 ms on a cold start) while the TCP handshake is in flight
+	if (tls !== undefined && plan !== 'direct' && factory === nodeSockets) {
+		preloadNodeSockets(true);
+	}
+	const socket = await connecting;
 	state.socket = socket;
 	try {
 		if ((plan === 'tls' || plan === 'tls-optional') && tls !== undefined) {
-			const answer = await requestSsl(socket);
-			if (answer === 'S') await socket.startTls(tls);
+			const [answer, options] = await Promise.all([requestSsl(socket), tls]);
+			if (answer === 'S') await socket.startTls(options);
 			else if (plan === 'tls') {
 				throw new ConnectionError(
 					`The server does not support TLS, but sslmode=${config.ssl.mode} requires it`,

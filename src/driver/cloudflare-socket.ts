@@ -167,8 +167,8 @@ class CloudflareSocket implements DriverSocket {
 		paused?.resolve();
 	}
 
-	end(): void {
-		void this.#writer.close().catch(() => {});
+	end(): Promise<void> {
+		return this.#writer.close().catch(() => {});
 	}
 
 	destroy(): void {

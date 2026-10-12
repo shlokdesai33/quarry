@@ -1,6 +1,7 @@
 import { md5Password } from './auth/md5.js';
 import {
 	ScramClient,
+	scramCrypto,
 	serverEndPoint,
 	type ChannelBinding,
 } from './auth/scram.js';
@@ -133,6 +134,7 @@ export class Connection implements AsyncDisposable {
 	#status: 'I' | 'T' | 'E' = 'I';
 	#closed = false;
 	#ending = false;
+	#closing: Promise<void> | undefined;
 	#fatal: PostgresError | undefined;
 	#failure: Error | undefined;
 	#starting = true;
@@ -325,6 +327,9 @@ export class Connection implements AsyncDisposable {
 		this.#socket.write(
 			fe.startup(this.#writer, this.#info.version, params).take(),
 		);
+		// a likely SCRAM exchange: load the crypto module (~3 ms on a cold
+		// start) while the server starts the backend, not after it asks
+		if (config.password !== undefined) scramCrypto();
 		let method: AuthMethod | undefined;
 		let scram: ScramClient | undefined;
 		let scramVerified = false;
@@ -1279,17 +1284,23 @@ export class Connection implements AsyncDisposable {
 		}
 	}
 
-	async #close(): Promise<void> {
+	#close(): Promise<void> {
+		if (this.#closed) return Promise.resolve();
+		this.#closing ??= this.#terminate();
+		return this.#closing;
+	}
+
+	async #terminate(): Promise<void> {
+		this.#ending = true;
+		await this.idle();
 		if (this.#closed) return;
-		if (!this.#ending) {
-			this.#ending = true;
-			await this.idle();
-			if (!this.#closed) {
-				this.#socket.write(fe.terminate(this.#writer).take());
-				this.#socket.end();
-			}
-		}
-		await this.#closedPromise;
+		this.#socket.write(fe.terminate(this.#writer).take());
+		// Like libpq, done once the Terminate is sent: waiting for the server
+		// to close the socket would wait for its backend to exit (~1.3 ms).
+		const sent = this.#socket.end();
+		await (sent === undefined
+			? this.#closedPromise
+			: Promise.race([sent, this.#closedPromise]));
 	}
 
 	/** Closes immediately, failing anything queued. */

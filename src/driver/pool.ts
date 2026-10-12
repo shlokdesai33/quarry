@@ -3,7 +3,7 @@ import {
 	type ConnectionOptions,
 	type ResolvedConfig,
 } from './config.js';
-import { openConnection } from './connect.js';
+import { openConnection, preloadSockets } from './connect.js';
 import type { Connection, CursorOptions, QueryOptions } from './connection.js';
 import { AbortError, ConnectionError, DriverError } from './errors.js';
 import type { Notification } from './notice.js';
@@ -207,6 +207,8 @@ export class Pool implements AsyncDisposable {
 		this.#pipeline = o.pipeline === false ? 0 : (o.pipeline ?? 50);
 		if (this.#max < 1) throw new DriverError('max must be at least 1');
 		this.#fillMin();
+		// in the background: no cost to createPool, a faster first query
+		unref(setTimeout(() => preloadSockets(this.#config), 0));
 	}
 
 	get stats(): PoolStats {
