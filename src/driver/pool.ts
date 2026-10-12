@@ -706,18 +706,22 @@ export class Pool implements AsyncDisposable {
 		}
 	}
 
+	/** Feeds a timed query's latency to its connection's adaptive depth. */
+	#sample(connection: Connection, latency: number): void {
+		if (this.#depths === undefined) return;
+		let depth = this.#depths.get(connection);
+		if (depth === undefined) {
+			depth = new Depth();
+			this.#depths.set(connection, depth);
+		}
+		depth.sample(latency, this.#sharedWaiters.length > 0);
+	}
+
 	/** Frees a query's slot: straight to the next queued query, or back to the pool when the last one ends. */
 	#done(connection: Connection, started: number): void {
 		const left = (this.#shared.get(connection) ?? 1) - 1;
 		this.#shared.set(connection, left);
-		if (started >= 0 && this.#depths !== undefined) {
-			let depth = this.#depths.get(connection);
-			if (depth === undefined) {
-				depth = new Depth();
-				this.#depths.set(connection, depth);
-			}
-			depth.sample(performance.now() - started, this.#sharedWaiters.length > 0);
-		}
+		if (started >= 0) this.#sample(connection, performance.now() - started);
 		this.#fillShared(connection);
 		if ((this.#shared.get(connection) ?? 0) > 0) return;
 		this.#shared.delete(connection);
