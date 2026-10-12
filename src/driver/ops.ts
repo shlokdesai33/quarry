@@ -1,5 +1,6 @@
 import {
 	ConnectionError,
+	DecodeError,
 	DriverError,
 	PostgresError,
 	ProtocolError,
@@ -45,6 +46,14 @@ export interface OpContext {
 	): { statement: Statement; created: boolean };
 	/** Drops a statement from the cache (it failed or went stale). */
 	forget(statement: Statement): void;
+	/**
+	 * Stops preparing a statement's SQL on this connection: even a fresh
+	 * Parse of it got a stale plan, which happens when a pooler maps it back
+	 * to a server-side statement prepared before a schema change.
+	 */
+	unprepare(statement: Statement): void;
+	/** Whether this SQL may be prepared as a named statement. */
+	preparable(sql: string, types: readonly number[]): boolean;
 	/** Writes bytes now, for operations that talk after being written (cursors, COPY). */
 	send(bytes: Uint8Array): boolean;
 	/** Resolves when the socket's write buffer has drained. */
@@ -192,6 +201,30 @@ function decoderFor(
 	return decoder;
 }
 
+/**
+ * Whether an error means a cached statement went stale, so preparing it
+ * again (outside a transaction) can succeed: its plan no longer fits a
+ * changed schema, a parameter type inferred from a column no longer fits
+ * that column, or the server no longer has the statement (DEALLOCATE,
+ * DISCARD ALL).
+ */
+function staleStatement(
+	error: PostgresError,
+	statement: Statement,
+	created: boolean,
+): boolean {
+	if (error.code === '0A000' && error.routine === 'RevalidateCachedQuery')
+		return true;
+	if (created) return false;
+	if (error.code === '42804' && error.routine === 'transformAssignedExpr')
+		return true;
+	return (
+		error.code === '26000' &&
+		error.routine === 'FetchPreparedStatement' &&
+		statement.error === undefined
+	);
+}
+
 /** One statement through the extended protocol: [Parse, Describe] Bind Execute Sync. */
 export class QueryOp extends Op {
 	readonly #sql: string;
@@ -209,6 +242,8 @@ export class QueryOp extends Op {
 	#rows: unknown[] = [];
 	#tag = '';
 	#error: PostgresError | undefined;
+	/** A value that failed to decode: the query fails with it, the rest of its rows are skipped. */
+	#decodeError: DecodeError | undefined;
 	#retried: boolean;
 
 	constructor(
@@ -233,7 +268,10 @@ export class QueryOp extends Op {
 	write(ctx: OpContext): void {
 		const w = ctx.writer;
 		this.#types = this.#options.types ?? ctx.types;
-		if (this.#options.prepare) {
+		if (
+			this.#options.prepare &&
+			ctx.preparable(this.#sql, this.#options.paramTypes)
+		) {
 			const { statement, created } = ctx.statement(
 				this.#sql,
 				this.#options.paramTypes,
@@ -273,6 +311,7 @@ export class QueryOp extends Op {
 	}
 
 	override dataRow(bytes: Uint8Array, start: number, end: number): boolean {
+		if (this.#decodeError !== undefined) return true;
 		let decoder = this.#decoder;
 		if (decoder === undefined) {
 			const fields = this.#planFields ?? this.#statement?.fields;
@@ -281,8 +320,14 @@ export class QueryOp extends Op {
 			this.#setFields(fields);
 			decoder = this.#decoder;
 		}
-		// oxlint-disable-next-line typescript/no-non-null-assertion
-		this.#rows.push(decoder!(bytes, start, end));
+		try {
+			// oxlint-disable-next-line typescript/no-non-null-assertion
+			this.#rows.push(decoder!(bytes, start, end));
+		} catch (error) {
+			if (!(error instanceof DecodeError)) throw error;
+			this.#decodeError = error;
+			this.#rows = [];
+		}
 		return true;
 	}
 
@@ -372,6 +417,10 @@ export class QueryOp extends Op {
 	#finish(ctx: OpContext, status: 'I' | 'T' | 'E'): boolean {
 		this.settle();
 		const error = this.#error;
+		if (error === undefined && this.#decodeError !== undefined) {
+			this.#reject(this.#decodeError);
+			return true;
+		}
 		if (error === undefined) {
 			const { command, rowCount } = parseTag(this.#tag);
 			this.#resolve({
@@ -383,19 +432,20 @@ export class QueryOp extends Op {
 			return true;
 		}
 		if (
-			error.code === '0A000' &&
-			error.routine === 'RevalidateCachedQuery' &&
 			this.#statement !== undefined &&
 			status === 'I' &&
-			!this.#retried
+			!this.#retried &&
+			staleStatement(error, this.#statement, this.#createdStatement)
 		) {
 			ctx.forget(this.#statement);
+			if (this.#createdStatement) ctx.unprepare(this.#statement);
+			// retried unnamed: a pooler passes that through instead of reusing its stale statement
 			ctx.retry(
 				new QueryOp(
 					this.#sql,
 					this.#params,
 					this.#values,
-					this.#options,
+					{ ...this.#options, prepare: false },
 					this.#resolve,
 					this.#reject,
 					true,
@@ -424,7 +474,7 @@ export class SimpleQueryOp extends Op {
 	#fields: readonly Field[] = [];
 	#decoder: RowDecoder | undefined;
 	#rows: unknown[] = [];
-	#error: PostgresError | undefined;
+	#error: PostgresError | DecodeError | undefined;
 	#ctxTypes: TypeParsers = {};
 
 	constructor(
@@ -450,7 +500,13 @@ export class SimpleQueryOp extends Op {
 	override dataRow(bytes: Uint8Array, start: number, end: number): boolean {
 		if (this.#decoder === undefined)
 			throw new ProtocolError('DataRow before RowDescription');
-		this.#rows.push(this.#decoder(bytes, start, end));
+		if (this.#error !== undefined) return true;
+		try {
+			this.#rows.push(this.#decoder(bytes, start, end));
+		} catch (error) {
+			if (!(error instanceof DecodeError)) throw error;
+			this.#error = error;
+		}
 		return true;
 	}
 
@@ -507,7 +563,8 @@ export class SimpleQueryOp extends Op {
 
 	fail(error: Error): void {
 		this.settle();
-		this.#reject(this.#error?.isFatal ? this.#error : error);
+		const own = this.#error;
+		this.#reject(own instanceof PostgresError && own.isFatal ? own : error);
 	}
 }
 
@@ -748,7 +805,15 @@ export class CursorOp extends Op {
 		if (this.#synced) return true;
 		if (this.#decoder === undefined)
 			throw new ProtocolError('DataRow before RowDescription');
-		this.#batch.push(this.#decoder(bytes, start, end));
+		try {
+			this.#batch.push(this.#decoder(bytes, start, end));
+		} catch (error) {
+			if (!(error instanceof DecodeError)) throw error;
+			// the iteration fails with it; the portal is closed so no more rows come
+			this.#error ??= error;
+			this.#batch = [];
+			this.#sync(true);
+		}
 		return true;
 	}
 

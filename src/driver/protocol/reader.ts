@@ -200,10 +200,12 @@ class Cursor {
 		return value;
 	}
 
+	/** A count (of parameters, columns, formats): unsigned, so up to 65535 parameters fit. */
 	count(): number {
-		const n = this.int16();
-		if (n < 0) throw new ProtocolError(`Negative count ${n}`);
-		return n;
+		this.#need(2);
+		const value = this.view.getUint16(this.pos);
+		this.pos += 2;
+		return value;
 	}
 }
 

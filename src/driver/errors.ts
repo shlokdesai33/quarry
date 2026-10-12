@@ -31,6 +31,28 @@ export class ConnectionError extends DriverError {
 	}
 }
 
+/**
+ * A result value could not be decoded: its type's parser (or binary
+ * decoder) threw. Only the query that received it fails; the connection
+ * stays usable. The value itself is never part of the message.
+ */
+export class DecodeError extends DriverError {
+	/** The result column's name. */
+	readonly column: string;
+	/** The column's type OID. */
+	readonly typeOid: number;
+
+	constructor(column: string, typeOid: number, cause: unknown) {
+		super(
+			`Could not decode a value of column ${JSON.stringify(column)} (type OID ${typeOid})`,
+			{ cause },
+		);
+		this.name = 'DecodeError';
+		this.column = column;
+		this.typeOid = typeOid;
+	}
+}
+
 /** A query or connection attempt was aborted by an `AbortSignal` or a client-side timeout. */
 export class AbortError extends DriverError {
 	constructor(message = 'The operation was aborted', options?: ErrorOptions) {

@@ -18,6 +18,7 @@ import {
 import {
 	AbortError,
 	ConnectionError,
+	DriverError,
 	PostgresError,
 	ProtocolError,
 	postgresError,
@@ -123,7 +124,11 @@ export class Connection implements AsyncDisposable {
 	#blocking: Op | undefined;
 	/** An operation this client asked the server to cancel: nothing more is written until it completes. */
 	#canceling: Op | undefined;
+	/** The operation the cancel request was sent for, once it is running. */
+	#cancelSent: Op | undefined;
 	readonly #statements = new Map<string, Statement>();
+	/** Statement keys never prepared again on this connection (see `OpContext.unprepare`). */
+	readonly #unprepared = new Set<string>();
 	#statementCount = 0;
 	#status: 'I' | 'T' | 'E' = 'I';
 	#closed = false;
@@ -180,6 +185,10 @@ export class Connection implements AsyncDisposable {
 			writer: this.#writer,
 			types: this.#types,
 			statement: (sql, types) => this.#statement(sql, types),
+			unprepare: (statement) => this.#unprepared.add(statement.key),
+			preparable: (sql, types) =>
+				this.#unprepared.size === 0 ||
+				!this.#unprepared.has(statementKey(sql, types)),
 			forget: (statement) => {
 				if (this.#statements.get(statement.key) === statement)
 					this.#statements.delete(statement.key);
@@ -589,10 +598,15 @@ export class Connection implements AsyncDisposable {
 			this.#blocking = undefined;
 			unblocked = true;
 		}
+		if (this.#cancelSent === op) this.#cancelSent = undefined;
 		if (this.#canceling === op) {
-			this.#canceling = undefined;
-			unblocked = true;
+			// later writes stay held back while another aborted query is pending
+			this.#canceling = this.#queue.find(
+				(next) => next.written && next.canceledBy !== undefined,
+			);
+			unblocked = this.#canceling === undefined;
 		}
+		this.#cancelAtHead();
 		if (unblocked || this.#written < this.#queue.length) this.#schedule();
 		if (this.#queue.length === 0)
 			for (const resolve of this.#idleWaiters.splice(0)) resolve();
@@ -619,7 +633,19 @@ export class Connection implements AsyncDisposable {
 			if (op === undefined) break;
 			this.#written++;
 			if (op.onTiming !== undefined) op.writtenAt = performance.now();
-			op.write(this.#ctx);
+			const before = this.#writer.length;
+			try {
+				op.write(this.#ctx);
+			} catch (error) {
+				// a request that can't be encoded fails alone; nothing of it is sent
+				this.#writer.truncate(before);
+				this.#written--;
+				this.#queue.splice(this.#written, 1);
+				op.fail(
+					error instanceof Error ? error : new DriverError(String(error)),
+				);
+				continue;
+			}
 			op.written = true;
 			if (op.exclusive) this.#blocking = op;
 		}
@@ -630,7 +656,7 @@ export class Connection implements AsyncDisposable {
 		sql: string,
 		types: readonly number[],
 	): { statement: Statement; created: boolean } {
-		const key = types.length === 0 ? sql : `${types.join(',')}\0${sql}`;
+		const key = statementKey(sql, types);
 		const existing = this.#statements.get(key);
 		if (existing !== undefined) {
 			this.#statements.delete(key);
@@ -702,10 +728,37 @@ export class Connection implements AsyncDisposable {
 			return;
 		}
 		op.canceledBy = reason;
-		if (this.#canceling !== undefined) return;
 		// hold back later queries so the cancel can't hit one of them
-		this.#canceling = op;
-		this.cancel().catch(() => {});
+		this.#canceling ??= op;
+		this.#cancelAtHead();
+	}
+
+	/**
+	 * Sends a cancel request once an aborted operation is the one the server
+	 * is running: sent while an earlier pipelined query still runs, it would
+	 * cancel that one instead.
+	 */
+	#cancelAtHead(): void {
+		const op = this.#queue[0];
+		if (
+			op === undefined ||
+			!op.written ||
+			op.canceledBy === undefined ||
+			this.#cancelSent === op
+		)
+			return;
+		this.#cancelSent = op;
+		// the server drops a cancel that arrives while it is still reading the
+		// query's messages, so it is repeated, with backoff, until the query ends
+		const send = (attempt: number) => {
+			if (op.done || this.#closed || this.#queue[0] !== op) return;
+			this.cancel().catch(() => {});
+			if (attempt >= 5) return;
+			const timer = setTimeout(() => send(attempt + 1), 50 * 2 ** attempt);
+			if (typeof timer === 'object' && 'unref' in timer) timer.unref();
+			op.onSettle(() => clearTimeout(timer));
+		};
+		send(0);
 	}
 
 	#options(options: QueryOptions | undefined): QueryOpOptions {
@@ -792,6 +845,11 @@ export class Connection implements AsyncDisposable {
 			);
 		}
 		return new Promise((resolve, reject) => {
+			const invalid = invalidSql(sql);
+			if (invalid) {
+				reject(invalid);
+				return;
+			}
 			let values;
 			try {
 				values = encodeParams(sql, params);
@@ -899,6 +957,11 @@ export class Connection implements AsyncDisposable {
 			| undefined,
 	): Promise<QueryResult<R>[]> {
 		return new Promise((resolve, reject) => {
+			const invalid = invalidSql(sql);
+			if (invalid) {
+				reject(invalid);
+				return;
+			}
 			const op = new SimpleQueryOp(
 				sql,
 				options?.types,
@@ -916,6 +979,11 @@ export class Connection implements AsyncDisposable {
 		options?: Pick<QueryOptions, 'paramTypes' | 'signal' | 'timeout'>,
 	): Promise<Description> {
 		return new Promise((resolve, reject) => {
+			const invalid = invalidSql(sql);
+			if (invalid) {
+				reject(invalid);
+				return;
+			}
 			this.#enqueue(
 				new DescribeOp(sql, options?.paramTypes ?? [], resolve, reject),
 				options?.signal,
@@ -934,6 +1002,14 @@ export class Connection implements AsyncDisposable {
 		params: readonly unknown[] = [],
 		options?: CursorOptions,
 	): AsyncIterable<R[]> {
+		const invalid = invalidSql(sql);
+		if (invalid) {
+			return {
+				[Symbol.asyncIterator]: () => ({
+					next: () => Promise.reject(invalid),
+				}),
+			};
+		}
 		return {
 			[Symbol.asyncIterator]: () => {
 				const op = new CursorOp(
@@ -1009,6 +1085,11 @@ export class Connection implements AsyncDisposable {
 		options: Pick<QueryOptions, 'signal' | 'timeout'> | undefined,
 	): Promise<number> {
 		return new Promise((resolve, reject) => {
+			const invalid = invalidSql(sql);
+			if (invalid) {
+				reject(invalid);
+				return;
+			}
 			this.#enqueue(
 				new CopyFromOp(sql, source, resolve, reject),
 				options?.signal,
@@ -1041,6 +1122,14 @@ export class Connection implements AsyncDisposable {
 			highWaterMark?: number;
 		},
 	): AsyncIterable<Uint8Array> {
+		const invalid = invalidSql(sql);
+		if (invalid) {
+			return {
+				[Symbol.asyncIterator]: () => ({
+					next: () => Promise.reject(invalid),
+				}),
+			};
+		}
 		return {
 			[Symbol.asyncIterator]: () => {
 				const op = new CopyToOp(sql, options?.highWaterMark ?? 1 << 20);
@@ -1223,6 +1312,23 @@ export class Connection implements AsyncDisposable {
 		this.#resolveClosed();
 		this.#emit(this.#closeListeners, error);
 	}
+}
+
+/** The statement cache's key: the SQL, prefixed with explicit parameter types. */
+function statementKey(sql: string, types: readonly number[]): string {
+	return types.length === 0 ? sql : `${types.join(',')}\0${sql}`;
+}
+
+/** Why `sql` can't be sent, if it can't: Postgres takes text without NUL bytes. */
+function invalidSql(sql: unknown): DriverError | undefined {
+	if (typeof sql !== 'string')
+		return new DriverError(`The SQL text must be a string, not ${typeof sql}`);
+	const nul = sql.indexOf('\0');
+	if (nul >= 0)
+		return new DriverError(
+			`The SQL text contains a NUL byte (at character ${nul + 1}), which PostgreSQL does not accept`,
+		);
+	return undefined;
 }
 
 export function quoteIdentifier(name: string): string {
