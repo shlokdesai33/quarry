@@ -73,12 +73,11 @@ export {
 	type CatalogType,
 	type RangeValue,
 } from './parsers.js';
-export { OAuthError, type OAuthFailure } from './auth/oauth.js';
 export {
 	detectCapabilities,
 	parseServerVersion,
 	type Capabilities,
 } from './capabilities.js';
-export type { AuthMethod, OAuthContext, ProtocolVersion } from './config.js';
+export type { AuthMethod, ProtocolVersion } from './config.js';
 export { LATEST_PROTOCOL_MINOR } from './protocol/frontend.js';
 export type { SpanLike, TelemetryOptions, TracerLike } from './telemetry.js';

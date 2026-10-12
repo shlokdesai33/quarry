@@ -8,7 +8,6 @@ import {
 } from '../../src/driver/errors.js';
 import type { BackendMessage } from '../../src/driver/protocol/messages.js';
 import { encodeBackend } from './helpers/backend.js';
-import { OAuthError } from '../../src/driver/auth/oauth.js';
 
 /** A scripted server: `onStartup` sees the protocol version and answers. */
 type Script = (
@@ -266,60 +265,38 @@ describe('tolerating the unknown and refusing the unsafe', () => {
 		);
 	});
 
-	it('runs the OAUTHBEARER exchange: token, error document, acknowledgement', async () => {
-		const received: string[] = [];
+	it('refuses a server or pooler that offers only OAUTHBEARER, without answering it', async () => {
+		const sent: number[] = [];
 		const port = await fakeServer((socket, _version, send) => {
 			send({ type: 'AuthenticationSASL', mechanisms: ['OAUTHBEARER'] });
-			socket.on('data', (chunk: Buffer) => {
-				received.push(chunk.subarray(5).toString('latin1'));
-				if (received.length === 1) {
-					send({
-						type: 'AuthenticationSASLContinue',
-						data: new TextEncoder().encode(
-							'{"status":"insufficient_scope","scope":"db","openid-configuration":"https://idp/.well-known/openid-configuration"}',
-						),
-					});
-				} else {
-					send({
-						type: 'ErrorResponse',
-						fields: {
-							S: 'FATAL',
-							V: 'FATAL',
-							C: '28000',
-							M: 'OAuth bearer authentication failed for user "u"',
-						},
-					});
-					socket.end();
-				}
-			});
+			socket.on('data', (chunk: Buffer) => sent.push(chunk[0] ?? 0));
 		});
-		const error = await connect({
-			...options(port),
-			oauthToken: () => 'tok-123',
-		}).catch((e: unknown) => e);
-		expect(error).toBeInstanceOf(OAuthError);
-		expect(error).toMatchObject({
-			status: 'insufficient_scope',
-			scope: 'db',
-			openidConfiguration: 'https://idp/.well-known/openid-configuration',
-		});
-		const initial = 'n,,\x01auth=Bearer tok-123\x01\x01';
-		expect(received[0]).toBe(
-			`OAUTHBEARER\0\0\0\0${String.fromCharCode(initial.length)}${initial}`,
+		const error = await connect({ ...options(port), password: 'pw' }).catch(
+			(e: unknown) => e,
 		);
-		expect(received[1]).toBe('\x01');
+		expect(error).toBeInstanceOf(ConnectionError);
+		expect(error).toMatchObject({ code: 'EAUTHMETHOD' });
+		expect(error instanceof Error && error.message).toMatch(
+			/SASL authentication with OAUTHBEARER, an authentication method this driver does not support/,
+		);
+		// no SASLInitialResponse ('p'): neither a token nor a SCRAM message went out
+		expect(sent).not.toContain(0x70);
 	});
 
-	it('succeeds when the server accepts the bearer token', async () => {
+	it('answers with SCRAM when OAUTHBEARER is offered alongside it', async () => {
+		const received: string[] = [];
 		const port = await fakeServer((socket, _version, send) => {
-			send({ type: 'AuthenticationSASL', mechanisms: ['OAUTHBEARER'] });
-			socket.once('data', () => send(...ready));
+			send({
+				type: 'AuthenticationSASL',
+				mechanisms: ['OAUTHBEARER', 'SCRAM-SHA-256'],
+			});
+			socket.once('data', (chunk: Buffer) => {
+				received.push(chunk.subarray(5).toString('latin1'));
+				socket.end();
+			});
 		});
-		await using conn = await connect({
-			...options(port),
-			oauthToken: async () => 'tok',
-		});
-		expect(conn.capabilities.saslMechanisms).toEqual(['OAUTHBEARER']);
+		await connect({ ...options(port), password: 'pw' }).catch(() => {});
+		expect(received[0]).toMatch(/^SCRAM-SHA-256\0/);
 	});
 });
 

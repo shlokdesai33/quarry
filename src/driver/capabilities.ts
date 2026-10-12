@@ -19,7 +19,7 @@ export interface Capabilities {
 	readonly serverVersion: string | undefined;
 	/** `in_hot_standby` is reported, so the server's role is known without a query. */
 	readonly reportsHotStandby: boolean;
-	/** SASL mechanisms offered during authentication, e.g. `SCRAM-SHA-256-PLUS` or `OAUTHBEARER`. */
+	/** SASL mechanisms offered during authentication, e.g. `SCRAM-SHA-256` and `SCRAM-SHA-256-PLUS`. */
 	readonly saslMechanisms: readonly string[];
 }
 

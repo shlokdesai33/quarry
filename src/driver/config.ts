@@ -52,7 +52,6 @@ export type AuthMethod =
 	| 'password'
 	| 'md5'
 	| 'scram-sha-256'
-	| 'oauth'
 	| 'gss'
 	| 'sspi'
 	| 'none';
@@ -61,19 +60,10 @@ const AUTH_METHODS: readonly AuthMethod[] = [
 	'password',
 	'md5',
 	'scram-sha-256',
-	'oauth',
 	'gss',
 	'sspi',
 	'none',
 ];
-
-/** What `oauthToken` is told about the connection asking for a token. */
-export interface OAuthContext {
-	readonly host: string;
-	readonly port: number;
-	readonly user: string;
-	readonly database: string;
-}
 
 /** Which server to accept when several hosts are listed, as libpq's `target_session_attrs`. */
 export type TargetSessionAttrs =
@@ -116,21 +106,13 @@ export interface ConnectionOptions {
 	readonly maxProtocolVersion?: ProtocolVersion | 'latest' | undefined;
 	/**
 	 * The authentication methods to accept, as libpq's `require_auth`: e.g.
-	 * `'scram-sha-256'`, `['scram-sha-256', 'oauth']`, or negated with `!`
+	 * `'scram-sha-256'`, `['scram-sha-256', 'none']`, or negated with `!`
 	 * (`'!password,!md5'`). Methods: `password`, `md5`, `scram-sha-256`,
-	 * `oauth`, `gss`, `sspi`, `none`. A server asking for anything else is
-	 * refused, so it can't downgrade the client to a weaker method.
+	 * `gss`, `sspi`, `none`. A server asking for anything else is refused,
+	 * so it can't downgrade the client to a weaker method. `oauth` is
+	 * rejected: the driver does not support OAuth (`OAUTHBEARER`).
 	 */
 	readonly requireAuth?: string | readonly string[] | undefined;
-	/**
-	 * Supplies a bearer token when the server asks for OAuth
-	 * (`OAUTHBEARER`, PostgreSQL 18+). Called once per connection attempt;
-	 * the token is never cached or logged. The driver does not run OAuth
-	 * login flows: get the token from your identity provider.
-	 */
-	readonly oauthToken?:
-		| ((context: OAuthContext) => string | Promise<string>)
-		| undefined;
 	/** Extra startup parameters (run-time settings), e.g. `{ search_path: 'app' }`. */
 	readonly params?: Readonly<Record<string, string>> | undefined;
 	/** Command-line options sent to the server, as `PGOPTIONS` (e.g. `-c statement_timeout=5s`). */
@@ -205,9 +187,6 @@ export interface ResolvedConfig {
 	readonly protocol: { readonly min: number; readonly max: number };
 	/** The authentication methods allowed, or undefined for any. */
 	readonly requireAuth: ReadonlySet<AuthMethod> | undefined;
-	readonly oauthToken:
-		| ((context: OAuthContext) => string | Promise<string>)
-		| undefined;
 	readonly params: Readonly<Record<string, string>>;
 	readonly targetSessionAttrs: TargetSessionAttrs;
 	readonly types: TypeParsers | undefined;
@@ -486,9 +465,17 @@ export function parseRequireAuth(
 			'require_auth cannot mix negated (!method) and plain methods',
 		);
 	}
-	const methods = entries.map((e) =>
-		oneOf(e.replace(/^!/, ''), AUTH_METHODS, 'require_auth method'),
-	);
+	if (entries.includes('oauth')) {
+		throw new DriverError(
+			'require_auth method "oauth" is not supported: this driver does not implement OAuth (OAUTHBEARER) authentication',
+		);
+	}
+	// `!oauth` excludes a method the driver never uses anyway, so it is accepted
+	const methods = entries
+		.filter((e) => e !== '!oauth')
+		.map((e) =>
+			oneOf(e.replace(/^!/, ''), AUTH_METHODS, 'require_auth method'),
+		);
 	return new Set(
 		negated[0] ? AUTH_METHODS.filter((m) => !methods.includes(m)) : methods,
 	);
@@ -623,7 +610,6 @@ export function resolveConfig(options: ConnectionOptions = {}): ResolvedConfig {
 			(keepalivesIdle ? Number(keepalivesIdle) * 1000 : 0),
 		protocol,
 		requireAuth: parseRequireAuth(options.requireAuth ?? kw('require_auth')),
-		oauthToken: options.oauthToken,
 		params,
 		targetSessionAttrs: oneOf(
 			options.targetSessionAttrs ?? kw('target_session_attrs') ?? 'any',

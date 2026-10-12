@@ -45,7 +45,6 @@ export {
 	IntegrityConstraintViolation,
 	LockNotAvailable,
 	NotNullViolation,
-	OAuthError,
 	PostgresError,
 	ProtocolError,
 	QueryCanceled,

@@ -39,8 +39,6 @@ export interface TestCluster {
 		readonly cert: string;
 		readonly key: string;
 	};
-	/** Whether `oauth_user` authenticates with OAUTHBEARER (the test validator was built). */
-	readonly oauth: boolean;
 	readonly users: {
 		readonly superuser: { user: string; password: string };
 		readonly trust: { user: string };
@@ -49,7 +47,6 @@ export interface TestCluster {
 		readonly scram: { user: string; password: string };
 		readonly sslOnly: { user: string; password: string };
 		readonly cert: { user: string };
-		readonly oauth: { user: string };
 	};
 }
 
@@ -61,7 +58,6 @@ const USERS = {
 	scram: { user: 'scram_user', password: 'scram pässwörd ½' },
 	sslOnly: { user: 'ssl_only', password: 'ssl-pw' },
 	cert: { user: 'cert_user' },
-	oauth: { user: 'oauth_user' },
 } as const;
 
 /** Finds the PostgreSQL server binaries: `PG_BIN`, `pg_config --bindir`, or the newest under /usr/lib/postgresql. */
@@ -210,29 +206,6 @@ function makeCertificates(dir: string): void {
 
 const KEY_PASSPHRASE = 'client key pässphrase';
 
-/** Builds the test OAuth validator; undefined when there is no compiler or server headers. */
-function buildValidator(binDir: string, dir: string): string | undefined {
-	try {
-		const include = run(join(binDir, 'pg_config'), [
-			'--includedir-server',
-		]).trim();
-		const out = join(dir, 'quarry_oauth_validator.so');
-		run(existsSync('/usr/bin/gcc') ? 'gcc' : 'cc', [
-			'-shared',
-			'-fPIC',
-			'-O1',
-			'-I',
-			include,
-			'-o',
-			out,
-			join(import.meta.dirname, 'oauth_validator.c'),
-		]);
-		return out;
-	} catch {
-		return undefined;
-	}
-}
-
 export interface RunningCluster {
 	readonly info: TestCluster;
 	stop(): Promise<void>;
@@ -254,7 +227,6 @@ export async function startCluster(binDir: string): Promise<RunningCluster> {
 			`The driver needs PostgreSQL 18 or later; ${binDir} is ${versionNum}`,
 		);
 	}
-	const validator = buildValidator(binDir, dir);
 
 	run(join(binDir, 'initdb'), [
 		'-D',
@@ -278,7 +250,6 @@ export async function startCluster(binDir: string): Promise<RunningCluster> {
 				`ssl_cert_file = '${join(dir, 'server.crt')}'`,
 				`ssl_key_file = '${join(dir, 'server.key')}'`,
 				`ssl_ca_file = '${join(dir, 'ca.crt')}'`,
-				...(validator ? [`oauth_validator_libraries = '${validator}'`] : []),
 				`password_encryption = 'scram-sha-256'`,
 				`max_connections = 300`,
 				`fsync = off`,
@@ -301,11 +272,6 @@ export async function startCluster(binDir: string): Promise<RunningCluster> {
 			'host all password_user 127.0.0.1/32 password',
 			'host all md5_user 127.0.0.1/32 md5',
 			'hostssl all cert_user 127.0.0.1/32 cert',
-			...(validator
-				? [
-						'host all oauth_user 127.0.0.1/32 oauth issuer="https://issuer.example.com" scope="openid postgres"',
-					]
-				: []),
 			'host all all 127.0.0.1/32 scram-sha-256',
 			'',
 		].join('\n'),
@@ -344,7 +310,6 @@ export async function startCluster(binDir: string): Promise<RunningCluster> {
 	psql(`create user scram_user superuser password '${USERS.scram.password}'`);
 	psql(`create user ssl_only password '${USERS.sslOnly.password}'`);
 	psql(`create user cert_user`);
-	psql(`create user oauth_user`);
 	psql(`create database quarry_test owner scram_user`);
 	const extensions = run(join(binDir, 'psql'), [
 		'-h',
@@ -428,7 +393,6 @@ export async function startCluster(binDir: string): Promise<RunningCluster> {
 				cert: readFileSync(join(dir, 'client.crt'), 'utf8'),
 				key: readFileSync(join(dir, 'client.key'), 'utf8'),
 			},
-			oauth: validator !== undefined,
 			users: USERS,
 		},
 		async stop() {

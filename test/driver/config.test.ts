@@ -355,17 +355,39 @@ describe('versions and policies', () => {
 
 	it('parses require_auth lists and negations', () => {
 		expect(parseRequireAuth(undefined)).toBeUndefined();
-		expect([...(parseRequireAuth('scram-sha-256,oauth') ?? [])]).toEqual([
+		expect([...(parseRequireAuth('scram-sha-256,none') ?? [])]).toEqual([
 			'scram-sha-256',
-			'oauth',
+			'none',
 		]);
 		expect([
 			...(parseRequireAuth(['!password', '!md5', '!none']) ?? []),
-		]).toEqual(['scram-sha-256', 'oauth', 'gss', 'sspi']);
+		]).toEqual(['scram-sha-256', 'gss', 'sspi']);
 		expect(() => parseRequireAuth('md5,!password')).toThrow(/cannot mix/);
 		expect(() => parseRequireAuth('kerberos')).toThrow(
 			/Invalid require_auth method/,
 		);
+	});
+
+	it('rejects require_auth=oauth as unsupported, and accepts !oauth', () => {
+		expect(() => parseRequireAuth('scram-sha-256,oauth')).toThrow(
+			/require_auth method "oauth" is not supported/,
+		);
+		expect(() =>
+			resolveConfig({
+				connectionString: 'postgres://h/d?require_auth=oauth',
+				env: {},
+			}),
+		).toThrow(/not supported/);
+		expect(() => resolveConfig({ env: { PGREQUIREAUTH: 'oauth' } })).toThrow(
+			/not supported/,
+		);
+		expect([...(parseRequireAuth('!oauth,!md5') ?? [])]).toEqual([
+			'password',
+			'scram-sha-256',
+			'gss',
+			'sspi',
+			'none',
+		]);
 	});
 
 	it('reads client certificate settings', () => {
