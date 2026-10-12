@@ -19,6 +19,15 @@ export interface Tx {
 export interface Driver {
 	readonly name: string;
 	query(sql: string, params?: unknown[]): Promise<readonly Row[]>;
+	/**
+	 * A query with declared parameter type OIDs, as quarry's query builder
+	 * sends them (JS arrays included). Clients without it get `query`.
+	 */
+	queryTyped?(
+		sql: string,
+		params: unknown[],
+		paramTypes: number[],
+	): Promise<readonly Row[]>;
 	transaction(fn: (tx: Tx) => Promise<void>): Promise<void>;
 	/** COPY … FROM STDIN with pre-encoded text chunks. */
 	copyFrom?(sql: string, chunks: readonly string[]): Promise<void>;
@@ -78,6 +87,13 @@ export const DRIVERS: Record<
 		describe:
 			"quarry/driver (built dist). Like-for-like decoding (int8/numeric as string, timestamptz as Date, as pg does; quarry's own adapter config). Defaults: prepared statements (LRU 100), binary results for hot types, pipelining onto shared connections when the pool is busy (50 per connection).",
 		make: (o) => quarry(o, { decode: 'compat' }),
+	},
+	'quarry-candidate': {
+		runtimes: ['node', 'bun', 'deno'],
+		describe:
+			'quarry (like-for-like decoding) from the build at `QUARRY_DIST_CANDIDATE`, for A/B runs of a driver change against `quarry`. Only in the matrix when that variable is set.',
+		make: (o) =>
+			quarry(o, { decode: 'compat' }, process.env['QUARRY_DIST_CANDIDATE']),
 	},
 	'quarry-lossless': {
 		runtimes: ['node', 'bun', 'deno'],
@@ -182,8 +198,12 @@ const quarryTx = (tx: any): Tx => ({
 async function quarry(
 	o: DriverOptions,
 	v: { decode: 'compat' | 'lossless'; prepare?: boolean },
+	dist = QUARRY_DIST,
 ): Promise<Driver> {
-	const d = await import(QUARRY_DIST);
+	if (dist === undefined) throw new Error('QUARRY_DIST_CANDIDATE is not set');
+	const d = await import(
+		dist.startsWith('/') ? new URL(`file://${dist}`).href : dist
+	);
 	const array = (parse?: (t: string) => unknown) => (t: string) =>
 		d.parseArray(t, parse);
 	// the parsers quarry's own adapter uses (src/decode.ts quarryTypes), for int8/numeric-as-string, timestamptz-as-Date parity with pg
@@ -213,6 +233,8 @@ async function quarry(
 	return {
 		name: 'quarry',
 		query: async (sql, params) => (await pool.query(sql, params)).rows,
+		queryTyped: async (sql, params, paramTypes) =>
+			(await pool.query(sql, params, { paramTypes })).rows,
 		transaction: (fn) => pool.transaction((tx: any) => fn(quarryTx(tx))),
 		copyFrom: async (sql, chunks) => {
 			await pool.copyFrom(sql, chunks);
@@ -457,6 +479,24 @@ async function bunSql(
 	const driver: Driver = {
 		name: 'bun.sql',
 		query: (s, p) => sql.unsafe(s, p ?? []),
+		// JS arrays through sql.array(); int4[] as a literal, since
+		// sql.array(…, 'int4') fails with "insufficient data left in message"
+		queryTyped: (s, p, types) =>
+			sql.unsafe(
+				s,
+				p.map((value, i) =>
+					!Array.isArray(value)
+						? value
+						: types[i] === 1007
+							? `{${value.join(',')}}`
+							: sql.array(
+									value,
+									({ 1009: 'text', 1022: 'float8' } as Record<number, string>)[
+										types[i]!
+									],
+								),
+				),
+			),
 		transaction: async (fn) => {
 			await sql.begin((tx: any) => fn(bunTx(tx)));
 		},
@@ -620,11 +660,22 @@ async function denoPostgres(o: DriverOptions): Promise<Driver> {
 
 /** Opens one connection, runs `select 1`, closes it: the connect cost of each client. */
 export async function connectOnce(name: string, t: Target): Promise<void> {
-	const base = name.replace(/-(named|noprep|lossless|nopipe|default)$/, '');
+	const base = name.replace(
+		/-(named|noprep|lossless|nopipe|default|candidate)$/,
+		'',
+	);
 	const ca = t.caFile ? readFileSync(t.caFile, 'utf8') : undefined;
 	switch (base) {
 		case 'quarry': {
-			const d = await import(QUARRY_DIST);
+			const dist =
+				name === 'quarry-candidate'
+					? process.env['QUARRY_DIST_CANDIDATE']
+					: QUARRY_DIST;
+			if (dist === undefined)
+				throw new Error('QUARRY_DIST_CANDIDATE is not set');
+			const d = await import(
+				dist.startsWith('/') ? new URL(`file://${dist}`).href : dist
+			);
 			const conn = await d.connect({
 				host: t.host,
 				port: t.port,

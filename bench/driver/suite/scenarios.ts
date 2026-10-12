@@ -31,6 +31,13 @@ export interface OpsScenario {
 	readonly warmupOps?: number;
 	readonly minOps?: number;
 	readonly maxOps?: number;
+	/**
+	 * Equal-work memory: peak RSS after exactly this many operations (and a
+	 * fixed warm-up), measured in its own process. The time-window peak
+	 * depends on how many operations fit in the window, so faster clients
+	 * allocate more within it.
+	 */
+	readonly memOps?: number;
 	setup?(d: Driver, ctx: Ctx): Promise<void>;
 	op(d: Driver, i: number, ctx: Ctx): Promise<unknown>;
 	check?(result: unknown, i: number): void;
@@ -163,6 +170,22 @@ function unnestParams(n: number): unknown[] {
 	];
 }
 
+/** The same rows as `unnestParams`, as JS arrays: what quarry's query builder passes. */
+function unnestJsParams(n: number): unknown[] {
+	return [
+		Array.from({ length: n }, (_, i) => `bulk row ${i}`),
+		Array.from({ length: n }, (_, i) => i / 10),
+		'2024-01-01 00:00:00+00',
+	];
+}
+/** text[], float8[]: the types quarry's builder declares for these parameters. */
+const UNNEST_TYPES = [1009, 1022, 0];
+const typed = (d: Driver, sql: string, params: unknown[], types: number[]) =>
+	d.queryTyped ? d.queryTyped(sql, params, types) : d.query(sql, params);
+const ANY_SQL =
+	'select id, name from bench_users where id = any($1) order by id';
+const INT4_ARRAY = 1007;
+
 const MULTI = 100;
 const MULTI_SQL = `insert into bench_writes (name, score, created) values ${Array.from({ length: MULTI }, (_, i) => `($${i * 3 + 1}, $${i * 3 + 2}, $${i * 3 + 3})`).join(', ')}`;
 const multiParams = () =>
@@ -240,46 +263,49 @@ export const SCENARIOS: Scenario[] = [
 		'fetch 100k rows',
 		'select * from bench_users where id <= 100000',
 		100_000,
-		{ durationMs: 2000, minOps: 5 },
+		{ durationMs: 2000, minOps: 5, memOps: 5 },
 	),
 	read(
 		'fetch1m',
 		'fetch 1M rows (one result)',
 		'select * from bench_users',
 		1_000_000,
-		{ durationMs: 3000, minOps: 3, warmupMs: 0, warmupOps: 1 },
+		{ durationMs: 3000, minOps: 3, warmupMs: 0, warmupOps: 1, memOps: 3 },
 	),
 	read(
 		'wide',
 		'wide rows: 1k rows × 100 columns',
 		'select * from bench_wide order by id',
 		1000,
-		{ valuesPerOp: 100_000 },
+		{ valuesPerOp: 100_000, memOps: 50 },
 	),
 	read(
 		'large-text',
 		'large values: 10 × 1 MB text',
 		`select id, t from bench_large where kind = 'text' order by id`,
 		10,
+		{ memOps: 20 },
 	),
 	read(
 		'large-bytea',
 		'large values: 10 × 1 MB bytea',
 		`select id, b from bench_large where kind = 'bytea' order by id`,
 		10,
+		{ memOps: 20 },
 	),
 	read(
 		'large-jsonb',
 		'large values: 20 × 200 KB jsonb',
 		`select id, j from bench_large where kind = 'jsonb' order by id`,
 		20,
+		{ memOps: 10 },
 	),
 	read(
 		'arrays',
 		'arrays: 1k rows of int4[100] + text[20]',
 		'select ints, texts from bench_arrays order by id',
 		1000,
-		{ valuesPerOp: 120_000 },
+		{ valuesPerOp: 120_000, memOps: 50 },
 	),
 	...TYPE_COLUMNS.map((col) =>
 		read(
@@ -371,6 +397,55 @@ export const SCENARIOS: Scenario[] = [
 			await d.query(UNNEST, unnestParams(10_000));
 			return writesContent(d);
 		},
+	},
+	{
+		kind: 'ops',
+		id: 'bulk-unnest-js',
+		group: 'writes',
+		title: 'bulk insert 10k rows (unnest, JS array parameters)',
+		rowsPerOp: 10_000,
+		minOps: 5,
+		setup: async (d, ctx) => {
+			await truncateWrites(d);
+			ctx.data['params'] = unnestJsParams(10_000);
+		},
+		op: (d, _i, ctx) =>
+			typed(d, UNNEST, ctx.data['params'] as unknown[], UNNEST_TYPES),
+		verify: async (d) => {
+			await truncateWrites(d);
+			await typed(d, UNNEST, unnestJsParams(10_000), UNNEST_TYPES);
+			return writesContent(d);
+		},
+	},
+	{
+		kind: 'ops',
+		id: 'bulk-unnest-js1k',
+		group: 'writes',
+		title: 'bulk insert 1k rows (unnest, JS array parameters)',
+		rowsPerOp: 1_000,
+		minOps: 5,
+		setup: async (d, ctx) => {
+			await truncateWrites(d);
+			ctx.data['params'] = unnestJsParams(1_000);
+		},
+		op: (d, _i, ctx) =>
+			typed(d, UNNEST, ctx.data['params'] as unknown[], UNNEST_TYPES),
+		verify: async (d) => {
+			await truncateWrites(d);
+			await typed(d, UNNEST, unnestJsParams(1_000), UNNEST_TYPES);
+			return writesContent(d);
+		},
+	},
+	{
+		kind: 'ops',
+		id: 'any1000-js',
+		group: 'params',
+		title: 'id = any($1) with 1000 ids (JS array), 1000 rows',
+		rowsPerOp: 1000,
+		op: (d, i) => typed(d, ANY_SQL, [inParams(1000, i)], [INT4_ARRAY]),
+		check: count(1000),
+		verify: (d) =>
+			typed(d, ANY_SQL, [inParams(1000, 7)], [INT4_ARRAY]).then(canonRows),
 	},
 	{
 		kind: 'ops',
@@ -499,6 +574,7 @@ export const SCENARIOS: Scenario[] = [
 		minOps: 3,
 		warmupMs: 0,
 		warmupOps: 1,
+		memOps: 3,
 		op: async (d) => {
 			let n = 0;
 			await d.stream!('select * from bench_users', [], 1000, (batch) => {

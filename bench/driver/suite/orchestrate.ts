@@ -31,7 +31,7 @@ import {
 	type BenchEnv,
 } from './env.ts';
 import { DRIVERS, defaultTarget, type Target } from './drivers.ts';
-import { SCENARIOS } from './scenarios.ts';
+import { byId, SCENARIOS } from './scenarios.ts';
 import type { Job } from './worker.ts';
 
 const args = process.argv.slice(2);
@@ -60,6 +60,8 @@ const ONLY_DRIVERS = list('only-drivers');
 const ONLY_SCENARIOS = list('only-scenarios');
 const ID =
 	arg('id') ?? new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+/** Set to a built `dist/driver/index.js` to add a `quarry-candidate` twin of every quarry cell. */
+const CANDIDATE = process.env['QUARRY_DIST_CANDIDATE'];
 const OUT = join(import.meta.dirname, 'results', ID);
 
 /** The main clients per runtime; every scenario runs on each. */
@@ -127,6 +129,8 @@ interface Cell {
 	readonly pipeline?: number;
 	readonly rtt?: number;
 	readonly durationMs?: number;
+	/** Equal-work memory cell: exactly this many operations (see `memOps` in scenarios.ts). */
+	readonly memOps?: number;
 }
 
 const cellKey = (c: Cell) =>
@@ -140,6 +144,8 @@ const cellKey = (c: Cell) =>
 		c.concurrency ?? null,
 		c.pipeline ?? null,
 		c.rtt ?? null,
+		// only when set, so keys of earlier results stay valid for --id resumes
+		...(c.memOps === undefined ? [] : [c.memOps]),
 	]);
 const keep = (driver: string, scenario: string) =>
 	(!ONLY_DRIVERS || ONLY_DRIVERS.includes(driver)) &&
@@ -147,12 +153,25 @@ const keep = (driver: string, scenario: string) =>
 
 function matrix(phase: string): Cell[] {
 	const cells: Cell[] = [];
-	const add = (c: Cell) => {
+	const push = (c: Cell) => {
 		if (
 			keep(c.driver, c.scenario) &&
 			DRIVERS[c.driver]?.runtimes.includes(c.runtime)
 		)
 			cells.push(c);
+	};
+	const add = (c: Cell) => {
+		push(c);
+		// equal-work memory twin, in its own process
+		const s = byId.get(c.scenario);
+		if (c.phase === 'main' && s?.kind === 'ops' && s.memOps !== undefined)
+			push({ ...c, memOps: s.memOps });
+		// A/B: every quarry cell again with the candidate build
+		if (CANDIDATE && c.driver === 'quarry') {
+			push({ ...c, driver: 'quarry-candidate' });
+			if (c.phase === 'main' && s?.kind === 'ops' && s.memOps !== undefined)
+				push({ ...c, driver: 'quarry-candidate', memOps: s.memOps });
+		}
 	};
 	for (const runtime of RUNTIMES) {
 		const core = CORE[runtime] ?? [];
@@ -226,6 +245,8 @@ function matrix(phase: string): Cell[] {
 				['pk', 1, 100],
 				['fetch1k', 10],
 				['tx-insert', 10],
+				['tx-empty', 10],
+				['savepoints', 10],
 				['insert1-c50', 10],
 				['connect-plain-trust', 10],
 			];
@@ -367,6 +388,7 @@ async function runCell(
 		durationMs: QUICK ? 150 : cell.durationMs,
 		warmupMs: QUICK ? 50 : undefined,
 		verify,
+		memOps: cell.memOps,
 	};
 	const [cmd, ...rest] = command(cell.runtime, JSON.stringify(job));
 	const child = spawn(cmd!, rest, {

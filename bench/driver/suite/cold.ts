@@ -17,7 +17,10 @@ let query: () => Promise<unknown>;
 let end: () => Promise<unknown>;
 switch (driver) {
 	case 'quarry': {
-		const { createPool } = await import('../../../dist/driver/index.js');
+		const dist =
+			process.env['QUARRY_DIST'] ??
+			new URL('../../../dist/driver/index.js', import.meta.url).href;
+		const { createPool } = await import(dist);
 		const pool = createPool({
 			connectionString: url,
 			ssl: 'disable',

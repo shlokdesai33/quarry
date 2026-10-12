@@ -28,6 +28,8 @@ export interface Job {
 	readonly durationMs?: number | undefined;
 	readonly warmupMs?: number | undefined;
 	readonly verify?: boolean | undefined;
+	/** Equal-work memory: exactly this many measured operations, after a fixed warm-up. */
+	readonly memOps?: number | undefined;
 }
 
 export interface CellResult {
@@ -190,10 +192,15 @@ async function runOps(
 	ctx: Ctx,
 ): Promise<CellResult> {
 	const concurrency = job.concurrency ?? s.concurrency ?? 1;
-	const durationMs = job.durationMs ?? s.durationMs ?? 1000;
-	const warmupMs = job.warmupMs ?? s.warmupMs ?? 500;
-	const minOps = s.minOps ?? 10;
-	const maxOps = s.maxOps ?? Number.POSITIVE_INFINITY;
+	const equalWork = job.memOps !== undefined;
+	// equal work: no time-based warm-up or window, only operation counts
+	const durationMs = equalWork ? 0 : (job.durationMs ?? s.durationMs ?? 1000);
+	const warmupMs = equalWork ? 0 : (job.warmupMs ?? s.warmupMs ?? 500);
+	const warmupOps = Math.max(s.warmupOps ?? 3, Math.min(concurrency, 3));
+	const minOps = job.memOps ?? s.minOps ?? 10;
+	const maxOps = equalWork
+		? warmupOps + job.memOps!
+		: (s.maxOps ?? Number.POSITIVE_INFINITY);
 	await s.setup?.(d, ctx);
 	let seq = 0;
 	const loopFor = async (
@@ -219,7 +226,7 @@ async function runOps(
 		return { done, elapsed: performance.now() - start };
 	};
 	// warm-up: JIT, prepared statements, every pool connection opened
-	await loopFor(warmupMs, Math.max(s.warmupOps ?? 3, Math.min(concurrency, 3)));
+	await loopFor(warmupMs, warmupOps);
 	gcNow();
 	let lat = new Float64Array(1 << 14);
 	let n = 0;

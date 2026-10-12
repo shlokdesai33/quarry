@@ -355,33 +355,38 @@ export async function startEnv(
 	pinned(CPUS.proxies, '/usr/sbin/pgbouncer', [join(dir, 'pgbouncer.ini')]);
 
 	const bin = process.env['BENCH_BIN'] ?? join(homedir(), 'benchbin');
-	await killPort(PORTS.toxiproxyApi);
-	pinned(CPUS.proxies, join(bin, 'toxiproxy-server'), [
-		'-host',
-		'127.0.0.1',
-		'-port',
-		String(PORTS.toxiproxyApi),
-	]);
-	await killPort(PORTS.wsproxy);
-	pinned(CPUS.proxies, join(bin, 'wsproxy'), [], {
-		LISTEN_PORT: `127.0.0.1:${PORTS.wsproxy}`,
-		PROMETHEUS_BIND: '127.0.0.1:0',
-		ALLOW_ADDR_REGEX: '',
-		LOG_CONN_INFO: 'false',
-	});
-	await Promise.all([
-		waitForPort(PORTS.bouncer),
-		waitForPort(PORTS.toxiproxyApi),
-		waitForPort(PORTS.wsproxy),
-	]);
-	await toxiproxy('POST', '/proxies', {
-		name: 'pg',
-		listen: `127.0.0.1:${PORTS.toxiproxy}`,
-		upstream: `127.0.0.1:${PORTS.postgres}`,
-		enabled: true,
-	}).catch(() => {});
-	await setLatency(0);
-	await waitForPort(PORTS.toxiproxy);
+	// BENCH_NO_PROXIES skips Toxiproxy and wsproxy (no RTT phases, no Neon), e.g. for quick local A/B runs
+	if (process.env['BENCH_NO_PROXIES']) {
+		await waitForPort(PORTS.bouncer);
+	} else {
+		await killPort(PORTS.toxiproxyApi);
+		pinned(CPUS.proxies, join(bin, 'toxiproxy-server'), [
+			'-host',
+			'127.0.0.1',
+			'-port',
+			String(PORTS.toxiproxyApi),
+		]);
+		await killPort(PORTS.wsproxy);
+		pinned(CPUS.proxies, join(bin, 'wsproxy'), [], {
+			LISTEN_PORT: `127.0.0.1:${PORTS.wsproxy}`,
+			PROMETHEUS_BIND: '127.0.0.1:0',
+			ALLOW_ADDR_REGEX: '',
+			LOG_CONN_INFO: 'false',
+		});
+		await Promise.all([
+			waitForPort(PORTS.bouncer),
+			waitForPort(PORTS.toxiproxyApi),
+			waitForPort(PORTS.wsproxy),
+		]);
+		await toxiproxy('POST', '/proxies', {
+			name: 'pg',
+			listen: `127.0.0.1:${PORTS.toxiproxy}`,
+			upstream: `127.0.0.1:${PORTS.postgres}`,
+			enabled: true,
+		}).catch(() => {});
+		await setLatency(0);
+		await waitForPort(PORTS.toxiproxy);
+	}
 
 	const url = (port: number) =>
 		`postgres://${USERS.trust}@127.0.0.1:${port}/${USERS.database}`;

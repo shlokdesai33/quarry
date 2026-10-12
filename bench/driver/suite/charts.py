@@ -29,6 +29,7 @@ SHORT = {
 
 COLORS = {
     "quarry": "#d62728",
+    "quarry-candidate": "#ff9f9a",
     "quarry-lossless": "#ff9896",
     "quarry-noprep": "#e377c2",
     "quarry-nopipe": "#8c564b",
@@ -46,13 +47,14 @@ COLORS = {
     "deno-postgres": "#c7c7c7",
 }
 ORDER = list(COLORS)
-CORE = ["quarry", "pg", "pg-named", "pg-native", "postgres.js", "neon", "bun.sql", "deno-postgres-nodelay"]
+CORE = ["quarry", "quarry-candidate", "pg", "pg-named", "pg-native", "postgres.js", "neon", "bun.sql", "deno-postgres-nodelay"]
 RT = {"node": "Node 24", "bun": "Bun 1.4", "deno": "Deno 2.9"}
 plt.rcParams.update({"figure.dpi": 130, "font.size": 9, "axes.grid": True, "grid.alpha": 0.3, "axes.axisbelow": True})
 written = []
 
 
 def find(phase, runtime, driver, scenario, **kw):
+    kw.setdefault("memOps", None)  # equal-work memory cells only when asked for
     for c in cells:
         if c["phase"] != phase or c["runtime"] != runtime or c["driver"] != driver or c["scenario"] != scenario:
             continue
@@ -82,6 +84,12 @@ def drivers_in(phase, runtime, core_only=True):
 
 
 def save(fig, name):
+    # a partial run may leave panels without data, which log scales reject
+    for ax in fig.axes:
+        has = any(b.get_height() > 0 for b in ax.patches) or any(len(line.get_ydata()) for line in ax.lines)
+        if not has:
+            ax.set_yscale("linear")
+            ax.set_xscale("linear")
     path = os.path.join(out, name)
     fig.tight_layout()
     fig.savefig(path)
@@ -110,7 +118,8 @@ def grouped_bars(ax, groups, drivers, getter, ylabel, log=False, errs=None):
         ax.bar(xs, ys, width, label=labels.get(d, d), color=COLORS.get(d), yerr=[es_lo, es_hi] if errs else None, capsize=1.5, error_kw={"lw": 0.6})
     ax.set_xticks(range(len(groups)))
     ax.set_ylabel(ylabel)
-    if log:
+    # a partial run may have no data for this panel
+    if log and any(b.get_height() > 0 for b in ax.patches):
         ax.set_yscale("log")
 
 
@@ -239,9 +248,15 @@ save(fig, "large-results.png")
 fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 for ax, runtime in zip(axes, ["node", "bun", "deno"]):
     ds = drivers_in("main", runtime)
-    grouped_bars(ax, ["pk", "fetch100k", "fetch1m", "stream1m", "stream-slow"], ds, lambda s, d: (find("main", runtime, d, s), val(find("main", runtime, d, s), "rssPeakMB")), "peak RSS (MB)")
-    ax.set_xticklabels(["point lookup\n(baseline)", "fetch 100k", "fetch 1M\n(one result)", "stream 1M\n(cursor)", "stream 200k\nslow consumer"], fontsize=7)
-    ax.set_title(f"{RT[runtime]}: peak process RSS")
+    def mem(s, d):
+        # equal work where the scenario has it, else the time-window figure
+        ops = summary["scenarios"][s].get("memOps")
+        c = find("main", runtime, d, s, memOps=ops) if ops else None
+        c = c or find("main", runtime, d, s)
+        return c, val(c, "rssPeakMB")
+    grouped_bars(ax, ["pk", "fetch100k", "fetch1m", "stream1m", "stream-slow"], ds, mem, "peak RSS (MB)")
+    ax.set_xticklabels(["point lookup\n(baseline)", "fetch 100k\n(× 5)", "fetch 1M\n(× 3)", "stream 1M\n(× 3)", "stream 200k\nslow consumer"], fontsize=7)
+    ax.set_title(f"{RT[runtime]}: peak RSS, equal work (× ops)")
     ax.legend(fontsize=6.5)
 save(fig, "memory.png")
 

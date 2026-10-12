@@ -26,6 +26,7 @@ interface Raw {
 		concurrency?: number;
 		pipeline?: number;
 		rtt?: number;
+		memOps?: number;
 	};
 	run: number;
 	result: Record<string, any>;
@@ -128,6 +129,7 @@ const keyOf = (c: Raw['cell']) =>
 		c.concurrency ?? '',
 		c.pipeline ?? '',
 		c.rtt ?? '',
+		c.memOps ?? '',
 	].join('|');
 
 interface Agg {
@@ -190,6 +192,8 @@ function get(
 		)
 			continue;
 		if ((extra.rtt ?? null) !== (c.rtt ?? null) && 'rtt' in extra) continue;
+		// equal-work memory cells only when asked for
+		if ((extra.memOps ?? null) !== (c.memOps ?? null)) continue;
 		return a;
 	}
 	return undefined;
@@ -199,6 +203,7 @@ function get(
 
 const LABEL: Record<string, string> = {
 	quarry: 'quarry',
+	'quarry-candidate': 'quarry (candidate)',
 	'quarry-lossless': 'quarry (lossless)',
 	'quarry-noprep': 'quarry (prepare: false)',
 	'quarry-nopipe': 'quarry (pipeline: false)',
@@ -342,6 +347,7 @@ const driversIn = (phase: string, runtime: string) => {
 };
 const CORE = new Set([
 	'quarry',
+	'quarry-candidate',
 	'pg',
 	'pg-named',
 	'pg-native',
@@ -432,6 +438,7 @@ const LAT_SCENARIOS = [
 	'fetch1k',
 	'params100',
 	'params1000',
+	'any1000-js',
 	'insert1',
 	'insert-multi100',
 	'update',
@@ -452,6 +459,8 @@ const BIG = [
 	'large-jsonb',
 	'arrays',
 	'bulk-unnest',
+	'bulk-unnest-js',
+	'bulk-unnest-js1k',
 	'bulk-copy',
 	'stream1m',
 	'stream-slow',
@@ -553,6 +562,8 @@ for (const runtime of RUNTIMES) {
 				'arrays',
 				'stream1m',
 				'bulk-unnest',
+				'bulk-unnest-js',
+				'bulk-unnest-js1k',
 				'bulk-copy',
 			].map((s) => ({
 				label: title(s),
@@ -570,7 +581,27 @@ for (const runtime of RUNTIMES) {
 	);
 	out.push(
 		table(
-			`${RT[runtime]}: peak RSS (MB) during the scenario`,
+			`${RT[runtime]}: peak RSS (MB) at equal work (the same number of operations for every client, after the same warm-up)`,
+			'Scenario',
+			SCENARIOS.filter((s) => s.kind === 'ops' && s.memOps !== undefined).map(
+				(s) => ({
+					label: `${s.title} × ${(s as { memOps?: number }).memOps}`,
+					pick: (driver: string) =>
+						metric('rssPeakMB')(
+							get('main', runtime, driver, s.id, {
+								memOps: (s as { memOps?: number }).memOps,
+							}),
+						),
+				}),
+			),
+			drivers,
+			(v) => fmtNum(v, 0),
+			true,
+		),
+	);
+	out.push(
+		table(
+			`${RT[runtime]}: peak RSS (MB) within the time window (secondary: faster clients do more operations in the window, so this favours slower ones)`,
 			'Scenario',
 			[
 				'pk',
@@ -628,13 +659,15 @@ for (const runtime of RUNTIMES) {
 	);
 	out.push(
 		table(
-			`${RT[runtime]}: writes, operations/s (bulk rows: batches of 10k rows per second)`,
+			`${RT[runtime]}: writes, operations/s (bulk rows: batches per second)`,
 			'Scenario',
 			[
 				'insert1',
 				'insert1-c50',
 				'insert-multi100',
 				'bulk-unnest',
+				'bulk-unnest-js',
+				'bulk-unnest-js1k',
 				'bulk-copy',
 				'update',
 				'upsert',
@@ -1292,6 +1325,7 @@ summary['scenarios'] = Object.fromEntries(
 			title: s.title,
 			group: s.group,
 			rowsPerOp: (s as { rowsPerOp?: number }).rowsPerOp ?? null,
+			memOps: (s as { memOps?: number }).memOps ?? null,
 		},
 	]),
 );

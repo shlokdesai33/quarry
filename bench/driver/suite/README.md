@@ -54,11 +54,13 @@ Useful options for `orchestrate.ts`:
 
 Results append to `results/<id>/raw.jsonl` as each cell finishes, so re-running with the same `--id` resumes where it stopped. `results/` is gitignored; `results-snapshots/` keeps the tables, footprint figures and metadata of the published runs.
 
-To compare a change to the driver, build it somewhere else and point `QUARRY_DIST` at its `driver/index.js`; every quarry configuration then uses that build:
+To compare a change to the driver, build it somewhere else and set `QUARRY_DIST_CANDIDATE` to its `driver/index.js`. Every `quarry` cell (and its equal-work memory twin) then gets a `quarry-candidate` twin, measured in the same session and shuffled with everything else:
 
 ```sh
-QUARRY_DIST=/path/to/other/dist/driver/index.js node orchestrate.ts --id candidate --only-drivers quarry
+QUARRY_DIST_CANDIDATE=/path/to/candidate/dist/driver/index.js node orchestrate.ts --id ab --only-drivers quarry,quarry-candidate,pg,postgres.js
 ```
+
+`QUARRY_DIST` replaces the build for every quarry configuration instead (`worker.ts`, `cold.ts`). With `BENCH_NO_PROXIES=1`, `env.ts` starts no Toxiproxy or wsproxy, for quick local A/B runs without the `rtt`, `pipeline` and Neon cells.
 
 To run one cell by hand:
 
@@ -125,7 +127,7 @@ Each client uses its public API, configured as its documentation recommends; `dr
 | `deno-postgres`         | Deno            | `jsr:@db/postgres@0.19.5` Pool, as shipped. It sends each message in its own write without `TCP_NODELAY`, so each query waits for a delayed ACK (~40 ms on Linux).                                                                                                                                         |
 | `deno-postgres-nodelay` | Deno            | The same with `Deno.connect` patched to call `setNoDelay(true)`: its best case, not reachable through its API                                                                                                                                                                                              |
 
-The pool size is 10 everywhere unless a scenario says otherwise. Every client gets the same SQL with `$n` parameters. Array parameters are pre-encoded literals, and COPY data is pre-encoded text, so the comparison covers the client's protocol and decoding work rather than parameter-encoding choices.
+The pool size is 10 everywhere unless a scenario says otherwise. Every client gets the same SQL with `$n` parameters. COPY data is pre-encoded text. Array parameters come two ways: as pre-encoded literals (`bulk-unnest`), so the comparison covers protocol work rather than encoders, and as real JS arrays (`bulk-unnest-js`, `bulk-unnest-js1k`, `any1000-js`), as quarry's query builder passes them. In the JS-array scenarios quarry declares the parameter types (`text[]`, `float8[]`, `int4[]`) like its builder does. Bun.sql gets `sql.array()` for text and float8, and an int4 literal, because `sql.array(…, 'int4')` fails. The other clients encode the arrays themselves.
 
 Features some clients lack are reported as n/a, not as zero:
 
@@ -146,7 +148,7 @@ Resource metrics:
 
 - **Client CPU:** `process.cpuUsage()` over the measured window, all threads, per operation.
 - **Server CPU:** the sum of utime and stime of every `postgres` process, from `/proc`.
-- **Memory:** peak RSS and heap, sampled every 10 ms.
+- **Memory:** peak RSS and heap, sampled every 10 ms. The primary figure is **at equal work**. Scenarios with `memOps` (fetch 100k × 5, fetch 1M × 3, wide × 50, large values, arrays × 50, stream 1M × 3) also run in a separate process for exactly that many operations, after the same fixed warm-up. The time-window peak is kept as a secondary figure. A window favours slower clients: V8 grows the heap about 4× after each mark-compact, so the peak tracks how many results were allocated in the window, not what one result holds.
 - **GC pauses:** from `PerformanceObserver('gc')`, on Node only.
 - **Event-loop lag:** the lateness of a 10 ms timer.
 
