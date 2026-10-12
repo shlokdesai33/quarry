@@ -390,7 +390,8 @@ const expectations: Record<string, Table> = {
 			'requests works after single connect_timeout': {
 				category: 'not-applicable',
 				reason:
-					'changes connect_timeout between attempts through valueOf(); quarry reads its options once',
+					'changes connect_timeout between attempts through valueOf(); quarry reads its options once (through PgBouncer the first connection can beat the 0.1 ms timeout, so it passes there)',
+				flaky: true,
 			},
 			'Catches connection config errors': {
 				category: 'not-applicable',
@@ -509,6 +510,7 @@ const throughBouncer: Record<string, Table> = {
 		'test/integration/client/idle_in_transaction_session_timeout-tests.js': {
 			'*': STARTUP_PARAMETERS,
 		},
+		'test/integration/client/no-data-tests.js': { '*': SESSION_STATE },
 		'test/integration/client/notice-tests.js': { '*': SESSION_STATE },
 		'test/integration/client/prepared-statement-tests.js': {
 			'*': SESSION_STATE,
@@ -550,6 +552,13 @@ const throughBouncer: Record<string, Table> = {
 				reason: 'PgBouncer here listens on TCP only',
 				target: 'bouncer',
 			},
+			'Connection destroyed': {
+				category: 'not-applicable',
+				reason:
+					'timing: races an empty query against end({ timeout: 0 }) on the next tick, which a local PgBouncer can answer first',
+				target: 'bouncer',
+				flaky: true,
+			},
 		},
 	},
 };
@@ -587,11 +596,20 @@ export function classify(
 		return any === undefined ? undefined : { ...any, wildcard: true };
 	};
 	const found = lookup(expectations[suite]?.[file]);
-	if (found !== undefined && !(found.target === 'bouncer' && !bouncer))
-		return found;
-	if (!bouncer) return undefined;
+	const applies =
+		found !== undefined && !(found.target === 'bouncer' && !bouncer);
+	if (!bouncer) return applies ? found : undefined;
+	// a bug fixed here records no category: through PgBouncer the pooler's reason may still apply
+	if (applies && found.category !== undefined) return found;
 	const pooled = lookup(throughBouncer[suite]?.[file]);
-	if (pooled !== undefined) return pooled;
+	if (pooled !== undefined)
+		return applies
+			? {
+					...pooled,
+					...(found.fixed === undefined ? {} : { fixed: found.fixed }),
+				}
+			: pooled;
+	if (applies) return found;
 	return error !== undefined && SESSION_STATE_SYMPTOM.test(error)
 		? { ...SESSION_STATE, flaky: true, wildcard: true }
 		: undefined;
