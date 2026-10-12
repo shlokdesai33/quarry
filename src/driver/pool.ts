@@ -29,8 +29,11 @@ export interface PoolOptions extends ConnectionOptions {
 	/**
 	 * Once every connection is in use, `query`, `simpleQuery` and `describe`
 	 * share connections, pipelining up to this many queries on each (default
-	 * 50; 0 or false to give every query a connection to itself). Reserved
-	 * clients, transactions, cursors and COPY always get their own.
+	 * 50; 0 or false to give every query a connection to itself). Beyond
+	 * that, queries wait in line and take the next free slot. Reserved
+	 * clients, transactions, cursors and COPY always get their own
+	 * connection: while one waits, a shared connection takes no new queries
+	 * and is handed over as soon as the ones in flight finish.
 	 */
 	readonly pipeline?: number | false | undefined;
 	/** Runs on each new connection before it is used, e.g. to set session state. */
@@ -46,7 +49,7 @@ export interface PoolStats {
 	readonly idle: number;
 	/** Connections handed out. */
 	readonly busy: number;
-	/** Callers waiting for a connection. */
+	/** Callers waiting for a connection or a pipeline slot. */
 	readonly waiting: number;
 }
 
@@ -175,7 +178,12 @@ export class Pool implements AsyncDisposable {
 	readonly #idle: Idle[] = [];
 	readonly #busy = new Set<Connection>();
 	readonly #expiresAt = new WeakMap<Connection, number>();
+	/** Callers waiting for a connection of their own (acquire, transaction, cursor, COPY). */
 	readonly #waiters: Waiter[] = [];
+	/** Queries waiting for a pipeline slot on a shared connection. */
+	readonly #sharedWaiters: Waiter[] = [];
+	/** Shared connections taking no new queries, to be handed to a waiter of `#waiters` once idle. */
+	readonly #draining = new Set<Connection>();
 	#opening = 0;
 	#ended = false;
 	#listener: Listener | undefined;
@@ -201,7 +209,7 @@ export class Pool implements AsyncDisposable {
 			total: this.#idle.length + this.#busy.size + this.#opening,
 			idle: this.#idle.length,
 			busy: this.#busy.size,
-			waiting: this.#waiters.length,
+			waiting: this.#waiters.length + this.#sharedWaiters.length,
 		};
 	}
 
@@ -252,7 +260,9 @@ export class Pool implements AsyncDisposable {
 		}
 		this.#busy.delete(connection);
 		this.#shared.delete(connection);
+		this.#draining.delete(connection);
 		this.#serveWaiters();
+		this.#rebalance();
 		this.#fillMin();
 	}
 
@@ -268,7 +278,10 @@ export class Pool implements AsyncDisposable {
 		}
 	}
 
-	/** Hands an available connection to the first waiter, or parks it idle. */
+	/**
+	 * Hands an available connection to the first caller waiting for one of
+	 * their own, else to queries waiting for a slot, or parks it idle.
+	 */
 	#giveBack(connection: Connection): void {
 		if (this.#ended || connection.closed) {
 			connection.destroy();
@@ -280,6 +293,17 @@ export class Pool implements AsyncDisposable {
 			waiter.cleanup();
 			this.#busy.add(connection);
 			waiter.resolve(connection);
+			this.#rebalance();
+			return;
+		}
+		if (this.#sharedWaiters.length > 0 && this.#shareable(connection)) {
+			this.#busy.add(connection);
+			this.#shared.set(connection, 0);
+			// share the queue with connections still opening, so a burst spreads out
+			this.#fillShared(
+				connection,
+				Math.ceil(this.#sharedWaiters.length / (this.#opening + 1)),
+			);
 			return;
 		}
 		const timer =
@@ -301,13 +325,13 @@ export class Pool implements AsyncDisposable {
 	#serveWaiters(): void {
 		while (
 			!this.#ended &&
-			this.#waiters.length > this.#opening &&
+			this.#waiters.length + this.#sharedWaiters.length > this.#opening &&
 			this.#total() < this.#max
 		) {
 			this.#open().then(
 				(connection) => this.#giveBack(connection),
 				(error: unknown) => {
-					const waiter = this.#waiters.shift();
+					const waiter = this.#waiters.shift() ?? this.#sharedWaiters.shift();
 					if (waiter) {
 						waiter.cleanup();
 						waiter.reject(
@@ -316,8 +340,67 @@ export class Pool implements AsyncDisposable {
 								: new ConnectionError(String(error)),
 						);
 					}
+					this.#rebalance();
 				},
 			);
+		}
+	}
+
+	/** Whether a connection can take more pipelined queries. */
+	#shareable(connection: Connection): boolean {
+		return (
+			!connection.closed &&
+			connection.transactionStatus === 'idle' &&
+			!this.#expired(connection)
+		);
+	}
+
+	/** Gives free pipeline slots on a shared connection to queued queries, up to `limit` in flight. */
+	#fillShared(connection: Connection, limit = this.#pipeline): void {
+		let count = this.#shared.get(connection) ?? 0;
+		const cap = Math.min(limit, this.#pipeline);
+		while (
+			count < cap &&
+			this.#sharedWaiters.length > 0 &&
+			!this.#draining.has(connection) &&
+			this.#shareable(connection)
+		) {
+			const waiter = this.#sharedWaiters.shift();
+			if (waiter === undefined) break;
+			waiter.cleanup();
+			this.#shared.set(connection, ++count);
+			waiter.resolve(connection);
+		}
+	}
+
+	/**
+	 * Keeps one shared connection draining for each caller waiting for a
+	 * connection of their own that no opening connection will serve. A
+	 * draining connection takes no new queries, so the waiter gets it once
+	 * the queries already in flight on it finish (at most `pipeline`), however
+	 * many queries keep arriving. The other connections keep pipelining.
+	 */
+	#rebalance(): void {
+		const target =
+			this.#ended || this.#total() < this.#max
+				? 0
+				: Math.max(0, this.#waiters.length - this.#opening);
+		for (const connection of this.#draining) {
+			if (this.#draining.size <= target) break;
+			this.#draining.delete(connection);
+			this.#fillShared(connection);
+		}
+		while (this.#draining.size < target) {
+			let best: Connection | undefined;
+			let fewest = Number.POSITIVE_INFINITY;
+			for (const [connection, count] of this.#shared) {
+				if (count < fewest && !this.#draining.has(connection)) {
+					best = connection;
+					fewest = count;
+				}
+			}
+			if (best === undefined) break;
+			this.#draining.add(best);
 		}
 	}
 
@@ -349,7 +432,15 @@ export class Pool implements AsyncDisposable {
 			);
 		const idle = this.#takeIdle();
 		if (idle !== undefined) return Promise.resolve(idle);
-		if (this.#waiters.length >= this.#maxWaiting) {
+		const waiting = this.#wait(this.#waiters, signal);
+		this.#serveWaiters();
+		this.#rebalance();
+		return waiting;
+	}
+
+	/** Queues a caller; it is resolved with a connection by `#giveBack` or `#fillShared`. */
+	#wait(queue: Waiter[], signal: AbortSignal | undefined): Promise<Connection> {
+		if (this.#waiters.length + this.#sharedWaiters.length >= this.#maxWaiting) {
 			return Promise.reject(
 				new DriverError(
 					`Too many callers waiting for a connection (maxWaiting ${this.#maxWaiting})`,
@@ -367,11 +458,12 @@ export class Pool implements AsyncDisposable {
 				},
 			};
 			const remove = (error: Error) => {
-				const index = this.#waiters.indexOf(waiter);
+				const index = queue.indexOf(waiter);
 				if (index < 0) return;
-				this.#waiters.splice(index, 1);
+				queue.splice(index, 1);
 				waiter.cleanup();
 				reject(error);
+				this.#rebalance();
 			};
 			const onAbort = () =>
 				remove(
@@ -392,8 +484,7 @@ export class Pool implements AsyncDisposable {
 				);
 			}
 			signal?.addEventListener('abort', onAbort, { once: true });
-			this.#waiters.push(waiter);
-			this.#serveWaiters();
+			queue.push(waiter);
 		});
 	}
 
@@ -446,14 +537,13 @@ export class Pool implements AsyncDisposable {
 
 	/**
 	 * A connection already lent out for queries that can take one more: the
-	 * least loaded, and only once the pool is full and nobody is waiting for
-	 * a connection of their own.
+	 * least loaded, once the pool is full and no query is queued ahead.
 	 */
 	#pickShared(): Connection | undefined {
 		if (
 			this.#pipeline <= 1 ||
 			this.#idle.length > 0 ||
-			this.#waiters.length > 0 ||
+			this.#sharedWaiters.length > 0 ||
 			this.#total() < this.#max
 		) {
 			return undefined;
@@ -463,9 +553,8 @@ export class Pool implements AsyncDisposable {
 		for (const [connection, count] of this.#shared) {
 			if (
 				count < fewest &&
-				!connection.closed &&
-				connection.transactionStatus === 'idle' &&
-				!this.#expired(connection)
+				!this.#draining.has(connection) &&
+				this.#shareable(connection)
 			) {
 				best = connection;
 				fewest = count;
@@ -474,29 +563,42 @@ export class Pool implements AsyncDisposable {
 		return best;
 	}
 
-	/** Runs `fn` on a shareable connection: pipelined onto a busy one when the pool is full. */
+	/**
+	 * Runs `fn` on a shareable connection: an idle one, else pipelined onto a
+	 * busy one when the pool is full, else the next free slot in line.
+	 */
 	async #withShared<T>(
 		signal: AbortSignal | undefined,
 		fn: (connection: Connection) => Promise<T>,
 	): Promise<T> {
-		if (this.#pipeline <= 1) return this.#with(signal, fn);
-		// registered before any await, so queries issued in the same tick see it
-		const ready = signal?.aborted
-			? undefined
-			: (this.#pickShared() ?? this.#takeIdle());
-		const connection = ready ?? (await this.#take(signal));
-		this.#shared.set(connection, (this.#shared.get(connection) ?? 0) + 1);
+		if (this.#pipeline <= 1 || signal?.aborted || this.#ended)
+			return this.#with(signal, fn);
+		// claimed before any await, so queries issued in the same tick see it
+		let connection = this.#takeIdle() ?? this.#pickShared();
+		if (connection !== undefined) {
+			this.#shared.set(connection, (this.#shared.get(connection) ?? 0) + 1);
+		} else {
+			// a slot handed over by #fillShared is already counted
+			const waiting = this.#wait(this.#sharedWaiters, signal);
+			this.#serveWaiters();
+			connection = await waiting;
+		}
 		try {
 			return await fn(connection);
 		} finally {
-			const left = (this.#shared.get(connection) ?? 1) - 1;
-			if (left > 0) {
-				this.#shared.set(connection, left);
-			} else {
-				this.#shared.delete(connection);
-				this.#release(connection, false);
-			}
+			this.#done(connection);
 		}
+	}
+
+	/** Frees a query's slot: straight to the next queued query, or back to the pool when the last one ends. */
+	#done(connection: Connection): void {
+		const left = (this.#shared.get(connection) ?? 1) - 1;
+		this.#shared.set(connection, left);
+		this.#fillShared(connection);
+		if ((this.#shared.get(connection) ?? 0) > 0) return;
+		this.#shared.delete(connection);
+		this.#draining.delete(connection);
+		this.#release(connection, false);
 	}
 
 	query<R = Record<string, unknown>>(
@@ -616,10 +718,14 @@ export class Pool implements AsyncDisposable {
 	async end(options: { timeout?: number } = {}): Promise<void> {
 		if (this.#ended) return;
 		this.#ended = true;
-		for (const waiter of this.#waiters.splice(0)) {
+		for (const waiter of [
+			...this.#waiters.splice(0),
+			...this.#sharedWaiters.splice(0),
+		]) {
 			waiter.cleanup();
 			waiter.reject(new DriverError('The pool has ended'));
 		}
+		this.#draining.clear();
 		const idle = this.#idle.splice(0);
 		await Promise.all([
 			...idle.map(async ({ connection, timer }) => {

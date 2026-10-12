@@ -13,9 +13,22 @@ import {
 import { connect } from '../../../src/driver/connect.js';
 import { createPool, type PoolOptions } from '../../../src/driver/pool.js';
 import { TransactionRolledBack } from '../../../src/driver/transaction.js';
-import { noPg, open, options, rejection, table } from './helpers.js';
+import {
+	noPg,
+	open,
+	options,
+	rejection,
+	slowSockets,
+	table,
+} from './helpers.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** How long `work` takes, in milliseconds. */
+const waited = async (work: () => Promise<unknown>) => {
+	const started = performance.now();
+	await work();
+	return performance.now() - started;
+};
 const pool = (overrides: PoolOptions = {}) =>
 	createPool({ ...options(), ...overrides });
 
@@ -337,6 +350,131 @@ describe.skipIf(noPg)('pool', () => {
 			...busy,
 		]);
 		expect(order).toEqual(['acquired', 'later query']);
+	});
+
+	it('keeps pipelining one connection when callers outnumber `pipeline`', async () => {
+		const net = slowSockets(10);
+		await using p = pool({ max: 1, pipeline: 10, socket: net.factory });
+		await p.query('select $1::int as v', [0]);
+		net.reset();
+		const started = performance.now();
+		const values = await Promise.all(
+			Array.from({ length: 200 }, async (_, i) => {
+				const { rows } = await p.query<{ v: number }>('select $1::int as v', [
+					i,
+				]);
+				return rows[0]?.v;
+			}),
+		);
+		const elapsed = performance.now() - started;
+		expect(values).toEqual(Array.from({ length: 200 }, (_, i) => i));
+		expect(net.maxInFlight()).toBe(10);
+		// 10 per 10 ms round trip: ~200 ms; one query per round trip would take ~2 s
+		expect(elapsed).toBeLessThan(1000);
+		expect(p.stats).toMatchObject({ total: 1, idle: 1, busy: 0, waiting: 0 });
+	});
+
+	it('keeps pipelining under sustained load beyond max × pipeline', async () => {
+		const net = slowSockets(10);
+		await using p = pool({ max: 2, socket: net.factory });
+		await Promise.all([p.query('select 1'), p.query('select 1')]);
+		while (p.stats.idle < 2) await sleep(5);
+		await p.query('select $1::int as v', [0]);
+		net.reset();
+		let maxWaiting = 0;
+		const started = performance.now();
+		// 150 callers, 4 queries each, on 2 connections × 50
+		await Promise.all(
+			Array.from({ length: 150 }, async (_, caller) => {
+				for (let k = 0; k < 4; k++) {
+					const v = caller * 4 + k;
+					const query = p.query<{ v: number }>('select $1::int as v', [v]);
+					maxWaiting = Math.max(maxWaiting, p.stats.waiting);
+					expect((await query).rows[0]?.v).toBe(v);
+				}
+			}),
+		);
+		const elapsed = performance.now() - started;
+		expect(maxWaiting).toBeGreaterThan(0);
+		expect(net.maxInFlight()).toBe(50);
+		// ~100 per 10 ms round trip: ~60 ms; one query per round trip per connection once anyone waits would take ~3 s
+		expect(elapsed).toBeLessThan(1000);
+		expect(p.stats).toMatchObject({ total: 2, idle: 2, busy: 0, waiting: 0 });
+	});
+
+	it('hands connections to transactions, clients and cursors under sustained load', async () => {
+		const net = slowSockets(5);
+		await using p = pool({
+			max: 2,
+			pipeline: 8,
+			acquireTimeout: 5000,
+			socket: net.factory,
+		});
+		await Promise.all([p.query('select 1'), p.query('select 1')]);
+		const state = { running: true };
+		let completed = 0;
+		const load = Promise.all(
+			Array.from({ length: 60 }, async () => {
+				while (state.running) {
+					await p.query('select 1');
+					completed++;
+				}
+			}),
+		);
+		await sleep(50);
+		const [transaction, acquired, cursor] = await Promise.all([
+			waited(() => p.transaction((tx) => tx.query('select 1'))),
+			waited(async () => {
+				const client = await p.acquire();
+				// held while the load keeps pipelining on the other connection
+				const before = completed;
+				await sleep(100);
+				expect(completed - before).toBeGreaterThan(30);
+				client.release();
+			}),
+			waited(async () => {
+				let n = 0;
+				for await (const row of p.stream<{ n: number }>(
+					'select generate_series(1, 10) as n',
+				))
+					n += row.n;
+				expect(n).toBe(55);
+			}),
+		]);
+		state.running = false;
+		await load;
+		// each waited for the queries already in flight, not for the load to stop
+		expect(transaction).toBeLessThan(1000);
+		expect(acquired).toBeLessThan(1500);
+		expect(cursor).toBeLessThan(1500);
+		expect(net.maxInFlight()).toBeLessThanOrEqual(8);
+		expect(p.stats).toMatchObject({ total: 2, busy: 0, waiting: 0 });
+		// and both connections pipeline again afterwards
+		net.reset();
+		await Promise.all(Array.from({ length: 64 }, () => p.query('select 1')));
+		expect(net.maxInFlight()).toBe(8);
+	});
+
+	it('times out and aborts queries waiting for a pipeline slot', async () => {
+		await using p = pool({ max: 1, pipeline: 2, acquireTimeout: 100 });
+		await p.query('select 1');
+		const busy = [
+			p.query('select pg_sleep(0.3)'),
+			p.query('select pg_sleep(0.3)'),
+		];
+		const timedOut = rejection(p.query('select 1'), ConnectionError);
+		const controller = new AbortController();
+		const aborted = p.query('select 1', [], { signal: controller.signal });
+		const queued = rejection(p.query('select 2 as x'), ConnectionError);
+		controller.abort();
+		await expect(aborted).rejects.toBeInstanceOf(AbortError);
+		expect((await timedOut).code).toBe('ETIMEDOUT');
+		await Promise.all(busy);
+		expect((await queued).code).toBe('ETIMEDOUT');
+		expect((await p.query<{ x: number }>('select 3 as x')).rows).toEqual([
+			{ x: 3 },
+		]);
+		expect(p.stats).toMatchObject({ total: 1, busy: 0, waiting: 0 });
 	});
 
 	it('times out, aborts and limits waiting acquires', async () => {
