@@ -9,7 +9,7 @@ import {
 import { Connection } from './connection.js';
 import { ConnectionError, PostgresError } from './errors.js';
 import { cloudflareSockets, isCloudflareWorkers } from './cloudflare-socket.js';
-import { nodeSockets } from './node-socket.js';
+import { nodeSockets, preloadNodeSockets } from './node-socket.js';
 import * as fe from './protocol/frontend.js';
 import type {
 	DriverSocket,
@@ -41,6 +41,15 @@ export async function connect(
 /** `cloudflare:sockets` on Cloudflare Workers; Node's `net`/`tls` elsewhere (Node, Bun, Deno). */
 function defaultSockets(): SocketFactory {
 	return isCloudflareWorkers() ? cloudflareSockets : nodeSockets;
+}
+
+/** Loads the socket modules a configuration's connections will need, ahead of its first connect. */
+export function preloadSockets(config: ResolvedConfig): void {
+	if (config.socket !== undefined || isCloudflareWorkers()) return;
+	preloadNodeSockets(
+		config.ssl.mode !== 'disable' &&
+			config.hosts.some((host) => !host.host.startsWith('/')),
+	);
 }
 
 /** Opens a connection from a resolved configuration, trying each host in turn. */
@@ -246,12 +255,17 @@ async function attempt(
 	const tls =
 		plan === 'plain' ? undefined : tlsOptions(config, host, plan === 'direct');
 	tls?.catch(() => {});
-	const socket = await factory.connect({
+	const connecting = factory.connect({
 		target,
 		tls: plan === 'direct' ? await tls : undefined,
 		keepAlive: config.keepAlive,
 		keepAliveInitialDelay: config.keepAliveInitialDelay,
 	});
+	// node:tls loads (~3 ms on a cold start) while the TCP handshake is in flight
+	if (tls !== undefined && plan !== 'direct' && factory === nodeSockets) {
+		preloadNodeSockets(true);
+	}
+	const socket = await connecting;
 	state.socket = socket;
 	try {
 		if ((plan === 'tls' || plan === 'tls-optional') && tls !== undefined) {

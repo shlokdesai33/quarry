@@ -27,6 +27,13 @@ let tlsModule: typeof Tls | Promise<typeof Tls> | undefined;
 const loadNet = () => (netModule ??= builtin('node:net') ?? import('node:net'));
 const loadTls = () => (tlsModule ??= builtin('node:tls') ?? import('node:tls'));
 
+/** Loads the modules connections will need (`node:tls` too with `tls`) ahead of time. */
+export function preloadNodeSockets(tls: boolean): void {
+	for (const loading of [loadNet(), tls ? loadTls() : undefined]) {
+		if (loading instanceof Promise) loading.catch(() => {});
+	}
+}
+
 const contexts = new Map<string, Tls.SecureContext>();
 const CONTEXT_CACHE_SIZE = 16;
 
@@ -228,7 +235,10 @@ export const nodeSockets: SocketFactory = {
 		let open: () => Net.Socket;
 		let secure: Tls.TLSSocket | undefined;
 		if (options.tls === undefined) {
-			const net = await loadNet();
+			// connects without yielding when the module is loaded, so callers
+			// can do other work while the TCP handshake is in flight
+			const loading = loadNet();
+			const net = loading instanceof Promise ? await loading : loading;
 			open = () => net.connect(base);
 		} else {
 			const [tls, direct] = [await loadTls(), options.tls];
