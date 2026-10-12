@@ -1,6 +1,6 @@
 import { DriverError } from './errors.js';
 import type { Field } from './protocol/messages.js';
-import { utf8 } from './protocol/text.js';
+import { NodeBuffer, utf8 } from './protocol/text.js';
 import { parseTimestamptz, parseVector } from './parsers.js';
 import {
 	arrayOids,
@@ -58,21 +58,13 @@ const timestamptz: BinaryParser = (b, s) => {
 };
 
 const TWO_32 = 4294967296;
-/** int8 as `int8out` prints it. */
-const int8Text: BinaryParser = (b, s) => {
-	const hi = int32(b, s);
-	const lo = int32(b, s + 4) >>> 0;
-	// exact as a double below 2^53
-	if (hi >= -0x200000 && hi < 0x200000) return String(hi * TWO_32 + lo);
-	return BigInt.asIntN(64, (BigInt(hi) << 32n) | BigInt(lo)).toString();
-};
 const int8BigInt: BinaryParser = (b, s) => {
 	const hi = int32(b, s);
 	const lo = int32(b, s + 4) >>> 0;
+	// exact as a double below 2^53
 	if (hi >= -0x200000 && hi < 0x200000) return BigInt(hi * TWO_32 + lo);
 	return BigInt.asIntN(64, (BigInt(hi) << 32n) | BigInt(lo));
 };
-const text: BinaryParser = (b, s, e) => utf8(b, s, e);
 const json: BinaryParser = (b, s, e) => JSON.parse(utf8(b, s, e));
 /** jsonb's binary format: a version byte (1), then the text. */
 const jsonb: BinaryParser = (b, s, e) => {
@@ -97,17 +89,42 @@ const invalidArray = (): DriverError =>
 /** PostgreSQL's MAXDIM. */
 const MAX_DIMENSIONS = 6;
 
+type Latin1Buffer = Uint8Array & {
+	latin1Slice(start: number, end: number): string;
+};
+const hasLatin1Slice = (b: Uint8Array): b is Latin1Buffer =>
+	NodeBuffer !== undefined && b instanceof NodeBuffer;
+
+/** Elements whose binary format is their UTF-8 text. */
+const TEXT = 'text';
+
 /**
  * Decodes a binary array into nested arrays, as `parseArray` does its text:
- * lower bounds are dropped and NULL elements are `null`.
+ * lower bounds are dropped and NULL elements are `null`. Text elements are
+ * sliced from one latin1 string of the whole value where they are ASCII: a
+ * substring costs far less than a native UTF-8 decode per element.
  */
-function arrayDecoder(elementOid: number, element: BinaryParser): BinaryParser {
+function arrayDecoder(
+	elementOid: number,
+	element: BinaryParser | typeof TEXT,
+): BinaryParser {
 	return (b, s, e) => {
 		const ndim = int32(b, s);
 		if (e - s < 12 || int32(b, s + 8) !== elementOid) throw invalidArray();
 		if (ndim === 0) return [];
 		let pos = s + 12 + ndim * 8;
 		if (ndim < 0 || ndim > MAX_DIMENSIONS || pos > e) throw invalidArray();
+		const latin1 =
+			element === TEXT && hasLatin1Slice(b) ? b.latin1Slice(s, e) : undefined;
+		const decode = (start: number, end: number): unknown => {
+			if (element !== TEXT) return element(b, start, end);
+			if (latin1 !== undefined) {
+				let ascii = true;
+				for (let i = start; i < end && ascii; i++) ascii = (b[i] ?? 0) < 0x80;
+				if (ascii) return latin1.slice(start - s, end - s);
+			}
+			return utf8(b, start, end);
+		};
 		const level = (dim: number): unknown[] => {
 			const n = int32(b, s + 12 + dim * 8);
 			const out: unknown[] = [];
@@ -125,7 +142,7 @@ function arrayDecoder(elementOid: number, element: BinaryParser): BinaryParser {
 				}
 				const next = pos + length;
 				if (length < 0 || next > e) throw invalidArray();
-				out.push(element(b, pos, next));
+				out.push(decode(pos, next));
 				pos = next;
 			}
 			return out;
@@ -155,17 +172,15 @@ const textLike = new Set<number>([
 
 /**
  * The binary decoder of an array element giving the same value as
- * `parser`: the scalar decoders, plus types that stay text as scalars
- * (decoding them from binary only pays off inside an array).
+ * `parser`: the scalar decoders, plus text-like types, int8 as a bigint and
+ * json, which stay text as scalars (binary only pays off inside an array).
  */
 function elementParser(
 	oid: number,
 	parser: TextParser | undefined,
-): BinaryParser | undefined {
-	if (parser === undefined) {
-		if (textLike.has(oid)) return text;
-		return oid === oids.int8 ? int8Text : undefined;
-	}
+): BinaryParser | typeof TEXT | undefined {
+	// without a parser int8 stays text: building its digits costs more than slicing them
+	if (parser === undefined) return textLike.has(oid) ? TEXT : undefined;
 	if (oid === oids.int8) return parser === parseBigInt ? int8BigInt : undefined;
 	if (oid === oids.json) return parser === parseJson ? json : undefined;
 	if (oid === oids.jsonb) return parser === parseJson ? jsonb : undefined;

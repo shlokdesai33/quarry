@@ -89,7 +89,7 @@ const RESULT_ARRAYS = `select * from (values
 		array['{"a" : 1}', null]::json[],
 		array['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', null]::uuid[],
 		'{1.50,NaN}'::numeric[], '{2024-01-01}'::date[],
-		'{{1,2},{3,NULL}}'::int4[], '{{{a}},{{b}}}'::text[], '[0:2]={7,8,9}'::int4[], '[-1:0][1:1]={{1},{2}}'::int8[]),
+		'{{1,2},{3,NULL}}'::int4[], '{{{a}},{{b}}}'::text[], '[0:2]={7,8,9}'::int4[], '[-1:0][1:1]={{1},{2}}'::int2[]),
 	(2, '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}',
 		'{}', '{}', '{}', '{}'),
 	(3, '{NULL}', null, '{NULL}', null, '{NULL}', '{NULL}', null, '{NULL}', '{NULL}', null, null,
@@ -122,7 +122,8 @@ describe.skipIf(noPg)('binary arrays', () => {
 			i2: 1,
 			i4: 1,
 			o: 1,
-			i8: 1,
+			// int8 as a string: slicing its text beats building the digits
+			i8: 0,
 			f8: 1,
 			// float4 text is the shortest float32 decimal, which binary doesn't give
 			f4: 0,
