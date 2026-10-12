@@ -69,13 +69,15 @@ const { paramTypes, fields } = await conn.describe(sql); // without running it
 Parameters:
 
 - Strings pass through unchanged; quarry encodes values itself.
-- Numbers, bigints, booleans and `Date`s become their Postgres text.
+- Numbers, bigints, booleans and `Date`s become their Postgres text. A `Date` is sent as a UTC timestamp, so a `timestamp without time zone` column receives the UTC wall-clock time whatever the process's time zone.
 - Arrays become array literals and other objects JSON.
 - `Uint8Array` is sent in binary.
 
 Queries issued concurrently on one connection are pipelined into shared socket writes. Each still gets its own Sync, so one failing query doesn't fail its neighbours (outside a transaction).
 
-Statements are prepared and cached per connection (100 by default; `statementCacheSize`, `prepare: false`). This is safe behind PgBouncer 1.21+ with `max_prepared_statements`.
+A query takes at most 65535 parameters, the protocol's limit; more are refused before anything is sent.
+
+Statements are prepared and cached per connection (100 by default; `statementCacheSize`, `prepare: false`). This is safe behind PgBouncer 1.21+ with `max_prepared_statements`. A cached statement that a schema change made stale (its result type or an inferred parameter type changed), or that the server no longer has (`DEALLOCATE`, `DISCARD ALL`), is prepared again and retried once, outside a transaction.
 
 From a cached statement's second run, columns whose parser has a binary twin (int2/int4/oid, float8, bool, bytea, and timestamptz decoded to `Date`) are received in binary, which is cheaper to decode and gives identical values. Custom parsers and raw types always get text. Turn it off with `binaryResults: false`.
 
@@ -89,7 +91,7 @@ Results arrive in text format and are decoded per type OID:
 
 ### Cancelling and timeouts
 
-- `signal` cancels a running query (a cancel request over a new connection), or drops one not yet sent.
+- `signal` cancels a running query (a cancel request over a new connection), or drops one not yet sent. A query pipelined behind others is canceled once the server gets to it, never one ahead of it.
 - `timeout` is a client-side deadline that cancels.
 - `statementTimeout` is enforced by the server, with `set_config(…, true)`, so it never leaks into other sessions behind a pooler.
 - `conn.cancel()` cancels whatever is running.
@@ -132,7 +134,9 @@ await pool.transaction(async (tx) => {
   - Reserved clients, transactions, cursors and COPY always get a connection of their own. While one waits, one shared connection per waiter takes no new queries, and it is handed over once the queries already in flight on it finish, so a steady stream of queries can't hold it back.
 - `onConnect`
 
-`pool.acquire()` reserves a client; release it with `release()` or `await using`. Connections that die, or are released mid-transaction, are discarded.
+`pool.acquire()` reserves a client; release it with `release()` or `await using`. Connections that die, or are released mid-transaction, are discarded. `maxLifetime` also recycles idle connections, including those kept open by `min`.
+
+`pool.end()` stops new work and closes the pool once the work already issued is done: queries and callers already waiting get a connection, and reserved clients and transactions keep theirs until released. `end({ timeout })` fails whatever is still waiting or running after that long.
 
 ## Poolers and proxies
 
@@ -147,6 +151,7 @@ await pool.transaction(async (tx) => {
 - Server errors are `PostgresError`s carrying every field the server sent, plus `query` (non-enumerable, so parameters don't leak into logs).
 - Common SQLSTATEs have their own classes: `UniqueViolation`, `ForeignKeyViolation`, `NotNullViolation`, `CheckViolation`, `ExclusionViolation` (with `columns`), `SerializationFailure`, `DeadlockDetected` (`isRetryable`), `QueryCanceled`, `LockNotAvailable`, `ReadOnlyTransaction`, `UndefinedTable`, `UndefinedColumn`.
 - Client-side failures are `ConnectionError`, `ProtocolError` or `AbortError`.
+- A result value whose parser throws fails only that query, with a `DecodeError` naming the column and type (never the value); the connection stays usable.
 
 ## With quarry
 
@@ -172,3 +177,4 @@ await db.transaction(async (tx) => {
 
 - `pnpm test` starts a throwaway cluster (TLS, a role per auth method, PgBouncer) when PostgreSQL is installed; otherwise the integration tests skip. `PG_VERSION=17`, `PG_BIN` and `PGBOUNCER_BIN` pick other versions.
 - `pnpm bench:driver` compares against `pg` and postgres.js.
+- `pnpm test:compat` runs node-postgres's and postgres.js's own test suites against this driver, through test-only shims in `test/driver/compat`, on PostgreSQL 18 (add `--bouncer` for a second pass through PgBouncer in transaction mode). It clones the pinned upstream releases into `.compat/`; `test/driver/compat/expectations.ts` lists every test allowed to fail and why.
