@@ -45,8 +45,28 @@ function tlsOptions(
 	};
 }
 
+/**
+ * A socket error's message. Connecting to a name with several addresses,
+ * such as `localhost`, fails with an `AggregateError` whose own message is
+ * empty, so its errors' messages are used instead.
+ */
+export function socketErrorMessage(error: Error & { code?: string }): string {
+	if (error.message !== '') return error.message;
+	const messages =
+		error instanceof AggregateError
+			? error.errors
+					.map((inner: unknown) =>
+						inner instanceof Error ? inner.message : '',
+					)
+					.filter((message) => message !== '')
+			: [];
+	return messages.length > 0
+		? messages.join('; ')
+		: (error.code ?? 'the connection failed');
+}
+
 function connectionError(error: Error & { code?: string }): ConnectionError {
-	return new ConnectionError(error.message, {
+	return new ConnectionError(socketErrorMessage(error), {
 		cause: error,
 		...(error.code === undefined ? {} : { code: error.code }),
 	});

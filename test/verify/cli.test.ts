@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { parseConfig, schemaTables } from '../../src/cli/config.js';
+import { ConnectionError } from '../../src/driver/errors.js';
 import { text } from '../../src/column-factories.js';
 import { defineTable } from '../../src/define-table.js';
 import { type Io, runCli, usage } from '../../src/cli/run.js';
@@ -80,6 +81,60 @@ describe('config', () => {
 			'the config must export `schema`, the tables to check',
 		);
 		expect(parseConfig(undefined)).toBe('the config module has no exports');
+	});
+
+	test('close defaults to db.close()', async () => {
+		let closed = 0;
+		const db = {
+			verify: async () => {
+				throw new Error('unused');
+			},
+			close: async () => {
+				closed++;
+			},
+		};
+		const config = parseConfig({ db, schema: [] });
+		await (typeof config === 'object' ? config.close?.() : undefined);
+		expect(closed).toBe(1);
+		const own = parseConfig({
+			db,
+			schema: [],
+			close: () => {
+				closed += 10;
+			},
+		});
+		await (typeof own === 'object' ? own.close?.() : undefined);
+		expect(closed).toBe(11);
+	});
+
+	test('a failing check prints one line, exits 2 and still closes', async () => {
+		let closed = false;
+		const failing = {
+			verify: async () => {
+				throw new ConnectionError('connect ECONNREFUSED 127.0.0.1:5432', {
+					code: 'ECONNREFUSED',
+				});
+			},
+			close: async () => {
+				closed = true;
+			},
+		};
+		const { io: streams, out } = io({
+			load: async () => ({ db: failing, schema: [users] }),
+		});
+		expect(await runCli(['verify', '--config', configPath], streams)).toBe(2);
+		expect(out.stderr).toBe(
+			'quarry verify: ConnectionError: connect ECONNREFUSED 127.0.0.1:5432\n  (set QUARRY_DEBUG=1 for the stack trace)\n',
+		);
+		expect(closed).toBe(true);
+		const debug = io({
+			env: { QUARRY_DEBUG: '1' },
+			load: async () => ({ db: failing, schema: [users] }),
+		});
+		await runCli(['verify', '--config', configPath], debug.io);
+		expect(debug.out.stderr).toMatch(
+			/^quarry verify: ConnectionError: .*\n {4}at /,
+		);
 	});
 
 	test('a schema module namespace keeps only its tables', () => {
