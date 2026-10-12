@@ -561,11 +561,21 @@ export function notRun(suite: string, file: string): boolean {
 	return skippedFiles[suite]?.[file] !== undefined;
 }
 
+/**
+ * Errors that only arise when session state (a temporary table, a
+ * prepared name) leaks between transactions a pooler ran on different
+ * server connections. Which connection a transaction gets varies, so
+ * through PgBouncer such a test can pass or fail from run to run.
+ */
+const SESSION_STATE_SYMPTOM =
+	/(relation|column|prepared statement) "[^"]+" (already exists|does not exist)/;
+
 export function classify(
 	suite: string,
 	file: string,
 	name: string,
 	target: string,
+	error?: string,
 ): Expectation | undefined {
 	const bouncer = target.startsWith('PgBouncer');
 	const lookup = (
@@ -579,7 +589,12 @@ export function classify(
 	const found = lookup(expectations[suite]?.[file]);
 	if (found !== undefined && !(found.target === 'bouncer' && !bouncer))
 		return found;
-	return bouncer ? lookup(throughBouncer[suite]?.[file]) : undefined;
+	if (!bouncer) return undefined;
+	const pooled = lookup(throughBouncer[suite]?.[file]);
+	if (pooled !== undefined) return pooled;
+	return error !== undefined && SESSION_STATE_SYMPTOM.test(error)
+		? { ...SESSION_STATE, flaky: true, wildcard: true }
+		: undefined;
 }
 
 /** Every expectation, for the report. */

@@ -6,6 +6,7 @@
 // fails without a recorded reason, or passes despite one, fails the run.
 //
 //   pnpm test:compat [suite…] [--bouncer] [--no-direct] [--json out.json]
+//   pnpm test:compat --reclassify out.json   (re-apply expectations to a saved run)
 import { execFileSync, spawn } from 'node:child_process';
 import {
 	existsSync,
@@ -471,7 +472,7 @@ async function main(): Promise<void> {
 	const wanted: string[] = [];
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i] ?? '';
-		if (['--json', '--filter', '--jobs'].includes(arg))
+		if (['--json', '--filter', '--jobs', '--reclassify'].includes(arg))
 			valued.set(arg, args[++i] ?? '');
 		else if (!arg.startsWith('--')) wanted.push(arg);
 	}
@@ -481,6 +482,15 @@ async function main(): Promise<void> {
 		: undefined;
 	jobs = Number(valued.get('--jobs') ?? 1);
 	const suites = wanted.length > 0 ? wanted : [...SUITES];
+	// re-applies the expectations to a saved run's outcomes, without running anything
+	const saved = valued.get('--reclassify');
+	if (saved !== undefined) {
+		const { outcomes } = JSON.parse(readFileSync(saved, 'utf8')) as {
+			outcomes: (Outcome & { target: string })[];
+		};
+		report(outcomes, json);
+		return;
+	}
 
 	prepare();
 	rmSync(join(cache, 'results'), { recursive: true, force: true });
@@ -577,7 +587,14 @@ async function main(): Promise<void> {
 	} finally {
 		await cluster.stop();
 	}
+	report(all, json);
+}
 
+/** Classifies outcomes against the expectations, prints the totals and, with `json`, writes them. */
+function report(
+	all: (Outcome & { target: string })[],
+	json: string | undefined,
+): void {
 	// classify and total
 	const totals = new Map<string, SuiteTotals>();
 	const problems: string[] = [];
@@ -595,7 +612,7 @@ async function main(): Promise<void> {
 			unexpectedPasses: 0,
 		};
 		totals.set(key, t);
-		const expectation = classify(o.suite, o.file, o.name, o.target);
+		const expectation = classify(o.suite, o.file, o.name, o.target, o.error);
 		t.run++;
 		let category: Category | 'pass' | 'unexpected' = 'pass';
 		if (o.passed) {
