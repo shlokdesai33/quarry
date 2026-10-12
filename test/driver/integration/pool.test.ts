@@ -376,7 +376,7 @@ describe.skipIf(noPg)('pool', () => {
 
 	it('keeps pipelining under sustained load beyond max × pipeline', async () => {
 		const net = slowSockets(10);
-		await using p = pool({ max: 2, socket: net.factory });
+		await using p = pool({ max: 2, pipeline: 50, socket: net.factory });
 		await Promise.all([p.query('select 1'), p.query('select 1')]);
 		while (p.stats.idle < 2) await sleep(5);
 		await p.query('select $1::int as v', [0]);
@@ -400,6 +400,52 @@ describe.skipIf(noPg)('pool', () => {
 		// ~100 per 10 ms round trip: ~60 ms; one query per round trip per connection once anyone waits would take ~3 s
 		expect(elapsed).toBeLessThan(1000);
 		expect(p.stats).toMatchObject({ total: 2, idle: 2, busy: 0, waiting: 0 });
+	});
+
+	it('deepens the pipeline when the round trip, not the server, is the limit', async () => {
+		const net = slowSockets(10);
+		await using p = pool({ max: 1, socket: net.factory });
+		await p.query('select $1::int as v', [0]);
+		net.reset();
+		// 100 at a time first: the default depth
+		await Promise.all(
+			Array.from({ length: 100 }, (_, i) =>
+				p.query('select $1::int as v', [i]),
+			),
+		);
+		expect(net.maxInFlight()).toBe(100);
+		net.reset();
+		const values = await Promise.all(
+			Array.from({ length: 600 }, async (_, caller) => {
+				const seen: (number | undefined)[] = [];
+				for (let k = 0; k < 4; k++) {
+					const v = caller * 4 + k;
+					const { rows } = await p.query<{ v: number }>('select $1::int as v', [
+						v,
+					]);
+					seen.push(rows[0]?.v);
+				}
+				return seen;
+			}),
+		);
+		expect(values.flat()).toEqual(Array.from({ length: 2400 }, (_, i) => i));
+		// grows from 100 by half each round trip while callers wait
+		expect(net.maxInFlight()).toBeGreaterThan(300);
+		expect(net.maxInFlight()).toBeLessThanOrEqual(600);
+		expect(p.stats).toMatchObject({ total: 1, idle: 1, busy: 0, waiting: 0 });
+	});
+
+	it('keeps the default depth when queries queue on the server', async () => {
+		const net = slowSockets(1);
+		await using p = pool({ max: 1, socket: net.factory });
+		await p.query('select 1');
+		net.reset();
+		await Promise.all(
+			Array.from({ length: 300 }, async () => {
+				for (let k = 0; k < 2; k++) await p.query('select pg_sleep(0.0005)');
+			}),
+		);
+		expect(net.maxInFlight()).toBe(100);
 	});
 
 	it('hands connections to transactions, clients and cursors under sustained load', async () => {
