@@ -9,7 +9,7 @@ import type { AnyTable } from '../table.js';
  * @example
  * // quarry.config.ts
  * import * as schema from './src/schema.ts';
- * export default defineConfig({ db: database(executor), schema, close: () => pool.end() });
+ * export default defineConfig({ db: database(process.env.DATABASE_URL), schema });
  */
 export interface QuarryConfig {
 	readonly db: Pick<Database, 'verify'>;
@@ -18,7 +18,10 @@ export interface QuarryConfig {
 	 * whose values that aren't tables are ignored.
 	 */
 	readonly schema: readonly AnyTable[] | Readonly<Record<string, unknown>>;
-	/** Called when the command is done, e.g. to end the driver's pool. */
+	/**
+	 * Called when the command is done. Defaults to `db.close()`, which ends
+	 * the pool a database opened from a connection string.
+	 */
 	readonly close?: (() => unknown) | undefined;
 }
 
@@ -78,12 +81,16 @@ export function parseConfig(exports: unknown): QuarryConfig | string {
 	const db: unknown = Reflect.get(config, 'db');
 	const schema: unknown = Reflect.get(config, 'schema');
 	const close: unknown = Reflect.get(config, 'close');
+	const closeDb: unknown =
+		typeof db === 'object' && db !== null
+			? Reflect.get(db, 'close')
+			: undefined;
 	if (
 		typeof db !== 'object' ||
 		db === null ||
 		typeof Reflect.get(db, 'verify') !== 'function'
 	) {
-		return 'the config must export `db`, a quarry database (database(executor))';
+		return 'the config must export `db`, a quarry database (database(url))';
 	}
 	if (typeof schema !== 'object' || schema === null) {
 		return 'the config must export `schema`, the tables to check';
@@ -99,6 +106,8 @@ export function parseConfig(exports: unknown): QuarryConfig | string {
 		close:
 			typeof close === 'function'
 				? () => Reflect.apply(close, config, [])
-				: undefined,
+				: typeof closeDb === 'function'
+					? () => Reflect.apply(closeDb, db, [])
+					: undefined,
 	};
 }
