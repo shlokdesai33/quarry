@@ -36,7 +36,10 @@ describe.skipIf(noPg)('queries', () => {
 		expect(rows).toEqual([{ n }]);
 		expect((await conn.describe(sql)).paramTypes).toHaveLength(n);
 		await expect(
-			conn.query('select 1', Array.from({ length: 65_536 }, () => 1)),
+			conn.query(
+				'select 1',
+				Array.from({ length: 65_536 }, () => 1),
+			),
 		).rejects.toThrow(/at most 65535 parameters/);
 		expect((await conn.query('select 1 as n')).rows).toEqual([{ n: 1 }]);
 	});
@@ -63,6 +66,7 @@ describe.skipIf(noPg)('queries', () => {
 		const pending = conn.query('select 1 as before');
 		const nul = conn.query('select 1\0');
 		const simple = conn.simpleQuery('select 1;\0');
+		// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- deliberately not a string
 		const notText = conn.query({} as string);
 		const after = conn.query<{ n: number }>('select 2 as n');
 		await expect(nul).rejects.toThrow(/NUL byte \(at character 9\)/);
