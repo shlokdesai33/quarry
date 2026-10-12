@@ -381,6 +381,12 @@ const expectations: Record<string, Table> = {
 				reason:
 					'postgres.js coerces options to strings (a user whose toString throws); quarry takes typed options',
 			},
+			connect_timeout: {
+				category: 'not-applicable',
+				reason:
+					'timing: the 200 ms connect timeout fires at 199–202 ms, and the test truncates the elapsed time to tenths of a second',
+				flaky: true,
+			},
 			'Multiple hosts': {
 				category: 'not-applicable',
 				reason: 'needs a second server on port 5433 (their CI runs two)',
@@ -429,6 +435,45 @@ const expectations: Record<string, Table> = {
 	},
 };
 
+/**
+ * Tests that pass directly but not through PgBouncer in transaction mode,
+ * because of what a transaction pooler is: each transaction may run on a
+ * different server connection, and PgBouncer (as configured here, as most
+ * deployments do) authenticates clients itself, without TLS, and ignores
+ * startup parameters.
+ */
+const SESSION_STATE: Expectation = {
+	category: 'not-applicable',
+	reason:
+		'relies on session state across transactions (temporary tables, SET, LISTEN), which transaction pooling does not keep',
+	target: 'bouncer',
+};
+const POOLER_AUTH: Expectation = {
+	category: 'not-applicable',
+	reason:
+		'PgBouncer authenticates clients itself (trust here), so server authentication is not exercised',
+	target: 'bouncer',
+};
+const POOLER_TLS: Expectation = {
+	category: 'not-applicable',
+	reason: 'PgBouncer here accepts clients without TLS',
+	target: 'bouncer',
+};
+const STARTUP_PARAMETERS: Expectation = {
+	category: 'not-applicable',
+	reason:
+		'PgBouncer ignores startup parameters (options, statement_timeout, …)',
+	target: 'bouncer',
+};
+const BACKEND_PID: Expectation = {
+	category: 'not-applicable',
+	reason:
+		"terminates the backend by the client's process ID, which through PgBouncer is PgBouncer's own, not a server backend's",
+	target: 'bouncer',
+};
+
+const throughBouncer: Record<string, Table> = {};
+
 /** Files not run at all, with why: their whole subject is the upstream library's own machinery. */
 export const skippedFiles: Record<string, Record<string, string>> = {};
 
@@ -442,13 +487,12 @@ export function classify(
 	name: string,
 	target: string,
 ): Expectation | undefined {
-	const table = expectations[suite]?.[file];
-	const found = table?.[name] ?? table?.['*'];
-	if (found === undefined) return undefined;
 	const bouncer = target.startsWith('PgBouncer');
-	if (found.target === 'bouncer' && !bouncer) return undefined;
-	if (found.target === 'direct' && bouncer) return undefined;
-	return found;
+	const lookup = (table: Record<string, Expectation> | undefined) =>
+		table?.[name] ?? table?.['*'];
+	const found = lookup(expectations[suite]?.[file]);
+	if (found !== undefined) return found;
+	return bouncer ? lookup(throughBouncer[suite]?.[file]) : undefined;
 }
 
 /** Every expectation, for the report. */

@@ -302,7 +302,7 @@ async function runPg(
 		const results = join(cache, 'results', `pg-${++resultCount}.jsonl`);
 		const exit = await child('node', [path], {
 			cwd: dir,
-			timeout: 90_000,
+			timeout: 60_000,
 			env: env(target, cluster, {
 				QUARRY_COMPAT_RESULTS: results,
 				QUARRY_COMPAT_SUITE: 'pg',
@@ -419,11 +419,23 @@ async function runPostgresJs(
 			QUARRY_COMPAT_FILE: 'tests/index.js',
 		}),
 	});
-	const got = outcomesOf('postgres', 'tests/index.js', readLines(results), {
-		...exit,
-		// the runner records every test; a non-zero exit only reports failures
-		code: exit.timedOut ? exit.code : 0,
-	});
+	const lines = readLines(results);
+	const got =
+		lines.length === 0
+			? [
+					{
+						suite: 'postgres',
+						file: 'tests/index.js',
+						name: '(file)',
+						passed: false,
+						error: `no tests ran (exit ${exit.code})\n${exit.output.slice(-3000)}`,
+					},
+				]
+			: outcomesOf('postgres', 'tests/index.js', lines, {
+					...exit,
+					// the runner records every test; a non-zero exit only reports failures
+					code: exit.timedOut ? exit.code : 0,
+				});
 	console.log(
 		`  tests/index.js: ${got.filter((o) => o.passed).length}/${got.length}`,
 	);

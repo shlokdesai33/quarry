@@ -12,6 +12,7 @@ import {
 	AbortError,
 	ConnectionError,
 	createPool,
+	DecodeError,
 	DriverError,
 	UndefinedParameterError,
 	parseArray,
@@ -462,6 +463,9 @@ export default function Postgres(a?: any, b?: any): any {
 		if (error instanceof AbortError && q.cancelRequested) {
 			// canceled before it reached the server (waiting for a connection)
 			out = Errors.generic('57014', 'canceling statement due to user request');
+		} else if (error instanceof DecodeError && error.cause instanceof Error) {
+			// postgres.js surfaces the parser's own error
+			out = error.cause;
 		} else if (error instanceof UndefinedParameterError) {
 			out = Errors.generic(
 				'UNDEFINED_VALUE',
