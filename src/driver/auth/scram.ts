@@ -1,3 +1,4 @@
+import type * as NodeCrypto from 'node:crypto';
 import { ConnectionError } from '../errors.js';
 import {
 	base64Decode,
@@ -10,6 +11,21 @@ import {
 export interface ChannelBinding {
 	readonly type: 'tls-server-end-point';
 	readonly data: Uint8Array;
+}
+
+type Hash = 'SHA-256' | 'SHA-384' | 'SHA-512';
+
+/** The primitives SCRAM and channel binding need. */
+export interface ScramCrypto {
+	hmac(key: Uint8Array, data: Uint8Array): Promise<Uint8Array>;
+	digest(hash: Hash, data: Uint8Array): Promise<Uint8Array>;
+	/** PBKDF2-HMAC-SHA-256, 32 bytes. */
+	pbkdf2(
+		password: Uint8Array,
+		salt: Uint8Array,
+		iterations: number,
+	): Promise<Uint8Array>;
+	random(length: number): Uint8Array;
 }
 
 /** A copy backed by a plain ArrayBuffer, as WebCrypto's types require. */
@@ -26,43 +42,143 @@ const subtle = (): SubtleCrypto => {
 	return value;
 };
 
-async function hmac(
-	key: Uint8Array,
-	data: Uint8Array | string,
-): Promise<Uint8Array> {
-	const k = await subtle().importKey(
-		'raw',
-		fresh(key),
-		{ name: 'HMAC', hash: 'SHA-256' },
-		false,
-		['sign'],
-	);
-	const message = typeof data === 'string' ? utf8Encode(data) : data;
-	return new Uint8Array(await subtle().sign('HMAC', k, fresh(message)));
+/** WebCrypto, for runtimes without `node:crypto` (Workers without `nodejs_compat`). */
+export const webScramCrypto: ScramCrypto = {
+	async hmac(key, data) {
+		const k = await subtle().importKey(
+			'raw',
+			fresh(key),
+			{ name: 'HMAC', hash: 'SHA-256' },
+			false,
+			['sign'],
+		);
+		return new Uint8Array(await subtle().sign('HMAC', k, fresh(data)));
+	},
+	async digest(hash, data) {
+		return new Uint8Array(await subtle().digest(hash, fresh(data)));
+	},
+	async pbkdf2(password, salt, iterations) {
+		const key = await subtle().importKey(
+			'raw',
+			fresh(password),
+			'PBKDF2',
+			false,
+			['deriveBits'],
+		);
+		const bits = await subtle().deriveBits(
+			{ name: 'PBKDF2', hash: 'SHA-256', salt: fresh(salt), iterations },
+			key,
+			256,
+		);
+		return new Uint8Array(bits);
+	},
+	random: (length) => globalThis.crypto.getRandomValues(new Uint8Array(length)),
+};
+
+/**
+ * `node:crypto`: HMACs and digests are synchronous and take microseconds,
+ * where each WebCrypto call is a round trip through Node's thread pool;
+ * PBKDF2 still runs off the main thread.
+ */
+export function nodeScramCrypto(crypto: typeof NodeCrypto): ScramCrypto {
+	const name = (hash: Hash) => hash.replace('-', '').toLowerCase();
+	return {
+		hmac: async (key, data) =>
+			crypto.createHmac('sha256', key).update(data).digest(),
+		digest: async (hash, data) =>
+			crypto.createHash(name(hash)).update(data).digest(),
+		pbkdf2: (password, salt, iterations) =>
+			new Promise((resolve, reject) => {
+				crypto.pbkdf2(password, salt, iterations, 32, 'sha256', (error, key) =>
+					error ? reject(error) : resolve(key),
+				);
+			}),
+		random: (length) => crypto.randomFillSync(new Uint8Array(length)),
+	};
 }
 
-async function sha256(data: Uint8Array): Promise<Uint8Array> {
-	return new Uint8Array(await subtle().digest('SHA-256', fresh(data)));
+let selected: ScramCrypto | undefined;
+
+/** `node:crypto` where the runtime has it (Node, Bun, Deno, Workers with `nodejs_compat`), else WebCrypto. */
+export function scramCrypto(): ScramCrypto {
+	if (selected === undefined) {
+		let crypto: typeof NodeCrypto | undefined;
+		try {
+			crypto =
+				typeof process === 'object' &&
+				typeof process.getBuiltinModule === 'function'
+					? process.getBuiltinModule('node:crypto')
+					: undefined;
+		} catch {
+			// no Node compatibility
+		}
+		selected =
+			crypto !== undefined &&
+			typeof crypto.createHmac === 'function' &&
+			typeof crypto.pbkdf2 === 'function'
+				? nodeScramCrypto(crypto)
+				: webScramCrypto;
+	}
+	return selected;
 }
 
-async function pbkdf2(
-	password: Uint8Array,
-	salt: Uint8Array,
+interface Keys {
+	readonly clientKey: Uint8Array;
+	readonly storedKey: Uint8Array;
+	readonly serverKey: Uint8Array;
+}
+
+/**
+ * Derived keys by iteration count, salt and password. The salt and count
+ * only change when the role's password does, so new connections (a pool
+ * warming up, reconnects) skip PBKDF2. The keys grant no more than the
+ * password the configuration already holds.
+ */
+const keyCache = new Map<string, Promise<Keys>>();
+const KEY_CACHE_SIZE = 16;
+
+async function deriveKeys(
+	crypto: ScramCrypto,
+	password: string,
+	salt: string,
 	iterations: number,
-): Promise<Uint8Array> {
-	const key = await subtle().importKey(
-		'raw',
-		fresh(password),
-		'PBKDF2',
-		false,
-		['deriveBits'],
+): Promise<Keys> {
+	const salted = await crypto.pbkdf2(
+		utf8Encode(saslprep(password)),
+		base64Decode(salt),
+		iterations,
 	);
-	const bits = await subtle().deriveBits(
-		{ name: 'PBKDF2', hash: 'SHA-256', salt: fresh(salt), iterations },
-		key,
-		256,
-	);
-	return new Uint8Array(bits);
+	const clientKey = await crypto.hmac(salted, utf8Encode('Client Key'));
+	return {
+		clientKey,
+		storedKey: await crypto.digest('SHA-256', clientKey),
+		serverKey: await crypto.hmac(salted, utf8Encode('Server Key')),
+	};
+}
+
+function cachedKeys(
+	crypto: ScramCrypto,
+	password: string,
+	salt: string,
+	iterations: number,
+): Promise<Keys> {
+	const id = `${iterations}:${salt}:${password}`;
+	let keys = keyCache.get(id);
+	if (keys === undefined) {
+		const derived = deriveKeys(crypto, password, salt, iterations);
+		derived.catch(() => {
+			if (keyCache.get(id) === derived) keyCache.delete(id);
+		});
+		keys = derived;
+		if (keyCache.size >= KEY_CACHE_SIZE) {
+			const oldest = keyCache.keys().next();
+			if (!oldest.done) keyCache.delete(oldest.value);
+		}
+	} else {
+		keyCache.delete(id);
+	}
+	keyCache.set(id, keys);
+	return keys;
 }
 
 function xor(a: Uint8Array, b: Uint8Array): Uint8Array {
@@ -170,9 +286,7 @@ export class ScramClient {
 			: clientSupportsBinding
 				? 'y,,'
 				: 'n,,';
-		this.#nonce =
-			nonce ??
-			base64Encode(globalThis.crypto.getRandomValues(new Uint8Array(18)));
+		this.#nonce = nonce ?? base64Encode(scramCrypto().random(18));
 		// the server ignores the SCRAM user name in favour of the startup user
 		this.#firstBare = `n=${username},r=${this.#nonce}`;
 	}
@@ -209,17 +323,16 @@ export class ScramClient {
 		const finalWithoutProof = `c=${base64Encode(cbind)},r=${nonce}`;
 		const authMessage = `${this.#firstBare},${serverFirst},${finalWithoutProof}`;
 
-		const salted = await pbkdf2(
-			utf8Encode(saslprep(this.#password)),
-			base64Decode(salt),
+		const crypto = scramCrypto();
+		const { clientKey, storedKey, serverKey } = await cachedKeys(
+			crypto,
+			this.#password,
+			salt,
 			iterations,
 		);
-		const clientKey = await hmac(salted, 'Client Key');
-		const storedKey = await sha256(clientKey);
-		const clientSignature = await hmac(storedKey, authMessage);
-		const proof = xor(clientKey, clientSignature);
-		const serverKey = await hmac(salted, 'Server Key');
-		this.#expectedServerSignature = await hmac(serverKey, authMessage);
+		const message = utf8Encode(authMessage);
+		const proof = xor(clientKey, await crypto.hmac(storedKey, message));
+		this.#expectedServerSignature = await crypto.hmac(serverKey, message);
 		return utf8Encode(`${finalWithoutProof},p=${base64Encode(proof)}`);
 	}
 
@@ -290,6 +403,6 @@ export async function serverEndPoint(
 		key += byte.toString(16).padStart(2, '0');
 	const hash = SIGNATURE_HASHES[key];
 	if (hash === undefined) return undefined;
-	const data = new Uint8Array(await subtle().digest(hash, fresh(der)));
+	const data = await scramCrypto().digest(hash, der);
 	return { type: 'tls-server-end-point', data };
 }

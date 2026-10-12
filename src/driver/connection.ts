@@ -1,6 +1,7 @@
 import { md5Password } from './auth/md5.js';
 import {
 	ScramClient,
+	scramCrypto,
 	serverEndPoint,
 	type ChannelBinding,
 } from './auth/scram.js';
@@ -324,6 +325,9 @@ export class Connection implements AsyncDisposable {
 		this.#socket.write(
 			fe.startup(this.#writer, this.#info.version, params).take(),
 		);
+		// a likely SCRAM exchange: load the crypto module (~3 ms on a cold
+		// start) while the server starts the backend, not after it asks
+		if (config.password !== undefined) scramCrypto();
 		let method: AuthMethod | undefined;
 		let scram: ScramClient | undefined;
 		let scramVerified = false;
