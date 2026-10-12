@@ -527,6 +527,29 @@ describe.skipIf(noPg)('pool', () => {
 		expect(p.stats.total).toBe(2);
 	});
 
+	// found by pg-pool's lifetime-timeout and sizing tests
+	it('recycles idle connections when their lifetime ends, even at min', async () => {
+		await using admin = await open();
+		const alive = async (pid: number) =>
+			(
+				await admin.query('select 1 from pg_stat_activity where pid = $1', [
+					pid,
+				])
+			).rows.length > 0;
+		await using p = pool({ min: 1, max: 1, idleTimeout: 0, maxLifetime: 100 });
+		const first = await p.acquire();
+		const pid = first.connection.processId;
+		first.release();
+		await sleep(400);
+		// closed and replaced while idle, before anything asked for a connection
+		expect(await alive(pid)).toBe(false);
+		expect(p.stats.total).toBe(1);
+		const { rows } = await p.query<{ pid: number }>(
+			'select pg_backend_pid() as pid',
+		);
+		expect(rows[0]?.pid).not.toBe(pid);
+	});
+
 	it('replaces connections that die while idle', async () => {
 		await using p = pool({ max: 1 });
 		const client = await p.acquire();
@@ -585,15 +608,76 @@ describe.skipIf(noPg)('pool', () => {
 		expect(p.stats.busy).toBe(0);
 	});
 
-	it('ends: waiters fail and later queries are refused', async () => {
+	// found by pg-pool's error-handling tests
+	it('keeps trying to connect for each waiter when connecting fails', async () => {
+		const { createServer } = await import('node:net');
+		const server = createServer((socket) => socket.destroy());
+		await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+		const address = server.address();
+		const port = typeof address === 'object' && address ? address.port : 0;
+		let attempts = 0;
+		server.on('connection', () => attempts++);
+		try {
+			const p = createPool({
+				...options(),
+				port,
+				max: 1,
+				acquireTimeout: 0,
+			});
+			const results = await Promise.allSettled([
+				p.acquire(),
+				p.acquire(),
+				p.acquire(),
+			]);
+			expect(results.map((r) => r.status)).toEqual([
+				'rejected',
+				'rejected',
+				'rejected',
+			]);
+			expect(attempts).toBe(3);
+			await p.end();
+		} finally {
+			server.close();
+		}
+	});
+
+	// found by pg-pool's ending tests and pg's type-parser-override test
+	it('ends once issued work is done, and refuses new work', async () => {
 		const p = pool({ max: 1 });
 		const held = await p.acquire();
+		await held.query('begin');
 		const waiting = p.acquire();
-		const ending = p.end();
-		await expect(waiting).rejects.toThrow(/ended/);
+		const queued = p.query<{ n: number }>('select 1 as n');
+		let ended = false;
+		const ending = p.end().then(() => (ended = true));
+		await expect(p.query('select 1')).rejects.toThrow(/ended/);
+		await expect(p.acquire()).rejects.toThrow(/ended/);
+		// the reserved client keeps its connection, transaction and all
+		await sleep(50);
+		await held.query('select 1');
+		await held.query('commit');
+		expect(ended).toBe(false);
 		held.release();
+		// the caller already waiting gets the connection, then the queued query
+		const next = await waiting;
+		await next.query('select 1');
+		next.release();
+		expect((await queued).rows).toEqual([{ n: 1 }]);
 		await ending;
+		expect(p.stats.total).toBe(0);
 		await expect(p.query('select 1')).rejects.toBeInstanceOf(DriverError);
+	});
+
+	it('ends after a timeout, failing what is still waiting', async () => {
+		const p = pool({ max: 1 });
+		const held = await p.acquire();
+		const waiting = p.acquire().catch((e: unknown) => e);
+		await p.end({ timeout: 100 });
+		expect(await waiting).toBeInstanceOf(DriverError);
+		await expect(held.query('select 1')).rejects.toBeInstanceOf(
+			ConnectionError,
+		);
+		held.release();
 	});
 
 	it('ends within a timeout even with a query still running', async () => {
