@@ -846,12 +846,12 @@ class Listener {
 				this.#connection = undefined;
 				if (!this.#closed && this.#channels.size > 0) this.#reconnect();
 			});
-			for (const channel of this.#channels.keys()) {
-				// oxlint-disable-next-line no-await-in-loop
-				await connection.query(`listen ${quote(channel)}`, [], {
-					prepare: false,
-				});
-			}
+			// sent together: the connection pipelines them in one round trip
+			await Promise.all(
+				Array.from(this.#channels.keys(), (channel) =>
+					connection.query(`listen ${quote(channel)}`, [], { prepare: false }),
+				),
+			);
 			this.#attempt = 0;
 			return connection;
 		})();
