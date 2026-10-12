@@ -192,6 +192,30 @@ function decoderFor(
 	return decoder;
 }
 
+/**
+ * Whether an error means a cached statement went stale, so preparing it
+ * again (outside a transaction) can succeed: its plan no longer fits a
+ * changed schema, a parameter type inferred from a column no longer fits
+ * that column, or the server no longer has the statement (DEALLOCATE,
+ * DISCARD ALL).
+ */
+function staleStatement(
+	error: PostgresError,
+	statement: Statement,
+	created: boolean,
+): boolean {
+	if (error.code === '0A000' && error.routine === 'RevalidateCachedQuery')
+		return true;
+	if (created) return false;
+	if (error.code === '42804' && error.routine === 'transformAssignedExpr')
+		return true;
+	return (
+		error.code === '26000' &&
+		error.routine === 'FetchPreparedStatement' &&
+		statement.error === undefined
+	);
+}
+
 /** One statement through the extended protocol: [Parse, Describe] Bind Execute Sync. */
 export class QueryOp extends Op {
 	readonly #sql: string;
@@ -383,11 +407,10 @@ export class QueryOp extends Op {
 			return true;
 		}
 		if (
-			error.code === '0A000' &&
-			error.routine === 'RevalidateCachedQuery' &&
 			this.#statement !== undefined &&
 			status === 'I' &&
-			!this.#retried
+			!this.#retried &&
+			staleStatement(error, this.#statement, this.#createdStatement)
 		) {
 			ctx.forget(this.#statement);
 			ctx.retry(

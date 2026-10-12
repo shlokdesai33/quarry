@@ -409,6 +409,39 @@ describe.skipIf(noPg)('queries', () => {
 		await conn.query(`drop table ${name}`);
 	});
 
+	// found by postgres.js's "Recreate prepared statements on transformAssignedExpr error"
+	it('re-prepares a cached statement whose inferred parameter type no longer fits', async () => {
+		const name = table();
+		const insert = () =>
+			conn.query<{ v: unknown }>(
+				`insert into ${name} (v) values ($1) returning v`,
+				['1'],
+			);
+		await conn.query(`create table ${name} (v text)`);
+		expect((await insert()).rows).toEqual([{ v: '1' }]);
+		await conn.query(
+			`alter table ${name} alter column v type int using v::integer`,
+		);
+		expect((await insert()).rows).toEqual([{ v: 1 }]);
+		// inside a transaction the error stands: retrying there isn't safe
+		await expect(
+			conn.transaction(async (tx) => {
+				await tx.query(`alter table ${name} alter column v type text`);
+				await tx.query(`insert into ${name} (v) values ($1) returning v`, [
+					'2',
+				]);
+			}),
+		).rejects.toBeInstanceOf(PostgresError);
+		await conn.query(`drop table ${name}`);
+	});
+
+	it('re-prepares a cached statement the server no longer has', async () => {
+		const select = () => conn.query<{ n: number }>('select 7 as n');
+		expect((await select()).rows).toEqual([{ n: 7 }]);
+		await conn.simpleQuery('deallocate all');
+		expect((await select()).rows).toEqual([{ n: 7 }]);
+	});
+
 	it('runs multi-statement scripts through the simple protocol', async () => {
 		const results = await conn.simpleQuery(
 			'select 1 as a; select 2 as b, 3 as c; create temp table if not exists s1 (x int)',
