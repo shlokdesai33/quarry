@@ -33,6 +33,7 @@ export { cloudflareSockets } from './cloudflare-socket.js';
 export {
 	arrayLiteral,
 	arrayOids,
+	arrayParser,
 	copyChunks,
 	copyLine,
 	defaultTypes,

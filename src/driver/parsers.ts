@@ -1,5 +1,5 @@
 import { DriverError } from './errors.js';
-import { parseArray, type TextParser, type TypeParsers } from './types.js';
+import { arrayParser, type TextParser, type TypeParsers } from './types.js';
 
 const TIMESTAMPTZ =
 	/^(\d{4,})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)(\.\d+)?([+-])(\d\d)(?::?(\d\d))?(?::?(\d\d))?( BC)?$/;
@@ -211,7 +211,7 @@ export function catalogTypes(
 	for (const type of catalog) {
 		if (type.elem === 0 || base[type.oid] !== undefined) continue;
 		const element = base[type.elem] ?? parsers[type.elem];
-		parsers[type.oid] = (text) => parseArray(text, element, type.delim);
+		parsers[type.oid] = arrayParser(element, type.delim, type.elem);
 	}
 	return Object.freeze({ ...parsers, ...base });
 }
