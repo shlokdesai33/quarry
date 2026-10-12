@@ -562,6 +562,39 @@ describe('buffer memory', () => {
 			{ type: 'CommandComplete', tag: 'B' },
 		]);
 	});
+
+	it('reserves about a byte per character for large strings', () => {
+		const w = new Writer();
+		const value = `${'x'.repeat(3_000_000)}é😀`;
+		w.begin(0x51).cstring(value).end();
+		expect(w.capacity).toBeLessThanOrEqual(4 << 20);
+		const out = w.take();
+		expect(Buffer.from(out.subarray(5, -1)).toString()).toBe(value);
+		expect(new DataView(out.buffer, out.byteOffset).getInt32(1)).toBe(
+			out.length - 1,
+		);
+		// a buffer grown for one large message isn't kept
+		expect(w.capacity).toBe(4096);
+		w.int8(1);
+		expect([...w.take()]).toEqual([1]);
+	});
+
+	it('encodes multi-byte text that overflows the free space', () => {
+		for (const value of [
+			'é'.repeat(5000),
+			'😀'.repeat(3000),
+			`a${'中'.repeat(2000)}`,
+		]) {
+			const w = new Writer(16);
+			w.int8(7).value(value);
+			const out = w.take();
+			const expected = Buffer.from(value);
+			expect(new DataView(out.buffer, out.byteOffset).getInt32(1)).toBe(
+				expected.length,
+			);
+			expect(Buffer.from(out.subarray(5)).equals(expected)).toBe(true);
+		}
+	});
 });
 
 /** Parses everything; returns normally or throws ProtocolError, never anything else. */
