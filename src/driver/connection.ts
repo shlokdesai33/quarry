@@ -42,7 +42,7 @@ import {
 } from './ops.js';
 import * as fe from './protocol/frontend.js';
 import type { BackendMessage } from './protocol/messages.js';
-import { Reader } from './protocol/reader.js';
+import { ChannelNames, decodeNotification, Reader } from './protocol/reader.js';
 import { Writer } from './protocol/writer.js';
 import { asResult, asRows, type RowMode } from './rows.js';
 import type { DriverSocket } from './socket.js';
@@ -149,6 +149,7 @@ export class Connection implements AsyncDisposable {
 	readonly #noticeListeners = new Set<Listener<Notice>>();
 	readonly #notificationListeners = new Set<Listener<Notification>>();
 	readonly #channels = new Map<string, Set<Listener<Notification>>>();
+	readonly #channelNames = new ChannelNames();
 	readonly #closeListeners = new Set<Listener<Error | undefined>>();
 	readonly #drainWaiters: (() => void)[] = [];
 	readonly #idleWaiters: (() => void)[] = [];
@@ -520,6 +521,17 @@ export class Connection implements AsyncDisposable {
 					const op = this.#queue[0];
 					if (op?.written && op.dataRow(reader.bytes, reader.start, reader.end))
 						continue;
+				} else if (type === 0x41) {
+					this.#notify(
+						decodeNotification(
+							reader.bytes,
+							reader.start,
+							reader.end,
+							this.#channelNames,
+						),
+					);
+					if (this.#closed) return;
+					continue;
 				}
 				this.#dispatch(reader.parse());
 				if (this.#closed) return;
@@ -543,22 +555,26 @@ export class Connection implements AsyncDisposable {
 		}
 	}
 
+	#notify(notification: Notification): void {
+		for (const listener of this.#notificationListeners) {
+			try {
+				listener(notification);
+			} catch (error) {
+				queueMicrotask(() => {
+					throw error;
+				});
+			}
+		}
+		if (this.#channels.size === 0) return;
+		const channel = this.#channels.get(notification.channel);
+		if (channel) this.#emit(channel, notification);
+	}
+
 	#dispatch(msg: BackendMessage): void {
 		switch (msg.type) {
 			case 'NoticeResponse':
 				this.#emit(this.#noticeListeners, toNotice(msg.fields));
 				return;
-			case 'NotificationResponse': {
-				const notification = {
-					pid: msg.pid,
-					channel: msg.channel,
-					payload: msg.payload,
-				};
-				this.#emit(this.#notificationListeners, notification);
-				const channel = this.#channels.get(msg.channel);
-				if (channel) this.#emit(channel, notification);
-				return;
-			}
 			case 'ParameterStatus':
 				this.#parameters.set(msg.name, msg.value);
 				return;
