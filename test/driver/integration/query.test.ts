@@ -6,6 +6,7 @@ import {
 	ForeignKeyViolation,
 	NotNullViolation,
 	PostgresError,
+	QueryCanceled,
 	UndefinedParameterError,
 	UndefinedTable,
 	UniqueViolation,
@@ -23,6 +24,23 @@ describe.skipIf(noPg)('queries', () => {
 	});
 	afterAll(async () => {
 		await conn?.close();
+	});
+
+	// found by postgres.js's "Cancel piped query"
+	it('cancels a pipelined query once it runs, never the query ahead of it', async () => {
+		const controller = new AbortController();
+		const first = conn.query('select pg_sleep(0.4) as a');
+		const second = conn.query('select pg_sleep(5) as b', [], {
+			signal: controller.signal,
+		});
+		const third = conn.query('select pg_sleep(5) as c', [], { timeout: 100 });
+		setTimeout(() => controller.abort(), 100);
+		const started = Date.now();
+		await expect(first).resolves.toMatchObject({ rowCount: 1 });
+		expect((await rejection(second, QueryCanceled)).reason).toBe('abort');
+		expect((await rejection(third, QueryCanceled)).reason).toBe('timeout');
+		expect(Date.now() - started).toBeLessThan(3000);
+		expect((await conn.query('select 1 as n')).rows).toEqual([{ n: 1 }]);
 	});
 
 	// found by postgres.js's "Catches query format errors"

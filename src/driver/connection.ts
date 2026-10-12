@@ -124,6 +124,8 @@ export class Connection implements AsyncDisposable {
 	#blocking: Op | undefined;
 	/** An operation this client asked the server to cancel: nothing more is written until it completes. */
 	#canceling: Op | undefined;
+	/** The operation the cancel request was sent for, once it is running. */
+	#cancelSent: Op | undefined;
 	readonly #statements = new Map<string, Statement>();
 	#statementCount = 0;
 	#status: 'I' | 'T' | 'E' = 'I';
@@ -590,10 +592,15 @@ export class Connection implements AsyncDisposable {
 			this.#blocking = undefined;
 			unblocked = true;
 		}
+		if (this.#cancelSent === op) this.#cancelSent = undefined;
 		if (this.#canceling === op) {
-			this.#canceling = undefined;
-			unblocked = true;
+			// later writes stay held back while another aborted query is pending
+			this.#canceling = this.#queue.find(
+				(next) => next.written && next.canceledBy !== undefined,
+			);
+			unblocked = this.#canceling === undefined;
 		}
+		this.#cancelAtHead();
 		if (unblocked || this.#written < this.#queue.length) this.#schedule();
 		if (this.#queue.length === 0)
 			for (const resolve of this.#idleWaiters.splice(0)) resolve();
@@ -715,10 +722,37 @@ export class Connection implements AsyncDisposable {
 			return;
 		}
 		op.canceledBy = reason;
-		if (this.#canceling !== undefined) return;
 		// hold back later queries so the cancel can't hit one of them
-		this.#canceling = op;
-		this.cancel().catch(() => {});
+		this.#canceling ??= op;
+		this.#cancelAtHead();
+	}
+
+	/**
+	 * Sends a cancel request once an aborted operation is the one the server
+	 * is running: sent while an earlier pipelined query still runs, it would
+	 * cancel that one instead.
+	 */
+	#cancelAtHead(): void {
+		const op = this.#queue[0];
+		if (
+			op === undefined ||
+			!op.written ||
+			op.canceledBy === undefined ||
+			this.#cancelSent === op
+		)
+			return;
+		this.#cancelSent = op;
+		// the server drops a cancel that arrives while it is still reading the
+		// query's messages, so it is repeated, with backoff, until the query ends
+		const send = (attempt: number) => {
+			if (op.done || this.#closed || this.#queue[0] !== op) return;
+			this.cancel().catch(() => {});
+			if (attempt >= 5) return;
+			const timer = setTimeout(() => send(attempt + 1), 50 * 2 ** attempt);
+			if (typeof timer === 'object' && 'unref' in timer) timer.unref();
+			op.onSettle(() => clearTimeout(timer));
+		};
+		send(0);
 	}
 
 	#options(options: QueryOptions | undefined): QueryOpOptions {
