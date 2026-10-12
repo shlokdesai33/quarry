@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Connection } from '../../../src/driver/connection.js';
 import {
 	ConnectionError,
+	DecodeError,
 	ForeignKeyViolation,
 	NotNullViolation,
 	PostgresError,
@@ -24,6 +25,42 @@ describe.skipIf(noPg)('queries', () => {
 	});
 	afterAll(async () => {
 		await conn?.close();
+	});
+
+	// found by node-postgres's throw-in-type-parser tests
+	it('fails only the query whose value a parser cannot decode', async () => {
+		const types = {
+			...rawTypes,
+			[oids.int4]: (text: string) => {
+				if (text === '777') throw new Error('bad int');
+				return Number(text);
+			},
+		};
+		const before = conn.query('select 1 as n', [], { types });
+		const bad = conn.query('select n from (values (1), (777), (3)) v (n)', [], {
+			types,
+		});
+		const after = conn.query('select 3 as n', [], { types });
+		const error = await rejection(bad, DecodeError);
+		expect(error).toMatchObject({ column: 'n', typeOid: oids.int4 });
+		expect(error.message).not.toContain('777');
+		expect((error.cause as Error).message).toBe('bad int');
+		expect((await before).rows).toEqual([{ n: 1 }]);
+		expect((await after).rows).toEqual([{ n: 3 }]);
+		await expect(
+			conn.simpleQuery('select 777 as n; select 1 as m', { types }),
+		).rejects.toBeInstanceOf(DecodeError);
+		await expect(async () => {
+			for await (const _ of conn.cursor(
+				'select generate_series(770, 1000) as n',
+				[],
+				{ types, batchSize: 1 },
+			));
+		}).rejects.toBeInstanceOf(DecodeError);
+		expect(conn.closed).toBe(false);
+		expect((await conn.query('select 4 as n', [], { types })).rows).toEqual([
+			{ n: 4 },
+		]);
 	});
 
 	// found by postgres.js's "big query body"

@@ -1,5 +1,5 @@
 import { binaryParser, type BinaryParser } from './binary.js';
-import { ProtocolError } from './errors.js';
+import { DecodeError, ProtocolError } from './errors.js';
 import type { QueryResult } from './ops.js';
 import type { Field } from './protocol/messages.js';
 import { utf8 } from './protocol/text.js';
@@ -101,12 +101,17 @@ export function rowDecoder(
 			if (length < 0 || valueEnd > end)
 				throw new ProtocolError('Invalid value length in DataRow');
 			const decode = binary[i];
-			if (decode !== undefined) {
-				row.push(decode(bytes, pos, valueEnd));
-			} else {
-				const parse = parsers[i];
-				const text = utf8(bytes, pos, valueEnd);
-				row.push(parse === undefined ? text : parse(text));
+			try {
+				if (decode !== undefined) {
+					row.push(decode(bytes, pos, valueEnd));
+				} else {
+					const parse = parsers[i];
+					const text = utf8(bytes, pos, valueEnd);
+					row.push(parse === undefined ? text : parse(text));
+				}
+			} catch (error) {
+				const field = fields[i];
+				throw new DecodeError(field?.name ?? '', field?.typeOid ?? 0, error);
 			}
 			pos = valueEnd;
 		}

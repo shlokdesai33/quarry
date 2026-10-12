@@ -1,5 +1,6 @@
 import {
 	ConnectionError,
+	DecodeError,
 	DriverError,
 	PostgresError,
 	ProtocolError,
@@ -233,6 +234,8 @@ export class QueryOp extends Op {
 	#rows: unknown[] = [];
 	#tag = '';
 	#error: PostgresError | undefined;
+	/** A value that failed to decode: the query fails with it, the rest of its rows are skipped. */
+	#decodeError: DecodeError | undefined;
 	#retried: boolean;
 
 	constructor(
@@ -297,6 +300,7 @@ export class QueryOp extends Op {
 	}
 
 	override dataRow(bytes: Uint8Array, start: number, end: number): boolean {
+		if (this.#decodeError !== undefined) return true;
 		let decoder = this.#decoder;
 		if (decoder === undefined) {
 			const fields = this.#planFields ?? this.#statement?.fields;
@@ -305,8 +309,14 @@ export class QueryOp extends Op {
 			this.#setFields(fields);
 			decoder = this.#decoder;
 		}
-		// oxlint-disable-next-line typescript/no-non-null-assertion
-		this.#rows.push(decoder!(bytes, start, end));
+		try {
+			// oxlint-disable-next-line typescript/no-non-null-assertion
+			this.#rows.push(decoder!(bytes, start, end));
+		} catch (error) {
+			if (!(error instanceof DecodeError)) throw error;
+			this.#decodeError = error;
+			this.#rows = [];
+		}
 		return true;
 	}
 
@@ -396,6 +406,10 @@ export class QueryOp extends Op {
 	#finish(ctx: OpContext, status: 'I' | 'T' | 'E'): boolean {
 		this.settle();
 		const error = this.#error;
+		if (error === undefined && this.#decodeError !== undefined) {
+			this.#reject(this.#decodeError);
+			return true;
+		}
 		if (error === undefined) {
 			const { command, rowCount } = parseTag(this.#tag);
 			this.#resolve({
@@ -447,7 +461,7 @@ export class SimpleQueryOp extends Op {
 	#fields: readonly Field[] = [];
 	#decoder: RowDecoder | undefined;
 	#rows: unknown[] = [];
-	#error: PostgresError | undefined;
+	#error: PostgresError | DecodeError | undefined;
 	#ctxTypes: TypeParsers = {};
 
 	constructor(
@@ -473,7 +487,13 @@ export class SimpleQueryOp extends Op {
 	override dataRow(bytes: Uint8Array, start: number, end: number): boolean {
 		if (this.#decoder === undefined)
 			throw new ProtocolError('DataRow before RowDescription');
-		this.#rows.push(this.#decoder(bytes, start, end));
+		if (this.#error !== undefined) return true;
+		try {
+			this.#rows.push(this.#decoder(bytes, start, end));
+		} catch (error) {
+			if (!(error instanceof DecodeError)) throw error;
+			this.#error = error;
+		}
 		return true;
 	}
 
@@ -530,7 +550,8 @@ export class SimpleQueryOp extends Op {
 
 	fail(error: Error): void {
 		this.settle();
-		this.#reject(this.#error?.isFatal ? this.#error : error);
+		const own = this.#error;
+		this.#reject(own instanceof PostgresError && own.isFatal ? own : error);
 	}
 }
 
@@ -771,7 +792,15 @@ export class CursorOp extends Op {
 		if (this.#synced) return true;
 		if (this.#decoder === undefined)
 			throw new ProtocolError('DataRow before RowDescription');
-		this.#batch.push(this.#decoder(bytes, start, end));
+		try {
+			this.#batch.push(this.#decoder(bytes, start, end));
+		} catch (error) {
+			if (!(error instanceof DecodeError)) throw error;
+			// the iteration fails with it; the portal is closed so no more rows come
+			this.#error ??= error;
+			this.#batch = [];
+			this.#sync(true);
+		}
 		return true;
 	}
 
