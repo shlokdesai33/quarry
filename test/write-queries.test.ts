@@ -462,6 +462,64 @@ describe('running a write query', () => {
 		await expect(several).rejects.toMatchObject({ table: 'users' });
 	});
 
+	// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the undefined a plain JS caller, or an `as` cast, can pass
+	const missing = undefined as never;
+
+	it('leaves out columns whose value is undefined, never writing NULL for them', () => {
+		expect(
+			compile(insertInto(users).values({ email: 'a', name: missing }).toNode()),
+		).toEqual({
+			sql: 'insert into "users" ("email") values ($1)',
+			params: ['a'],
+		});
+		expect(
+			compile(
+				insertInto(users)
+					.values([
+						{ email: 'a', name: null },
+						{ email: 'b', name: missing },
+					])
+					.toNode(),
+			),
+		).toEqual({
+			sql: 'insert into "users" ("email", "name") values ($1, $2), ($3, default)',
+			params: ['a', null, 'b'],
+		});
+		expect(
+			compile(
+				update(users)
+					.set({ name: missing, email: 'b' })
+					.where('users.id', 1)
+					.toNode(),
+			),
+		).toEqual({
+			sql: 'update "users" set "email" = $1 where "users"."id" = $2',
+			params: ['b', 1],
+		});
+	});
+
+	it('refuses a set() that leaves no columns to set', () => {
+		const message =
+			'The update of "users" sets no columns: an undefined value leaves its column out, and every value given was undefined (or none was given)';
+		expect(() => update(users).set({ name: missing })).toThrow(message);
+		expect(() => update(users).set({})).toThrow(message);
+		expect(() =>
+			insertInto(users)
+				.values({ email: 'a', name: null })
+				.onConflict('email')
+				.doUpdate(() => ({ name: missing })),
+		).toThrow(message);
+		expect(
+			compile(
+				update(users)
+					.set({ email: 'b' })
+					.set({ name: missing })
+					.where('users.id', 1)
+					.toNode(),
+			).sql,
+		).toBe('update "users" set "email" = $1 where "users"."id" = $2');
+	});
+
 	it('needs a database', async () => {
 		await expect(
 			insertInto(users).values({ email: 'a', name: null }).execute(),

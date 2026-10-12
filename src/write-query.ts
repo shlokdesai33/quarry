@@ -95,7 +95,8 @@ export function valueNode(column: AnyColumn, value: unknown): OperationNode {
 
 /**
  * The assignments of `values` merged over `set`: a column set again keeps its
- * place and takes the new value.
+ * place and takes the new value, and an undefined value is left out. Throws
+ * when that leaves nothing to set.
  */
 export function setNodes(
 	table: AnyTable,
@@ -108,7 +109,13 @@ export function setNodes(
 		const { column, name } = columnOf(table, key);
 		merged.set(name, valueNode(column, value));
 	}
-	return [...merged].map(([column, value]) => ({ column, value }));
+	const nodes = [...merged].map(([column, value]) => ({ column, value }));
+	if (nodes.length === 0) {
+		throw new Error(
+			`The update of "${table.name}" sets no columns: an undefined value leaves its column out, and every value given was undefined (or none was given)`,
+		);
+	}
+	return nodes;
 }
 
 /**
