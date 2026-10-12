@@ -1,7 +1,7 @@
 import { DriverError } from './errors.js';
 import type { Field } from './protocol/messages.js';
 import { utf8 } from './protocol/text.js';
-import { parseTimestamptz } from './parsers.js';
+import { parseTimestamptz, parseVector } from './parsers.js';
 import {
 	arrayOids,
 	arrayParserInfo,
@@ -78,6 +78,17 @@ const json: BinaryParser = (b, s, e) => JSON.parse(utf8(b, s, e));
 const jsonb: BinaryParser = (b, s, e) => {
 	if (b[s] !== 1) throw new DriverError('Unsupported jsonb binary version');
 	return JSON.parse(utf8(b, s + 1, e));
+};
+
+/** pgvector's binary format: Int16 dimensions, Int16 unused, then float4s. */
+const vector: BinaryParser = (b, s, e) => {
+	const dim = ((b[s] ?? 0) << 8) | (b[s + 1] ?? 0);
+	if (e - s !== 4 + dim * 4)
+		throw new DriverError('Invalid vector binary value');
+	const view = new DataView(b.buffer, b.byteOffset + s + 4, dim * 4);
+	const out: number[] = [];
+	for (let i = 0; i < dim; i++) out.push(view.getFloat32(i * 4));
+	return out;
 };
 
 const invalidArray = (): DriverError =>
@@ -173,6 +184,7 @@ export function binaryParser(
 	parser: TextParser | undefined,
 ): BinaryParser | undefined {
 	if (parser === undefined) return undefined;
+	if (parser === parseVector) return vector;
 	const array = arrayParserInfo(parser);
 	if (array !== undefined) {
 		const elementOid = array.elementOid ?? arrayElements[oid];

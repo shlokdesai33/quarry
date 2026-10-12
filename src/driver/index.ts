@@ -70,6 +70,7 @@ export {
 	catalogTypes,
 	parseRange,
 	parseTimestamptz,
+	parseHalfvec,
 	parseVector,
 	type CatalogType,
 	type RangeValue,
