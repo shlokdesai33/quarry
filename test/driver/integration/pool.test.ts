@@ -527,7 +527,6 @@ describe.skipIf(noPg)('pool', () => {
 		expect(p.stats.total).toBe(2);
 	});
 
-	// found by pg-pool's lifetime-timeout and sizing tests
 	it('recycles idle connections when their lifetime ends, even at min', async () => {
 		await using admin = await open();
 		const alive = async (pid: number) =>
@@ -608,7 +607,6 @@ describe.skipIf(noPg)('pool', () => {
 		expect(p.stats.busy).toBe(0);
 	});
 
-	// found by pg-pool's error-handling tests
 	it('keeps trying to connect for each waiter when connecting fails', async () => {
 		const { createServer } = await import('node:net');
 		const server = createServer((socket) => socket.destroy());
@@ -643,7 +641,6 @@ describe.skipIf(noPg)('pool', () => {
 		}
 	});
 
-	// found by pg-pool's ending tests and pg's type-parser-override test
 	it('ends once issued work is done, and refuses new work', async () => {
 		const p = pool({ max: 1 });
 		const held = await p.acquire();

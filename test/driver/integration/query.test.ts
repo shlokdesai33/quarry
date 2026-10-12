@@ -27,7 +27,6 @@ describe.skipIf(noPg)('queries', () => {
 		await conn?.close();
 	});
 
-	// found by node-postgres's throw-in-type-parser tests
 	it('fails only the query whose value a parser cannot decode', async () => {
 		const types = {
 			...rawTypes,
@@ -63,7 +62,6 @@ describe.skipIf(noPg)('queries', () => {
 		]);
 	});
 
-	// found by postgres.js's "big query body"
 	it('takes up to 65535 parameters, and refuses more before sending', async () => {
 		const n = 40_000;
 		const placeholders = Array.from({ length: n }, (_, i) => `($${i + 1})`);
@@ -81,7 +79,6 @@ describe.skipIf(noPg)('queries', () => {
 		expect((await conn.query('select 1 as n')).rows).toEqual([{ n: 1 }]);
 	});
 
-	// found by postgres.js's "Cancel piped query"
 	it('cancels a pipelined query once it runs, never the query ahead of it', async () => {
 		const controller = new AbortController();
 		const first = conn.query('select pg_sleep(0.4) as a');
@@ -98,7 +95,6 @@ describe.skipIf(noPg)('queries', () => {
 		expect((await conn.query('select 1 as n')).rows).toEqual([{ n: 1 }]);
 	});
 
-	// found by postgres.js's "Catches query format errors"
 	it('rejects SQL it cannot send, without crashing or breaking the connection', async () => {
 		const pending = conn.query('select 1 as before');
 		const nul = conn.query('select 1\0');
@@ -211,7 +207,11 @@ describe.skipIf(noPg)('queries', () => {
 			(false, 32767::int2, 2147483647::int4, 0::oid, 'Infinity'::float4, '1e-310'::float8, ''::bytea, 'infinity'::timestamptz),
 			(null, 1::int2, 0::int4, 26::oid, '-1.5'::float4, '-Infinity'::float8, null, '0044-03-15 12:00:00.123456+00 BC'::timestamptz),
 			(true, 0::int2, 7::int4, 1::oid, '3.4e38'::float4, '0.1'::float8, '\\xdeadbeef'::bytea, '1969-12-31 23:59:59.9995+00'::timestamptz),
-			(true, 0::int2, 7::int4, 1::oid, '1'::float4, 'NaN'::float8, '\\x'::bytea, '2024-02-29 13:45:01.000999+05:30'::timestamptz)
+			(true, 0::int2, 7::int4, 1::oid, '1'::float4, 'NaN'::float8, '\\x'::bytea, '2024-02-29 13:45:01.000999+05:30'::timestamptz),
+			-- more than 2^53 microseconds from 2000, just below a millisecond
+			(true, 0::int2, 7::int4, 1::oid, '1'::float4, '1'::float8, '\\x'::bytea, '1700-01-01 00:00:00.999999+00'::timestamptz),
+			(true, 0::int2, 7::int4, 1::oid, '1'::float4, '1'::float8, '\\x'::bytea, '3000-06-15 12:34:56.789999+00'::timestamptz),
+			(true, 0::int2, 7::int4, 1::oid, '1'::float4, '1'::float8, '\\x'::bytea, '4000-01-01 00:00:00.999999+00 BC'::timestamptz)
 		) as t(b, i2, i4, o, f4, f8, bytes, ts)`;
 		await using c = await open({ types: quarryTypes });
 		const text = await c.query(sql, [], { binary: false });
@@ -450,7 +450,6 @@ describe.skipIf(noPg)('queries', () => {
 		await conn.query(`drop table ${name}`);
 	});
 
-	// found by postgres.js's "Recreate prepared statements on transformAssignedExpr error"
 	it('re-prepares a cached statement whose inferred parameter type no longer fits', async () => {
 		const name = table();
 		const insert = () =>
