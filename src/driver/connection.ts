@@ -852,7 +852,7 @@ export class Connection implements AsyncDisposable {
 			}
 			let values;
 			try {
-				values = encodeParams(sql, params);
+				values = encodeParams(sql, params, options?.paramTypes);
 			} catch (error) {
 				reject(error);
 				return;
@@ -1015,7 +1015,7 @@ export class Connection implements AsyncDisposable {
 				const op = new CursorOp(
 					sql,
 					params,
-					encodeParams(sql, params),
+					encodeParams(sql, params, options?.paramTypes),
 					this.#options(options),
 					options?.batchSize ?? 1000,
 				);

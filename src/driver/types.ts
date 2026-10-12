@@ -1,3 +1,4 @@
+import { binaryArray } from './array-params.js';
 import { DriverError, UndefinedParameterError } from './errors.js';
 import type { WireValue } from './protocol/frontend.js';
 
@@ -380,11 +381,14 @@ const MAX_PARAMETERS = 65535;
 
 /**
  * Encodes a query's parameters with `encodeParam`, refusing `undefined`
- * (or an undefined array element) instead of sending it as NULL.
+ * (or an undefined array element) instead of sending it as NULL. An array
+ * whose type `paramTypes` declares is sent in binary where the driver has
+ * an encoder for it and every element fits.
  */
 export function encodeParams(
 	sql: string,
 	params: readonly unknown[],
+	paramTypes: readonly number[] = [],
 ): WireValue[] {
 	if (params.length > MAX_PARAMETERS) {
 		throw new DriverError(
@@ -397,7 +401,12 @@ export function encodeParams(
 		const element = undefinedAt(value);
 		if (element !== undefined)
 			throw new UndefinedParameterError(sql, i + 1, element);
-		values.push(encodeDefined(value));
+		const type = paramTypes[i];
+		values.push(
+			(type !== undefined && Array.isArray(value)
+				? binaryArray(value, type)
+				: undefined) ?? encodeDefined(value),
+		);
 	}
 	return values;
 }
