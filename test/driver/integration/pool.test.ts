@@ -179,6 +179,33 @@ describe.skipIf(noPg)('transactions', () => {
 		).rejects.toBeInstanceOf(TransactionRolledBack);
 	});
 
+	it('rejects once, without an unhandled rejection, when BEGIN fails with settings or a timeout', async () => {
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on('unhandledRejection', onUnhandled);
+		try {
+			const c = await open();
+			c.destroy();
+			for (const txOptions of [
+				{ settings: { 'app.tenant_id': 1 } },
+				{ timeout: 1000 },
+			]) {
+				let ran = false;
+				await rejection(
+					c.transaction(async () => {
+						ran = true;
+					}, txOptions),
+					ConnectionError,
+				);
+				expect(ran).toBe(false);
+			}
+			await sleep(20);
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off('unhandledRejection', onUnhandled);
+		}
+	});
+
 	it('refuses use after the transaction finished', async () => {
 		let leaked: { query(sql: string): Promise<unknown> } | undefined;
 		await conn.transaction(async (tx) => {
