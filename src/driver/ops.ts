@@ -46,6 +46,14 @@ export interface OpContext {
 	): { statement: Statement; created: boolean };
 	/** Drops a statement from the cache (it failed or went stale). */
 	forget(statement: Statement): void;
+	/**
+	 * Stops preparing a statement's SQL on this connection: even a fresh
+	 * Parse of it got a stale plan, which happens when a pooler maps it back
+	 * to a server-side statement prepared before a schema change.
+	 */
+	unprepare(statement: Statement): void;
+	/** Whether this SQL may be prepared as a named statement. */
+	preparable(sql: string, types: readonly number[]): boolean;
 	/** Writes bytes now, for operations that talk after being written (cursors, COPY). */
 	send(bytes: Uint8Array): boolean;
 	/** Resolves when the socket's write buffer has drained. */
@@ -260,7 +268,10 @@ export class QueryOp extends Op {
 	write(ctx: OpContext): void {
 		const w = ctx.writer;
 		this.#types = this.#options.types ?? ctx.types;
-		if (this.#options.prepare) {
+		if (
+			this.#options.prepare &&
+			ctx.preparable(this.#sql, this.#options.paramTypes)
+		) {
 			const { statement, created } = ctx.statement(
 				this.#sql,
 				this.#options.paramTypes,
@@ -427,12 +438,14 @@ export class QueryOp extends Op {
 			staleStatement(error, this.#statement, this.#createdStatement)
 		) {
 			ctx.forget(this.#statement);
+			if (this.#createdStatement) ctx.unprepare(this.#statement);
+			// retried unnamed: a pooler passes that through instead of reusing its stale statement
 			ctx.retry(
 				new QueryOp(
 					this.#sql,
 					this.#params,
 					this.#values,
-					this.#options,
+					{ ...this.#options, prepare: false },
 					this.#resolve,
 					this.#reject,
 					true,

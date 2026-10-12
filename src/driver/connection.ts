@@ -127,6 +127,8 @@ export class Connection implements AsyncDisposable {
 	/** The operation the cancel request was sent for, once it is running. */
 	#cancelSent: Op | undefined;
 	readonly #statements = new Map<string, Statement>();
+	/** Statement keys never prepared again on this connection (see `OpContext.unprepare`). */
+	readonly #unprepared = new Set<string>();
 	#statementCount = 0;
 	#status: 'I' | 'T' | 'E' = 'I';
 	#closed = false;
@@ -183,6 +185,10 @@ export class Connection implements AsyncDisposable {
 			writer: this.#writer,
 			types: this.#types,
 			statement: (sql, types) => this.#statement(sql, types),
+			unprepare: (statement) => this.#unprepared.add(statement.key),
+			preparable: (sql, types) =>
+				this.#unprepared.size === 0 ||
+				!this.#unprepared.has(statementKey(sql, types)),
 			forget: (statement) => {
 				if (this.#statements.get(statement.key) === statement)
 					this.#statements.delete(statement.key);
@@ -650,7 +656,7 @@ export class Connection implements AsyncDisposable {
 		sql: string,
 		types: readonly number[],
 	): { statement: Statement; created: boolean } {
-		const key = types.length === 0 ? sql : `${types.join(',')}\0${sql}`;
+		const key = statementKey(sql, types);
 		const existing = this.#statements.get(key);
 		if (existing !== undefined) {
 			this.#statements.delete(key);
@@ -1306,6 +1312,11 @@ export class Connection implements AsyncDisposable {
 		this.#resolveClosed();
 		this.#emit(this.#closeListeners, error);
 	}
+}
+
+/** The statement cache's key: the SQL, prefixed with explicit parameter types. */
+function statementKey(sql: string, types: readonly number[]): string {
+	return types.length === 0 ? sql : `${types.join(',')}\0${sql}`;
 }
 
 /** Why `sql` can't be sent, if it can't: Postgres takes text without NUL bytes. */
