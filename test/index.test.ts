@@ -26,6 +26,7 @@ describe('the package entry point', () => {
 			'array',
 			'NoRowError',
 			'TooManyRowsError',
+			'violatedColumns',
 		]) {
 			expect(typeof Reflect.get(quarry, name), name).toBe('function');
 		}

@@ -70,6 +70,11 @@ export interface TransactionOptions {
 		| undefined;
 	/** Ends the transaction (and its session) if it runs longer than this: milliseconds or an interval. */
 	readonly timeout?: number | string | undefined;
+	/**
+	 * Throws if already inside a transaction, instead of nesting as a
+	 * savepoint: for work that must really commit when the callback resolves.
+	 */
+	readonly durable?: boolean | undefined;
 }
 
 /**
@@ -112,15 +117,29 @@ export interface TransactionExecutor extends Executor {
 	setLocal(name: string, value: string | number | boolean): Promise<void>;
 }
 
+/** `on "users" ` for a message, or nothing when the table isn't known. */
+const onTable = (table: string | undefined) =>
+	table === undefined ? '' : `on ${JSON.stringify(table)} `;
+
+/** Sets `query` without making it enumerable, so its params stay out of logs and `JSON.stringify`. */
+function hideQuery(error: Error, query: CompiledQuery): void {
+	Object.defineProperty(error, 'query', { value: query });
+}
+
 /** The query returned no row where `one` expects exactly one. */
 export class NoRowError extends Error {
-	/** The query that returned no row. */
-	readonly query: CompiledQuery;
+	/** The query that returned no row. Not enumerable. */
+	declare readonly query: CompiledQuery;
+	/** The table the query reads (its `from`) or writes, by its name in the database. */
+	readonly table: string | undefined;
 
-	constructor(query: CompiledQuery) {
-		super('The query returned no row, where exactly one was expected');
+	constructor(query: CompiledQuery, table?: string) {
+		super(
+			`The query ${onTable(table)}returned no row, where exactly one was expected`,
+		);
 		this.name = 'NoRowError';
-		this.query = query;
+		this.table = table;
+		hideQuery(this, query);
 	}
 }
 
@@ -129,13 +148,18 @@ export class NoRowError extends Error {
  * one.
  */
 export class TooManyRowsError extends Error {
-	/** The query that returned several rows. */
-	readonly query: CompiledQuery;
+	/** The query that returned several rows. Not enumerable. */
+	declare readonly query: CompiledQuery;
+	/** The table the query reads (its `from`) or writes, by its name in the database. */
+	readonly table: string | undefined;
 
-	constructor(query: CompiledQuery) {
-		super('The query returned several rows, where at most one was expected');
+	constructor(query: CompiledQuery, table?: string) {
+		super(
+			`The query ${onTable(table)}returned several rows, where at most one was expected`,
+		);
 		this.name = 'TooManyRowsError';
-		this.query = query;
+		this.table = table;
+		hideQuery(this, query);
 	}
 }
 
@@ -147,16 +171,24 @@ export class TooManyRowsError extends Error {
 export class RowCountError extends Error {
 	readonly expected: number;
 	readonly actual: number;
-	/** The query that ran. */
-	readonly query: CompiledQuery;
+	/** The query that ran. Not enumerable. */
+	declare readonly query: CompiledQuery;
+	/** The table the query writes, by its name in the database. */
+	readonly table: string | undefined;
 
-	constructor(query: CompiledQuery, expected: number, actual: number) {
+	constructor(
+		query: CompiledQuery,
+		expected: number,
+		actual: number,
+		table?: string,
+	) {
 		super(
-			`The query affected ${actual} row${actual === 1 ? '' : 's'}, where ${expected} ${expected === 1 ? 'was' : 'were'} expected`,
+			`The query ${onTable(table)}affected ${actual} row${actual === 1 ? '' : 's'}, where ${expected} ${expected === 1 ? 'was' : 'were'} expected`,
 		);
 		this.name = 'RowCountError';
 		this.expected = expected;
 		this.actual = actual;
-		this.query = query;
+		this.table = table;
+		hideQuery(this, query);
 	}
 }

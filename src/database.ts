@@ -92,8 +92,9 @@ export interface Database extends AsyncDisposable {
 	/**
 	 * Runs `fn` in a transaction: committed when it resolves, rolled back
 	 * when it throws. `tx` runs queries inside it; `tx.transaction` nests a
-	 * savepoint. With `retries`, serialization failures and deadlocks re-run
-	 * `fn`, so put side effects in `tx.afterCommit`.
+	 * savepoint, unless it is `durable`, which throws instead. With
+	 * `retries`, serialization failures and deadlocks re-run `fn`, so put side
+	 * effects in `tx.afterCommit`.
 	 *
 	 * @example
 	 * await db.transaction(async (tx) => {

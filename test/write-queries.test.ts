@@ -438,14 +438,28 @@ describe('running a write query', () => {
 			.execute()
 			.catch((e: unknown) => e);
 		expect(error).toBeInstanceOf(RowCountError);
-		expect(error).toMatchObject({ expected: 1, actual: 0 });
-		await expect(
-			none.deleteFrom(users).where('users.id', 1).returning(['users.id']).one(),
-		).rejects.toBeInstanceOf(NoRowError);
+		expect(error).toMatchObject({
+			expected: 1,
+			actual: 0,
+			table: 'users',
+			message: 'The query on "users" affected 0 rows, where 1 was expected',
+		});
+		expect(JSON.stringify(error)).not.toContain('"A"');
+		const noRow = none
+			.deleteFrom(users)
+			.where('users.id', 1)
+			.returning(['users.id'])
+			.one();
+		await expect(noRow).rejects.toBeInstanceOf(NoRowError);
+		await expect(noRow).rejects.toMatchObject({ table: 'users' });
 		const two = databaseWith(fakeExecutor([{ id: 1 }, { id: 2 }]).executor);
-		await expect(
-			two.deleteFrom(users).allRows().returning(['users.id']).maybeOne(),
-		).rejects.toBeInstanceOf(TooManyRowsError);
+		const several = two
+			.deleteFrom(users)
+			.allRows()
+			.returning(['users.id'])
+			.maybeOne();
+		await expect(several).rejects.toBeInstanceOf(TooManyRowsError);
+		await expect(several).rejects.toMatchObject({ table: 'users' });
 	});
 
 	it('needs a database', async () => {
