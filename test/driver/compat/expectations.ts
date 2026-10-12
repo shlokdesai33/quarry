@@ -255,6 +255,13 @@ const expectations: Record<string, Table> = {
 					"counts release events from pool.query too; quarry's pool.query runs on (or pipelines onto) a connection without checking a client out",
 			},
 		},
+		'test/lifetime-timeout.js': {
+			'lifetime timeout connection lifetime should expire and remove the client':
+				{
+					reason: 'an idle connection past maxLifetime',
+					fixed: 'B2',
+				},
+		},
 		'test/idle-timeout.js': {
 			'idle timeout unrefs the connections and timeouts so the program can exit when idle when the allowExitOnIdle option is set':
 				{
