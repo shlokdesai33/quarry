@@ -463,6 +463,7 @@ describe.skipIf(noPg)('queries', () => {
 			`alter table ${name} alter column v type int using v::integer`,
 		);
 		expect((await insert()).rows).toEqual([{ v: 1 }]);
+		expect((await insert()).rows).toEqual([{ v: 1 }]);
 		// inside a transaction the error stands: retrying there isn't safe
 		await expect(
 			conn.transaction(async (tx) => {
