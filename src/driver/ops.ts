@@ -591,6 +591,14 @@ export class QueryOp extends Op {
 		this.settle();
 		this.#reject(this.#error?.isFatal ? this.#error : error);
 	}
+
+	/** The server skipped the statement, so a Parse it sent never ran. */
+	skip(error: Error, ctx: OpContext): void {
+		const statement = this.#statement;
+		if (statement && this.#createdStatement && !statement.parsed)
+			ctx.forget(statement);
+		this.fail(error);
+	}
 }
 
 /**
@@ -627,7 +635,8 @@ export class SyncGroupOp extends Op {
 				: undefined;
 			for (const [i, op] of this.#ops.entries()) {
 				if (i <= this.#current) op.handle(msg, ctx);
-				else op.fail(skipped ?? new ProtocolError('A statement was skipped'));
+				else
+					op.skip(skipped ?? new ProtocolError('A statement was skipped'), ctx);
 			}
 			return true;
 		}
