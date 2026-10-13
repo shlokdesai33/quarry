@@ -37,7 +37,8 @@ describe('the query', () => {
 			.selectFrom(users)
 			.select(['users.id', 'users.firstName'])
 			.where('users.email', 'ada@example.com')
-			.all();
+			.all()
+			.execute();
 		expect(ran).toEqual([
 			{
 				sql: 'select "users"."id" as "id", "users"."first_name" as "firstName" from "users" where "users"."email" = $1',
@@ -51,7 +52,8 @@ describe('the query', () => {
 		await db
 			.selectFrom(users)
 			.select((eb) => [eb.fn.lower('users.email').as('lowerEmail')])
-			.all();
+			.all()
+			.execute();
 		expect(ran[0]?.sql).toBe(
 			'select lower("users"."email") as "lowerEmail" from "users"',
 		);
@@ -66,7 +68,8 @@ describe('the query', () => {
 			.innerJoin(users.as('managers'))
 			.on((eb) => eb.ref('managers.id').eq(eb.ref('users.managerId')))
 			.select(['users.id', 'contacts.phone', 'managers.email'])
-			.all();
+			.all()
+			.execute();
 		expect(ran[0]?.sql).toBe(
 			'select "users"."id" as "id", "contacts"."phone" as "phone", "managers"."email" as "email" from "users" inner join "contacts" on "contacts"."user_id" = "users"."id" inner join "users" as "managers" on "managers"."id" = "users"."manager_id"',
 		);
@@ -74,13 +77,18 @@ describe('the query', () => {
 
 	it('selects no columns until told to', async () => {
 		const { db, ran } = fake([]);
-		await db.selectFrom(users).all();
+		await db.selectFrom(users).all().execute();
 		expect(ran[0]?.sql).toBe('select from "users"');
 	});
 
 	it('passes the tag to the executor beside the SQL', async () => {
 		const { db, ran } = fake([]);
-		await db.selectFrom(users).select(['users.id']).tag('users.ids').first();
+		await db
+			.selectFrom(users)
+			.select(['users.id'])
+			.tag('users.ids')
+			.first()
+			.execute();
 		expect(ran).toEqual([
 			{
 				sql: 'select "users"."id" as "id" from "users" limit $1',
@@ -92,12 +100,12 @@ describe('the query', () => {
 
 	it('passes no tag when none was set', async () => {
 		const { db, ran } = fake([]);
-		await db.selectFrom(users).all();
+		await db.selectFrom(users).all().execute();
 		expect(ran[0]).not.toHaveProperty('tag');
 	});
 
 	it('runs only when started from a database', async () => {
-		await expect(selectFrom(users).all()).rejects.toThrow(
+		await expect(selectFrom(users).all().execute()).rejects.toThrow(
 			'The query has no database to run on',
 		);
 	});
@@ -107,7 +115,11 @@ describe('all', () => {
 	it('returns every row', async () => {
 		const rows = [{ id: 1 }, { id: 2 }];
 		expect(
-			await fake(rows).db.selectFrom(users).select(['users.id']).all(),
+			await fake(rows)
+				.db.selectFrom(users)
+				.select(['users.id'])
+				.all()
+				.execute(),
 		).toEqual(rows);
 	});
 });
@@ -115,7 +127,9 @@ describe('all', () => {
 describe('first', () => {
 	it('fetches with `limit 1` and returns the row', async () => {
 		const { db, ran } = fake([{ id: 1 }]);
-		expect(await db.selectFrom(users).select(['users.id']).first()).toEqual({
+		expect(
+			await db.selectFrom(users).select(['users.id']).first().execute(),
+		).toEqual({
 			id: 1,
 		});
 		expect(ran[0]).toEqual({
@@ -125,21 +139,25 @@ describe('first', () => {
 	});
 
 	it('returns undefined when there is none', async () => {
-		expect(await fake([]).db.selectFrom(users).first()).toBeUndefined();
+		expect(
+			await fake([]).db.selectFrom(users).first().execute(),
+		).toBeUndefined();
 	});
 });
 
 describe('one', () => {
 	it('fetches with `limit 2` and returns the one row', async () => {
 		const { db, ran } = fake([{ id: 1 }]);
-		expect(await db.selectFrom(users).select(['users.id']).one()).toEqual({
+		expect(
+			await db.selectFrom(users).select(['users.id']).one().execute(),
+		).toEqual({
 			id: 1,
 		});
 		expect(ran[0]?.params).toEqual([2]);
 	});
 
 	it('throws when there is none', async () => {
-		const failure = fake([]).db.selectFrom(users).one();
+		const failure = fake([]).db.selectFrom(users).one().execute();
 		await expect(failure).rejects.toBeInstanceOf(NoRowError);
 		await expect(failure).rejects.toMatchObject({
 			table: 'users',
@@ -154,6 +172,7 @@ describe('one', () => {
 			.db.selectFrom(users)
 			.where('users.email', 'secret-param')
 			.one()
+			.execute()
 			.catch((e: unknown) => e);
 		if (!(error instanceof NoRowError)) throw new Error('expected NoRowError');
 		expect(error.query.params).toContain('secret-param');
@@ -167,14 +186,15 @@ describe('one', () => {
 
 	it('keeps the tag on the query it throws with', async () => {
 		await expect(
-			fake([]).db.selectFrom(users).tag('users.one').one(),
+			fake([]).db.selectFrom(users).tag('users.one').one().execute(),
 		).rejects.toMatchObject({ query: { tag: 'users.one' } });
 	});
 
 	it('throws when there are several', async () => {
 		const failure = fake([{ id: 1 }, { id: 2 }])
 			.db.selectFrom(users)
-			.one();
+			.one()
+			.execute();
 		await expect(failure).rejects.toBeInstanceOf(TooManyRowsError);
 		await expect(failure).rejects.toMatchObject({ table: 'users' });
 	});
@@ -185,18 +205,22 @@ describe('maybeOne', () => {
 		expect(
 			await fake([{ id: 1 }])
 				.db.selectFrom(users)
-				.maybeOne(),
+				.maybeOne()
+				.execute(),
 		).toEqual({
 			id: 1,
 		});
-		expect(await fake([]).db.selectFrom(users).maybeOne()).toBeUndefined();
+		expect(
+			await fake([]).db.selectFrom(users).maybeOne().execute(),
+		).toBeUndefined();
 	});
 
 	it('throws when there are several', async () => {
 		await expect(
 			fake([{ id: 1 }, { id: 2 }])
 				.db.selectFrom(users)
-				.maybeOne(),
+				.maybeOne()
+				.execute(),
 		).rejects.toBeInstanceOf(TooManyRowsError);
 	});
 });

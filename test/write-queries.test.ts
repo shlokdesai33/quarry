@@ -411,7 +411,8 @@ describe('running a write query', () => {
 				.insertInto(users)
 				.values({ email: 'a', name: null })
 				.returning(['users.id'])
-				.one(),
+				.one()
+				.execute(),
 		).toEqual({ id: 7 });
 		expect(
 			await db
@@ -419,7 +420,8 @@ describe('running a write query', () => {
 				.set({ name: 'A' })
 				.allRows()
 				.returning(['users.id'])
-				.first(),
+				.first()
+				.execute(),
 		).toEqual({ id: 7 });
 		expect(ran.map((q) => q.sql.split(' ')[0])).toEqual([
 			'delete',
@@ -451,7 +453,8 @@ describe('running a write query', () => {
 			.deleteFrom(users)
 			.where('users.id', 1)
 			.returning(['users.id'])
-			.one();
+			.one()
+			.execute();
 		await expect(noRow).rejects.toBeInstanceOf(NoRowError);
 		await expect(noRow).rejects.toMatchObject({ table: 'users' });
 		const two = databaseWith(fakeExecutor([{ id: 1 }, { id: 2 }]).executor);
@@ -459,7 +462,8 @@ describe('running a write query', () => {
 			.deleteFrom(users)
 			.allRows()
 			.returning(['users.id'])
-			.maybeOne();
+			.maybeOne()
+			.execute();
 		await expect(several).rejects.toBeInstanceOf(TooManyRowsError);
 		await expect(several).rejects.toMatchObject({ table: 'users' });
 	});

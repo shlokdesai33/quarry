@@ -37,6 +37,18 @@ export function executorFrom(execute: Execute): Executor {
 			yield (await run(query, options)).rows;
 		},
 		describe: () => Promise.reject(new Error('describe needs a database')),
+		async batch(queries, options = {}) {
+			const settled = await Promise.allSettled(
+				queries.map((query) => run(query, options)),
+			);
+			if (options.transaction === undefined) return settled;
+			const values = settled.map((outcome) => {
+				if (outcome.status === 'rejected') throw outcome.reason;
+				return outcome.value;
+			});
+			options.verify?.(values);
+			return settled;
+		},
 		async transaction(fn) {
 			const committed: (() => unknown)[] = [];
 			const rolledBack: (() => unknown)[] = [];

@@ -3,7 +3,8 @@ import { describe, expect, it } from 'vitest';
 import { statementNames } from '../../../src/driver/capabilities.js';
 import { DecodeError } from '../../../src/driver/errors.js';
 import { versionAtLeast } from '../setup/cluster.js';
-import { cluster, open, pg, table } from './helpers.js';
+import { Transaction } from '../../../src/driver/transaction.js';
+import { cluster, open, pg, recordingSockets, table } from './helpers.js';
 
 // named prepared statements in transaction mode need PgBouncer 1.21+
 const prepare = versionAtLeast(pg?.bouncerVersion, 1, 21);
@@ -16,6 +17,9 @@ const bouncer = () => ({
 	ssl: 'disable' as const,
 	prepare,
 });
+
+/** A statement selecting `n` and its parameter. */
+const numbered = (n: number) => `select ${n}::int as n, $1::text as s`;
 
 /** `n` queries issued together, so a connection pipelines them. */
 const pipelined = <R>(n: number, query: () => Promise<R>) =>
@@ -211,6 +215,42 @@ describe.skipIf(!pg?.bouncerPort)('PgBouncer in transaction mode', () => {
 					expect(r).toMatchObject({ value: { rows: [{ x: '1' }] } });
 				expect((await select()).rows).toEqual([{ x: '1' }]);
 				await conn.query(`drop table ${name}`);
+			});
+
+			it('include the statements of a batch, but not a transaction’s first one', async () => {
+				const net = recordingSockets();
+				await using conn = await open({ ...bouncer(), socket: net.factory });
+				const statements = [1, 2, 3].map((n) => ({
+					sql: numbered(n),
+					params: ['x'],
+				}));
+				const rows = [1, 2, 3].map((n) => ({ n, s: 'x' }));
+				// alone in the queue: COMMIT waits for verify
+				const { done } = Transaction.batch(conn, statements, {
+					verify: () => {},
+				});
+				expect((await done).map((r) => r.rows[0])).toEqual(rows);
+				// inside a transaction, with BEGIN
+				const grouped = await conn.transaction((tx) =>
+					Promise.all(tx.queryGroup(statements)),
+				);
+				expect(grouped.map((r) => r.rows[0])).toEqual(rows);
+				await conn.transaction((tx) => tx.query(numbered(4), ['x']));
+				await conn.transaction((tx) => tx.query(numbered(4), ['x']));
+				// Parse: type, length, statement name, SQL
+				const parses = [
+					...net.sent().matchAll(/P[\s\S]{4}(q\d+)?\0select (\d)/g),
+				].map(([, name, n]) => `${n}:${name === undefined ? '' : 'named'}`);
+				expect(parses).toEqual([
+					'1:',
+					'2:',
+					'3:',
+					'1:',
+					'2:',
+					'3:',
+					// alone under its Sync but for BEGIN: named once, then bound
+					'4:named',
+				]);
 			});
 		},
 	);

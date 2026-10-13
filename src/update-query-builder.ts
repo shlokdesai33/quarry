@@ -1,9 +1,11 @@
+import { compile, type CompiledQuery } from './compile.js';
 import type { Executor, RunOptions } from './executor.js';
 import {
 	type ExpressionBuilder,
 	expressionBuilder,
 } from './expression-builder.js';
 import type { SelectionNode, SetNode, UpdateNode } from './node.js';
+import { type Missing, type Query, rejectAwait } from './query.js';
 import type { RefsOf } from './refs.js';
 import {
 	type AddRow,
@@ -22,14 +24,14 @@ import {
 	columnOf,
 	exactlyOne,
 	atMostOne,
-	executeWrite,
-	writeRows,
 	rowCount,
 	rowsNode,
 	type SetValues,
 	setNodes,
 	type UpdateManyRow,
-	type WriteResult,
+	writeOutput,
+	type WriteOutput,
+	writeQuery,
 } from './write-query.js';
 
 /** What an `update` of `T` has recorded so far. */
@@ -144,6 +146,9 @@ export function updateManyWith<
  * `set` is called, `'where'` until `where` or `allRows` is. Running it is a
  * type error until `M` is `never`.
  *
+ * It runs with `execute()` (or in `db.batch`), never when awaited;
+ * `all`, `first`, `one` and `maybeOne` shape its `returning` rows.
+ *
  * Immutable: every method returns a new builder.
  */
 export class UpdateQueryBuilder<T extends AnyTable, O, M extends UpdateNeeds> {
@@ -250,62 +255,70 @@ export class UpdateQueryBuilder<T extends AnyTable, O, M extends UpdateNeeds> {
 		return condition ? build(this) : this;
 	}
 
+	/** Every `returning` row; runs with `execute()`. */
+	all(this: UpdateQueryBuilder<T, O & object, never>): Query<O[]> {
+		return writeQuery<O, O[]>(
+			this.#state.executor,
+			this.toNode(),
+			({ rows }) => rows,
+		);
+	}
+
+	/** The first `returning` row, if any; runs with `execute()`. */
+	first(this: UpdateQueryBuilder<T, O & object, never>): Query<O | undefined> {
+		return writeQuery<O, O | undefined>(
+			this.#state.executor,
+			this.toNode(),
+			({ rows }) => rows[0],
+		);
+	}
+
 	/**
-	 * Runs the query, resolving to the number of rows updated. Throws
+	 * The one `returning` row; runs with `execute()`, which throws
+	 * `NoRowError` when there is none and `TooManyRowsError` when there are
+	 * several (after the statement has run).
+	 */
+	one(this: UpdateQueryBuilder<T, O & object, never>): Query<O> {
+		return writeQuery(this.#state.executor, this.toNode(), exactlyOne<O>, true);
+	}
+
+	/** The `returning` row, if any; runs with `execute()`, which throws `TooManyRowsError` when there are several. */
+	maybeOne(
+		this: UpdateQueryBuilder<T, O & object, never>,
+	): Query<O | undefined> {
+		return writeQuery(this.#state.executor, this.toNode(), atMostOne<O>, true);
+	}
+
+	/**
+	 * Runs the query, resolving to every `returning` row, as `all()` does,
+	 * or without `returning`, to the number of rows updated. Throws
 	 * `RowCountError` if `expectRows` was set and a different number was.
 	 */
 	execute(
 		this: UpdateQueryBuilder<T, unknown, never>,
 		options?: RunOptions,
-	): Promise<WriteResult> {
-		return executeWrite(this.#state.executor, this.toNode(), options);
+	): Promise<WriteOutput<O>> {
+		return writeOutput<O>(this.#state.executor, this.toNode()).execute(options);
 	}
 
-	/** Runs the query and returns every `returning` row. */
-	async all(
-		this: UpdateQueryBuilder<T, O & object, never>,
-		options?: RunOptions,
-	): Promise<O[]> {
-		return (await writeRows<O>(this.#state.executor, this.toNode(), options))
-			.rows;
+	/** The SQL and parameters `execute()` sends. */
+	toSQL(): CompiledQuery {
+		return compile(this.toNode());
 	}
 
-	/** Runs the query and returns its first `returning` row, if any. */
-	async first(
-		this: UpdateQueryBuilder<T, O & object, never>,
-		options?: RunOptions,
-	): Promise<O | undefined> {
-		const { rows } = await writeRows<O>(
-			this.#state.executor,
-			this.toNode(),
-			options,
-		);
-		return rows[0];
+	/** The query `execute()` runs, for `db.batch`; one that still needs clauses has none. */
+	toQuery(): [M] extends [never] ? Query<WriteOutput<O>> : Missing<M> {
+		// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the type keeps a query that can't run yet out of a batch
+		return writeOutput<O>(this.#state.executor, this.toNode()) as [M] extends [
+			never,
+		]
+			? Query<WriteOutput<O>>
+			: Missing<M>;
 	}
 
-	/**
-	 * Runs the query and returns its one `returning` row: throws
-	 * `NoRowError` when there is none and `TooManyRowsError` when there are
-	 * several (after the statement has run).
-	 */
-	async one(
-		this: UpdateQueryBuilder<T, O & object, never>,
-		options?: RunOptions,
-	): Promise<O> {
-		return exactlyOne(
-			await writeRows<O>(this.#state.executor, this.toNode(), options),
-		);
-	}
-
-	/** Runs the query and returns its `returning` row, if any: throws `TooManyRowsError` when there are several. */
-	async maybeOne(
-		this: UpdateQueryBuilder<T, O & object, never>,
-		options?: RunOptions,
-	): Promise<O | undefined> {
-		return atMostOne(
-			await writeRows<O>(this.#state.executor, this.toNode(), options),
-		);
-	}
+	/** @deprecated A query runs with `execute()`; awaiting one rejects. */
+	// oxlint-disable-next-line unicorn/no-thenable -- so that a forgotten execute() fails loudly
+	readonly then = rejectAwait;
 
 	/** The whole query as one node. */
 	toNode(): UpdateNode {

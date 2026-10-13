@@ -1,4 +1,4 @@
-import { compile } from './compile.js';
+import { compile, type CompiledQuery } from './compile.js';
 import type { DataType } from './data-type/data-type.js';
 import {
 	type Executor,
@@ -22,6 +22,7 @@ import type {
 	TableNode,
 } from './node.js';
 import type { AnyPredicate, EqualsValue } from './operators.js';
+import { Query, rejectAwait } from './query.js';
 import type { Ref, Refs, RefsOf } from './refs.js';
 import {
 	type AddRow,
@@ -186,7 +187,8 @@ interface SelectState<T extends readonly AnyTable[]> {
 
 /**
  * Starts a `select` from `table`, built without a database: it can be
- * inspected and composed, but runs only when started from `database(...)`.
+ * inspected and composed, and run by a database's `batch`, but `execute()`
+ * runs only a query started from `database(...)`.
  *
  * @example
  * selectFrom(users)
@@ -255,8 +257,15 @@ export function selectFromWith<T extends AnyTable>(
  * whose result rows are `O`. Every reference is resolved against `T`, so a
  * column can only be used once its table has been joined.
  *
+ * Nothing runs until `execute()` (or `stream`, or `db.batch`): `all`,
+ * `first`, `one` and `maybeOne` only set the shape of the result, keeping
+ * its locking clauses.
+ *
  * Immutable: every method returns a new builder. `L` is what its latest
  * locking clause still takes, if it has one.
+ *
+ * @example
+ * const user = await db.selectFrom(users).where('users.id', id).select(['users.email']).one().execute();
  */
 export class SelectQueryBuilder<
 	T extends readonly AnyTable[],
@@ -456,7 +465,7 @@ export class SelectQueryBuilder<
 	 * Skips the rows another transaction has locked, rather than waiting for
 	 * them: for workers claiming jobs from a queue, each a different one.
 	 *
-	 * @example await tx.selectFrom(jobs).select(['jobs.id']).where('jobs.status', 'queued').forUpdate().skipLocked().first()
+	 * @example await tx.selectFrom(jobs).select(['jobs.id']).where('jobs.status', 'queued').forUpdate().skipLocked().first().execute()
 	 */
 	skipLocked(
 		this: SelectQueryBuilder<T, O, 'strength' | 'of'>,
@@ -485,46 +494,66 @@ export class SelectQueryBuilder<
 		return new SelectQueryBuilder<T, O, L>({ ...this.#state, tag: name });
 	}
 
-	/** Runs the query and returns every row. */
-	async all(options?: RunOptions): Promise<O[]> {
-		return (await this.#execute(undefined, options)).rows;
+	/** Every row; runs with `execute()`. */
+	all(): Query<O[]> {
+		return this.#query(undefined, false, (rows) => rows);
 	}
 
-	/** Runs the query with `limit 1` and returns its row, if any. */
-	async first(options?: RunOptions): Promise<O | undefined> {
-		const [row] = (await this.#execute(1, options)).rows;
-		return row;
-	}
-
-	/**
-	 * Runs the query and returns its one row: throws `NoRowError` when there
-	 * is none and `TooManyRowsError` when there are several. Fetches at most
-	 * two rows, enough to tell.
-	 */
-	async one(options?: RunOptions): Promise<O> {
-		const { query, rows } = await this.#execute(2, options);
-		const [row, ...rest] = rows;
-		if (row === undefined) {
-			throw new NoRowError(query, this.#state.from.name);
-		}
-		if (rest.length > 0) {
-			throw new TooManyRowsError(query, this.#state.from.name);
-		}
-		return row;
+	/** The row, if any, with `limit 1`; runs with `execute()`. */
+	first(): Query<O | undefined> {
+		return this.#query(1, false, (rows) => rows[0]);
 	}
 
 	/**
-	 * Runs the query and returns its row, if any: throws `TooManyRowsError`
-	 * when there are several. Fetches at most two rows, enough to tell.
+	 * The one row; runs with `execute()`, which throws `NoRowError` when
+	 * there is none and `TooManyRowsError` when there are several. Fetches at
+	 * most two rows (`limit 2`), enough to tell.
 	 */
-	async maybeOne(options?: RunOptions): Promise<O | undefined> {
-		const { query, rows } = await this.#execute(2, options);
-		const [row, ...rest] = rows;
-		if (rest.length > 0) {
-			throw new TooManyRowsError(query, this.#state.from.name);
-		}
-		return row;
+	one(): Query<O> {
+		return this.#query(2, true, (rows, query) => {
+			const [row, ...rest] = rows;
+			if (row === undefined) {
+				throw new NoRowError(query, this.#state.from.name);
+			}
+			if (rest.length > 0) {
+				throw new TooManyRowsError(query, this.#state.from.name);
+			}
+			return row;
+		});
 	}
+
+	/**
+	 * The row, if any; runs with `execute()`, which throws
+	 * `TooManyRowsError` when there are several. Fetches at most two rows.
+	 */
+	maybeOne(): Query<O | undefined> {
+		return this.#query(2, true, (rows, query) => {
+			const [row, ...rest] = rows;
+			if (rest.length > 0) {
+				throw new TooManyRowsError(query, this.#state.from.name);
+			}
+			return row;
+		});
+	}
+
+	/** Runs the query and returns every row, as `all().execute()` does. */
+	execute(options?: RunOptions): Promise<O[]> {
+		return this.all().execute(options);
+	}
+
+	/** The SQL and parameters `execute()` sends. */
+	toSQL(): CompiledQuery {
+		return compile(this.toNode());
+	}
+
+	/** The query `execute()` runs: every row. */
+	toQuery(): Query<O[]> {
+		return this.all();
+	}
+
+	/** @deprecated A query runs with `execute()`; awaiting one rejects. */
+	// oxlint-disable-next-line unicorn/no-thenable -- so that a forgotten execute() fails loudly
+	readonly then = rejectAwait;
 
 	/**
 	 * Runs the query and yields its rows as they arrive, fetching
@@ -621,18 +650,25 @@ export class SelectQueryBuilder<
 		return executor;
 	}
 
-	/** Runs the query, fetching at most `limit` rows besides any limit of its own. */
-	async #execute(limit: number | undefined, options: RunOptions | undefined) {
-		const executor = this.#executor();
+	/** The query, fetching at most `limit` rows besides any limit of its own, read by `read`. */
+	#query<R>(
+		limit: number | undefined,
+		checked: boolean,
+		read: (rows: O[], query: CompiledQuery) => R,
+	): Query<R> {
 		const node = this.toNode();
 		const query = compile(
 			limit === undefined
 				? node
 				: { ...node, limit: Math.min(node.limit ?? limit, limit) },
 		);
-		const { rows } = await executor.execute(query, options);
-		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the select list supplies the row type
-		return { query, rows: rows as O[] };
+		return new Query({
+			query,
+			executor: this.#state.executor,
+			checked,
+			// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the select list supplies the row type
+			read: ({ rows }) => read(rows as O[], query),
+		});
 	}
 }
 

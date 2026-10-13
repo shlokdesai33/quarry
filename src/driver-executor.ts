@@ -16,6 +16,7 @@ import {
 	type TypeParsers,
 } from './driver/index.js';
 import type {
+	ExecuteBatchOptions,
 	ExecuteOptions,
 	ExecuteResult,
 	QueryDescription,
@@ -95,19 +96,31 @@ interface Runner {
 		options?: Record<string, unknown>,
 	): AsyncIterable<R[]>;
 	describe(sql: string): Promise<Description>;
+	queryGroup(
+		statements: readonly GroupStatement[],
+		options?: { signal?: AbortSignal | undefined },
+	): Promise<QueryResult<unknown>>[];
 	readonly transactionStatus: 'idle' | 'transaction' | 'failed';
 }
+
+type GroupStatement = Parameters<Transaction['queryGroup']>[0][number];
+
+const executeResult = (result: QueryResult<unknown>): ExecuteResult => ({
+	rows: result.rows,
+	rowCount: result.rowCount,
+	command: result.command,
+});
 
 const CALLSITE = Symbol('quarry.callsite');
 
 /** Adds the query and its tag to a server error, and the caller's stack to any error. */
 function decorate(
 	error: unknown,
-	query: CompiledQuery,
+	query: CompiledQuery | undefined,
 	callsite: Error | undefined,
 ): void {
 	if (!(error instanceof Error)) return;
-	if (error instanceof PostgresError) {
+	if (error instanceof PostgresError && query !== undefined) {
 		Object.defineProperty(error, 'query', {
 			value: { sql: query.sql, params: query.params, tag: query.tag },
 		});
@@ -419,6 +432,146 @@ export class DriverExecutor implements TransactionExecutor {
 			decorate(error, query, callsite);
 			throw error;
 		}
+	}
+
+	/**
+	 * Runs the queries on one connection, in one write. Outside a
+	 * transaction, each has its own Sync, so each succeeds or fails on its
+	 * own. With `transaction`, `Transaction.batch` sends BEGIN, the queries
+	 * and COMMIT together. Inside a transaction, the queries share one Sync
+	 * (and BEGIN's, if it wasn't sent yet), and `transaction` makes them a
+	 * savepoint.
+	 */
+	async batch(
+		queries: readonly CompiledQuery[],
+		options: ExecuteBatchOptions = {},
+	): Promise<readonly PromiseSettledResult<ExecuteResult>[]> {
+		const { transaction, verify, signal, timeout } = options;
+		const source = this.#source;
+		const inTransaction = source instanceof Transaction;
+		if (inTransaction && transaction !== undefined) {
+			return this.transaction(
+				(tx) => tx.batch(queries, { ...options, transaction: undefined }),
+				transaction,
+			);
+		}
+		if (inTransaction && timeout !== undefined) {
+			throw new DriverError(
+				'A batch inside a transaction takes no timeout: set statement_timeout with setLocal',
+			);
+		}
+		const callsite = this.#callsite();
+		const observe = this.#options.onQuery !== undefined;
+		const start = observe ? performance.now() : 0;
+		let acquired = start;
+		const statements = queries.map((query) => ({
+			sql: query.sql,
+			params: query.params,
+			options: this.#queryOptions({}, undefined, query),
+		}));
+		/** Each query's outcome, reported to `onQuery`; `shared` when a failure skipped the rest with its error. */
+		const settle = async (
+			results: readonly Promise<QueryResult<unknown>>[],
+			shared: boolean,
+		) => {
+			const settled = await Promise.allSettled(results);
+			let decorated = false;
+			return queries.map((query, i) => {
+				const outcome = settled[i]!;
+				if (outcome.status === 'rejected') {
+					if (!shared || !decorated) decorate(outcome.reason, query, callsite);
+					decorated = true;
+					if (observe) {
+						this.#report(
+							'execute',
+							query,
+							start,
+							acquired,
+							undefined,
+							undefined,
+							undefined,
+							outcome.reason,
+						);
+					}
+					return outcome;
+				}
+				const value = executeResult(outcome.value);
+				if (observe) {
+					this.#report(
+						'execute',
+						query,
+						start,
+						acquired,
+						undefined,
+						value.command,
+						value.rowCount ?? value.rows.length,
+					);
+				}
+				return { status: 'fulfilled', value } as const;
+			});
+		};
+		/** The results of a batch that ran all or nothing, checked by `verify`. */
+		const verified = (settled: PromiseSettledResult<ExecuteResult>[]) => {
+			const values: ExecuteResult[] = [];
+			for (const outcome of settled) {
+				if (outcome.status === 'rejected') throw outcome.reason;
+				values.push(outcome.value);
+			}
+			try {
+				verify?.(values);
+			} catch (error) {
+				decorate(error, undefined, callsite);
+				throw error;
+			}
+			return settled;
+		};
+		return this.#run(signal, async (runner) => {
+			if (observe) acquired = performance.now();
+			if (inTransaction) {
+				return verified(
+					await settle(runner.queryGroup(statements, { signal }), true),
+				);
+			}
+			if (transaction === undefined) {
+				return settle(
+					queries.map((query) =>
+						runner.query<unknown>(
+							query.sql,
+							query.params,
+							this.#queryOptions(options, undefined, query),
+						),
+					),
+					false,
+				);
+			}
+			const { results, done } = Transaction.batch(runner, statements, {
+				...transaction,
+				...(timeout === undefined
+					? {}
+					: {
+							settings: {
+								...transaction.settings,
+								statement_timeout: interval(timeout),
+							},
+						}),
+				signal,
+				...(verify === undefined
+					? {}
+					: {
+							verify: (rows: readonly QueryResult<unknown>[]) =>
+								verify(rows.map(executeResult)),
+						}),
+			});
+			done.catch(() => {});
+			const settled = await settle(results, true);
+			try {
+				await done;
+			} catch (error) {
+				decorate(error, undefined, callsite);
+				throw error;
+			}
+			return settled;
+		});
 	}
 
 	transaction<T>(

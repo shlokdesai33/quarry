@@ -148,6 +148,11 @@ export abstract class Op {
 		return false;
 	}
 
+	/** How many statements it writes that may be named; more than one is pipelining. */
+	get prepares(): number {
+		return 0;
+	}
+
 	abstract write(ctx: OpContext): void;
 	/** Handles one message; true when the operation is complete. */
 	abstract handle(msg: BackendMessage, ctx: OpContext): boolean;
@@ -329,6 +334,10 @@ export class QueryOp extends Op {
 		this.#resolve = resolve;
 		this.#reject = reject;
 		this.#retried = retried;
+	}
+
+	override get prepares(): number {
+		return this.#options.prepare ? 1 : 0;
 	}
 
 	/** The server's error for this statement, once it arrived. */
@@ -624,6 +633,14 @@ export class QueryOp extends Op {
 		this.settle();
 		this.#reject(this.#error?.isFatal ? this.#error : error);
 	}
+
+	/** The server skipped the statement, so a Parse it sent never ran. */
+	skip(error: Error, ctx: OpContext): void {
+		const statement = this.#statement;
+		if (statement && this.#createdStatement && !statement.parsed)
+			ctx.forget(statement);
+		this.fail(error);
+	}
 }
 
 /**
@@ -643,6 +660,12 @@ export class SyncGroupOp extends Op {
 		this.#ops = ops;
 	}
 
+	override get prepares(): number {
+		let count = 0;
+		for (const op of this.#ops) count += op.prepares;
+		return count;
+	}
+
 	write(ctx: OpContext): void {
 		for (const op of this.#ops) op.write(ctx, false);
 		fe.sync(ctx.writer);
@@ -660,12 +683,15 @@ export class SyncGroupOp extends Op {
 				: undefined;
 			for (const [i, op] of this.#ops.entries()) {
 				if (i <= this.#current) op.handle(msg, ctx);
-				else op.fail(skipped ?? new ProtocolError('A statement was skipped'));
+				else
+					op.skip(skipped ?? new ProtocolError('A statement was skipped'), ctx);
 			}
 			return true;
 		}
 		const op = this.#ops[this.#current];
 		if (op === undefined || this.#failed) return this.unexpected(msg);
+		// a cancel is requested for the group, and hits the statement running
+		op.canceledBy = this.canceledBy;
 		op.handle(msg, ctx);
 		if (msg.type === 'ErrorResponse') this.#failed = true;
 		else if (

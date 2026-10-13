@@ -149,6 +149,7 @@ await pool.transaction(async (tx) => {
 - A COMMIT that the server turned into a ROLLBACK (because an error was swallowed inside) throws `TransactionRolledBack`.
 - BEGIN (with the settings) is sent with the callback's first statement, under one Sync, so a transaction takes 2 round trips. If BEGIN fails, the server skips that statement, and the transaction rejects with BEGIN's error. The callback has already started by then.
 - A savepoint's `release` isn't waited for; if it fails, the next statement in the transaction, or the COMMIT, reports its error.
+- quarry's `db.batch(queries, { transaction: true })` runs a fixed list of statements in one round trip: BEGIN, the settings and the statements under one Sync, then COMMIT with its own, all in one write. A failed statement skips the rest, so COMMIT reports ROLLBACK; a failed BEGIN runs nothing, and the COMMIT after it does nothing.
 
 ## Pool
 

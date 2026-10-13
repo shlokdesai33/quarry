@@ -220,10 +220,13 @@ export class Connection implements AsyncDisposable {
 			writer: this.#writer,
 			types: this.#types,
 			statement: (sql, types, named) => this.#statement(sql, types, named),
-			// alone: nothing else in flight or waiting on the connection
+			// alone: nothing else in flight or waiting on the connection, nor
+			// another statement under its Sync that may be named
 			named: () =>
 				this.#naming === 'always' ||
-				(this.#naming === 'alone' && this.#queue.length === 1),
+				(this.#naming === 'alone' &&
+					this.#queue.length === 1 &&
+					(this.#queue[0]?.prepares ?? 0) <= 1),
 			unprepare: (statement) => this.#unprepared.add(statement.key),
 			preparable: (sql, types) =>
 				this.#unprepared.size === 0 ||
@@ -1002,10 +1005,11 @@ export class Connection implements AsyncDisposable {
 	/**
 	 * @internal Runs statements under one Sync: once one fails, the server
 	 * skips the rest, and they reject with its error. One that can't be
-	 * sent skips the rest the same way.
+	 * sent skips the rest the same way. `signal` cancels the whole group.
 	 */
 	queryGroup(
 		statements: readonly GroupStatement[],
+		{ signal }: { readonly signal?: AbortSignal | undefined } = {},
 	): Promise<QueryResult<unknown>>[] {
 		const ops: QueryOp[] = [];
 		let invalid: { error: unknown } | undefined;
@@ -1042,7 +1046,7 @@ export class Connection implements AsyncDisposable {
 					);
 				}),
 		);
-		if (ops.length > 0) this.#enqueue(new SyncGroupOp(ops));
+		if (ops.length > 0) this.#enqueue(new SyncGroupOp(ops), signal);
 		if (this.#config.telemetry === undefined && !this.#config.captureStack)
 			return results;
 		return results.map((result, i) =>

@@ -1,11 +1,9 @@
 import type { AnyColumn } from './column/any-column.js';
 import { compile, type CompiledQuery } from './compile.js';
 import {
-	type ExecuteResult,
 	type Executor,
 	NoRowError,
 	RowCountError,
-	type RunOptions,
 	TooManyRowsError,
 } from './executor.js';
 import { Expression } from './expression.js';
@@ -19,6 +17,7 @@ import type {
 	UpdateNode,
 } from './node.js';
 import type { Expr } from './operators.js';
+import { Query } from './query.js';
 import type { AnyTable } from './table.js';
 import type { Prettify } from './types.js';
 import { codeType, renderType } from './verify/sql-type.js';
@@ -180,52 +179,64 @@ export function rowCount(count: number): number {
 	return count;
 }
 
-/** Compiles and runs a write query, checking `expectRows`. */
-async function runWrite(
+/**
+ * A write query, read by `read` once `expectRows` is checked; `checked`
+ * when `read` itself can throw. The rows are typed by the caller's
+ * `returning` list.
+ */
+export function writeQuery<O, R>(
 	executor: Executor | undefined,
 	node: InsertNode | UpdateNode | DeleteNode,
-	options: RunOptions | undefined,
-): Promise<{ readonly query: CompiledQuery; readonly result: ExecuteResult }> {
-	if (executor === undefined) {
-		throw new Error(
-			'The query has no database to run on: start it from `database(...)`',
-		);
-	}
+	read: (written: WrittenRows<O>) => R,
+	checked = false,
+): Query<R> {
 	const query = compile(node);
-	const result = await executor.execute(query, options);
-	const count = result.rowCount ?? 0;
-	if (node.expectRows !== undefined && count !== node.expectRows) {
-		throw new RowCountError(query, node.expectRows, count, node.table.name);
-	}
-	return { query, result };
+	const { expectRows, table } = node;
+	return new Query({
+		query,
+		executor,
+		checked: checked || expectRows !== undefined,
+		read: (result) => {
+			const count = result.rowCount ?? 0;
+			if (expectRows !== undefined && count !== expectRows) {
+				throw new RowCountError(query, expectRows, count, table.name);
+			}
+			// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the returning list supplies the row type
+			const rows = result.rows as O[];
+			return read({ query, rows, rowCount: count, table: table.name });
+		},
+	});
 }
 
-/** Runs a write query, resolving to the number of rows it affected. */
-export async function executeWrite(
+/**
+ * What a write query's `execute()` resolves to without a shape: its
+ * `returning` rows, or without `returning` (`O` is `undefined`), its row
+ * count.
+ */
+export type WriteOutput<O> = [O] extends [undefined] ? WriteResult : O[];
+
+/** A write query in its default shape; see `WriteOutput`. */
+export function writeOutput<O>(
 	executor: Executor | undefined,
 	node: InsertNode | UpdateNode | DeleteNode,
-	options: RunOptions | undefined,
-): Promise<WriteResult> {
-	const { result } = await runWrite(executor, node, options);
-	return { rowCount: result.rowCount ?? 0 };
+): Query<WriteOutput<O>> {
+	const returns = node.returning.length > 0;
+	return writeQuery<O, WriteOutput<O>>(
+		executor,
+		node,
+		(written) =>
+			// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- `returning` is what makes `O` a row type
+			(returns
+				? written.rows
+				: { rowCount: written.rowCount }) as WriteOutput<O>,
+	);
 }
 
-/** Runs a write query, returning its `returning` rows, typed by the caller's `returning` list. */
-// eslint-disable-next-line typescript/no-unnecessary-type-parameters -- the builder's row type, which only its returning list knows
-export async function writeRows<O>(
-	executor: Executor | undefined,
-	node: InsertNode | UpdateNode | DeleteNode,
-	options: RunOptions | undefined,
-): Promise<WrittenRows<O>> {
-	const { query, result } = await runWrite(executor, node, options);
-	// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the returning list supplies the row type
-	return { query, rows: result.rows as O[], table: node.table.name };
-}
-
-/** A write query's `returning` rows, with the query and the table it wrote. */
-interface WrittenRows<O> {
+/** A write query's `returning` rows, with the query, its row count and the table it wrote. */
+export interface WrittenRows<O> {
 	readonly query: CompiledQuery;
 	readonly rows: O[];
+	readonly rowCount: number;
 	readonly table: string;
 }
 

@@ -1,3 +1,4 @@
+import { type BatchResults, batchWith } from './batch.js';
 import {
 	type DeleteQueryBuilder,
 	deleteFromWith,
@@ -15,6 +16,7 @@ import {
 	type DatabaseOptions,
 } from './driver-executor.js';
 import type {
+	BatchOptions,
 	Executor,
 	TransactionExecutor,
 	TransactionOptions,
@@ -27,6 +29,7 @@ import {
 	type SelectQueryBuilder,
 	selectFromWith,
 } from './select-query-builder.js';
+import type { Executable } from './query.js';
 import type { AnyTable } from './table.js';
 import {
 	type UpdateManyOptions,
@@ -60,8 +63,9 @@ export interface Database extends AsyncDisposable {
 	): Promise<VerifyReport>;
 
 	/**
-	 * Starts a `select` from `table`, run on this database by `all`, `first`,
-	 * `one` and `maybeOne`.
+	 * Starts a `select` from `table`, run on this database by `execute()`,
+	 * after a result shape (`all`, `first`, `one`, `maybeOne`) or without
+	 * one, for every row.
 	 */
 	selectFrom<T extends AnyTable>(
 		table: T,
@@ -90,6 +94,38 @@ export interface Database extends AsyncDisposable {
 	): DeleteQueryBuilder<T, undefined, 'where'>;
 
 	/**
+	 * Runs `queries` in one round trip, on one connection, and resolves to
+	 * their results by position: each is a shaped query (`one()`, `all()`,
+	 * …) or a builder, read as its `execute()` would be. The batch runs them
+	 * on this database, wherever they were started.
+	 *
+	 * - Outside a transaction, each query runs on its own: when any fails
+	 *   (or `one` finds no row), the others still run and stay committed,
+	 *   and the batch rejects with a `BatchError` holding every outcome.
+	 * - With `transaction`, they run all or nothing in one transaction,
+	 *   BEGIN and COMMIT included in the round trip; the batch rejects with
+	 *   the error that rolled it back. A result that `one`, `maybeOne`
+	 *   or `expectRows` checks makes COMMIT wait for it: a second round trip.
+	 * - Inside a transaction, they share one Sync: the first error skips
+	 *   the rest and rejects the batch, failing the transaction as any
+	 *   failed query does; `transaction` makes them a savepoint.
+	 *
+	 * @example
+	 * const [user, posts, { rowCount }] = await db.batch([
+	 *   db.selectFrom(users).where('users.id', id).select(['users.email']).one(),
+	 *   db.selectFrom(posts).where('posts.userId', id).select(['posts.title']),
+	 *   db.update(users).set({ seenAt: now }).where('users.id', id),
+	 * ]);
+	 *
+	 * @example
+	 * await db.batch([debit, credit], { transaction: true });
+	 */
+	batch<const Q extends readonly Executable<unknown>[]>(
+		queries: Q,
+		options?: BatchOptions,
+	): Promise<BatchResults<Q>>;
+
+	/**
 	 * Runs `fn` in a transaction: committed when it resolves, rolled back
 	 * when it throws. `tx` runs queries inside it; `tx.transaction` nests a
 	 * savepoint, unless it is `durable`, which throws instead. With
@@ -98,7 +134,7 @@ export interface Database extends AsyncDisposable {
 	 *
 	 * @example
 	 * await db.transaction(async (tx) => {
-	 *   const order = await tx.insertInto(orders).values(row).returning(['orders.id']).one();
+	 *   const order = await tx.insertInto(orders).values(row).returning(['orders.id']).one().execute();
 	 *   tx.afterCommit(() => queue.publish('order.created', order.id));
 	 * }, { isolation: 'serializable', retries: 3 });
 	 */
@@ -139,7 +175,7 @@ export type DatabaseSource =
  *
  * @example
  * const db = database(process.env.DATABASE_URL);
- * const user = await db.selectFrom(users).where('users.id', id).one();
+ * const user = await db.selectFrom(users).where('users.id', id).one().execute();
  */
 export function database(
 	source: DatabaseSource,
@@ -183,6 +219,7 @@ function queries(
 		updateMany: (table, rows, options) =>
 			updateManyWith(table, rows, options, executor),
 		deleteFrom: (table) => deleteFromWith(table, executor),
+		batch: (list, options) => batchWith(executor, list, options),
 		transaction: (fn, options) =>
 			executor.transaction((tx) => fn(transactionWith(tx)), options),
 	};
