@@ -18,6 +18,9 @@ const bouncer = () => ({
 	prepare,
 });
 
+/** A statement selecting `n` and its parameter. */
+const numbered = (n: number) => `select ${n}::int as n, $1::text as s`;
+
 /** `n` queries issued together, so a connection pipelines them. */
 const pipelined = <R>(n: number, query: () => Promise<R>) =>
 	Promise.allSettled(Array.from({ length: n }, query));
@@ -217,9 +220,8 @@ describe.skipIf(!pg?.bouncerPort)('PgBouncer in transaction mode', () => {
 			it('include the statements of a batch, but not a transaction’s first one', async () => {
 				const net = recordingSockets();
 				await using conn = await open({ ...bouncer(), socket: net.factory });
-				const sql = (n: number) => `select ${n}::int as n, $1::text as s`;
 				const statements = [1, 2, 3].map((n) => ({
-					sql: sql(n),
+					sql: numbered(n),
 					params: ['x'],
 				}));
 				const rows = [1, 2, 3].map((n) => ({ n, s: 'x' }));
@@ -233,8 +235,8 @@ describe.skipIf(!pg?.bouncerPort)('PgBouncer in transaction mode', () => {
 					Promise.all(tx.queryGroup(statements)),
 				);
 				expect(grouped.map((r) => r.rows[0])).toEqual(rows);
-				await conn.transaction((tx) => tx.query(sql(4), ['x']));
-				await conn.transaction((tx) => tx.query(sql(4), ['x']));
+				await conn.transaction((tx) => tx.query(numbered(4), ['x']));
+				await conn.transaction((tx) => tx.query(numbered(4), ['x']));
 				// Parse: type, length, statement name, SQL
 				const parses = [
 					...net.sent().matchAll(/P[\s\S]{4}(q\d+)?\0select (\d)/g),
