@@ -661,7 +661,11 @@ export class Transaction {
 		// a failed statement skips the rest, so the statements report for BEGIN too
 		for (const result of all) result.catch(noop);
 		const results = all.slice(opening.length);
-		const pipelined = verify === undefined ? conn.query('commit') : undefined;
+		// nothing is sent once aborted, so nothing needs committing
+		const pipelined =
+			verify === undefined && !signal?.aborted
+				? conn.query('commit')
+				: undefined;
 		pipelined?.catch(noop);
 		const done = (async () => {
 			try {
