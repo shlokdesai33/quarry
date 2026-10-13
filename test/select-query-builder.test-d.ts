@@ -4,6 +4,7 @@ import { defineTable } from '../src/define-table.js';
 import {
 	type Fragment,
 	fragment,
+	type SelectQueryBuilder,
 	selectFrom,
 } from '../src/select-query-builder.js';
 
@@ -286,5 +287,132 @@ describe('tag', () => {
 	it('takes a string', () => {
 		// @ts-expect-error a tag is a string
 		selectFrom(users).tag(1);
+	});
+});
+
+describe('locking', () => {
+	const query = selectFrom(users).select(['users.id']);
+
+	it('keeps the query’s tables and row, tracking what the clause takes', () => {
+		expectTypeOf(query.$lock).toEqualTypeOf<'none'>();
+		expectTypeOf(query.forUpdate()).toEqualTypeOf<
+			SelectQueryBuilder<[typeof users], { id: number }, 'strength'>
+		>();
+		expectTypeOf(query.forNoKeyUpdate().$lock).toEqualTypeOf<'strength'>();
+		expectTypeOf(query.forShare().$lock).toEqualTypeOf<'strength'>();
+		expectTypeOf(query.forKeyShare().$lock).toEqualTypeOf<'strength'>();
+		expectTypeOf(query.forUpdate().of(users).$lock).toEqualTypeOf<'of'>();
+		expectTypeOf(
+			query.forUpdate().of(users).skipLocked().$lock,
+		).toEqualTypeOf<'done'>();
+		expectTypeOf(query.forUpdate().noWait().$lock).toEqualTypeOf<'done'>();
+		expectTypeOf(query.forUpdate().skipLocked().$output).toEqualTypeOf<{
+			id: number;
+		}>();
+	});
+
+	it('takes modifiers only after a strength', () => {
+		// @ts-expect-error no locking clause yet
+		query.skipLocked();
+		// @ts-expect-error no locking clause yet
+		query.noWait();
+		// @ts-expect-error no locking clause yet
+		query.of(users);
+	});
+
+	it('takes one wait policy, after `of`', () => {
+		// @ts-expect-error skipLocked and noWait are exclusive
+		query.forUpdate().skipLocked().noWait();
+		// @ts-expect-error skipLocked and noWait are exclusive
+		query.forUpdate().noWait().skipLocked();
+		// @ts-expect-error once
+		query.forUpdate().skipLocked().skipLocked();
+		// @ts-expect-error `of` comes before the wait policy, as in SQL
+		query.forUpdate().skipLocked().of(users);
+		// @ts-expect-error `of` takes all its tables at once
+		query.forUpdate().of(users).of(users);
+	});
+
+	it('types `of` by the tables in scope', () => {
+		const joined = selectFrom(users)
+			.innerJoin(contacts)
+			.on('contacts.userId', 'users.id');
+		joined.forUpdate().of(users);
+		joined.forUpdate().of(users, contacts);
+		joined.forUpdate().of('contacts');
+		joined.forUpdate().of('users', contacts).skipLocked();
+
+		// @ts-expect-error contacts is not joined
+		query.forUpdate().of(contacts);
+		// @ts-expect-error contacts is not joined
+		query.forUpdate().of('contacts');
+		// @ts-expect-error no such table
+		joined.forUpdate().of('posts');
+		// @ts-expect-error `of` takes at least one table
+		joined.forUpdate().of();
+		// @ts-expect-error a table, not a column
+		joined.forUpdate().of('users.id');
+	});
+
+	it('names an aliased table by its alias', () => {
+		const managers = users.as('managers');
+		const aliased = selectFrom(contacts)
+			.innerJoin(managers)
+			.on('managers.id', 'contacts.userId');
+		aliased.forUpdate().of(managers);
+		aliased.forUpdate().of('managers');
+
+		// @ts-expect-error the query references users as managers
+		aliased.forUpdate().of(users);
+		// @ts-expect-error the query references users as managers
+		aliased.forUpdate().of('users');
+	});
+
+	it('sees the tables joined after the strength', () => {
+		selectFrom(users)
+			.forUpdate()
+			.innerJoin(contacts)
+			.on('contacts.userId', 'users.id')
+			.of(contacts)
+			.skipLocked();
+	});
+
+	it('keeps the clause open through other methods', () => {
+		expectTypeOf(
+			query
+				.forUpdate()
+				.where('users.age', 18)
+				.select(['users.email'])
+				.tag('locked').$lock,
+		).toEqualTypeOf<'strength'>();
+		expectTypeOf(
+			query.forUpdate().when(true, (qb) => qb.where('users.age', 18)).$lock,
+		).toEqualTypeOf<'strength'>();
+		expectTypeOf(
+			query.forUpdate().of(users).pipe(admins).$lock,
+		).toEqualTypeOf<'of'>();
+	});
+
+	it('closes it when `when` or `pipe` may have added one', () => {
+		const locked = query.when(true, (qb) => qb.forUpdate());
+		expectTypeOf(locked.$lock).toEqualTypeOf<'done'>();
+		// @ts-expect-error the latest clause may be the one before `when`
+		locked.skipLocked();
+		const lockedPiece = fragment(users, (qb) => qb.forShare());
+		expectTypeOf(query.pipe(lockedPiece).$lock).toEqualTypeOf<'done'>();
+		// @ts-expect-error as for `when`
+		query.forUpdate().pipe(lockedPiece).of(users);
+	});
+
+	it('takes several clauses', () => {
+		selectFrom(users)
+			.innerJoin(contacts)
+			.on('contacts.userId', 'users.id')
+			.forUpdate()
+			.of(contacts)
+			.skipLocked()
+			.forShare()
+			.of(users)
+			.noWait();
 	});
 });

@@ -87,6 +87,7 @@ export {
 	fragment,
 	selectFrom,
 	type Fragment,
+	type LockState,
 	type SelectQueryBuilder,
 } from './select-query-builder.js';
 export type { AnyTable, Table } from './table.js';
