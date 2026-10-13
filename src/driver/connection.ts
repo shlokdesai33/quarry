@@ -1454,8 +1454,8 @@ export class Connection implements AsyncDisposable {
 /**
  * Which cached statements to write named. A pooler that rewrites named
  * statements (PgBouncer) flushes what it holds and writes the new name
- * apart from the rest before every named Bind: pipelined queries reach the
- * server in two writes each instead of one write between them, which costs
+ * apart from the rest of every named Bind: each named query reaches the
+ * server in two writes, where unnamed ones share one. Under load that costs
  * the single-threaded pooler more than parsing them again costs the server.
  */
 function naming(
