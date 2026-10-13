@@ -110,9 +110,9 @@ export abstract class Op {
 	/** Receives the operation's timing when it settles, if set. */
 	onTiming: ((timing: OpTiming) => void) | undefined;
 	/**
-	 * Called once the operation settles, in a microtask queued before its
-	 * result is delivered: a pool frees the connection before the caller's
-	 * next query, without a promise of its own per query.
+	 * Called by the connection once the operation has settled and left its
+	 * queue, before callbacks on its result run: a pool frees the connection
+	 * before the caller's next query, without a promise of its own per query.
 	 */
 	onDone: (() => void) | undefined;
 	queuedAt = 0;
@@ -137,11 +137,6 @@ export abstract class Op {
 				queuedMs: written - this.queuedAt,
 				execMs: now - written,
 			});
-		}
-		const onDone = this.onDone;
-		if (onDone !== undefined) {
-			this.onDone = undefined;
-			queueMicrotask(onDone);
 		}
 	}
 
@@ -606,17 +601,19 @@ export class QueryOp extends Op {
 			ctx.forget(this.#statement);
 			if (this.#createdStatement) ctx.unprepare(this.#statement);
 			// retried unnamed: a pooler passes that through instead of reusing its stale statement
-			ctx.retry(
-				new QueryOp(
-					this.#sql,
-					this.#params,
-					this.#values,
-					{ ...this.#options, prepare: false },
-					this.#resolve,
-					this.#reject,
-					true,
-				),
+			const retry = new QueryOp(
+				this.#sql,
+				this.#params,
+				this.#values,
+				{ ...this.#options, prepare: false },
+				this.#resolve,
+				this.#reject,
+				true,
 			);
+			// done once the retry is
+			retry.onDone = this.onDone;
+			this.onDone = undefined;
+			ctx.retry(retry);
 			return true;
 		}
 		this.#reject(error);

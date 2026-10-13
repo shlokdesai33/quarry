@@ -671,6 +671,15 @@ export class Connection implements AsyncDisposable {
 		if (unblocked || this.#written < this.#queue.length) this.#schedule();
 		if (this.#queue.length === 0 && this.#idleWaiters.length > 0)
 			for (const resolve of this.#idleWaiters.splice(0)) resolve();
+		this.#finished(op);
+	}
+
+	/** Runs a settled operation's `onDone`, once it has left the queue. */
+	#finished(op: Op): void {
+		const onDone = op.onDone;
+		if (onDone === undefined) return;
+		op.onDone = undefined;
+		onDone();
 	}
 
 	// --- outgoing ----------------------------------------------------------
@@ -709,6 +718,7 @@ export class Connection implements AsyncDisposable {
 				op.fail(
 					error instanceof Error ? error : new DriverError(String(error)),
 				);
+				this.#finished(op);
 				continue;
 			}
 			op.written = true;
@@ -772,6 +782,7 @@ export class Connection implements AsyncDisposable {
 	#enqueue(op: Op, signal?: AbortSignal, timeout?: number): void {
 		if (this.#closed || this.#ending) {
 			op.fail(closedError(this.#fatal));
+			this.#finished(op);
 			return;
 		}
 		if (signal?.aborted) {
@@ -780,6 +791,7 @@ export class Connection implements AsyncDisposable {
 					cause: signal.reason,
 				}),
 			);
+			this.#finished(op);
 			return;
 		}
 		if (op.onTiming !== undefined) op.queuedAt = performance.now();
@@ -814,6 +826,7 @@ export class Connection implements AsyncDisposable {
 					cause === undefined ? undefined : { cause },
 				),
 			);
+			this.#finished(op);
 			return;
 		}
 		op.canceledBy = reason;
@@ -962,31 +975,27 @@ export class Connection implements AsyncDisposable {
 		const promise = new Promise<QueryResult<unknown>>(capture);
 		const resolve = capturedResolve;
 		const reject = capturedReject;
-		const invalid = invalidSql(sql);
-		if (invalid) {
-			if (onDone !== undefined) queueMicrotask(onDone);
-			reject(invalid);
-			return asResultPromise<R>(promise);
-		}
-		let values;
+		let op: QueryOp | undefined;
 		try {
-			values = encodeParams(sql, params, options?.paramTypes);
+			const invalid = invalidSql(sql);
+			if (invalid) throw invalid;
+			op = new QueryOp(
+				sql,
+				params,
+				encodeParams(sql, params, options?.paramTypes),
+				this.#options(options),
+				resolve,
+				reject,
+			);
+			op.onTiming = options?.onTiming;
+			op.onDone = onDone;
+			this.#enqueue(op, options?.signal, options?.timeout);
 		} catch (error) {
-			if (onDone !== undefined) queueMicrotask(onDone);
+			// thrown before the operation was queued: nothing else ends it
+			if (op === undefined) onDone?.();
+			else if (this.#queue.indexOf(op) < 0) this.#finished(op);
 			reject(error);
-			return asResultPromise<R>(promise);
 		}
-		const op = new QueryOp(
-			sql,
-			params,
-			values,
-			this.#options(options),
-			resolve,
-			reject,
-		);
-		op.onTiming = options?.onTiming;
-		op.onDone = onDone;
-		this.#enqueue(op, options?.signal, options?.timeout);
 		return asResultPromise<R>(promise);
 	}
 
@@ -1493,6 +1502,7 @@ export class Connection implements AsyncDisposable {
 		for (const resolve of this.#drainWaiters.splice(0)) resolve();
 		this.#resolveClosed();
 		this.#emit(this.#closeListeners, error);
+		for (const op of ops) this.#finished(op);
 	}
 }
 
