@@ -216,10 +216,13 @@ export class Connection implements AsyncDisposable {
 			writer: this.#writer,
 			types: this.#types,
 			statement: (sql, types, named) => this.#statement(sql, types, named),
-			// alone: nothing else in flight or waiting on the connection
+			// alone: nothing else in flight or waiting on the connection, nor
+			// another statement under its Sync that may be named
 			named: () =>
 				this.#naming === 'always' ||
-				(this.#naming === 'alone' && this.#queue.length === 1),
+				(this.#naming === 'alone' &&
+					this.#queue.length === 1 &&
+					(this.#queue[0]?.prepares ?? 0) <= 1),
 			unprepare: (statement) => this.#unprepared.add(statement.key),
 			preparable: (sql, types) =>
 				this.#unprepared.size === 0 ||

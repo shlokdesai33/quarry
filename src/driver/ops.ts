@@ -137,6 +137,11 @@ export abstract class Op {
 		return false;
 	}
 
+	/** How many statements it writes that may be named; more than one is pipelining. */
+	get prepares(): number {
+		return 0;
+	}
+
 	abstract write(ctx: OpContext): void;
 	/** Handles one message; true when the operation is complete. */
 	abstract handle(msg: BackendMessage, ctx: OpContext): boolean;
@@ -302,6 +307,10 @@ export class QueryOp extends Op {
 		this.#resolve = resolve;
 		this.#reject = reject;
 		this.#retried = retried;
+	}
+
+	override get prepares(): number {
+		return this.#options.prepare ? 1 : 0;
 	}
 
 	/** The server's error for this statement, once it arrived. */
@@ -616,6 +625,12 @@ export class SyncGroupOp extends Op {
 	constructor(ops: readonly QueryOp[]) {
 		super();
 		this.#ops = ops;
+	}
+
+	override get prepares(): number {
+		let count = 0;
+		for (const op of this.#ops) count += op.prepares;
+		return count;
 	}
 
 	write(ctx: OpContext): void {
