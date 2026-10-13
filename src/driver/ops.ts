@@ -25,6 +25,8 @@ export interface Statement {
 	/** The server-side name; '' for SQL only ever sent unnamed, whose columns are still cached. */
 	readonly name: string;
 	readonly key: string;
+	/** When the statement was last looked up, on the connection's counter: the cache evicts the lowest. */
+	used: number;
 	/** Set once ParseComplete arrives. */
 	parsed: boolean;
 	fields: readonly Field[] | undefined;
@@ -108,17 +110,27 @@ export abstract class Op {
 	canceledBy: 'abort' | 'timeout' | undefined;
 	/** Receives the operation's timing when it settles, if set. */
 	onTiming: ((timing: OpTiming) => void) | undefined;
+	/**
+	 * Called once the operation settles, in a microtask queued before its
+	 * result is delivered: a pool frees the connection before the caller's
+	 * next query, without a promise of its own per query.
+	 */
+	onDone: (() => void) | undefined;
 	queuedAt = 0;
 	writtenAt = 0;
-	readonly #cleanups: (() => void)[] = [];
+	#cleanups: (() => void)[] | undefined;
 
 	onSettle(cleanup: () => void): void {
-		this.#cleanups.push(cleanup);
+		(this.#cleanups ??= []).push(cleanup);
 	}
 
 	protected settle(): void {
 		this.done = true;
-		for (const cleanup of this.#cleanups.splice(0)) cleanup();
+		const cleanups = this.#cleanups;
+		if (cleanups !== undefined) {
+			this.#cleanups = undefined;
+			for (const cleanup of cleanups) cleanup();
+		}
 		if (this.onTiming !== undefined) {
 			const now = performance.now();
 			const written = this.writtenAt || now;
@@ -126,6 +138,11 @@ export abstract class Op {
 				queuedMs: written - this.queuedAt,
 				execMs: now - written,
 			});
+		}
+		const onDone = this.onDone;
+		if (onDone !== undefined) {
+			this.onDone = undefined;
+			queueMicrotask(onDone);
 		}
 	}
 
@@ -157,16 +174,31 @@ export abstract class Op {
 	}
 }
 
-export function parseTag(tag: string): {
-	command: string;
-	rowCount: number | null;
-} {
+interface ParsedTag {
+	readonly command: string;
+	readonly rowCount: number | null;
+}
+
+/** The latest tag parsed: a connection mostly sees the same few tags in a row. */
+let lastTag = '';
+let lastParsed: ParsedTag = { command: '', rowCount: null };
+
+export function parseTag(tag: string): ParsedTag {
+	if (tag === lastTag) return lastParsed;
 	const space = tag.lastIndexOf(' ');
-	const last = tag.slice(space + 1);
-	if (space > 0 && /^\d+$/.test(last)) {
-		return { command: tag.slice(0, tag.indexOf(' ')), rowCount: Number(last) };
+	let digits = space > 0 && space < tag.length - 1;
+	for (let i = space + 1; digits && i < tag.length; i++) {
+		const code = tag.charCodeAt(i);
+		digits = code >= 0x30 && code <= 0x39;
 	}
-	return { command: tag, rowCount: null };
+	lastParsed = digits
+		? {
+				command: tag.slice(0, tag.indexOf(' ')),
+				rowCount: Number(tag.slice(space + 1)),
+			}
+		: { command: tag, rowCount: null };
+	lastTag = tag;
+	return lastParsed;
 }
 
 export interface QueryOpOptions {
@@ -278,7 +310,8 @@ export class QueryOp extends Op {
 	#types: TypeParsers | undefined;
 	#fields: readonly Field[] | undefined;
 	#decoder: RowDecoder | undefined;
-	#rows: unknown[] = [];
+	/** Created with the first row, sized for it: most queries return one row or none. */
+	#rows: unknown[] | undefined;
 	#tag = '';
 	#error: PostgresError | undefined;
 	/** A value that failed to decode: the query fails with it, the rest of its rows are skipped. */
@@ -389,11 +422,13 @@ export class QueryOp extends Op {
 		}
 		try {
 			// oxlint-disable-next-line typescript/no-non-null-assertion
-			this.#rows.push(decoder!(bytes, start, end));
+			const row = decoder!(bytes, start, end);
+			if (this.#rows === undefined) this.#rows = [row];
+			else this.#rows.push(row);
 		} catch (error) {
 			if (!(error instanceof DecodeError)) throw error;
 			this.#decodeError = error;
-			this.#rows = [];
+			this.#rows = undefined;
 		}
 		return true;
 	}
@@ -555,7 +590,7 @@ export class QueryOp extends Op {
 			this.#resolve({
 				command,
 				rowCount,
-				rows: this.#rows,
+				rows: this.#rows ?? [],
 				fields: this.#fields ?? [],
 			});
 			return true;

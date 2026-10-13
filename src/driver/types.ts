@@ -379,6 +379,9 @@ function encodeDefined(value: unknown): WireValue {
 /** The protocol counts parameters in 16 bits. */
 const MAX_PARAMETERS = 65535;
 
+const NO_TYPES: readonly number[] = [];
+const NO_VALUES: readonly WireValue[] = [];
+
 /**
  * Encodes a query's parameters with `encodeParam`, refusing `undefined`
  * (or an undefined array element) instead of sending it as NULL. An array
@@ -388,8 +391,9 @@ const MAX_PARAMETERS = 65535;
 export function encodeParams(
 	sql: string,
 	params: readonly unknown[],
-	paramTypes: readonly number[] = [],
-): WireValue[] {
+	paramTypes: readonly number[] = NO_TYPES,
+): readonly WireValue[] {
+	if (params.length === 0) return NO_VALUES;
 	if (params.length > MAX_PARAMETERS) {
 		throw new DriverError(
 			`A query can have at most ${MAX_PARAMETERS} parameters; this one has ${params.length}`,

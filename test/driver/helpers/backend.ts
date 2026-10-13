@@ -132,7 +132,8 @@ export function encodeBackend(message: BackendMessage): Uint8Array {
 export function dataRowPayload(values: readonly (string | null)[]): Uint8Array {
 	const w = new Writer(64).int16(values.length);
 	for (const v of values) w.value(v);
-	return w.take();
+	// a plain copy: `take` may return a Buffer, or a view into a shared one
+	return new Uint8Array(w.take());
 }
 
 /** A small deterministic PRNG (mulberry32), so fuzz failures reproduce from the seed. */
