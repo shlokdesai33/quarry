@@ -135,7 +135,10 @@ function env(
 	extra: Record<string, string>,
 ) {
 	return {
-		...process.env,
+		// the caller's PG* settings would change the upstream tests' defaults
+		...Object.fromEntries(
+			Object.entries(process.env).filter(([key]) => !key.startsWith('PG')),
+		),
 		NODE_OPTIONS: `--import ${join(here, 'hooks.ts')} --no-warnings`,
 		QUARRY_COMPAT_REDIRECTS: JSON.stringify(redirects()),
 		QUARRY_COMPAT_PG_TYPES: join(np, 'node_modules', 'pg-types'),
