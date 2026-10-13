@@ -8,7 +8,9 @@ import {
 import {
 	checkServerVersion,
 	detectCapabilities,
+	statementNames,
 	type Capabilities,
+	type StatementNames,
 } from './capabilities.js';
 import {
 	findPgpassPassword,
@@ -153,6 +155,8 @@ export class Connection implements AsyncDisposable {
 	/** Statement keys never prepared again on this connection (see `OpContext.unprepare`). */
 	readonly #unprepared = new Set<string>();
 	#statementCount = 0;
+	/** Which cached statements are written named: every one, those written alone, or none (see `OpContext.named`). */
+	#naming: 'always' | 'alone' | 'never' = 'always';
 	#status: 'I' | 'T' | 'E' = 'I';
 	#closed = false;
 	#ending = false;
@@ -211,7 +215,11 @@ export class Connection implements AsyncDisposable {
 		this.#ctx = {
 			writer: this.#writer,
 			types: this.#types,
-			statement: (sql, types) => this.#statement(sql, types),
+			statement: (sql, types, named) => this.#statement(sql, types, named),
+			// alone: nothing else in flight or waiting on the connection
+			named: () =>
+				this.#naming === 'always' ||
+				(this.#naming === 'alone' && this.#queue.length === 1),
 			unprepare: (statement) => this.#unprepared.add(statement.key),
 			preparable: (sql, types) =>
 				this.#unprepared.size === 0 ||
@@ -435,6 +443,10 @@ export class Connection implements AsyncDisposable {
 						this.#protocolMinor,
 						this.#parameters,
 						this.#saslMechanisms,
+					);
+					this.#naming = naming(
+						statementNames(this.#capabilities.pgbouncer),
+						this.#config.preparePipelined,
 					);
 					this.#starting = false;
 					this.#startupError = undefined;
@@ -715,16 +727,19 @@ export class Connection implements AsyncDisposable {
 	#statement(
 		sql: string,
 		types: readonly number[],
+		named: boolean,
 	): { statement: Statement; created: boolean } {
 		const key = statementKey(sql, types);
 		const existing = this.#statements.get(key);
 		if (existing !== undefined) {
 			this.#statements.delete(key);
-			this.#statements.set(key, existing);
-			return { statement: existing, created: false };
+			if (!named || existing.name !== '') {
+				this.#statements.set(key, existing);
+				return { statement: existing, created: false };
+			}
 		}
 		const statement: Statement = {
-			name: `q${++this.#statementCount}`,
+			name: named ? `q${++this.#statementCount}` : '',
 			key,
 			parsed: false,
 			fields: undefined,
@@ -739,7 +754,7 @@ export class Connection implements AsyncDisposable {
 			if (oldestKey !== undefined && oldest !== undefined) {
 				this.#statements.delete(oldestKey);
 				// written before the new statement's Parse; the op ignores the CloseComplete
-				fe.close(this.#writer, 'S', oldest.name);
+				if (oldest.name !== '') fe.close(this.#writer, 'S', oldest.name);
 			}
 		}
 		return { statement, created: true };
@@ -1434,6 +1449,21 @@ export class Connection implements AsyncDisposable {
 		this.#resolveClosed();
 		this.#emit(this.#closeListeners, error);
 	}
+}
+
+/**
+ * Which cached statements to write named. A pooler that rewrites named
+ * statements (PgBouncer) flushes what it holds and writes the new name
+ * apart from the rest before every named Bind: pipelined queries reach the
+ * server in two writes each instead of one write between them, which costs
+ * the single-threaded pooler more than parsing them again costs the server.
+ */
+function naming(
+	names: StatementNames,
+	preparePipelined: boolean | undefined,
+): 'always' | 'alone' | 'never' {
+	if (names === 'unsupported') return 'never';
+	return (preparePipelined ?? names === 'kept') ? 'always' : 'alone';
 }
 
 /** The statement cache's key: the SQL, prefixed with explicit parameter types. */
