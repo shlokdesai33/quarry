@@ -14,13 +14,18 @@ import {
 	tstzrange,
 	vector,
 } from '../../../src/column-factories.js';
-import { database, type Database } from '../../../src/database.js';
+import {
+	database,
+	type Database,
+	type DatabaseTransaction,
+} from '../../../src/database.js';
 import { defineEnum } from '../../../src/define-enum.js';
 import { defineTable } from '../../../src/define-table.js';
 import type { QueryEvent } from '../../../src/driver-executor.js';
 import { createPool, type Pool } from '../../../src/driver/pool.js';
 import {
 	DriverError,
+	LockNotAvailable,
 	NotNullViolation,
 	QueryCanceled,
 	UniqueViolation,
@@ -60,6 +65,13 @@ const posts = defineTable('posts', {
 	},
 });
 
+const jobs = defineTable('jobs', {
+	columns: {
+		id: integer().identity(),
+		status: text<'queued' | 'running'>(),
+	},
+});
+
 /** A view that sleeps, so a select can run long enough to cancel. */
 const slow = defineTable('slow', { columns: { done: text() } });
 
@@ -91,6 +103,7 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				"window" tstzrange not null default '(,)', embedding vector(3)
 			);
 			create table posts (id int generated always as identity primary key, user_id int not null, title text not null);
+			create table jobs (id int generated always as identity primary key, status text not null);
 			create view slow as select pg_sleep(2)::text as done;
 		`);
 		});
@@ -426,6 +439,77 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					.where('posts.title', 'never')
 					.maybeOne(),
 			).toBeUndefined();
+		});
+
+		it('claims a different job per worker with for update skip locked', async () => {
+			await db
+				.insertInto(jobs)
+				.values([{ status: 'queued' }, { status: 'queued' }])
+				.execute();
+			// `first`, not `one`: `one` fetches two rows, and would lock both
+			const claim = async (tx: DatabaseTransaction) =>
+				(
+					await tx
+						.selectFrom(jobs)
+						.select(['jobs.id'])
+						.where('jobs.status', 'queued')
+						.forUpdate()
+						.skipLocked()
+						.first()
+				)?.id;
+			let claimed!: (id: number | undefined) => void;
+			const firstId = new Promise<number | undefined>((resolve) => {
+				claimed = resolve;
+			});
+			let release!: () => void;
+			const released = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const first = db.transaction(async (tx) => {
+				const id = await claim(tx);
+				claimed(id);
+				await released;
+				if (id !== undefined) {
+					await tx
+						.update(jobs)
+						.set({ status: 'running' })
+						.where('jobs.id', id)
+						.execute();
+				}
+				return id;
+			});
+			const held = await firstId;
+			try {
+				expect(held).toEqual(expect.any(Number));
+				const second = await db.transaction(async (tx) => {
+					const id = await claim(tx);
+					// both jobs are locked now, so a third worker finds none
+					expect(await db.transaction(claim)).toBeUndefined();
+					return id;
+				});
+				expect(second).toEqual(expect.any(Number));
+				expect(second).not.toBe(held);
+				await rejection(
+					db
+						.selectFrom(jobs)
+						.select(['jobs.id'])
+						.where('jobs.id', held!)
+						.forNoKeyUpdate()
+						.noWait()
+						.first(),
+					LockNotAvailable,
+				);
+			} finally {
+				release();
+			}
+			expect(await first).toBe(held);
+			expect(
+				await db
+					.selectFrom(jobs)
+					.select(['jobs.status'])
+					.where('jobs.id', held!)
+					.one(),
+			).toEqual({ status: 'running' });
 		});
 
 		it('refuses to nest a durable transaction', async () => {
