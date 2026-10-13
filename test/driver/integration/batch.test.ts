@@ -9,6 +9,7 @@ import {
 	AbortError,
 	CheckViolation,
 	DriverError,
+	LockNotAvailable,
 	PostgresError,
 	QueryCanceled,
 	UniqueViolation,
@@ -387,6 +388,51 @@ describe.skipIf(noPg)('db.batch', () => {
 			expect(error).toBeInstanceOf(AbortError);
 			expect(trips).toBe(0);
 			expect(await noteBodies()).toEqual([]);
+		});
+	});
+
+	describe('with row locks', () => {
+		it('keeps the locking clause through the shape, and holds the locks in its transaction', async () => {
+			const claim = (id: number) => byId(id).forUpdate().skipLocked().first();
+			expect(claim(1).toSQL().sql).toMatch(
+				/ limit \$\d+ for update skip locked$/,
+			);
+			await using other = await open({
+				params: { search_path: `${schema},public` },
+			});
+			await other.transaction(async (tx) => {
+				await tx.query('select id from accounts where id = 1 for update');
+				const { value, trips } = await measure(() =>
+					db.batch([claim(1), claim(2), setBalance(2, 60)], {
+						transaction: true,
+					}),
+				);
+				expect(value).toEqual([
+					undefined,
+					{ owner: 'alan', balance: 50 },
+					{ rowCount: 1 },
+				]);
+				expect(trips).toBe(1);
+				// a checked shape: COMMIT waits for it, and the lock error rolls back
+				await rejection(
+					db.batch([setBalance(2, 70), byId(1).forUpdate().noWait().one()], {
+						transaction: true,
+					}),
+					LockNotAvailable,
+				);
+				// outside a transaction, the lock is the statement's own
+				const error = await rejection(
+					db.batch([byId(1).forShare().noWait().all(), byId(2).forShare()]),
+					BatchError,
+				);
+				expect(error.errors[0]).toBeInstanceOf(LockNotAvailable);
+				expect(error.results[1]).toMatchObject({ status: 'fulfilled' });
+			});
+			expect(await balances()).toEqual([
+				{ id: 1, balance: 100 },
+				{ id: 2, balance: 60 },
+			]);
+			expect(conn.transactionStatus).toBe('idle');
 		});
 	});
 
