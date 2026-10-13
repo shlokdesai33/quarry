@@ -226,7 +226,7 @@ export class Connection implements AsyncDisposable {
 				this.#naming === 'always' ||
 				(this.#naming === 'alone' &&
 					this.#queue.length === 1 &&
-					(this.#queue[0]?.prepares ?? 0) <= 1),
+					(this.#queue.at(0)?.prepares ?? 0) <= 1),
 			unprepare: (statement) => this.#unprepared.add(statement.key),
 			preparable: (sql, types) =>
 				this.#unprepared.size === 0 ||
