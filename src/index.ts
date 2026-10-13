@@ -23,6 +23,7 @@ export {
 	varchar,
 	vector,
 } from './column-factories.js';
+export { BatchError, type BatchResults } from './batch.js';
 export { compile, type CompiledQuery } from './compile.js';
 export {
 	database,
@@ -67,6 +68,8 @@ export {
 	NoRowError,
 	RowCountError,
 	TooManyRowsError,
+	type BatchOptions,
+	type BatchTransactionOptions,
 	type QueryDescription,
 	type RunOptions,
 	type StreamOptions,
@@ -82,6 +85,7 @@ export {
 	type InsertQueryBuilder,
 	type OnConflictBuilder,
 } from './insert-query-builder.js';
+export type { AnyQuery, Query } from './query.js';
 export type { Range } from './range.js';
 export {
 	fragment,

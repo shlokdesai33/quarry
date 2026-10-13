@@ -77,6 +77,29 @@ export interface TransactionOptions {
 	readonly durable?: boolean | undefined;
 }
 
+/** The transaction a batch runs in: it runs once, so it isn't retried. */
+export type BatchTransactionOptions = Omit<TransactionOptions, 'retries'>;
+
+/** Options of `db.batch`. */
+export interface BatchOptions extends RunOptions {
+	/**
+	 * Runs the queries in one transaction, all or nothing: `true`, or the
+	 * transaction's options. Inside a transaction, in a savepoint.
+	 */
+	readonly transaction?: boolean | BatchTransactionOptions | undefined;
+}
+
+/** What an executor is asked to do with a batch. */
+export interface ExecuteBatchOptions extends RunOptions {
+	/** Runs the queries in a transaction of their own (a savepoint, inside one). */
+	readonly transaction?: BatchTransactionOptions | undefined;
+	/**
+	 * Checks the results of a batch that runs all or nothing, before it is
+	 * done (before its transaction commits): throwing fails it.
+	 */
+	readonly verify?: ((results: readonly ExecuteResult[]) => void) | undefined;
+}
+
 /**
  * Runs compiled queries. The driver implements it; so can a mock, a SQL
  * snapshot recorder, or another backend (HTTP, PGlite). Not part of the
@@ -95,6 +118,17 @@ export interface Executor {
 	): AsyncIterable<readonly unknown[]>;
 	/** The query's parameter and result types, without running it. */
 	describe(query: CompiledQuery): Promise<QueryDescription>;
+	/**
+	 * Runs `queries` in one round trip, on one connection. Outside a
+	 * transaction, each runs on its own, and this resolves to each one's
+	 * outcome. In a transaction (with `transaction`, or the one the
+	 * executor is in) they run all or nothing: this rejects with the error
+	 * that failed them, after calling `verify` on the results.
+	 */
+	batch(
+		queries: readonly CompiledQuery[],
+		options?: ExecuteBatchOptions,
+	): Promise<readonly PromiseSettledResult<ExecuteResult>[]>;
 	/**
 	 * Runs `fn` in a transaction, passing an executor whose queries run
 	 * inside it. Inside a transaction, this nests a savepoint.
