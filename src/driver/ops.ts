@@ -633,6 +633,8 @@ export class SyncGroupOp extends Op {
 		}
 		const op = this.#ops[this.#current];
 		if (op === undefined || this.#failed) return this.unexpected(msg);
+		// a cancel is requested for the group, and hits the statement running
+		op.canceledBy = this.canceledBy;
 		op.handle(msg, ctx);
 		if (msg.type === 'ErrorResponse') this.#failed = true;
 		else if (

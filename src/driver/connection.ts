@@ -948,10 +948,11 @@ export class Connection implements AsyncDisposable {
 	/**
 	 * @internal Runs statements under one Sync: once one fails, the server
 	 * skips the rest, and they reject with its error. One that can't be
-	 * sent skips the rest the same way.
+	 * sent skips the rest the same way. `signal` cancels the whole group.
 	 */
 	queryGroup(
 		statements: readonly GroupStatement[],
+		{ signal }: { readonly signal?: AbortSignal | undefined } = {},
 	): Promise<QueryResult<unknown>>[] {
 		const ops: QueryOp[] = [];
 		let invalid: { error: unknown } | undefined;
@@ -988,7 +989,7 @@ export class Connection implements AsyncDisposable {
 					);
 				}),
 		);
-		if (ops.length > 0) this.#enqueue(new SyncGroupOp(ops));
+		if (ops.length > 0) this.#enqueue(new SyncGroupOp(ops), signal);
 		if (this.#config.telemetry === undefined && !this.#config.captureStack)
 			return results;
 		return results.map((result, i) =>
