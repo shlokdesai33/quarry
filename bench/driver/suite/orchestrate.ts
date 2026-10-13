@@ -222,7 +222,8 @@ function matrix(phase: string): Cell[] {
 		}
 		if (phase === 'pipeline' && runtime === 'node') {
 			for (const rtt of [0, 5])
-				for (const pipeline of [1, 2, 4, 8, 16, 32, 64, 100])
+				// undefined: the default, adaptive depth
+				for (const pipeline of [1, 2, 4, 8, 16, 32, 64, 100, undefined])
 					add({
 						phase,
 						runtime,
@@ -232,7 +233,7 @@ function matrix(phase: string): Cell[] {
 						rtt,
 						max: 1,
 						concurrency: 100,
-						pipeline,
+						...(pipeline === undefined ? {} : { pipeline }),
 						durationMs: 2000,
 					});
 		}
@@ -243,6 +244,7 @@ function matrix(phase: string): Cell[] {
 				['pk', 10],
 				['pk', 10, 50],
 				['pk', 1, 100],
+				['pk', 1, 500],
 				['fetch1k', 10],
 				['tx-insert', 10],
 				['tx-empty', 10],

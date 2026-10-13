@@ -183,6 +183,7 @@ RTT_VARIANTS = [
     ("select1", 10, None, "select 1, sequential"),
     ("pk", 10, 50, "point lookup, 50 concurrent, pool 10"),
     ("pk", 1, 100, "point lookup, 100 concurrent, pool 1"),
+    ("pk", 1, 500, "point lookup, 500 concurrent, pool 1"),
     ("tx-insert", 10, None, "begin; insert; commit, sequential"),
     ("insert1-c50", 10, None, "insert, 50 concurrent, pool 10"),
     ("connect-plain-trust", 10, None, "connect + select 1 + close"),
@@ -191,7 +192,8 @@ for runtime in ["node", "bun"]:
     ds = drivers_in("rtt", runtime)
     if not ds:
         continue
-    fig, axes = plt.subplots(2, 3, figsize=(14, 7.5))
+    fig, axes = plt.subplots(2, 4, figsize=(18, 7.5))
+    axes.flat[-1].set_visible(False)
     for ax, (s, mx, conc, name) in zip(axes.flat, RTT_VARIANTS):
         for d in ds:
             xs, ys = [], []
@@ -217,10 +219,11 @@ for runtime in ["node", "bun"]:
 pipe = summary.get("pipeline") or {}
 if pipe:
     fig, ax = plt.subplots(figsize=(6, 4))
-    for rtt, series in pipe.items():
-        xs = [int(k) for k, v in series.items() if v]
-        ys = [v["median"] for v in series.values() if v]
-        ax.plot(xs, ys, marker="o", label=f"RTT {rtt} ms")
+    for (rtt, series), color in zip(pipe.items(), ["#9467bd", "#ff7f0e"]):
+        fixed = [(int(k), v["median"]) for k, v in series.items() if v and k != "adaptive"]
+        ax.plot([x for x, _ in fixed], [y for _, y in fixed], marker="o", color=color, label=f"RTT {rtt} ms, fixed depth")
+        if series.get("adaptive"):
+            ax.axhline(series["adaptive"]["median"], color=color, ls="--", lw=1, label=f"RTT {rtt} ms, adaptive (default)")
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlabel("quarry `pipeline` (queries in flight per connection)")
@@ -352,7 +355,7 @@ if len(sys.argv) > 4:
     axes[0].set_xscale("log")
     axes[0].set_xlabel("concurrent callers")
     axes[0].set_ylabel("point lookups/s")
-    axes[0].set_title("quarry concurrency sweep, before vs after the pool fix (Node)")
+    axes[0].set_title("quarry concurrency sweep, baseline (dashed) vs candidate run (solid), Node")
     axes[0].legend(fontsize=7)
     depths = [1, 2, 4, 8, 16, 32, 64, 100]
     for rtt, color in [(0, "#9467bd"), (5, "#ff7f0e")]:
@@ -362,7 +365,7 @@ if len(sys.argv) > 4:
     axes[1].set_yscale("log")
     axes[1].set_xlabel("`pipeline` option")
     axes[1].set_ylabel("point lookups/s (log)")
-    axes[1].set_title("1 connection, 100 callers, before vs after the pool fix")
+    axes[1].set_title("1 connection, 100 callers: baseline (dashed) vs candidate run (solid)")
     axes[1].legend(fontsize=7)
     save(fig, "pool-fix-ab.png")
     print(written[-1])

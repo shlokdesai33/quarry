@@ -1054,17 +1054,19 @@ for (const runtime of RUNTIMES) {
 		label: string;
 		pick: (d: string) => Stat | undefined | 'unsupported';
 	}[] = [];
-	const depths = [1, 2, 4, 8, 16, 32, 64, 100];
+	// undefined: the default, adaptive depth
+	const depths = [1, 2, 4, 8, 16, 32, 64, 100, undefined];
 	const series: Record<string, Record<string, Stat | undefined>> = {};
 	for (const rtt of [0, 5]) {
 		for (const p of depths) {
 			const a = get('pipeline', 'node', 'quarry', 'pk', { pipeline: p, rtt });
-			(series[String(rtt)] ??= {})[String(p)] = a?.m['throughput'];
+			(series[String(rtt)] ??= {})[p === undefined ? 'adaptive' : String(p)] =
+				a?.m['throughput'];
 		}
 	}
 	for (const p of depths)
 		rows.push({
-			label: String(p),
+			label: p === undefined ? 'adaptive (default)' : String(p),
 			pick: (rtt) =>
 				metric('throughput')(
 					get('pipeline', 'node', 'quarry', 'pk', {
@@ -1094,6 +1096,7 @@ summary['rtt'] = {};
 		['pk', 10, undefined, 'point lookup, sequential'],
 		['pk', 10, 50, 'point lookup, 50 concurrent, pool 10'],
 		['pk', 1, 100, 'point lookup, 100 concurrent, pool 1 (pipelining)'],
+		['pk', 1, 500, 'point lookup, 500 concurrent, pool 1 (deep pipelining)'],
 		['fetch1k', 10, undefined, 'fetch 1k rows, sequential'],
 		[
 			'tx-insert',
