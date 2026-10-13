@@ -399,18 +399,18 @@ export function encodeParams(
 			`A query can have at most ${MAX_PARAMETERS} parameters; this one has ${params.length}`,
 		);
 	}
-	const values: WireValue[] = [];
+	// oxlint-disable-next-line unicorn/no-new-array -- sized up front: growing by push allocates room for 16 more
+	const values = new Array<WireValue>(params.length);
 	for (let i = 0; i < params.length; i++) {
 		const value = params[i];
 		const element = undefinedAt(value);
 		if (element !== undefined)
 			throw new UndefinedParameterError(sql, i + 1, element);
 		const type = paramTypes[i];
-		values.push(
+		values[i] =
 			(type !== undefined && Array.isArray(value)
 				? binaryArray(value, type)
-				: undefined) ?? encodeDefined(value),
-		);
+				: undefined) ?? encodeDefined(value);
 	}
 	return values;
 }

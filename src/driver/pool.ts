@@ -303,7 +303,8 @@ export class Pool implements AsyncDisposable {
 
 	#expired(slot: Slot): boolean {
 		return (
-			slot.expiresAt !== Number.POSITIVE_INFINITY && Date.now() >= slot.expiresAt
+			slot.expiresAt !== Number.POSITIVE_INFINITY &&
+			Date.now() >= slot.expiresAt
 		);
 	}
 
@@ -689,25 +690,31 @@ export class Pool implements AsyncDisposable {
 			return;
 		}
 		if (connection.pending > 0 || connection.transactionStatus !== 'idle') {
-			// queries still running, or a transaction left open: never hand that
-			// to someone else; it stays lent out until its queries finish
-			void connection.idle().then(() => {
-				if (connection.transactionStatus === 'idle') {
-					this.#releaseSlot(slot, false);
-				} else {
-					this.#unlend(slot);
-					connection.destroy(
-						new DriverError('Released with a transaction open'),
-					);
-					this.#serveWaiters();
-					this.#checkDrained();
-				}
-				return undefined;
-			});
+			this.#releaseWhenIdle(slot);
 			return;
 		}
 		this.#unlend(slot);
 		this.#giveBack(slot);
+	}
+
+	/**
+	 * Queries still running, or a transaction left open: never hand that to
+	 * someone else; it stays lent out until its queries finish. (A method of
+	 * its own: a closure in `#releaseSlot` would cost every release a context.)
+	 */
+	#releaseWhenIdle(slot: Slot): void {
+		const { connection } = slot;
+		void connection.idle().then(() => {
+			if (connection.transactionStatus === 'idle') {
+				this.#releaseSlot(slot, false);
+			} else {
+				this.#unlend(slot);
+				connection.destroy(new DriverError('Released with a transaction open'));
+				this.#serveWaiters();
+				this.#checkDrained();
+			}
+			return undefined;
+		});
 	}
 
 	/** Reserves a connection until `release` is called. */
@@ -867,20 +874,31 @@ export class Pool implements AsyncDisposable {
 		params?: readonly unknown[],
 		options?: QueryOptions,
 	): Promise<QueryResult<R>> {
-		// the common case without a closure per query
+		// no closures in this function: one would cost every query a context
 		const slot = this.#claimShared(options?.signal);
-		if (slot === undefined) {
-			return this.#withShared(options?.signal, (connection) =>
-				connection.query<R>(sql, params, options),
-			);
-		}
+		if (slot === undefined) return this.#queryShared(sql, params, options);
 		const started = this.#timing();
 		return slot.connection.queryThen<R>(
 			sql,
 			params,
 			options,
-			started < 0 ? slot.settled : () => this.#done(slot, started),
+			started < 0 ? slot.settled : this.#settledTimed(slot, started),
 		);
+	}
+
+	#queryShared<R>(
+		sql: string,
+		params: readonly unknown[] | undefined,
+		options: QueryOptions | undefined,
+	): Promise<QueryResult<R>> {
+		return this.#withShared(options?.signal, (connection) =>
+			connection.query<R>(sql, params, options),
+		);
+	}
+
+	/** Ends a timed query's turn on its connection, sampling its latency. */
+	#settledTimed(slot: Slot, started: number): () => void {
+		return () => this.#done(slot, started);
 	}
 
 	simpleQuery<R = Record<string, unknown>>(

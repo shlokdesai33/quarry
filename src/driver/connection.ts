@@ -728,11 +728,7 @@ export class Connection implements AsyncDisposable {
 		return false;
 	}
 
-	#statement(
-		sql: string,
-		types: readonly number[],
-		named: boolean,
-	): { statement: Statement; created: boolean } {
+	#statement(sql: string, types: readonly number[], named: boolean): Statement {
 		const key = statementKey(sql, types);
 		const existing = this.#statements.get(key);
 		if (existing !== undefined) {
@@ -741,7 +737,7 @@ export class Connection implements AsyncDisposable {
 				// and re-adding a key on every hit makes the Map rehash, garbage
 				// that adds up to GC pauses on small queries
 				existing.used = ++this.#statementUses;
-				return { statement: existing, created: false };
+				return existing;
 			}
 			// an unnamed entry, replaced by a named statement
 			this.#statements.delete(key);
@@ -750,6 +746,7 @@ export class Connection implements AsyncDisposable {
 			name: named ? `q${++this.#statementCount}` : '',
 			key,
 			used: ++this.#statementUses,
+			unwritten: true,
 			parsed: false,
 			fields: undefined,
 			paramTypes: undefined,
@@ -769,7 +766,7 @@ export class Connection implements AsyncDisposable {
 			}
 		}
 		this.#statements.set(key, statement);
-		return { statement, created: true };
+		return statement;
 	}
 
 	#enqueue(op: Op, signal?: AbortSignal, timeout?: number): void {
@@ -788,15 +785,20 @@ export class Connection implements AsyncDisposable {
 		if (op.onTiming !== undefined) op.queuedAt = performance.now();
 		this.#queue.push(op);
 		this.#schedule();
-		if (signal) {
-			const onAbort = () => this.#abort(op, 'abort', signal.reason);
-			signal.addEventListener('abort', onAbort, { once: true });
-			op.onSettle(() => signal.removeEventListener('abort', onAbort));
-		}
-		if (timeout !== undefined && timeout > 0) {
-			const timer = setTimeout(() => this.#abort(op, 'timeout'), timeout);
-			op.onSettle(() => clearTimeout(timer));
-		}
+		// in methods of their own: closures here would cost every query a context
+		if (signal) this.#abortOn(op, signal);
+		if (timeout !== undefined && timeout > 0) this.#timeOut(op, timeout);
+	}
+
+	#abortOn(op: Op, signal: AbortSignal): void {
+		const onAbort = () => this.#abort(op, 'abort', signal.reason);
+		signal.addEventListener('abort', onAbort, { once: true });
+		op.onSettle(() => signal.removeEventListener('abort', onAbort));
+	}
+
+	#timeOut(op: Op, timeout: number): void {
+		const timer = setTimeout(() => this.#abort(op, 'timeout'), timeout);
+		op.onSettle(() => clearTimeout(timer));
 	}
 
 	#abort(op: Op, reason: 'abort' | 'timeout', cause?: unknown): void {
@@ -955,34 +957,37 @@ export class Connection implements AsyncDisposable {
 				options.statementTimeout,
 			);
 		}
-		const result = new Promise<QueryResult<unknown>>((resolve, reject) => {
-			const invalid = invalidSql(sql);
-			if (invalid) {
-				if (onDone !== undefined) queueMicrotask(onDone);
-				reject(invalid);
-				return;
-			}
-			let values;
-			try {
-				values = encodeParams(sql, params, options?.paramTypes);
-			} catch (error) {
-				if (onDone !== undefined) queueMicrotask(onDone);
-				reject(error);
-				return;
-			}
-			const op = new QueryOp(
-				sql,
-				params,
-				values,
-				this.#options(options),
-				resolve,
-				reject,
-			);
-			op.onTiming = options?.onTiming;
-			op.onDone = onDone;
-			this.#enqueue(op, options?.signal, options?.timeout);
-		});
-		return asResultPromise<R>(result);
+		// one shared executor: one closing over this query would cost a
+		// closure and its context per query
+		const promise = new Promise<QueryResult<unknown>>(capture);
+		const resolve = capturedResolve;
+		const reject = capturedReject;
+		const invalid = invalidSql(sql);
+		if (invalid) {
+			if (onDone !== undefined) queueMicrotask(onDone);
+			reject(invalid);
+			return asResultPromise<R>(promise);
+		}
+		let values;
+		try {
+			values = encodeParams(sql, params, options?.paramTypes);
+		} catch (error) {
+			if (onDone !== undefined) queueMicrotask(onDone);
+			reject(error);
+			return asResultPromise<R>(promise);
+		}
+		const op = new QueryOp(
+			sql,
+			params,
+			values,
+			this.#options(options),
+			resolve,
+			reject,
+		);
+		op.onTiming = options?.onTiming;
+		op.onDone = onDone;
+		this.#enqueue(op, options?.signal, options?.timeout);
+		return asResultPromise<R>(promise);
 	}
 
 	/**
@@ -1505,6 +1510,17 @@ function naming(
 	if (names === 'unsupported') return 'never';
 	return (preparePipelined ?? names === 'kept') ? 'always' : 'alone';
 }
+
+/** The resolving functions of the latest promise `capture` executed for. */
+let capturedResolve: (result: QueryResult<unknown>) => void = () => {};
+let capturedReject: (error: unknown) => void = () => {};
+const capture = (
+	resolve: (result: QueryResult<unknown>) => void,
+	reject: (error: unknown) => void,
+) => {
+	capturedResolve = resolve;
+	capturedReject = reject;
+};
 
 /** The statement cache's key: the SQL, prefixed with explicit parameter types. */
 function statementKey(sql: string, types: readonly number[]): string {

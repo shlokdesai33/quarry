@@ -27,6 +27,8 @@ export interface Statement {
 	readonly key: string;
 	/** When the statement was last looked up, on the connection's counter: the cache evicts the lowest. */
 	used: number;
+	/** Created, and its Parse not yet written: the operation that finds it so writes it. */
+	unwritten: boolean;
 	/** Set once ParseComplete arrives. */
 	parsed: boolean;
 	fields: readonly Field[] | undefined;
@@ -48,14 +50,11 @@ export interface OpContext {
 	readonly writer: Writer;
 	readonly types: TypeParsers;
 	/**
-	 * The cached statement for this SQL, created if new. A `named` one is
-	 * created with a name, to be parsed; an unnamed entry is then replaced.
+	 * The cached statement for this SQL, created if new (`unwritten` until
+	 * its Parse is written). A `named` one is created with a name, to be
+	 * parsed; an unnamed entry is then replaced.
 	 */
-	statement(
-		sql: string,
-		types: readonly number[],
-		named: boolean,
-	): { statement: Statement; created: boolean };
+	statement(sql: string, types: readonly number[], named: boolean): Statement;
 	/**
 	 * Whether a statement written now should be named. Behind a pooler that
 	 * rewrites named statements, a query pipelined with others is sent
@@ -351,7 +350,7 @@ export class QueryOp extends Op {
 			ctx.preparable(this.#sql, this.#options.paramTypes)
 		) {
 			const named = ctx.named();
-			const { statement, created } = ctx.statement(
+			const statement = ctx.statement(
 				this.#sql,
 				this.#options.paramTypes,
 				named,
@@ -375,6 +374,8 @@ export class QueryOp extends Op {
 				if (sync) fe.sync(w);
 				return;
 			}
+			const created = statement.unwritten;
+			statement.unwritten = false;
 			this.#createdStatement = created;
 			if (created) {
 				fe.parse(w, statement.name, this.#sql, this.#options.paramTypes);
@@ -914,11 +915,13 @@ export class CursorOp extends Op {
 		this.#ctx = ctx;
 		const w = ctx.writer;
 		if (this.#options.prepare && ctx.named()) {
-			const { statement, created } = ctx.statement(
+			const statement = ctx.statement(
 				this.#sql,
 				this.#options.paramTypes,
 				true,
 			);
+			const created = statement.unwritten;
+			statement.unwritten = false;
 			this.#statement = statement;
 			this.#created = created;
 			if (created) {
