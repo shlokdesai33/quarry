@@ -19,7 +19,8 @@ const field = (name: string, typeOid: number, format = 0): Field => ({
 function payload(values: readonly (string | Uint8Array | null)[]): Uint8Array {
 	const w = new Writer(64).int16(values.length);
 	for (const v of values) w.value(v);
-	return w.take();
+	// a plain copy: `take` may return a Buffer, or a view into a shared one
+	return new Uint8Array(w.take());
 }
 
 const int4 = (n: number) => {

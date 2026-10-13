@@ -222,7 +222,7 @@ describe('Writer and frontend messages', () => {
 		const out = one((w) =>
 			fe.bind(w, 'p', 's', ['abc', null, new Uint8Array([9, 8]), ''], 0),
 		);
-		const view = new DataView(out.buffer);
+		const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
 		expect(String.fromCharCode(out[0]!)).toBe('B');
 		expect(view.getInt32(1)).toBe(out.length - 1);
 		// portal "p\0", statement "s\0", then 4 format codes: 0,0,1,0
@@ -250,7 +250,7 @@ describe('Writer and frontend messages', () => {
 	it('writes multi-byte strings with the right lengths, growing its buffer', () => {
 		const big = 'é😀'.repeat(5000);
 		const out = one((w) => fe.bind(w, '', '', [big]));
-		const view = new DataView(out.buffer);
+		const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
 		const len = view.getInt32(5 + 2 + 2 + 2);
 		expect(len).toBe(Buffer.byteLength(big));
 		expect(Buffer.from(out.subarray(15, 15 + len)).toString()).toBe(big);
@@ -263,7 +263,7 @@ describe('Writer and frontend messages', () => {
 	it('writes a 3.2 cancel request with a long key', () => {
 		const key = new Uint8Array(32).map((_, i) => i);
 		const out = fe.cancelRequest(77, key);
-		const view = new DataView(out.buffer);
+		const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
 		expect(view.getInt32(0)).toBe(12 + 32);
 		expect(view.getInt32(4)).toBe(80877102);
 		expect(view.getInt32(8)).toBe(77);

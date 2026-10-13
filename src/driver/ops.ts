@@ -25,6 +25,10 @@ export interface Statement {
 	/** The server-side name; '' for SQL only ever sent unnamed, whose columns are still cached. */
 	readonly name: string;
 	readonly key: string;
+	/** When the statement was last looked up, on the connection's counter: the cache evicts the lowest. */
+	used: number;
+	/** Created, and its Parse not yet written: the operation that finds it so writes it. */
+	unwritten: boolean;
 	/** Set once ParseComplete arrives. */
 	parsed: boolean;
 	fields: readonly Field[] | undefined;
@@ -46,14 +50,11 @@ export interface OpContext {
 	readonly writer: Writer;
 	readonly types: TypeParsers;
 	/**
-	 * The cached statement for this SQL, created if new. A `named` one is
-	 * created with a name, to be parsed; an unnamed entry is then replaced.
+	 * The cached statement for this SQL, created if new (`unwritten` until
+	 * its Parse is written). A `named` one is created with a name, to be
+	 * parsed; an unnamed entry is then replaced.
 	 */
-	statement(
-		sql: string,
-		types: readonly number[],
-		named: boolean,
-	): { statement: Statement; created: boolean };
+	statement(sql: string, types: readonly number[], named: boolean): Statement;
 	/**
 	 * Whether a statement written now should be named. Behind a pooler that
 	 * rewrites named statements, a query pipelined with others is sent
@@ -108,17 +109,27 @@ export abstract class Op {
 	canceledBy: 'abort' | 'timeout' | undefined;
 	/** Receives the operation's timing when it settles, if set. */
 	onTiming: ((timing: OpTiming) => void) | undefined;
+	/**
+	 * Called by the connection once the operation has settled and left its
+	 * queue, before callbacks on its result run: a pool frees the connection
+	 * before the caller's next query, without a promise of its own per query.
+	 */
+	onDone: (() => void) | undefined;
 	queuedAt = 0;
 	writtenAt = 0;
-	readonly #cleanups: (() => void)[] = [];
+	#cleanups: (() => void)[] | undefined;
 
 	onSettle(cleanup: () => void): void {
-		this.#cleanups.push(cleanup);
+		(this.#cleanups ??= []).push(cleanup);
 	}
 
 	protected settle(): void {
 		this.done = true;
-		for (const cleanup of this.#cleanups.splice(0)) cleanup();
+		const cleanups = this.#cleanups;
+		if (cleanups !== undefined) {
+			this.#cleanups = undefined;
+			for (const cleanup of cleanups) cleanup();
+		}
 		if (this.onTiming !== undefined) {
 			const now = performance.now();
 			const written = this.writtenAt || now;
@@ -157,16 +168,31 @@ export abstract class Op {
 	}
 }
 
-export function parseTag(tag: string): {
-	command: string;
-	rowCount: number | null;
-} {
+interface ParsedTag {
+	readonly command: string;
+	readonly rowCount: number | null;
+}
+
+/** The latest tag parsed: a connection mostly sees the same few tags in a row. */
+let lastTag = '';
+let lastParsed: ParsedTag = { command: '', rowCount: null };
+
+export function parseTag(tag: string): ParsedTag {
+	if (tag === lastTag) return lastParsed;
 	const space = tag.lastIndexOf(' ');
-	const last = tag.slice(space + 1);
-	if (space > 0 && /^\d+$/.test(last)) {
-		return { command: tag.slice(0, tag.indexOf(' ')), rowCount: Number(last) };
+	let digits = space > 0 && space < tag.length - 1;
+	for (let i = space + 1; digits && i < tag.length; i++) {
+		const code = tag.charCodeAt(i);
+		digits = code >= 0x30 && code <= 0x39;
 	}
-	return { command: tag, rowCount: null };
+	lastParsed = digits
+		? {
+				command: tag.slice(0, tag.indexOf(' ')),
+				rowCount: Number(tag.slice(space + 1)),
+			}
+		: { command: tag, rowCount: null };
+	lastTag = tag;
+	return lastParsed;
 }
 
 export interface QueryOpOptions {
@@ -278,7 +304,8 @@ export class QueryOp extends Op {
 	#types: TypeParsers | undefined;
 	#fields: readonly Field[] | undefined;
 	#decoder: RowDecoder | undefined;
-	#rows: unknown[] = [];
+	/** Created with the first row, sized for it: most queries return one row or none. */
+	#rows: unknown[] | undefined;
 	#tag = '';
 	#error: PostgresError | undefined;
 	/** A value that failed to decode: the query fails with it, the rest of its rows are skipped. */
@@ -318,7 +345,7 @@ export class QueryOp extends Op {
 			ctx.preparable(this.#sql, this.#options.paramTypes)
 		) {
 			const named = ctx.named();
-			const { statement, created } = ctx.statement(
+			const statement = ctx.statement(
 				this.#sql,
 				this.#options.paramTypes,
 				named,
@@ -342,6 +369,8 @@ export class QueryOp extends Op {
 				if (sync) fe.sync(w);
 				return;
 			}
+			const created = statement.unwritten;
+			statement.unwritten = false;
 			this.#createdStatement = created;
 			if (created) {
 				fe.parse(w, statement.name, this.#sql, this.#options.paramTypes);
@@ -389,11 +418,13 @@ export class QueryOp extends Op {
 		}
 		try {
 			// oxlint-disable-next-line typescript/no-non-null-assertion
-			this.#rows.push(decoder!(bytes, start, end));
+			const row = decoder!(bytes, start, end);
+			if (this.#rows === undefined) this.#rows = [row];
+			else this.#rows.push(row);
 		} catch (error) {
 			if (!(error instanceof DecodeError)) throw error;
 			this.#decodeError = error;
-			this.#rows = [];
+			this.#rows = undefined;
 		}
 		return true;
 	}
@@ -555,7 +586,7 @@ export class QueryOp extends Op {
 			this.#resolve({
 				command,
 				rowCount,
-				rows: this.#rows,
+				rows: this.#rows ?? [],
 				fields: this.#fields ?? [],
 			});
 			return true;
@@ -570,17 +601,19 @@ export class QueryOp extends Op {
 			ctx.forget(this.#statement);
 			if (this.#createdStatement) ctx.unprepare(this.#statement);
 			// retried unnamed: a pooler passes that through instead of reusing its stale statement
-			ctx.retry(
-				new QueryOp(
-					this.#sql,
-					this.#params,
-					this.#values,
-					{ ...this.#options, prepare: false },
-					this.#resolve,
-					this.#reject,
-					true,
-				),
+			const retry = new QueryOp(
+				this.#sql,
+				this.#params,
+				this.#values,
+				{ ...this.#options, prepare: false },
+				this.#resolve,
+				this.#reject,
+				true,
 			);
+			// done once the retry is
+			retry.onDone = this.onDone;
+			this.onDone = undefined;
+			ctx.retry(retry);
 			return true;
 		}
 		this.#reject(error);
@@ -879,11 +912,13 @@ export class CursorOp extends Op {
 		this.#ctx = ctx;
 		const w = ctx.writer;
 		if (this.#options.prepare && ctx.named()) {
-			const { statement, created } = ctx.statement(
+			const statement = ctx.statement(
 				this.#sql,
 				this.#options.paramTypes,
 				true,
 			);
+			const created = statement.unwritten;
+			statement.unwritten = false;
 			this.#statement = statement;
 			this.#created = created;
 			if (created) {

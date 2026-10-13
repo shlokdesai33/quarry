@@ -288,3 +288,11 @@ export function asResult<R>(result: QueryResult<unknown>): QueryResult<R> {
 	// oxlint-disable-next-line typescript/no-unsafe-type-assertion
 	return result as QueryResult<R>;
 }
+
+/** `asResult` for a pending result, without a callback per query to cast it. */
+export function asResultPromise<R>(
+	result: Promise<QueryResult<unknown>>,
+): Promise<QueryResult<R>> {
+	// oxlint-disable-next-line typescript/no-unsafe-type-assertion
+	return result as Promise<QueryResult<R>>;
+}

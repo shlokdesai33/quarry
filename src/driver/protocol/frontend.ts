@@ -104,14 +104,19 @@ export function bind(
 	resultFormat: 0 | 1 | readonly number[] = 0,
 ): Writer {
 	w.begin(0x42).cstring(portal).cstring(statement);
-	if (values.some((value) => value instanceof Uint8Array)) {
+	// index loops: this runs per query, and a callback would be allocated each time
+	let binary = false;
+	for (let i = 0; i < values.length && !binary; i++)
+		binary = values[i] instanceof Uint8Array;
+	if (binary) {
 		w.int16(values.length);
-		for (const value of values) w.int16(value instanceof Uint8Array ? 1 : 0);
+		for (let i = 0; i < values.length; i++)
+			w.int16(values[i] instanceof Uint8Array ? 1 : 0);
 	} else {
 		w.int16(0);
 	}
 	w.int16(values.length);
-	for (const value of values) w.value(value);
+	for (let i = 0; i < values.length; i++) w.value(values[i] ?? null);
 	if (resultFormat === 0) w.int16(0);
 	else if (resultFormat === 1) w.int16(1).int16(1);
 	else {

@@ -379,6 +379,9 @@ function encodeDefined(value: unknown): WireValue {
 /** The protocol counts parameters in 16 bits. */
 const MAX_PARAMETERS = 65535;
 
+const NO_TYPES: readonly number[] = [];
+const NO_VALUES: readonly WireValue[] = [];
+
 /**
  * Encodes a query's parameters with `encodeParam`, refusing `undefined`
  * (or an undefined array element) instead of sending it as NULL. An array
@@ -388,25 +391,26 @@ const MAX_PARAMETERS = 65535;
 export function encodeParams(
 	sql: string,
 	params: readonly unknown[],
-	paramTypes: readonly number[] = [],
-): WireValue[] {
+	paramTypes: readonly number[] = NO_TYPES,
+): readonly WireValue[] {
+	if (params.length === 0) return NO_VALUES;
 	if (params.length > MAX_PARAMETERS) {
 		throw new DriverError(
 			`A query can have at most ${MAX_PARAMETERS} parameters; this one has ${params.length}`,
 		);
 	}
-	const values: WireValue[] = [];
+	// oxlint-disable-next-line unicorn/no-new-array -- sized up front: growing by push allocates room for 16 more
+	const values = new Array<WireValue>(params.length);
 	for (let i = 0; i < params.length; i++) {
 		const value = params[i];
 		const element = undefinedAt(value);
 		if (element !== undefined)
 			throw new UndefinedParameterError(sql, i + 1, element);
 		const type = paramTypes[i];
-		values.push(
+		values[i] =
 			(type !== undefined && Array.isArray(value)
 				? binaryArray(value, type)
-				: undefined) ?? encodeDefined(value),
-		);
+				: undefined) ?? encodeDefined(value);
 	}
 	return values;
 }

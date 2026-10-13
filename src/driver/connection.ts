@@ -48,7 +48,8 @@ import * as fe from './protocol/frontend.js';
 import type { BackendMessage } from './protocol/messages.js';
 import { ChannelNames, decodeNotification, Reader } from './protocol/reader.js';
 import { Writer } from './protocol/writer.js';
-import { asResult, asRows, type RowMode } from './rows.js';
+import { Queue } from './queue.js';
+import { asResult, asResultPromise, asRows, type RowMode } from './rows.js';
 import type { DriverSocket } from './socket.js';
 import { startQuerySpan } from './telemetry.js';
 import { Transaction, type TransactionOptions } from './transaction.js';
@@ -139,7 +140,7 @@ export class Connection implements AsyncDisposable {
 	readonly #reader: Reader;
 	readonly #writer = new Writer();
 	readonly #types: TypeParsers;
-	readonly #queue: Op[] = [];
+	readonly #queue = new Queue<Op>();
 	/** How many operations at the front of the queue have been written. */
 	#written = 0;
 	#flushScheduled = false;
@@ -155,6 +156,7 @@ export class Connection implements AsyncDisposable {
 	/** Statement keys never prepared again on this connection (see `OpContext.unprepare`). */
 	readonly #unprepared = new Set<string>();
 	#statementCount = 0;
+	#statementUses = 0;
 	/** Which cached statements are written named: every one, those written alone, or none (see `OpContext.named`). */
 	#naming: 'always' | 'alone' | 'never' = 'always';
 	#status: 'I' | 'T' | 'E' = 'I';
@@ -186,6 +188,8 @@ export class Connection implements AsyncDisposable {
 	/** When the connection was opened (ms since epoch). */
 	readonly createdAt = Date.now();
 	readonly #ctx: OpContext;
+	#defaultOptions: QueryOpOptions | undefined;
+	readonly #flushTask = () => this.#flush();
 
 	private constructor(
 		socket: DriverSocket,
@@ -559,7 +563,7 @@ export class Connection implements AsyncDisposable {
 			for (let type = reader.nextType(); type >= 0; type = reader.nextType()) {
 				if (type === 0x44 && !this.#starting) {
 					// rows go straight from the buffer to the operation's decoder
-					const op = this.#queue[0];
+					const op = this.#queue.at(0);
 					if (op?.written && op.dataRow(reader.bytes, reader.start, reader.end))
 						continue;
 				} else if (type === 0x41) {
@@ -637,7 +641,7 @@ export class Connection implements AsyncDisposable {
 		) {
 			this.#fatal = postgresError(msg.fields);
 		}
-		const op = this.#queue[0];
+		const op = this.#queue.at(0);
 		if (op === undefined || !op.written) {
 			if (msg.type === 'ErrorResponse') {
 				// e.g. idle_session_timeout or an administrator terminating the backend
@@ -665,8 +669,17 @@ export class Connection implements AsyncDisposable {
 		}
 		this.#cancelAtHead();
 		if (unblocked || this.#written < this.#queue.length) this.#schedule();
-		if (this.#queue.length === 0)
+		if (this.#queue.length === 0 && this.#idleWaiters.length > 0)
 			for (const resolve of this.#idleWaiters.splice(0)) resolve();
+		this.#finished(op);
+	}
+
+	/** Runs a settled operation's `onDone`, once it has left the queue. */
+	#finished(op: Op): void {
+		const onDone = op.onDone;
+		if (onDone === undefined) return;
+		op.onDone = undefined;
+		onDone();
 	}
 
 	// --- outgoing ----------------------------------------------------------
@@ -674,7 +687,7 @@ export class Connection implements AsyncDisposable {
 	#schedule(): void {
 		if (this.#flushScheduled) return;
 		this.#flushScheduled = true;
-		queueMicrotask(() => this.#flush());
+		queueMicrotask(this.#flushTask);
 	}
 
 	/**
@@ -690,7 +703,7 @@ export class Connection implements AsyncDisposable {
 			this.#blocking === undefined &&
 			this.#canceling === undefined
 		) {
-			const op = this.#queue[this.#written];
+			const op = this.#queue.at(this.#written);
 			if (op === undefined) break;
 			this.#written++;
 			if (op.onTiming !== undefined) op.writtenAt = performance.now();
@@ -701,10 +714,11 @@ export class Connection implements AsyncDisposable {
 				// a request that can't be encoded fails alone; nothing of it is sent
 				this.#writer.truncate(before);
 				this.#written--;
-				this.#queue.splice(this.#written, 1);
+				this.#queue.removeAt(this.#written);
 				op.fail(
 					error instanceof Error ? error : new DriverError(String(error)),
 				);
+				this.#finished(op);
 				continue;
 			}
 			op.written = true;
@@ -724,23 +738,25 @@ export class Connection implements AsyncDisposable {
 		return false;
 	}
 
-	#statement(
-		sql: string,
-		types: readonly number[],
-		named: boolean,
-	): { statement: Statement; created: boolean } {
+	#statement(sql: string, types: readonly number[], named: boolean): Statement {
 		const key = statementKey(sql, types);
 		const existing = this.#statements.get(key);
 		if (existing !== undefined) {
-			this.#statements.delete(key);
 			if (!named || existing.name !== '') {
-				this.#statements.set(key, existing);
-				return { statement: existing, created: false };
+				// a use stamp instead of moving the entry to the Map's end: deleting
+				// and re-adding a key on every hit makes the Map rehash, garbage
+				// that adds up to GC pauses on small queries
+				existing.used = ++this.#statementUses;
+				return existing;
 			}
+			// an unnamed entry, replaced by a named statement
+			this.#statements.delete(key);
 		}
 		const statement: Statement = {
 			name: named ? `q${++this.#statementCount}` : '',
 			key,
+			used: ++this.#statementUses,
+			unwritten: true,
 			parsed: false,
 			fields: undefined,
 			paramTypes: undefined,
@@ -748,21 +764,25 @@ export class Connection implements AsyncDisposable {
 			decoders: new Map(),
 			plans: new Map(),
 		};
-		this.#statements.set(key, statement);
-		if (this.#statements.size > this.#config.statementCacheSize) {
-			const [oldestKey, oldest] = this.#statements.entries().next().value ?? [];
-			if (oldestKey !== undefined && oldest !== undefined) {
-				this.#statements.delete(oldestKey);
+		if (this.#statements.size >= this.#config.statementCacheSize) {
+			let oldest: Statement | undefined;
+			for (const candidate of this.#statements.values())
+				if (oldest === undefined || candidate.used < oldest.used)
+					oldest = candidate;
+			if (oldest !== undefined) {
+				this.#statements.delete(oldest.key);
 				// written before the new statement's Parse; the op ignores the CloseComplete
 				if (oldest.name !== '') fe.close(this.#writer, 'S', oldest.name);
 			}
 		}
-		return { statement, created: true };
+		this.#statements.set(key, statement);
+		return statement;
 	}
 
 	#enqueue(op: Op, signal?: AbortSignal, timeout?: number): void {
 		if (this.#closed || this.#ending) {
 			op.fail(closedError(this.#fatal));
+			this.#finished(op);
 			return;
 		}
 		if (signal?.aborted) {
@@ -771,27 +791,33 @@ export class Connection implements AsyncDisposable {
 					cause: signal.reason,
 				}),
 			);
+			this.#finished(op);
 			return;
 		}
 		if (op.onTiming !== undefined) op.queuedAt = performance.now();
 		this.#queue.push(op);
 		this.#schedule();
-		if (signal) {
-			const onAbort = () => this.#abort(op, 'abort', signal.reason);
-			signal.addEventListener('abort', onAbort, { once: true });
-			op.onSettle(() => signal.removeEventListener('abort', onAbort));
-		}
-		if (timeout !== undefined && timeout > 0) {
-			const timer = setTimeout(() => this.#abort(op, 'timeout'), timeout);
-			op.onSettle(() => clearTimeout(timer));
-		}
+		// in methods of their own: closures here would cost every query a context
+		if (signal) this.#abortOn(op, signal);
+		if (timeout !== undefined && timeout > 0) this.#timeOut(op, timeout);
+	}
+
+	#abortOn(op: Op, signal: AbortSignal): void {
+		const onAbort = () => this.#abort(op, 'abort', signal.reason);
+		signal.addEventListener('abort', onAbort, { once: true });
+		op.onSettle(() => signal.removeEventListener('abort', onAbort));
+	}
+
+	#timeOut(op: Op, timeout: number): void {
+		const timer = setTimeout(() => this.#abort(op, 'timeout'), timeout);
+		op.onSettle(() => clearTimeout(timer));
 	}
 
 	#abort(op: Op, reason: 'abort' | 'timeout', cause?: unknown): void {
 		if (op.done) return;
 		if (!op.written) {
 			const index = this.#queue.indexOf(op);
-			if (index >= 0) this.#queue.splice(index, 1);
+			if (index >= 0) this.#queue.removeAt(index);
 			op.fail(
 				new AbortError(
 					reason === 'timeout'
@@ -800,6 +826,7 @@ export class Connection implements AsyncDisposable {
 					cause === undefined ? undefined : { cause },
 				),
 			);
+			this.#finished(op);
 			return;
 		}
 		op.canceledBy = reason;
@@ -814,7 +841,7 @@ export class Connection implements AsyncDisposable {
 	 * cancel that one instead.
 	 */
 	#cancelAtHead(): void {
-		const op = this.#queue[0];
+		const op = this.#queue.at(0);
 		if (
 			op === undefined ||
 			!op.written ||
@@ -826,7 +853,7 @@ export class Connection implements AsyncDisposable {
 		// the server drops a cancel that arrives while it is still reading the
 		// query's messages, so it is repeated, with backoff, until the query ends
 		const send = (attempt: number) => {
-			if (op.done || this.#closed || this.#queue[0] !== op) return;
+			if (op.done || this.#closed || this.#queue.at(0) !== op) return;
 			this.cancel().catch(() => {});
 			if (attempt >= 5) return;
 			const timer = setTimeout(() => send(attempt + 1), 50 * 2 ** attempt);
@@ -837,6 +864,8 @@ export class Connection implements AsyncDisposable {
 	}
 
 	#options(options: QueryOptions | undefined): QueryOpOptions {
+		if (options === undefined)
+			return (this.#defaultOptions ??= this.#options({}));
 		return {
 			rowMode: options?.rowMode ?? 'object',
 			types: options?.types,
@@ -870,6 +899,27 @@ export class Connection implements AsyncDisposable {
 			() => this.#query<R>(sql, params, options),
 			(r) => r.rowCount,
 		);
+	}
+
+	/**
+	 * @internal `query`, calling `onDone` once it settles, before callbacks
+	 * on the returned promise run (see `Op.onDone`).
+	 */
+	queryThen<R = Record<string, unknown>>(
+		sql: string,
+		params: readonly unknown[] | undefined,
+		options: QueryOptions | undefined,
+		onDone: () => void,
+	): Promise<QueryResult<R>> {
+		if (
+			this.#config.telemetry === undefined &&
+			!this.#config.captureStack &&
+			options?.statementTimeout === undefined
+		)
+			return this.#query<R>(sql, params ?? [], options, onDone);
+		const result = this.query<R>(sql, params, options);
+		result.then(onDone, onDone);
+		return result;
 	}
 
 	/**
@@ -910,6 +960,7 @@ export class Connection implements AsyncDisposable {
 		sql: string,
 		params: readonly unknown[],
 		options: QueryOptions | undefined,
+		onDone?: () => void,
 	): Promise<QueryResult<R>> {
 		if (options?.statementTimeout !== undefined) {
 			return this.#queryWithTimeout<R>(
@@ -919,30 +970,33 @@ export class Connection implements AsyncDisposable {
 				options.statementTimeout,
 			);
 		}
-		return new Promise((resolve, reject) => {
+		// one shared executor: one closing over this query would cost a
+		// closure and its context per query
+		const promise = new Promise<QueryResult<unknown>>(capture);
+		const resolve = capturedResolve;
+		const reject = capturedReject;
+		let op: QueryOp | undefined;
+		try {
 			const invalid = invalidSql(sql);
-			if (invalid) {
-				reject(invalid);
-				return;
-			}
-			let values;
-			try {
-				values = encodeParams(sql, params, options?.paramTypes);
-			} catch (error) {
-				reject(error);
-				return;
-			}
-			const op = new QueryOp(
+			if (invalid) throw invalid;
+			op = new QueryOp(
 				sql,
 				params,
-				values,
+				encodeParams(sql, params, options?.paramTypes),
 				this.#options(options),
-				(result) => resolve(asResult<R>(result)),
+				resolve,
 				reject,
 			);
 			op.onTiming = options?.onTiming;
+			op.onDone = onDone;
 			this.#enqueue(op, options?.signal, options?.timeout);
-		});
+		} catch (error) {
+			// thrown before the operation was queued: nothing else ends it
+			if (op === undefined) onDone?.();
+			else if (this.#queue.indexOf(op) < 0) this.#finished(op);
+			reject(error);
+		}
+		return asResultPromise<R>(promise);
 	}
 
 	/**
@@ -1441,13 +1495,14 @@ export class Connection implements AsyncDisposable {
 		this.#failure = error;
 		this.#socket.destroy();
 		this.#startupError?.(error);
-		const ops = this.#queue.splice(0);
+		const ops = this.#queue.drain();
 		this.#written = 0;
 		for (const op of ops) op.fail(error);
 		for (const resolve of this.#idleWaiters.splice(0)) resolve();
 		for (const resolve of this.#drainWaiters.splice(0)) resolve();
 		this.#resolveClosed();
 		this.#emit(this.#closeListeners, error);
+		for (const op of ops) this.#finished(op);
 	}
 }
 
@@ -1465,6 +1520,17 @@ function naming(
 	if (names === 'unsupported') return 'never';
 	return (preparePipelined ?? names === 'kept') ? 'always' : 'alone';
 }
+
+/** The resolving functions of the latest promise `capture` executed for. */
+let capturedResolve: (result: QueryResult<unknown>) => void = () => {};
+let capturedReject: (error: unknown) => void = () => {};
+const capture = (
+	resolve: (result: QueryResult<unknown>) => void,
+	reject: (error: unknown) => void,
+) => {
+	capturedResolve = resolve;
+	capturedReject = reject;
+};
 
 /** The statement cache's key: the SQL, prefixed with explicit parameter types. */
 function statementKey(sql: string, types: readonly number[]): string {
