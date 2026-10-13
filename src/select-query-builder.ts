@@ -1,4 +1,4 @@
-import { compile } from './compile.js';
+import { compile, type CompiledQuery } from './compile.js';
 import type { DataType } from './data-type/data-type.js';
 import {
 	type Executor,
@@ -22,6 +22,7 @@ import type {
 	TableNode,
 } from './node.js';
 import type { AnyPredicate, EqualsValue } from './operators.js';
+import { Query } from './query.js';
 import type { Ref, Refs, RefsOf } from './refs.js';
 import {
 	type AddRow,
@@ -487,13 +488,12 @@ export class SelectQueryBuilder<
 
 	/** Runs the query and returns every row. */
 	async all(options?: RunOptions): Promise<O[]> {
-		return (await this.#execute(undefined, options)).rows;
+		return this.asAll().execute(options);
 	}
 
 	/** Runs the query with `limit 1` and returns its row, if any. */
 	async first(options?: RunOptions): Promise<O | undefined> {
-		const [row] = (await this.#execute(1, options)).rows;
-		return row;
+		return this.asFirst().execute(options);
 	}
 
 	/**
@@ -502,15 +502,7 @@ export class SelectQueryBuilder<
 	 * two rows, enough to tell.
 	 */
 	async one(options?: RunOptions): Promise<O> {
-		const { query, rows } = await this.#execute(2, options);
-		const [row, ...rest] = rows;
-		if (row === undefined) {
-			throw new NoRowError(query, this.#state.from.name);
-		}
-		if (rest.length > 0) {
-			throw new TooManyRowsError(query, this.#state.from.name);
-		}
-		return row;
+		return this.asOne().execute(options);
 	}
 
 	/**
@@ -518,12 +510,42 @@ export class SelectQueryBuilder<
 	 * when there are several. Fetches at most two rows, enough to tell.
 	 */
 	async maybeOne(options?: RunOptions): Promise<O | undefined> {
-		const { query, rows } = await this.#execute(2, options);
-		const [row, ...rest] = rows;
-		if (rest.length > 0) {
-			throw new TooManyRowsError(query, this.#state.from.name);
-		}
-		return row;
+		return this.asMaybeOne().execute(options);
+	}
+
+	/** `all` without running it: for `db.batch`, or to run later. */
+	asAll(): Query<O[]> {
+		return this.#query(undefined, false, (rows) => rows);
+	}
+
+	/** `first` without running it: for `db.batch`, or to run later. */
+	asFirst(): Query<O | undefined> {
+		return this.#query(1, false, (rows) => rows[0]);
+	}
+
+	/** `one` without running it: for `db.batch`, or to run later. */
+	asOne(): Query<O> {
+		return this.#query(2, true, (rows, query) => {
+			const [row, ...rest] = rows;
+			if (row === undefined) {
+				throw new NoRowError(query, this.#state.from.name);
+			}
+			if (rest.length > 0) {
+				throw new TooManyRowsError(query, this.#state.from.name);
+			}
+			return row;
+		});
+	}
+
+	/** `maybeOne` without running it: for `db.batch`, or to run later. */
+	asMaybeOne(): Query<O | undefined> {
+		return this.#query(2, true, (rows, query) => {
+			const [row, ...rest] = rows;
+			if (rest.length > 0) {
+				throw new TooManyRowsError(query, this.#state.from.name);
+			}
+			return row;
+		});
 	}
 
 	/**
@@ -621,18 +643,25 @@ export class SelectQueryBuilder<
 		return executor;
 	}
 
-	/** Runs the query, fetching at most `limit` rows besides any limit of its own. */
-	async #execute(limit: number | undefined, options: RunOptions | undefined) {
-		const executor = this.#executor();
+	/** The query, fetching at most `limit` rows besides any limit of its own, read by `read`. */
+	#query<R>(
+		limit: number | undefined,
+		checked: boolean,
+		read: (rows: O[], query: CompiledQuery) => R,
+	): Query<R> {
 		const node = this.toNode();
 		const query = compile(
 			limit === undefined
 				? node
 				: { ...node, limit: Math.min(node.limit ?? limit, limit) },
 		);
-		const { rows } = await executor.execute(query, options);
-		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the select list supplies the row type
-		return { query, rows: rows as O[] };
+		return new Query({
+			query,
+			executor: this.#state.executor,
+			checked,
+			// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the select list supplies the row type
+			read: ({ rows }) => read(rows as O[], query),
+		});
 	}
 }
 
