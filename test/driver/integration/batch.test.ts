@@ -114,7 +114,7 @@ describe.skipIf(noPg)('db.batch', () => {
 			create view ${schema}.slow as select pg_sleep(0.3)::text as done;
 		`);
 		// loads the type catalog, once, before anything is measured
-		await db.selectFrom(accounts).all();
+		await db.selectFrom(accounts).execute();
 	});
 	afterAll(async () => {
 		await conn?.query(`drop schema if exists ${schema} cascade`);
@@ -131,22 +131,22 @@ describe.skipIf(noPg)('db.batch', () => {
 		it('sends reads and writes in one write, reading each by its shape', async () => {
 			const { value, error, trips, writes } = await measure(() =>
 				db.batch([
-					byId(1).asOne(),
+					byId(1).one(),
 					db
 						.selectFrom(accounts)
 						.select(['accounts.id'])
 						.where((eb) => eb.ref('accounts.balance').gt(0))
-						.asAll(),
-					db.insertInto(notes).values({ body: 'hello' }).asExecute(),
-					setBalance(2, 55).returning(['accounts.balance']).asOne(),
+						.all(),
+					db.insertInto(notes).values({ body: 'hello' }),
+					setBalance(2, 55).returning(['accounts.balance']).one(),
 					db
 						.insertInto(notes)
 						.values([{ body: 'a' }, { body: 'b' }])
 						.returning(['notes.id'])
-						.asAll(),
-					db.deleteFrom(notes).where('notes.body', 'a').asExecute(),
-					byId(3).asMaybeOne(),
-					byId(2).asFirst(),
+						.all(),
+					db.deleteFrom(notes).where('notes.body', 'a'),
+					byId(3).maybeOne(),
+					byId(2).first(),
 				]),
 			);
 			expect(error).toBeUndefined();
@@ -178,14 +178,11 @@ describe.skipIf(noPg)('db.batch', () => {
 		it('runs every query on its own: one that fails leaves the others, and the batch reports each outcome', async () => {
 			const { error, trips } = await measure(() =>
 				db.batch([
-					db.insertInto(notes).values({ body: 'kept' }).asExecute(),
-					db
-						.insertInto(accounts)
-						.values({ id: 1, owner: 'dup', balance: 0 })
-						.asExecute(),
-					setBalance(2, -50).asExecute(),
-					byId(9).asOne(),
-					setBalance(1, 101).returning(['accounts.balance']).asOne(),
+					db.insertInto(notes).values({ body: 'kept' }),
+					db.insertInto(accounts).values({ id: 1, owner: 'dup', balance: 0 }),
+					setBalance(2, -50),
+					byId(9).one(),
+					setBalance(1, 101).returning(['accounts.balance']).one(),
 				]),
 			);
 			expect(trips).toBe(1);
@@ -221,7 +218,7 @@ describe.skipIf(noPg)('db.batch', () => {
 		it('applies the timeout to each query', async () => {
 			const error = await rejection(
 				db.batch(
-					[db.selectFrom(slow).select(['slow.done']).asOne(), byId(1).asOne()],
+					[db.selectFrom(slow).select(['slow.done']).one(), byId(1).one()],
 					{ timeout: 100 },
 				),
 				BatchError,
@@ -243,8 +240,8 @@ describe.skipIf(noPg)('db.batch', () => {
 					.selectFrom(accounts)
 					.select(['accounts.owner'])
 					.where('accounts.id', 1)
-					.asOne(),
-				pooled.selectFrom(accounts).select(['accounts.owner']).asAll(),
+					.one(),
+				pooled.selectFrom(accounts).select(['accounts.owner']).all(),
 			]);
 			expect(one).toEqual({ owner: 'ada' });
 			expect(two).toHaveLength(2);
@@ -256,10 +253,10 @@ describe.skipIf(noPg)('db.batch', () => {
 			const { value, error, trips, writes } = await measure(() =>
 				db.batch(
 					[
-						setBalance(1, 70).asExecute(),
-						setBalance(2, 80).asExecute(),
-						db.insertInto(notes).values({ body: 'transfer' }).asExecute(),
-						byId(2).asAll(),
+						setBalance(1, 70),
+						setBalance(2, 80),
+						db.insertInto(notes).values({ body: 'transfer' }),
+						byId(2).all(),
 					],
 					{ transaction: true },
 				),
@@ -283,10 +280,10 @@ describe.skipIf(noPg)('db.batch', () => {
 			const { error, trips } = await measure(() =>
 				db.batch(
 					[
-						db.insertInto(notes).values({ body: 'dropped' }).asExecute(),
-						setBalance(2, 250).asExecute(),
-						setBalance(1, -100).asExecute(),
-						byId(1).asAll(),
+						db.insertInto(notes).values({ body: 'dropped' }),
+						setBalance(2, 250),
+						setBalance(1, -100),
+						byId(1).all(),
 					],
 					{ transaction: true },
 				),
@@ -305,8 +302,8 @@ describe.skipIf(noPg)('db.batch', () => {
 			const ok = await measure(() =>
 				db.batch(
 					[
-						setBalance(1, 101).returning(['accounts.balance']).asOne(),
-						byId(2).asOne(),
+						setBalance(1, 101).returning(['accounts.balance']).one(),
+						byId(2).one(),
 					],
 					{ transaction: true },
 				),
@@ -319,10 +316,7 @@ describe.skipIf(noPg)('db.batch', () => {
 
 			const noRow = await measure(() =>
 				db.batch(
-					[
-						db.insertInto(notes).values({ body: 'dropped' }).asExecute(),
-						byId(9).asOne(),
-					],
+					[db.insertInto(notes).values({ body: 'dropped' }), byId(9).one()],
 					{ transaction: true },
 				),
 			);
@@ -334,8 +328,8 @@ describe.skipIf(noPg)('db.batch', () => {
 			const rowCount = await measure(() =>
 				db.batch(
 					[
-						db.insertInto(notes).values({ body: 'dropped' }).asExecute(),
-						setBalance(9, 1).expectRows(1).asExecute(),
+						db.insertInto(notes).values({ body: 'dropped' }),
+						setBalance(9, 1).expectRows(1),
 					],
 					{ transaction: true },
 				),
@@ -355,7 +349,7 @@ describe.skipIf(noPg)('db.batch', () => {
 					db
 						.selectFrom(settings)
 						.select(['settings.tenant', 'settings.isolation'])
-						.asAll(),
+						.all(),
 				],
 				{
 					transaction: {
@@ -369,8 +363,8 @@ describe.skipIf(noPg)('db.batch', () => {
 			const error = await rejection(
 				db.batch(
 					[
-						db.insertInto(notes).values({ body: 'dropped' }).asExecute(),
-						db.selectFrom(slow).select(['slow.done']).asAll(),
+						db.insertInto(notes).values({ body: 'dropped' }),
+						db.selectFrom(slow).select(['slow.done']).all(),
 					],
 					{ transaction: true, timeout: 100 },
 				),
@@ -385,7 +379,7 @@ describe.skipIf(noPg)('db.batch', () => {
 			const controller = new AbortController();
 			controller.abort();
 			const { error, trips } = await measure(() =>
-				db.batch([db.insertInto(notes).values({ body: 'x' }).asExecute()], {
+				db.batch([db.insertInto(notes).values({ body: 'x' })], {
 					transaction: true,
 					signal: controller.signal,
 				}),
@@ -401,8 +395,8 @@ describe.skipIf(noPg)('db.batch', () => {
 			const { value, trips } = await measure(() =>
 				db.transaction((tx) =>
 					tx.batch([
-						tx.insertInto(notes).values({ body: 'in tx' }).asExecute(),
-						tx.selectFrom(notes).select(['notes.body']).asAll(),
+						tx.insertInto(notes).values({ body: 'in tx' }),
+						tx.selectFrom(notes).select(['notes.body']).all(),
 					]),
 				),
 			);
@@ -415,9 +409,9 @@ describe.skipIf(noPg)('db.batch', () => {
 			const error = await rejection(
 				db.transaction(async (tx) => {
 					await tx.batch([
-						tx.insertInto(notes).values({ body: 'dropped' }).asExecute(),
-						setBalance(1, -400).asExecute(),
-						tx.insertInto(notes).values({ body: 'skipped' }).asExecute(),
+						tx.insertInto(notes).values({ body: 'dropped' }),
+						setBalance(1, -400),
+						tx.insertInto(notes).values({ body: 'skipped' }),
 					]);
 				}),
 				CheckViolation,
@@ -432,8 +426,8 @@ describe.skipIf(noPg)('db.batch', () => {
 				const failure = await tx
 					.batch(
 						[
-							tx.insertInto(notes).values({ body: 'dropped' }).asExecute(),
-							setBalance(1, -400).asExecute(),
+							tx.insertInto(notes).values({ body: 'dropped' }),
+							setBalance(1, -400),
 						],
 						{ transaction: true },
 					)
@@ -447,7 +441,7 @@ describe.skipIf(noPg)('db.batch', () => {
 
 		it('takes no timeout', async () => {
 			await rejection(
-				db.transaction((tx) => tx.batch([byId(1).asAll()], { timeout: 100 })),
+				db.transaction((tx) => tx.batch([byId(1).all()], { timeout: 100 })),
 				DriverError,
 			);
 		});

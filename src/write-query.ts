@@ -208,10 +208,29 @@ export function writeQuery<O, R>(
 	});
 }
 
-/** The number of rows a write query affected. */
-export const writeResult = (written: WrittenRows<unknown>): WriteResult => ({
-	rowCount: written.rowCount,
-});
+/**
+ * What a write query's `execute()` resolves to without a shape: its
+ * `returning` rows, or without `returning` (`O` is `undefined`), its row
+ * count.
+ */
+export type WriteOutput<O> = [O] extends [undefined] ? WriteResult : O[];
+
+/** A write query in its default shape; see `WriteOutput`. */
+export function writeOutput<O>(
+	executor: Executor | undefined,
+	node: InsertNode | UpdateNode | DeleteNode,
+): Query<WriteOutput<O>> {
+	const returns = node.returning.length > 0;
+	return writeQuery<O, WriteOutput<O>>(
+		executor,
+		node,
+		(written) =>
+			// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- `returning` is what makes `O` a row type
+			(returns
+				? written.rows
+				: { rowCount: written.rowCount }) as WriteOutput<O>,
+	);
+}
 
 /** A write query's `returning` rows, with the query, its row count and the table it wrote. */
 export interface WrittenRows<O> {

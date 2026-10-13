@@ -154,7 +154,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					'users.window',
 					'users.embedding',
 				])
-				.one();
+				.one()
+				.execute();
 			expect(ada).toEqual({
 				id: 1,
 				balance: '12345678901234567890.5',
@@ -185,7 +186,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					{ firstName: 'Cy', email: 'c@x', embedding: null },
 				])
 				.returning(['users.email', 'users.active', 'users.window'])
-				.all();
+				.all()
+				.execute();
 			expect(many).toEqual([
 				{
 					email: 'b@x',
@@ -214,7 +216,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				.onConflict('email')
 				.merge(['firstName'])
 				.returning(['users.id', 'users.firstName'])
-				.one();
+				.one()
+				.execute();
 			expect(merged).toEqual({ id: 1, firstName: 'Ada Lovelace' });
 			expect(
 				await db
@@ -231,7 +234,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				.set({ visits: '42' })
 				.where('users.email', 'b@x')
 				.returning(['users.visits'])
-				.one();
+				.one()
+				.execute();
 			expect(updated).toEqual({ visits: '42' });
 			expect(
 				await db
@@ -244,7 +248,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 						{ by: 'id' },
 					)
 					.returning(['users.firstName'])
-					.all(),
+					.all()
+					.execute(),
 			).toEqual(
 				expect.arrayContaining([{ firstName: 'Bea' }, { firstName: 'Cyd' }]),
 			);
@@ -252,7 +257,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				.deleteFrom(posts)
 				.where('posts.title', 'second')
 				.returning(['posts.title'])
-				.all();
+				.all()
+				.execute();
 			expect(removed).toEqual([{ title: 'second' }]);
 			await expect(
 				db
@@ -270,20 +276,23 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				.on('posts.userId', 'users.id')
 				.select(['users.email', 'posts.title'])
 				.where('users.admin', true)
-				.all();
+				.all()
+				.execute();
 			expect(titles).toEqual([{ email: 'a@x', title: 'first' }]);
 			await expect(
 				db
 					.selectFrom(users)
 					.select(['users.id'])
 					.where('users.email', 'nobody')
-					.one(),
+					.one()
+					.execute(),
 			).rejects.toBeInstanceOf(NoRowError);
 			const first = await db
 				.selectFrom(users)
 				.select(['users.email'])
 				.where((eb) => eb.ref('users.roles').contains(['admin']))
-				.first();
+				.first()
+				.execute();
 			expect(first).toEqual({ email: 'a@x' });
 		});
 
@@ -318,13 +327,18 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				db
 					.selectFrom(slow)
 					.select(['slow.done'])
-					.all({ signal: controller.signal }),
+					.all()
+					.execute({ signal: controller.signal }),
 				QueryCanceled,
 			);
 			setTimeout(() => controller.abort(), 100);
 			expect((await running).reason).toBe('abort');
 			const timedOut = await rejection(
-				db.selectFrom(slow).select(['slow.done']).all({ timeout: '100ms' }),
+				db
+					.selectFrom(slow)
+					.select(['slow.done'])
+					.all()
+					.execute({ timeout: '100ms' }),
 				QueryCanceled,
 			);
 			expect(timedOut.reason).toBe('statement_timeout');
@@ -332,7 +346,12 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 
 		it('reports tags and timings to onQuery, and enriches errors', async () => {
 			events.length = 0;
-			await db.selectFrom(users).select(['users.id']).tag('users.ids').all();
+			await db
+				.selectFrom(users)
+				.select(['users.id'])
+				.tag('users.ids')
+				.all()
+				.execute();
 			expect(events.find((e) => e.tag === 'users.ids')).toMatchObject({
 				kind: 'execute',
 				command: 'SELECT',
@@ -360,7 +379,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					.selectFrom(slow)
 					.select(['slow.done'])
 					.where('slow.done', 'secret-param')
-					.all({ timeout: '50ms' }),
+					.all()
+					.execute({ timeout: '50ms' }),
 				QueryCanceled,
 			);
 			expect(error.query?.params).toEqual(['secret-param']);
@@ -411,9 +431,9 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 						}),
 					).rejects.toBeInstanceOf(RowCountError);
 					await tx.setLocal('app.user', 7);
-					return (await tx.selectFrom(posts).select(['posts.title']).all()).map(
-						(r) => r.title,
-					);
+					return (
+						await tx.selectFrom(posts).select(['posts.title']).all().execute()
+					).map((r) => r.title);
 				},
 				{
 					isolation: 'repeatable read',
@@ -437,7 +457,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					.selectFrom(posts)
 					.select(['posts.id'])
 					.where('posts.title', 'never')
-					.maybeOne(),
+					.maybeOne()
+					.execute(),
 			).toBeUndefined();
 		});
 
@@ -456,6 +477,7 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 						.forUpdate()
 						.skipLocked()
 						.first()
+						.execute()
 				)?.id;
 			let claimed!: (id: number | undefined) => void;
 			const firstId = new Promise<number | undefined>((resolve) => {
@@ -496,7 +518,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 						.where('jobs.id', held!)
 						.forNoKeyUpdate()
 						.noWait()
-						.first(),
+						.first()
+						.execute(),
 					LockNotAvailable,
 				);
 			} finally {
@@ -508,7 +531,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					.selectFrom(jobs)
 					.select(['jobs.status'])
 					.where('jobs.id', held!)
-					.one(),
+					.one()
+					.execute(),
 			).toEqual({ status: 'running' });
 		});
 
@@ -536,7 +560,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 							.selectFrom(posts)
 							.select(['posts.id'])
 							.where('posts.title', 'first')
-							.one(),
+							.one()
+							.execute(),
 					{ durable: true },
 				),
 			).toMatchObject({ id: expect.any(Number) });
@@ -550,7 +575,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				.selectFrom(users)
 				.select(['users.createdAt', 'users.active', 'users.embedding'])
 				.where('users.id', 1)
-				.one();
+				.one()
+				.execute();
 			expect(row).toEqual({
 				createdAt: '2024-01-02 03:04:05.678+00',
 				active: '[2024-01-01,2024-02-01)',
@@ -576,7 +602,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					.selectFrom(posts)
 					.select(['posts.title'])
 					.where('posts.title', 'first')
-					.one(),
+					.one()
+					.execute(),
 			).toEqual({ title: 'first' });
 			const c = pg;
 			if (c === null) return;
@@ -587,7 +614,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					.selectFrom(users)
 					.select(['users.email'])
 					.where('users.id', 1)
-					.one(),
+					.one()
+					.execute(),
 			).toEqual({ email: 'a@x' });
 			await fromUrl.close();
 		});

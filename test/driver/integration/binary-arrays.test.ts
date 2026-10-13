@@ -580,7 +580,8 @@ describe.skipIf(noPg)('quarry’s binary array parameters', () => {
 			.selectFrom(items)
 			.select(['items.id', 'items.big', 'items.at', 'items.doc', 'items.uid'])
 			.where((eb) => eb.ref('items.id').in(eb.val([1, 2, 3])))
-			.all();
+			.all()
+			.execute();
 		expect(stored.toSorted((a, b) => a.id - b.id)).toEqual(
 			rows.map((r) => ({
 				id: r.id,
@@ -674,7 +675,7 @@ describe.skipIf(noPg)('quarry’s binary array parameters', () => {
 				.values([{ id: 1, v: [0.1, 0.2, 0.3] }])
 				.execute();
 			const read = () =>
-				vdb.selectFrom(embeddings).select(['embeddings.v']).one();
+				vdb.selectFrom(embeddings).select(['embeddings.v']).one().execute();
 			const first = await read();
 			expect(await read()).toEqual(first);
 			expect(await read()).toEqual({ v: [0.1, 0.2, 0.3].map(Math.fround) });

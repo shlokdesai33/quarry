@@ -4,11 +4,11 @@ import type {
 	ExecuteResult,
 	Executor,
 } from './executor.js';
-import type { AnyQuery, Query } from './query.js';
+import type { Executable } from './query.js';
 
 /** The results of the queries `Q`, by position. */
-export type BatchResults<Q extends readonly AnyQuery[]> = {
-	-readonly [K in keyof Q]: Q[K] extends Query<infer T> ? T : never;
+export type BatchResults<Q extends readonly Executable<unknown>[]> = {
+	-readonly [K in keyof Q]: Q[K] extends Executable<infer T> ? T : never;
 };
 
 /**
@@ -34,12 +34,13 @@ export class BatchError extends AggregateError {
 }
 
 /** Runs `queries` on `executor` in one round trip; see `Database.batch`. */
-export async function batchWith<const Q extends readonly AnyQuery[]>(
+export async function batchWith<const Q extends readonly Executable<unknown>[]>(
 	executor: Executor,
-	queries: Q,
+	items: Q,
 	options: BatchOptions = {},
 ): Promise<BatchResults<Q>> {
 	const { transaction, ...run } = options;
+	const queries = items.map((item) => item.toQuery());
 	const read = (result: ExecuteResult, i: number) =>
 		queries[i]!._quarry.read(result);
 	let values: unknown[] | undefined;

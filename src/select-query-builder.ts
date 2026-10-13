@@ -22,7 +22,7 @@ import type {
 	TableNode,
 } from './node.js';
 import type { AnyPredicate, EqualsValue } from './operators.js';
-import { Query } from './query.js';
+import { Query, rejectAwait } from './query.js';
 import type { Ref, Refs, RefsOf } from './refs.js';
 import {
 	type AddRow,
@@ -187,7 +187,8 @@ interface SelectState<T extends readonly AnyTable[]> {
 
 /**
  * Starts a `select` from `table`, built without a database: it can be
- * inspected and composed, but runs only when started from `database(...)`.
+ * inspected and composed, and run by a database's `batch`, but `execute()`
+ * runs only a query started from `database(...)`.
  *
  * @example
  * selectFrom(users)
@@ -256,8 +257,15 @@ export function selectFromWith<T extends AnyTable>(
  * whose result rows are `O`. Every reference is resolved against `T`, so a
  * column can only be used once its table has been joined.
  *
+ * Nothing runs until `execute()` (or `stream`, or `db.batch`): `all`,
+ * `first`, `one` and `maybeOne` only set the shape of the result, keeping
+ * its locking clauses.
+ *
  * Immutable: every method returns a new builder. `L` is what its latest
  * locking clause still takes, if it has one.
+ *
+ * @example
+ * const user = await db.selectFrom(users).where('users.id', id).select(['users.email']).one().execute();
  */
 export class SelectQueryBuilder<
 	T extends readonly AnyTable[],
@@ -457,7 +465,7 @@ export class SelectQueryBuilder<
 	 * Skips the rows another transaction has locked, rather than waiting for
 	 * them: for workers claiming jobs from a queue, each a different one.
 	 *
-	 * @example await tx.selectFrom(jobs).select(['jobs.id']).where('jobs.status', 'queued').forUpdate().skipLocked().first()
+	 * @example await tx.selectFrom(jobs).select(['jobs.id']).where('jobs.status', 'queued').forUpdate().skipLocked().first().execute()
 	 */
 	skipLocked(
 		this: SelectQueryBuilder<T, O, 'strength' | 'of'>,
@@ -486,45 +494,22 @@ export class SelectQueryBuilder<
 		return new SelectQueryBuilder<T, O, L>({ ...this.#state, tag: name });
 	}
 
-	/** Runs the query and returns every row. */
-	async all(options?: RunOptions): Promise<O[]> {
-		return this.asAll().execute(options);
-	}
-
-	/** Runs the query with `limit 1` and returns its row, if any. */
-	async first(options?: RunOptions): Promise<O | undefined> {
-		return this.asFirst().execute(options);
-	}
-
-	/**
-	 * Runs the query and returns its one row: throws `NoRowError` when there
-	 * is none and `TooManyRowsError` when there are several. Fetches at most
-	 * two rows, enough to tell.
-	 */
-	async one(options?: RunOptions): Promise<O> {
-		return this.asOne().execute(options);
-	}
-
-	/**
-	 * Runs the query and returns its row, if any: throws `TooManyRowsError`
-	 * when there are several. Fetches at most two rows, enough to tell.
-	 */
-	async maybeOne(options?: RunOptions): Promise<O | undefined> {
-		return this.asMaybeOne().execute(options);
-	}
-
-	/** `all` without running it: for `db.batch`, or to run later. */
-	asAll(): Query<O[]> {
+	/** Every row; runs with `execute()`. */
+	all(): Query<O[]> {
 		return this.#query(undefined, false, (rows) => rows);
 	}
 
-	/** `first` without running it: for `db.batch`, or to run later. */
-	asFirst(): Query<O | undefined> {
+	/** The row, if any, with `limit 1`; runs with `execute()`. */
+	first(): Query<O | undefined> {
 		return this.#query(1, false, (rows) => rows[0]);
 	}
 
-	/** `one` without running it: for `db.batch`, or to run later. */
-	asOne(): Query<O> {
+	/**
+	 * The one row; runs with `execute()`, which throws `NoRowError` when
+	 * there is none and `TooManyRowsError` when there are several. Fetches at
+	 * most two rows (`limit 2`), enough to tell.
+	 */
+	one(): Query<O> {
 		return this.#query(2, true, (rows, query) => {
 			const [row, ...rest] = rows;
 			if (row === undefined) {
@@ -537,8 +522,11 @@ export class SelectQueryBuilder<
 		});
 	}
 
-	/** `maybeOne` without running it: for `db.batch`, or to run later. */
-	asMaybeOne(): Query<O | undefined> {
+	/**
+	 * The row, if any; runs with `execute()`, which throws
+	 * `TooManyRowsError` when there are several. Fetches at most two rows.
+	 */
+	maybeOne(): Query<O | undefined> {
 		return this.#query(2, true, (rows, query) => {
 			const [row, ...rest] = rows;
 			if (rest.length > 0) {
@@ -547,6 +535,25 @@ export class SelectQueryBuilder<
 			return row;
 		});
 	}
+
+	/** Runs the query and returns every row, as `all().execute()` does. */
+	execute(options?: RunOptions): Promise<O[]> {
+		return this.all().execute(options);
+	}
+
+	/** The SQL and parameters `execute()` sends. */
+	toSQL(): CompiledQuery {
+		return compile(this.toNode());
+	}
+
+	/** The query `execute()` runs: every row. */
+	toQuery(): Query<O[]> {
+		return this.all();
+	}
+
+	/** @deprecated A query runs with `execute()`; awaiting one rejects. */
+	// oxlint-disable-next-line unicorn/no-thenable -- so that a forgotten execute() fails loudly
+	readonly then = rejectAwait;
 
 	/**
 	 * Runs the query and yields its rows as they arrive, fetching

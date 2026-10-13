@@ -15,17 +15,44 @@ interface QueryState<T> {
 	readonly checked: boolean;
 }
 
+declare const notExecuted: unique symbol;
+
 /**
- * A compiled query and how its result is read: every row, the first, the
- * one row, or a write's row count. The builders' `asAll`, `asFirst`,
- * `asOne`, `asMaybeOne` and (for writes) `asExecute` make one, without
- * running anything; `all`, `first`, `one`, … run it at once. `db.batch`
- * runs several in one round trip, and `execute` runs one on its own.
+ * What awaiting a query gives, at the type level, instead of its result:
+ * a query runs with `execute()`, and awaiting one rejects.
+ */
+export interface NotExecuted {
+	readonly [notExecuted]: 'A query runs with execute(): await q.one().execute()';
+}
+
+/**
+ * Makes awaiting a query or builder reject with a hint, rather than resolve
+ * to the query unrun (a write that silently never happens).
+ */
+export function rejectAwait(
+	_resolve: (value: NotExecuted) => unknown,
+	reject: (reason: unknown) => unknown,
+): void {
+	reject(
+		new TypeError(
+			'A query runs with execute(), not when awaited: `await q.one().execute()`, or `await db.batch([...])` for several',
+		),
+	);
+}
+
+/**
+ * A query with the shape of its result: every row, the first, or the one
+ * row. The builders' `all`, `first`, `one` and
+ * `maybeOne` set the shape and return one; nothing runs until `execute()`,
+ * or `db.batch`, which runs several in one round trip.
+ *
+ * @example
+ * const user = await db.selectFrom(users).where('users.id', id).select(['users.email']).one().execute();
  *
  * @example
  * const [user, posts] = await db.batch([
- *   db.selectFrom(users).where('users.id', id).select(['users.email']).asOne(),
- *   db.selectFrom(posts).where('posts.userId', id).select(['posts.title']).asAll(),
+ *   db.selectFrom(users).where('users.id', id).select(['users.email']).one(),
+ *   db.selectFrom(posts).where('posts.userId', id).select(['posts.title']).all(),
  * ]);
  */
 export class Query<T> {
@@ -50,7 +77,34 @@ export class Query<T> {
 		}
 		return read(await executor.execute(query, options));
 	}
+
+	/** The SQL and parameters `execute` sends, with the shape's limit. */
+	toSQL(): CompiledQuery {
+		return this._quarry.query;
+	}
+
+	/** The query itself: what `db.batch` takes from a query or a builder. */
+	toQuery(): this {
+		return this;
+	}
+
+	/** @deprecated A query runs with `execute()`; awaiting one rejects. */
+	// oxlint-disable-next-line unicorn/no-thenable -- so that a forgotten execute() fails loudly
+	readonly then = rejectAwait;
 }
 
 /** Any query, whatever its result. */
 export type AnyQuery = Query<unknown>;
+
+/**
+ * What `db.batch` takes: a query, or a builder, which runs with its
+ * default shape (`execute()` without a shape).
+ */
+export interface Executable<T> {
+	toQuery(): Query<T>;
+}
+
+/** A builder that still needs the clauses `M` before it can run. */
+export interface Missing<M extends string> {
+	readonly missing: M;
+}

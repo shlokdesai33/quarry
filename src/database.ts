@@ -29,7 +29,7 @@ import {
 	type SelectQueryBuilder,
 	selectFromWith,
 } from './select-query-builder.js';
-import type { AnyQuery } from './query.js';
+import type { Executable } from './query.js';
 import type { AnyTable } from './table.js';
 import {
 	type UpdateManyOptions,
@@ -63,8 +63,9 @@ export interface Database extends AsyncDisposable {
 	): Promise<VerifyReport>;
 
 	/**
-	 * Starts a `select` from `table`, run on this database by `all`, `first`,
-	 * `one` and `maybeOne`.
+	 * Starts a `select` from `table`, run on this database by `execute()`,
+	 * after a result shape (`all`, `first`, `one`, `maybeOne`) or without
+	 * one, for every row.
 	 */
 	selectFrom<T extends AnyTable>(
 		table: T,
@@ -94,8 +95,8 @@ export interface Database extends AsyncDisposable {
 
 	/**
 	 * Runs `queries` in one round trip, on one connection, and resolves to
-	 * their results by position. Make each with a builder's `asAll`,
-	 * `asFirst`, `asOne`, `asMaybeOne` or `asExecute`; the batch runs them
+	 * their results by position: each is a shaped query (`one()`, `all()`,
+	 * …) or a builder, read as its `execute()` would be. The batch runs them
 	 * on this database, wherever they were started.
 	 *
 	 * - Outside a transaction, each query runs on its own: when any fails
@@ -103,7 +104,7 @@ export interface Database extends AsyncDisposable {
 	 *   and the batch rejects with a `BatchError` holding every outcome.
 	 * - With `transaction`, they run all or nothing in one transaction,
 	 *   BEGIN and COMMIT included in the round trip; the batch rejects with
-	 *   the error that rolled it back. A result that `asOne`, `asMaybeOne`
+	 *   the error that rolled it back. A result that `one`, `maybeOne`
 	 *   or `expectRows` checks makes COMMIT wait for it: a second round trip.
 	 * - Inside a transaction, they share one Sync: the first error skips
 	 *   the rest and rejects the batch, failing the transaction as any
@@ -111,15 +112,15 @@ export interface Database extends AsyncDisposable {
 	 *
 	 * @example
 	 * const [user, posts, { rowCount }] = await db.batch([
-	 *   db.selectFrom(users).where('users.id', id).select(['users.email']).asOne(),
-	 *   db.selectFrom(posts).where('posts.userId', id).select(['posts.title']).asAll(),
-	 *   db.update(users).set({ seenAt: now }).where('users.id', id).asExecute(),
+	 *   db.selectFrom(users).where('users.id', id).select(['users.email']).one(),
+	 *   db.selectFrom(posts).where('posts.userId', id).select(['posts.title']),
+	 *   db.update(users).set({ seenAt: now }).where('users.id', id),
 	 * ]);
 	 *
 	 * @example
-	 * await db.batch([debit.asExecute(), credit.asExecute()], { transaction: true });
+	 * await db.batch([debit, credit], { transaction: true });
 	 */
-	batch<const Q extends readonly AnyQuery[]>(
+	batch<const Q extends readonly Executable<unknown>[]>(
 		queries: Q,
 		options?: BatchOptions,
 	): Promise<BatchResults<Q>>;
@@ -133,7 +134,7 @@ export interface Database extends AsyncDisposable {
 	 *
 	 * @example
 	 * await db.transaction(async (tx) => {
-	 *   const order = await tx.insertInto(orders).values(row).returning(['orders.id']).one();
+	 *   const order = await tx.insertInto(orders).values(row).returning(['orders.id']).one().execute();
 	 *   tx.afterCommit(() => queue.publish('order.created', order.id));
 	 * }, { isolation: 'serializable', retries: 3 });
 	 */
@@ -174,7 +175,7 @@ export type DatabaseSource =
  *
  * @example
  * const db = database(process.env.DATABASE_URL);
- * const user = await db.selectFrom(users).where('users.id', id).one();
+ * const user = await db.selectFrom(users).where('users.id', id).one().execute();
  */
 export function database(
 	source: DatabaseSource,

@@ -1,10 +1,11 @@
+import { compile, type CompiledQuery } from './compile.js';
 import type { Executor, RunOptions } from './executor.js';
 import {
 	type ExpressionBuilder,
 	expressionBuilder,
 } from './expression-builder.js';
 import type { DeleteNode, SelectionNode } from './node.js';
-import type { Query } from './query.js';
+import { type Missing, type Query, rejectAwait } from './query.js';
 import type { RefsOf } from './refs.js';
 import {
 	type AddRow,
@@ -22,9 +23,9 @@ import {
 	atMostOne,
 	exactlyOne,
 	rowCount,
+	writeOutput,
+	type WriteOutput,
 	writeQuery,
-	type WriteResult,
-	writeResult,
 } from './write-query.js';
 
 /** What a `delete` from `T` has recorded so far. */
@@ -71,6 +72,9 @@ export function deleteFromWith<T extends AnyTable>(
  * A `delete` from `T` whose `returning` rows are `O` (`undefined` without
  * `returning`). `M` is `'where'` until `where` or `allRows` is called;
  * running it is a type error until then.
+ *
+ * It runs with `execute()` (or in `db.batch`), never when awaited;
+ * `all`, `first`, `one` and `maybeOne` shape its `returning` rows.
  *
  * Immutable: every method returns a new builder.
  */
@@ -146,60 +150,8 @@ export class DeleteQueryBuilder<T extends AnyTable, O, M extends 'where'> {
 		return condition ? build(this) : this;
 	}
 
-	/**
-	 * Runs the query, resolving to the number of rows deleted. Throws
-	 * `RowCountError` if `expectRows` was set and a different number was.
-	 */
-	async execute(
-		this: DeleteQueryBuilder<T, unknown, never>,
-		options?: RunOptions,
-	): Promise<WriteResult> {
-		return this.asExecute().execute(options);
-	}
-
-	/** Runs the query and returns every `returning` row. */
-	async all(
-		this: DeleteQueryBuilder<T, O & object, never>,
-		options?: RunOptions,
-	): Promise<O[]> {
-		return this.asAll().execute(options);
-	}
-
-	/** Runs the query and returns its first `returning` row, if any. */
-	async first(
-		this: DeleteQueryBuilder<T, O & object, never>,
-		options?: RunOptions,
-	): Promise<O | undefined> {
-		return this.asFirst().execute(options);
-	}
-
-	/**
-	 * Runs the query and returns its one `returning` row: throws
-	 * `NoRowError` when there is none and `TooManyRowsError` when there are
-	 * several (after the statement has run).
-	 */
-	async one(
-		this: DeleteQueryBuilder<T, O & object, never>,
-		options?: RunOptions,
-	): Promise<O> {
-		return this.asOne().execute(options);
-	}
-
-	/** Runs the query and returns its `returning` row, if any: throws `TooManyRowsError` when there are several. */
-	async maybeOne(
-		this: DeleteQueryBuilder<T, O & object, never>,
-		options?: RunOptions,
-	): Promise<O | undefined> {
-		return this.asMaybeOne().execute(options);
-	}
-
-	/** `execute` without running it: for `db.batch`, or to run later. */
-	asExecute(this: DeleteQueryBuilder<T, unknown, never>): Query<WriteResult> {
-		return writeQuery(this.#state.executor, this.toNode(), writeResult);
-	}
-
-	/** `all` without running it: for `db.batch`, or to run later. */
-	asAll(this: DeleteQueryBuilder<T, O & object, never>): Query<O[]> {
+	/** Every `returning` row; runs with `execute()`. */
+	all(this: DeleteQueryBuilder<T, O & object, never>): Query<O[]> {
 		return writeQuery<O, O[]>(
 			this.#state.executor,
 			this.toNode(),
@@ -207,10 +159,8 @@ export class DeleteQueryBuilder<T extends AnyTable, O, M extends 'where'> {
 		);
 	}
 
-	/** `first` without running it: for `db.batch`, or to run later. */
-	asFirst(
-		this: DeleteQueryBuilder<T, O & object, never>,
-	): Query<O | undefined> {
+	/** The first `returning` row, if any; runs with `execute()`. */
+	first(this: DeleteQueryBuilder<T, O & object, never>): Query<O | undefined> {
 		return writeQuery<O, O | undefined>(
 			this.#state.executor,
 			this.toNode(),
@@ -218,17 +168,52 @@ export class DeleteQueryBuilder<T extends AnyTable, O, M extends 'where'> {
 		);
 	}
 
-	/** `one` without running it: for `db.batch`, or to run later. */
-	asOne(this: DeleteQueryBuilder<T, O & object, never>): Query<O> {
+	/**
+	 * The one `returning` row; runs with `execute()`, which throws
+	 * `NoRowError` when there is none and `TooManyRowsError` when there are
+	 * several (after the statement has run).
+	 */
+	one(this: DeleteQueryBuilder<T, O & object, never>): Query<O> {
 		return writeQuery(this.#state.executor, this.toNode(), exactlyOne<O>, true);
 	}
 
-	/** `maybeOne` without running it: for `db.batch`, or to run later. */
-	asMaybeOne(
+	/** The `returning` row, if any; runs with `execute()`, which throws `TooManyRowsError` when there are several. */
+	maybeOne(
 		this: DeleteQueryBuilder<T, O & object, never>,
 	): Query<O | undefined> {
 		return writeQuery(this.#state.executor, this.toNode(), atMostOne<O>, true);
 	}
+
+	/**
+	 * Runs the query, resolving to every `returning` row, as `all()` does,
+	 * or without `returning`, to the number of rows deleted. Throws
+	 * `RowCountError` if `expectRows` was set and a different number was.
+	 */
+	execute(
+		this: DeleteQueryBuilder<T, unknown, never>,
+		options?: RunOptions,
+	): Promise<WriteOutput<O>> {
+		return writeOutput<O>(this.#state.executor, this.toNode()).execute(options);
+	}
+
+	/** The SQL and parameters `execute()` sends. */
+	toSQL(): CompiledQuery {
+		return compile(this.toNode());
+	}
+
+	/** The query `execute()` runs, for `db.batch`; one that still needs clauses has none. */
+	toQuery(): [M] extends [never] ? Query<WriteOutput<O>> : Missing<M> {
+		// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the type keeps a query that can't run yet out of a batch
+		return writeOutput<O>(this.#state.executor, this.toNode()) as [M] extends [
+			never,
+		]
+			? Query<WriteOutput<O>>
+			: Missing<M>;
+	}
+
+	/** @deprecated A query runs with `execute()`; awaiting one rejects. */
+	// oxlint-disable-next-line unicorn/no-thenable -- so that a forgotten execute() fails loudly
+	readonly then = rejectAwait;
 
 	/** The whole query as one node. */
 	toNode(): DeleteNode {
