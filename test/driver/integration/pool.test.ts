@@ -5,6 +5,7 @@ import {
 	AbortError,
 	ConnectionError,
 	DriverError,
+	PostgresError,
 	QueryCanceled,
 	ReadOnlyTransaction,
 	TransactionTimeout,
@@ -12,12 +13,16 @@ import {
 } from '../../../src/driver/errors.js';
 import { connect } from '../../../src/driver/connect.js';
 import { createPool, type PoolOptions } from '../../../src/driver/pool.js';
-import { TransactionRolledBack } from '../../../src/driver/transaction.js';
+import {
+	TransactionRolledBack,
+	type Transaction,
+} from '../../../src/driver/transaction.js';
 import {
 	noPg,
 	open,
 	options,
 	rejection,
+	roundTripSockets,
 	slowSockets,
 	table,
 } from './helpers.js';
@@ -29,6 +34,9 @@ const waited = async (work: () => Promise<unknown>) => {
 	await work();
 	return performance.now() - started;
 };
+/** Releases the savepoint from inside it, so the driver's own release fails. */
+const releaseInside = (tx: Transaction) =>
+	tx.transaction((sp) => sp.query('release savepoint quarry_sp_1_1'));
 const pool = (overrides: PoolOptions = {}) =>
 	createPool({ ...options(), ...overrides });
 
@@ -177,6 +185,202 @@ describe.skipIf(noPg)('transactions', () => {
 				await tx.query('select 1/0').catch(() => {});
 			}),
 		).rejects.toBeInstanceOf(TransactionRolledBack);
+	});
+
+	it('rejects once, without an unhandled rejection, when BEGIN fails with settings or a timeout', async () => {
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on('unhandledRejection', onUnhandled);
+		try {
+			const c = await open();
+			c.destroy();
+			for (const txOptions of [
+				{ settings: { 'app.tenant_id': 1 } },
+				{ timeout: 1000 },
+			]) {
+				await rejection(
+					c.transaction((tx) => tx.query('select 1'), txOptions),
+					ConnectionError,
+				);
+			}
+			await sleep(20);
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off('unhandledRejection', onUnhandled);
+		}
+	});
+
+	it('sends BEGIN with the first statement and releases savepoints without waiting', async () => {
+		const net = roundTripSockets();
+		await using c = await open({ socket: net.factory });
+		const trips = async (work: () => Promise<unknown>) => {
+			const before = net.roundTrips();
+			await work();
+			return net.roundTrips() - before;
+		};
+		expect(await trips(() => c.transaction((tx) => tx.query('select 1')))).toBe(
+			2,
+		);
+		expect(
+			await trips(() =>
+				c.transaction((tx) => tx.query('select 1'), {
+					isolation: 'repeatable read',
+					settings: { 'app.tenant_id': 1 },
+					timeout: '5s',
+				}),
+			),
+		).toBe(2);
+		expect(await trips(() => c.transaction(async () => {}))).toBe(1);
+		// begin+savepoint, select, 4 × (release+savepoint, select), release+commit
+		expect(
+			await trips(() =>
+				c.transaction(async (tx) => {
+					for (let k = 0; k < 5; k++)
+						await tx.transaction((sp) => sp.query('select 1'));
+				}),
+			),
+		).toBe(11);
+		expect(
+			await trips(() =>
+				c
+					.transaction(async () => {
+						throw new Error('before any statement');
+					})
+					.catch(() => {}),
+			),
+		).toBe(0);
+		expect(c.transactionStatus).toBe('idle');
+	});
+
+	it('reports a failed first statement as itself and rolls back', async () => {
+		await conn.query(`truncate ${name}`);
+		await conn.query(`insert into ${name} values (1, 'a')`);
+		await rejection(
+			conn.transaction(async (tx) => {
+				await tx.query(`insert into ${name} values (1, 'dup')`);
+			}),
+			UniqueViolation,
+		);
+		await rejection(
+			conn.transaction((tx) => tx.query('selec 1')),
+			PostgresError,
+		);
+		expect(conn.transactionStatus).toBe('idle');
+		expect(await ids()).toEqual([1]);
+	});
+
+	it('skips the first statement, and sends nothing more, when the settings fail', async () => {
+		await conn.query(`truncate ${name}`);
+		let later: unknown;
+		const error = await rejection(
+			conn.transaction(
+				async (tx) => {
+					const first = await tx
+						.query(`insert into ${name} values (1, 'a')`)
+						.catch((e: unknown) => e);
+					later = await tx
+						.query(`insert into ${name} values (2, 'b')`)
+						.catch((e: unknown) => e);
+					return first;
+				},
+				{ settings: { statement_timeout: 'not a duration' } },
+			),
+			PostgresError,
+		);
+		expect(error.code).toBe('22023');
+		expect(later).toBe(error);
+		expect(conn.transactionStatus).toBe('idle');
+		expect(await ids()).toEqual([]);
+	});
+
+	it('keeps statement order while BEGIN is in flight', async () => {
+		await conn.query(`truncate ${name}`);
+		const order = await conn.transaction(async (tx) => {
+			const a = tx.query(`insert into ${name} values (1, 'a')`);
+			const b = tx.query(`insert into ${name} values (2, 'b')`);
+			await a;
+			const c = tx.query<{ ids: number[] }>(
+				`select array_agg(id order by id) as ids from ${name}`,
+			);
+			await b;
+			return (await c).rows[0]?.ids;
+		});
+		expect(order).toEqual([1, 2]);
+	});
+
+	it('runs a first statement that needs its own Sync after BEGIN', async () => {
+		const ctl = new AbortController();
+		const viaSignal = await conn.transaction(
+			async (tx) =>
+				(
+					await tx.query<{ s: string }>(
+						"select current_setting('app.x') as s",
+						[],
+						{ signal: ctl.signal },
+					)
+				).rows[0]?.s,
+			{ settings: { 'app.x': 'signal' } },
+		);
+		expect(viaSignal).toBe('signal');
+		const batches: unknown[] = [];
+		await conn.transaction(async (tx) => {
+			expect(tx.transactionStatus).toBe('transaction');
+			for await (const batch of tx.cursor('select generate_series(1, 3) as n'))
+				batches.push(batch);
+		});
+		expect(batches).toEqual([[{ n: 1 }, { n: 2 }, { n: 3 }]]);
+		expect(conn.transactionStatus).toBe('idle');
+	});
+
+	it('refuses a nested conn.transaction() before BEGIN was sent', async () => {
+		await expect(
+			conn.transaction(() => conn.transaction(async () => {})),
+		).rejects.toThrow(/already in a transaction/);
+		await expect(
+			conn.transaction(() =>
+				conn.transaction(async () => {}, { durable: true }),
+			),
+		).rejects.toThrow(/durable/);
+		expect(conn.transactionStatus).toBe('idle');
+	});
+
+	it('reports a failed savepoint release at the next statement, or at commit', async () => {
+		await conn.query(`truncate ${name}`);
+		const next = await rejection(
+			conn.transaction(async (tx) => {
+				await tx.query(`insert into ${name} values (1, 'a')`);
+				await releaseInside(tx);
+				await tx.query('select 1');
+			}),
+			PostgresError,
+		);
+		expect(next.code).toBe('3B001');
+		const atCommit = await rejection(
+			conn.transaction(async (tx) => {
+				await tx.query(`insert into ${name} values (2, 'b')`);
+				await releaseInside(tx);
+			}),
+			PostgresError,
+		);
+		expect(atCommit.code).toBe('3B001');
+		expect(conn.transactionStatus).toBe('idle');
+		expect(await ids()).toEqual([]);
+	});
+
+	it('still rolls a savepoint back when its callback swallowed an error', async () => {
+		await conn.query(`truncate ${name}`);
+		await conn.transaction(async (tx) => {
+			await tx.query(`insert into ${name} values (1, 'a')`);
+			await rejection(
+				tx.transaction(async (sp) => {
+					await sp.query(`insert into ${name} values (2, 'b')`);
+					await sp.query('select 1/0').catch(() => {});
+				}),
+				PostgresError,
+			);
+			await tx.query(`insert into ${name} values (3, 'c')`);
+		});
+		expect(await ids()).toEqual([1, 3]);
 	});
 
 	it('refuses use after the transaction finished', async () => {
@@ -376,7 +580,7 @@ describe.skipIf(noPg)('pool', () => {
 
 	it('keeps pipelining under sustained load beyond max × pipeline', async () => {
 		const net = slowSockets(10);
-		await using p = pool({ max: 2, socket: net.factory });
+		await using p = pool({ max: 2, pipeline: 50, socket: net.factory });
 		await Promise.all([p.query('select 1'), p.query('select 1')]);
 		while (p.stats.idle < 2) await sleep(5);
 		await p.query('select $1::int as v', [0]);
@@ -400,6 +604,52 @@ describe.skipIf(noPg)('pool', () => {
 		// ~100 per 10 ms round trip: ~60 ms; one query per round trip per connection once anyone waits would take ~3 s
 		expect(elapsed).toBeLessThan(1000);
 		expect(p.stats).toMatchObject({ total: 2, idle: 2, busy: 0, waiting: 0 });
+	});
+
+	it('deepens the pipeline when the round trip, not the server, is the limit', async () => {
+		const net = slowSockets(10);
+		await using p = pool({ max: 1, socket: net.factory });
+		await p.query('select $1::int as v', [0]);
+		net.reset();
+		// 100 at a time first: the default depth
+		await Promise.all(
+			Array.from({ length: 100 }, (_, i) =>
+				p.query('select $1::int as v', [i]),
+			),
+		);
+		expect(net.maxInFlight()).toBe(100);
+		net.reset();
+		const values = await Promise.all(
+			Array.from({ length: 600 }, async (_, caller) => {
+				const seen: (number | undefined)[] = [];
+				for (let k = 0; k < 4; k++) {
+					const v = caller * 4 + k;
+					const { rows } = await p.query<{ v: number }>('select $1::int as v', [
+						v,
+					]);
+					seen.push(rows[0]?.v);
+				}
+				return seen;
+			}),
+		);
+		expect(values.flat()).toEqual(Array.from({ length: 2400 }, (_, i) => i));
+		// grows from 100 by half each round trip while callers wait
+		expect(net.maxInFlight()).toBeGreaterThan(300);
+		expect(net.maxInFlight()).toBeLessThanOrEqual(600);
+		expect(p.stats).toMatchObject({ total: 1, idle: 1, busy: 0, waiting: 0 });
+	});
+
+	it('keeps the default depth when queries queue on the server', async () => {
+		const net = slowSockets(1);
+		await using p = pool({ max: 1, socket: net.factory });
+		await p.query('select 1');
+		net.reset();
+		await Promise.all(
+			Array.from({ length: 300 }, async () => {
+				for (let k = 0; k < 2; k++) await p.query('select pg_sleep(0.0005)');
+			}),
+		);
+		expect(net.maxInFlight()).toBe(100);
 	});
 
 	it('hands connections to transactions, clients and cursors under sustained load', async () => {
@@ -714,5 +964,45 @@ describe.skipIf(noPg)('pool', () => {
 		await sleep(100);
 		expect(received).toEqual(['one', 'two']);
 		await unlisten();
+	});
+
+	it('re-subscribes every channel after the listen connection drops', async () => {
+		const applicationName = 'quarry relisten test';
+		await using p = pool({ applicationName });
+		const channels = ['pool_a', 'pool_b', 'pool c', 'pool_é'];
+		const received: string[] = [];
+		const unlistens = [];
+		for (const channel of channels) {
+			unlistens.push(
+				await p.listen(channel, (n) =>
+					received.push(`${n.channel}:${n.payload}`),
+				),
+			);
+		}
+		await using admin = await open();
+		const listening = async () =>
+			(
+				await admin.query<{ pid: number }>(
+					`select pid from pg_stat_activity
+					where application_name = $1 and query like 'listen %' and state = 'idle'`,
+					[applicationName],
+				)
+			).rows.map((r) => r.pid);
+		const [before] = await listening();
+		expect(before).toBeDefined();
+		await admin.query('select pg_terminate_backend($1)', [before]);
+		let after: number[] = [];
+		for (let i = 0; i < 60; i++) {
+			after = (await listening()).filter((pid) => pid !== before);
+			if (after.length > 0) break;
+			await sleep(50);
+		}
+		expect(after).toHaveLength(1);
+		await sleep(100);
+		for (const channel of channels)
+			await p.query('select pg_notify($1, $2)', [channel, 'back']);
+		await sleep(100);
+		expect(received).toEqual(channels.map((c) => `${c}:back`));
+		for (const unlisten of unlistens) await unlisten();
 	});
 });

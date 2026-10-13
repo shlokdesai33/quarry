@@ -137,7 +137,10 @@ export function rowsNode(
 	return {
 		columns: columns.map(({ name }) => name),
 		types: columns.map(({ column }) =>
-			renderType(codeType(column._quarry.dataType)),
+			renderType({
+				...codeType(column._quarry.dataType),
+				modifiers: undefined,
+			}),
 		),
 		rows: rows.map((row) => {
 			const values = new Map(Object.entries(row));

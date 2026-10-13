@@ -72,14 +72,33 @@ Parameters:
 - Numbers, bigints, booleans and `Date`s become their Postgres text. A `Date` is sent as a UTC timestamp, so a `timestamp without time zone` column receives the UTC wall-clock time whatever the process's time zone.
 - Arrays become array literals and other objects JSON.
 - `Uint8Array` is sent in binary.
+- An array whose type is declared in `paramTypes` is sent in binary when its elements fit the type, which is much cheaper for the server to read than a literal. This applies to bool, int2/int4/int8, float8, timestamptz (`Date`s), uuid, text/varchar/char, jsonb (JSON text) and bytea arrays. Anything else is sent as a literal, as before. Quarry declares the types of its `unnest` arrays (multi-row insert, `updateMany`) and of `column = any($1)` for integer and boolean columns.
 
-Queries issued concurrently on one connection are pipelined into shared socket writes. Each still gets its own Sync, so one failing query doesn't fail its neighbours (outside a transaction).
+  ```ts
+  await conn.query(
+  	'select * from unnest($1::int4[], $2::text[])',
+  	[ids, names],
+  	{
+  		paramTypes: [arrayOids.int4, arrayOids.text],
+  	},
+  );
+  ```
+
+Queries issued concurrently on one connection are pipelined into shared socket writes. Each still gets its own Sync, so one failing query doesn't fail its neighbours (outside a transaction). Writes respect backpressure: a long queue goes out in 64 KiB chunks, and once the socket's buffer is full, the remaining queries wait unencoded until it drains, so a deep pipeline or large parameters can't pile up in memory.
 
 A query takes at most 65535 parameters, the protocol's limit; more are refused before anything is sent.
 
 Statements are prepared and cached per connection (100 by default; `statementCacheSize`, `prepare: false`). This is safe behind PgBouncer 1.21+ with `max_prepared_statements`. A cached statement that a schema change made stale (its result type or an inferred parameter type changed), or that the server no longer has (`DEALLOCATE`, `DISCARD ALL`), is retried once as an unnamed statement, outside a transaction. Behind PgBouncer, which maps a new Parse of the same text back to the statement it already prepared, SQL that still comes back stale is no longer prepared on that connection.
 
-From a cached statement's second run, columns whose parser has a binary twin (int2/int4/oid, float8, bool, bytea, and timestamptz decoded to `Date`) are received in binary, which is cheaper to decode and gives identical values. Custom parsers and raw types always get text. Turn it off with `binaryResults: false`.
+From a cached statement's second run, columns whose parser has a binary twin are received in binary, which is cheaper to decode and gives identical values. These are:
+
+- int2/int4/oid, float8, bool, bytea, and timestamptz decoded to `Date`;
+- arrays of those, and of text-like types, json/jsonb and int8 as `bigint`, when the array parser is the driver's own (`defaultTypes`, quarry's, the catalog's, or one built with `arrayParser`);
+- pgvector's `vector`.
+
+Custom parsers and raw types always get text. Turn it off with `binaryResults: false`.
+
+`parseVector` returns the float32 values stored, on every path: `[0.1]` reads as `[0.10000000149011612]`, the value pgvector holds and the value its binary format carries.
 
 ### Decoding
 
@@ -122,6 +141,8 @@ await pool.transaction(async (tx) => {
 - Retries cover serialization failures and deadlocks only.
 - `settings` are applied with bound parameters.
 - A COMMIT that the server turned into a ROLLBACK (because an error was swallowed inside) throws `TransactionRolledBack`.
+- BEGIN (with the settings) is sent with the callback's first statement, under one Sync, so a transaction takes 2 round trips. If BEGIN fails, the server skips that statement, and the transaction rejects with BEGIN's error. The callback has already started by then.
+- A savepoint's `release` isn't waited for; if it fails, the next statement in the transaction, or the COMMIT, reports its error.
 
 ## Pool
 
@@ -130,7 +151,9 @@ await pool.transaction(async (tx) => {
 - `max`, `min`
 - `idleTimeout` (30 s), `maxLifetime` (1 h, with jitter)
 - `acquireTimeout` (30 s), `maxWaiting`
-- `pipeline` (50): once every connection is busy, `query`, `simpleQuery` and `describe` are pipelined onto shared connections, up to this many in flight on each. Further queries wait in line and take the next free slot. `false` gives every query a connection to itself.
+- `pipeline`: once every connection is busy, `query`, `simpleQuery` and `describe` are pipelined onto shared connections. Further queries wait in line and take the next free slot.
+  - By default the depth adapts per connection. It starts at 100 queries in flight. While queries are waiting and finish nearly as fast as the round trip allows, so the network rather than the server is the limit, it grows by half each round trip, up to 1000. Once queries queue on the server, more depth would only line them up behind each other, so it shrinks back towards 100. At 0 ms it stays at 100; at 5 ms with 1000 callers on one connection it reaches the server's throughput instead of 100 per round trip.
+  - A number fixes the depth; `false` gives every query a connection to itself.
   - Reserved clients, transactions, cursors and COPY always get a connection of their own. While one waits, one shared connection per waiter takes no new queries, and it is handed over once the queries already in flight on it finish, so a steady stream of queries can't hold it back.
 - `onConnect`
 

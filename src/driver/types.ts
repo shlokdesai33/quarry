@@ -1,3 +1,4 @@
+import { binaryArray } from './array-params.js';
 import { DriverError, UndefinedParameterError } from './errors.js';
 import type { WireValue } from './protocol/frontend.js';
 
@@ -182,10 +183,42 @@ export function parseArray(
 	return result;
 }
 
-const array =
-	(parse?: TextParser, delimiter?: string): TextParser =>
-	(text) =>
-		parseArray(text, parse, delimiter);
+/** What an `arrayParser` was built from. */
+export interface ArrayParserInfo {
+	/** The element parser; undefined keeps elements as the server's text. */
+	readonly element: TextParser | undefined;
+	readonly delimiter: string;
+	/** The element type's OID, when known where the parser was built (the catalog). */
+	readonly elementOid: number | undefined;
+}
+
+const arrayParsers = new WeakMap<TextParser, ArrayParserInfo>();
+
+/**
+ * A parser for array output, each element through `element` (or kept as
+ * text). Unlike a hand-written `parseArray` closure, the driver recognises
+ * it, so the array can be received in binary when the element type has a
+ * binary decoder giving the same value.
+ */
+export function arrayParser(
+	element?: TextParser,
+	delimiter = ',',
+	elementOid?: number,
+): TextParser {
+	const parse: TextParser = (text) => parseArray(text, element, delimiter);
+	arrayParsers.set(parse, { element, delimiter, elementOid });
+	return parse;
+}
+
+/** What `parser` was built from, if `arrayParser` built it. */
+export function arrayParserInfo(
+	parser: TextParser,
+): ArrayParserInfo | undefined {
+	return arrayParsers.get(parser);
+}
+
+const array = (parse?: TextParser, delimiter?: string): TextParser =>
+	arrayParser(parse, delimiter);
 
 /** Built-in text parsers. Shared, so a binary decoder can be matched to the parser it stands in for. */
 export const parseBool: TextParser = (text) => text === 't';
@@ -348,11 +381,14 @@ const MAX_PARAMETERS = 65535;
 
 /**
  * Encodes a query's parameters with `encodeParam`, refusing `undefined`
- * (or an undefined array element) instead of sending it as NULL.
+ * (or an undefined array element) instead of sending it as NULL. An array
+ * whose type `paramTypes` declares is sent in binary where the driver has
+ * an encoder for it and every element fits.
  */
 export function encodeParams(
 	sql: string,
 	params: readonly unknown[],
+	paramTypes: readonly number[] = [],
 ): WireValue[] {
 	if (params.length > MAX_PARAMETERS) {
 		throw new DriverError(
@@ -365,7 +401,12 @@ export function encodeParams(
 		const element = undefinedAt(value);
 		if (element !== undefined)
 			throw new UndefinedParameterError(sql, i + 1, element);
-		values.push(encodeDefined(value));
+		const type = paramTypes[i];
+		values.push(
+			(type !== undefined && Array.isArray(value)
+				? binaryArray(value, type)
+				: undefined) ?? encodeDefined(value),
+		);
 	}
 	return values;
 }

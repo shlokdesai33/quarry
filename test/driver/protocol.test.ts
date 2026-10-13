@@ -3,7 +3,12 @@ import { serialize } from 'pg-protocol';
 import { Parser } from 'pg-protocol/dist/parser.js';
 import * as fe from '../../src/driver/protocol/frontend.js';
 import { Writer } from '../../src/driver/protocol/writer.js';
-import { Reader, textValues } from '../../src/driver/protocol/reader.js';
+import {
+	ChannelNames,
+	decodeNotification,
+	Reader,
+	textValues,
+} from '../../src/driver/protocol/reader.js';
 import type { BackendMessage } from '../../src/driver/protocol/messages.js';
 import { ProtocolError } from '../../src/driver/errors.js';
 import {
@@ -361,6 +366,234 @@ describe('Reader', () => {
 		expect(() =>
 			textValues(new Uint8Array([0, 1, 0xff, 0xff, 0xff, 0xfe])),
 		).toThrow(ProtocolError);
+	});
+});
+
+/** A NotificationResponse body, at `offset` inside a larger buffer as the reader hands it out. */
+function notificationBody(
+	pid: number,
+	channel: string,
+	payload: string,
+	offset = 3,
+): { buf: Uint8Array; start: number; end: number } {
+	const encoded = encodeBackend({
+		type: 'NotificationResponse',
+		pid,
+		channel,
+		payload,
+	}).subarray(5);
+	const buf = Buffer.alloc(offset + encoded.length + 2, 0xee);
+	buf.set(encoded, offset);
+	return { buf, start: offset, end: offset + encoded.length };
+}
+
+function decode(
+	pid: number,
+	channel: string,
+	payload: string,
+	names?: ChannelNames,
+) {
+	const { buf, start, end } = notificationBody(pid, channel, payload);
+	return decodeNotification(buf, start, end, names);
+}
+
+describe('NotificationResponse decoding', () => {
+	it('decodes pid, channel and payload, short and long, ASCII and not', () => {
+		const names = new ChannelNames();
+		for (const payload of [
+			'',
+			'1',
+			'123456',
+			'1234567',
+			'é',
+			'😀',
+			'aé😀',
+			'{"id":1,"op":"update","table":"users"}',
+			'x'.repeat(10_000),
+		]) {
+			for (const cache of [undefined, names]) {
+				expect(decode(-7, 'Quarry Events', payload, cache)).toEqual({
+					pid: -7,
+					channel: 'Quarry Events',
+					payload,
+				});
+			}
+		}
+		expect(decode(0x7fffffff, 'é😀', 'p', names)).toEqual({
+			pid: 0x7fffffff,
+			channel: 'é😀',
+			payload: 'p',
+		});
+	});
+
+	it('also decodes from plain Uint8Arrays', () => {
+		const { buf, start, end } = notificationBody(1, 'chan', 'é1');
+		expect(decodeNotification(new Uint8Array(buf), start, end)).toEqual({
+			pid: 1,
+			channel: 'chan',
+			payload: 'é1',
+		});
+	});
+
+	it('reuses channel names only for the same bytes, and evicts beyond its size', () => {
+		const names = new ChannelNames();
+		const channels = Array.from({ length: 20 }, (_, i) => `chan_${i % 10}`);
+		channels.push('chan_x', 'chbn_0', 'chan_', 'chan_00', '', 'chan_0');
+		for (let round = 0; round < 3; round++) {
+			for (const channel of channels)
+				expect(decode(1, channel, 'p', names).channel).toBe(channel);
+		}
+	});
+
+	it('keeps its own copy of the channel bytes', () => {
+		const names = new ChannelNames();
+		const { buf, start, end } = notificationBody(1, 'alpha', 'p');
+		expect(decodeNotification(buf, start, end, names).channel).toBe('alpha');
+		buf.set(Buffer.from('omega'), start + 4);
+		expect(decodeNotification(buf, start, end, names).channel).toBe('omega');
+		expect(decode(1, 'alpha', 'p', names).channel).toBe('alpha');
+	});
+
+	it('rejects truncated and unterminated bodies', () => {
+		const { buf, start, end } = notificationBody(1, 'chan', 'payload');
+		for (let cut = start; cut < end; cut++) {
+			expect(() => decodeNotification(buf, start, cut)).toThrow(ProtocolError);
+			expect(() =>
+				decodeNotification(buf, start, cut, new ChannelNames()),
+			).toThrow(ProtocolError);
+		}
+	});
+
+	it('matches pg-protocol over a stream of many notifications', () => {
+		const rand = prng(7);
+		const sent = Array.from({ length: 2000 }, (_, i) => ({
+			type: 'NotificationResponse' as const,
+			pid: i,
+			channel: `c${Math.floor(rand() * 12)}`,
+			payload: randomString(rand, 40),
+		}));
+		const stream = concat(sent.map(encodeBackend));
+		const theirs: { channel: string; payload: string }[] = [];
+		new Parser().parse(Buffer.from(stream), (m: any) => theirs.push(m));
+		const reader = new Reader();
+		const names = new ChannelNames();
+		const ours: { channel: string; payload: string }[] = [];
+		for (let at = 0; at < stream.length;) {
+			const size = 1 + Math.floor(rand() * 300);
+			reader.push(stream.subarray(at, at + size));
+			at += size;
+			for (let t = reader.nextType(); t >= 0; t = reader.nextType()) {
+				expect(t).toBe(0x41);
+				ours.push(
+					decodeNotification(reader.bytes, reader.start, reader.end, names),
+				);
+			}
+		}
+		expect(ours.map((n) => [n.channel, n.payload])).toEqual(
+			theirs.map((n) => [n.channel, n.payload]),
+		);
+	});
+});
+
+const row = (value: string) =>
+	encodeBackend({ type: 'DataRow', payload: dataRowPayload([value]) });
+
+describe('buffer memory', () => {
+	it('copies only a message split across chunks, and reads the rest in place', () => {
+		const [a, b, c] = [row('first'), row('second'), row('third')];
+		const stream = concat([a, b, c]);
+		const cut = a.length + 4;
+		const first = new Uint8Array(stream.subarray(0, cut));
+		const second = new Uint8Array(stream.subarray(cut));
+		const reader = new Reader();
+		reader.push(first);
+		expect(reader.nextType()).toBe(0x44);
+		expect(reader.bytes.buffer).toBe(first.buffer);
+		expect(reader.nextType()).toBe(-1);
+		reader.push(second);
+		const split = reader.next();
+		expect(reader.bytes.buffer).not.toBe(second.buffer);
+		expect(reader.bytes.length).toBe(b.length);
+		expect(reader.nextType()).toBe(0x44);
+		expect(reader.bytes.buffer).toBe(second.buffer);
+		expect(textValues(reader.bytes.subarray(reader.start, reader.end))).toEqual(
+			['third'],
+		);
+		// drained: nothing is held while the connection is idle
+		expect(reader.nextType()).toBe(-1);
+		expect(reader.bytes.length).toBe(0);
+		expect(reader.buffered).toBe(0);
+		// messages handed out stay valid after later chunks
+		reader.push(row('fourth'));
+		reader.next();
+		if (split?.type === 'DataRow')
+			expect(textValues(split.payload)).toEqual(['second']);
+	});
+
+	it('splits a header across chunks, byte by byte', () => {
+		const stream = concat([
+			encodeBackend({ type: 'ParseComplete' }),
+			encodeBackend({ type: 'CommandComplete', tag: 'SELECT 1' }),
+			encodeBackend({ type: 'ReadyForQuery', status: 'I' }),
+		]);
+		const reader = new Reader();
+		const out: BackendMessage[] = [];
+		for (let i = 0; i < stream.length; i++) {
+			reader.push(stream.subarray(i, i + 1));
+			out.push(...readAll(reader));
+		}
+		expect(out.map((m) => m.type)).toEqual([
+			'ParseComplete',
+			'CommandComplete',
+			'ReadyForQuery',
+		]);
+		expect(reader.buffered).toBe(0);
+	});
+
+	it('keeps unread messages ahead of a chunk pushed before reading them', () => {
+		const a = encodeBackend({ type: 'CommandComplete', tag: 'A' });
+		const b = encodeBackend({ type: 'CommandComplete', tag: 'B' });
+		const reader = new Reader();
+		reader.push(a);
+		reader.push(b.subarray(0, 3));
+		reader.push(b.subarray(3));
+		expect(readAll(reader)).toEqual([
+			{ type: 'CommandComplete', tag: 'A' },
+			{ type: 'CommandComplete', tag: 'B' },
+		]);
+	});
+
+	it('reserves about a byte per character for large strings', () => {
+		const w = new Writer();
+		const value = `${'x'.repeat(3_000_000)}é😀`;
+		w.begin(0x51).cstring(value).end();
+		expect(w.capacity).toBeLessThanOrEqual(4 << 20);
+		const out = w.take();
+		expect(Buffer.from(out.subarray(5, -1)).toString()).toBe(value);
+		expect(new DataView(out.buffer, out.byteOffset).getInt32(1)).toBe(
+			out.length - 1,
+		);
+		// a buffer grown for one large message isn't kept
+		expect(w.capacity).toBe(4096);
+		w.int8(1);
+		expect([...w.take()]).toEqual([1]);
+	});
+
+	it('encodes multi-byte text that overflows the free space', () => {
+		for (const value of [
+			'é'.repeat(5000),
+			'😀'.repeat(3000),
+			`a${'中'.repeat(2000)}`,
+		]) {
+			const w = new Writer(16);
+			w.int8(7).value(value);
+			const out = w.take();
+			const expected = Buffer.from(value);
+			expect(new DataView(out.buffer, out.byteOffset).getInt32(1)).toBe(
+				expected.length,
+			);
+			expect(Buffer.from(out.subarray(5)).equals(expected)).toBe(true);
+		}
 	});
 });
 

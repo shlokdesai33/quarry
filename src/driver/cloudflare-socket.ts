@@ -24,6 +24,14 @@ type Connect = (
 	},
 ) => WorkersSocket;
 
+/**
+ * Bytes queued on the socket before `write` reports a full buffer, as
+ * Node's default high-water mark. Workers' socket streams always report a
+ * `desiredSize` of 1, however much is queued, so the driver counts the
+ * bytes whose writes haven't completed itself.
+ */
+const HIGH_WATER_MARK = 65_536;
+
 // a variable, so bundlers and the type checker leave the Workers-only module alone
 const MODULE = 'cloudflare:sockets';
 
@@ -75,6 +83,10 @@ class CloudflareSocket implements DriverSocket {
 	#onClose: () => void = () => {};
 	#onError: (error: Error) => void = () => {};
 	#onDrain: () => void = () => {};
+	/** Bytes written whose write hasn't completed yet. */
+	#buffered = 0;
+	/** `write` reported a full buffer: `onDrain` fires once it empties. */
+	#needDrain = false;
 
 	constructor(socket: WorkersSocket, encrypted: boolean) {
 		this.#socket = socket;
@@ -117,20 +129,28 @@ class CloudflareSocket implements DriverSocket {
 	}
 
 	write(data: Uint8Array): boolean {
-		const writer = this.#writer;
-		writer.write(data).catch((error: unknown) => {
-			this.#onError(
-				new ConnectionError(
-					error instanceof Error ? error.message : 'Socket write failed',
-					{ cause: error },
-				),
-			);
-		});
-		if ((writer.desiredSize ?? 1) > 0) return true;
-		void writer.ready.then(
-			() => this.#onDrain(),
-			() => {},
+		const size = data.length;
+		this.#buffered += size;
+		this.#writer.write(data).then(
+			() => {
+				this.#buffered -= size;
+				if (this.#needDrain && this.#buffered === 0) {
+					this.#needDrain = false;
+					this.#onDrain();
+				}
+				return undefined;
+			},
+			(error: unknown) => {
+				this.#onError(
+					new ConnectionError(
+						error instanceof Error ? error.message : 'Socket write failed',
+						{ cause: error },
+					),
+				);
+			},
 		);
+		if (this.#buffered < HIGH_WATER_MARK) return true;
+		this.#needDrain = true;
 		return false;
 	}
 
@@ -167,8 +187,8 @@ class CloudflareSocket implements DriverSocket {
 		paused?.resolve();
 	}
 
-	end(): void {
-		void this.#writer.close().catch(() => {});
+	end(): Promise<void> {
+		return this.#writer.close().catch(() => {});
 	}
 
 	destroy(): void {

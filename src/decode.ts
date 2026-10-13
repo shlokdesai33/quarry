@@ -1,8 +1,8 @@
 import {
 	arrayOids,
+	arrayParser,
 	catalogTypes,
 	oids,
-	parseArray,
 	parseBool,
 	parseBytea,
 	parseFloat,
@@ -19,10 +19,8 @@ import {
 const identity: TextParser = (text) => text;
 const dateRange: TextParser = (text) => parseRange(text, identity);
 const timeRange: TextParser = (text) => parseRange(text, parseTimestamptz);
-const array =
-	(parse?: TextParser, delimiter?: string): TextParser =>
-	(text) =>
-		parseArray(text, parse, delimiter);
+const array = (parse?: TextParser, delimiter?: string): TextParser =>
+	arrayParser(parse, delimiter);
 
 /**
  * Parsers matching the TypeScript types quarry's columns declare: int8 and

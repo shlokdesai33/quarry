@@ -1,3 +1,4 @@
+import * as nodeCrypto from 'node:crypto';
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
@@ -7,7 +8,13 @@ import {
 	utf8Encode,
 } from '../../src/driver/auth/encoding.js';
 import { md5, md5Password } from '../../src/driver/auth/md5.js';
-import { ScramClient, saslprep } from '../../src/driver/auth/scram.js';
+import {
+	nodeScramCrypto,
+	ScramClient,
+	saslprep,
+	webScramCrypto,
+	type ScramCrypto,
+} from '../../src/driver/auth/scram.js';
 import { parseServerVersion } from '../../src/driver/capabilities.js';
 import {
 	parseRequireAuth,
@@ -16,6 +23,14 @@ import {
 	resolveConfig,
 } from '../../src/driver/config.js';
 import { prng } from './helpers/backend.js';
+
+/** The client-final-message for a password and salt, with a fixed nonce. */
+async function scramProof(password: string, salt: string): Promise<string> {
+	const client = new ScramClient(password, undefined, false, 'abc');
+	return utf8Decode(
+		await client.final(utf8Encode(`r=abcdef,s=${salt},i=4096`)),
+	);
+}
 
 describe('parseConnectionString', () => {
 	it('parses URLs', () => {
@@ -302,6 +317,34 @@ describe('auth primitives', () => {
 		expect(() => client.verify(utf8Encode('e=invalid-proof'))).toThrow(
 			/invalid-proof/,
 		);
+	});
+
+	it('caches SCRAM keys per password, salt and iteration count', async () => {
+		const rfc = 'W22ZaJ0SNY7soEsUEjb6gQ==';
+		const first = await scramProof('pencil', rfc);
+		expect(await scramProof('pencil', rfc)).toBe(first);
+		expect(await scramProof('pen', rfc)).not.toBe(first);
+		expect(await scramProof('pencil', 'AAAAaJ0SNY7soEsUEjb6gQ==')).not.toBe(
+			first,
+		);
+	});
+
+	it('derives the same SCRAM values with node:crypto and WebCrypto', async () => {
+		const node = nodeScramCrypto(nodeCrypto);
+		const web = webScramCrypto;
+		const key = utf8Encode('key');
+		const data = utf8Encode('data');
+		const results = (crypto: ScramCrypto) =>
+			Promise.all([
+				crypto.hmac(key, data),
+				crypto.digest('SHA-256', data),
+				crypto.digest('SHA-384', data),
+				crypto.digest('SHA-512', data),
+				crypto.pbkdf2(key, data, 4096),
+			]).then((values) => values.map((value) => [...value]));
+		expect(await results(node)).toEqual(await results(web));
+		expect(node.random(18)).toHaveLength(18);
+		expect(web.random(18)).toHaveLength(18);
 	});
 
 	it('SCRAM rejects a server nonce that does not extend the client’s', async () => {

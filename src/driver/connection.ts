@@ -1,6 +1,7 @@
 import { md5Password } from './auth/md5.js';
 import {
 	ScramClient,
+	scramCrypto,
 	serverEndPoint,
 	type ChannelBinding,
 } from './auth/scram.js';
@@ -32,6 +33,7 @@ import {
 	Op,
 	QueryOp,
 	SimpleQueryOp,
+	SyncGroupOp,
 	closedError,
 	type Description,
 	type OpContext,
@@ -42,7 +44,7 @@ import {
 } from './ops.js';
 import * as fe from './protocol/frontend.js';
 import type { BackendMessage } from './protocol/messages.js';
-import { Reader } from './protocol/reader.js';
+import { ChannelNames, decodeNotification, Reader } from './protocol/reader.js';
 import { Writer } from './protocol/writer.js';
 import { asResult, asRows, type RowMode } from './rows.js';
 import type { DriverSocket } from './socket.js';
@@ -62,7 +64,10 @@ export interface QueryOptions {
 	readonly types?: TypeParsers;
 	/** Use a cached named prepared statement (default: the connection's `prepare` option). */
 	readonly prepare?: boolean;
-	/** Parameter type OIDs; 0 or missing entries let the server infer. */
+	/**
+	 * Parameter type OIDs; 0 or missing entries let the server infer. An
+	 * array whose type is declared here is sent in binary where it can be.
+	 */
 	readonly paramTypes?: readonly number[];
 	/** Cancels the query when aborted. A query not yet sent is dropped without contacting the server. */
 	readonly signal?: AbortSignal;
@@ -87,6 +92,15 @@ export interface QueryOptions {
 	readonly binary?: boolean;
 }
 
+/** A statement of `Connection.queryGroup`; per-query cancellation and timing don't apply. */
+export interface GroupStatement {
+	readonly sql: string;
+	readonly params?: readonly unknown[] | undefined;
+	readonly options?:
+		| Omit<QueryOptions, 'signal' | 'timeout' | 'statementTimeout' | 'onTiming'>
+		| undefined;
+}
+
 export interface CursorOptions extends QueryOptions {
 	/** Rows fetched per round trip (default 1000). */
 	readonly batchSize?: number;
@@ -103,9 +117,16 @@ export interface OpenInfo {
 type Listener<T> = (value: T) => void;
 
 /**
+ * Encoded bytes handed to the socket at a time when a flush covers many
+ * queries, so a long queue is encoded only as fast as the socket takes it.
+ */
+const FLUSH_BYTES = 65_536;
+
+/**
  * One session with the server. Queries can be issued concurrently: they
- * are pipelined, written together in one socket write per tick, and their
- * results come back in order. An error in one query does not affect the
+ * are pipelined, written together in one socket write per tick (in 64 KiB
+ * chunks, pausing while the socket's buffer is full), and their results
+ * come back in order. An error in one query does not affect the
  * others (each has its own Sync), except inside a transaction, where
  * Postgres aborts the transaction as usual.
  */
@@ -120,6 +141,8 @@ export class Connection implements AsyncDisposable {
 	/** How many operations at the front of the queue have been written. */
 	#written = 0;
 	#flushScheduled = false;
+	/** The socket's write buffer is full: nothing more is encoded until it drains. */
+	#backpressure = false;
 	/** An exclusive operation that has been written: nothing more is written until it completes. */
 	#blocking: Op | undefined;
 	/** An operation this client asked the server to cancel: nothing more is written until it completes. */
@@ -133,6 +156,7 @@ export class Connection implements AsyncDisposable {
 	#status: 'I' | 'T' | 'E' = 'I';
 	#closed = false;
 	#ending = false;
+	#closing: Promise<void> | undefined;
 	#fatal: PostgresError | undefined;
 	#failure: Error | undefined;
 	#starting = true;
@@ -149,6 +173,7 @@ export class Connection implements AsyncDisposable {
 	readonly #noticeListeners = new Set<Listener<Notice>>();
 	readonly #notificationListeners = new Set<Listener<Notification>>();
 	readonly #channels = new Map<string, Set<Listener<Notification>>>();
+	readonly #channelNames = new ChannelNames();
 	readonly #closeListeners = new Set<Listener<Error | undefined>>();
 	readonly #drainWaiters: (() => void)[] = [];
 	readonly #idleWaiters: (() => void)[] = [];
@@ -179,7 +204,9 @@ export class Connection implements AsyncDisposable {
 		socket.onClose(() => this.#onSocketClose());
 		socket.onError((error) => this.#fail(error));
 		socket.onDrain(() => {
+			this.#backpressure = false;
 			for (const resolve of this.#drainWaiters.splice(0)) resolve();
+			if (this.#written < this.#queue.length) this.#schedule();
 		});
 		this.#ctx = {
 			writer: this.#writer,
@@ -193,7 +220,7 @@ export class Connection implements AsyncDisposable {
 				if (this.#statements.get(statement.key) === statement)
 					this.#statements.delete(statement.key);
 			},
-			send: (bytes) => this.#socket.write(bytes),
+			send: (bytes) => this.#send(bytes),
 			drain: () => new Promise((resolve) => this.#drainWaiters.push(resolve)),
 			pause: () => this.#socket.pause(),
 			resume: () => this.#socket.resume(),
@@ -324,6 +351,9 @@ export class Connection implements AsyncDisposable {
 		this.#socket.write(
 			fe.startup(this.#writer, this.#info.version, params).take(),
 		);
+		// a likely SCRAM exchange: load the crypto module (~3 ms on a cold
+		// start) while the server starts the backend, not after it asks
+		if (config.password !== undefined) scramCrypto();
 		let method: AuthMethod | undefined;
 		let scram: ScramClient | undefined;
 		let scramVerified = false;
@@ -520,6 +550,17 @@ export class Connection implements AsyncDisposable {
 					const op = this.#queue[0];
 					if (op?.written && op.dataRow(reader.bytes, reader.start, reader.end))
 						continue;
+				} else if (type === 0x41) {
+					this.#notify(
+						decodeNotification(
+							reader.bytes,
+							reader.start,
+							reader.end,
+							this.#channelNames,
+						),
+					);
+					if (this.#closed) return;
+					continue;
 				}
 				this.#dispatch(reader.parse());
 				if (this.#closed) return;
@@ -543,22 +584,26 @@ export class Connection implements AsyncDisposable {
 		}
 	}
 
+	#notify(notification: Notification): void {
+		for (const listener of this.#notificationListeners) {
+			try {
+				listener(notification);
+			} catch (error) {
+				queueMicrotask(() => {
+					throw error;
+				});
+			}
+		}
+		if (this.#channels.size === 0) return;
+		const channel = this.#channels.get(notification.channel);
+		if (channel) this.#emit(channel, notification);
+	}
+
 	#dispatch(msg: BackendMessage): void {
 		switch (msg.type) {
 			case 'NoticeResponse':
 				this.#emit(this.#noticeListeners, toNotice(msg.fields));
 				return;
-			case 'NotificationResponse': {
-				const notification = {
-					pid: msg.pid,
-					channel: msg.channel,
-					payload: msg.payload,
-				};
-				this.#emit(this.#notificationListeners, notification);
-				const channel = this.#channels.get(msg.channel);
-				if (channel) this.#emit(channel, notification);
-				return;
-			}
 			case 'ParameterStatus':
 				this.#parameters.set(msg.name, msg.value);
 				return;
@@ -620,10 +665,14 @@ export class Connection implements AsyncDisposable {
 		queueMicrotask(() => this.#flush());
 	}
 
-	/** Writes every queued operation that may go out now, in one socket write. */
+	/**
+	 * Writes the queued operations that may go out now: in one socket write,
+	 * or in chunks of `FLUSH_BYTES` for a long queue. Once the socket's
+	 * buffer is full, the rest stay queued, unencoded, until it drains.
+	 */
 	#flush(): void {
 		this.#flushScheduled = false;
-		if (this.#closed) return;
+		if (this.#closed || this.#backpressure) return;
 		while (
 			this.#written < this.#queue.length &&
 			this.#blocking === undefined &&
@@ -648,8 +697,19 @@ export class Connection implements AsyncDisposable {
 			}
 			op.written = true;
 			if (op.exclusive) this.#blocking = op;
+			if (
+				this.#writer.length >= FLUSH_BYTES &&
+				!this.#send(this.#writer.take())
+			)
+				return;
 		}
-		if (this.#writer.length > 0) this.#socket.write(this.#writer.take());
+		if (this.#writer.length > 0) this.#send(this.#writer.take());
+	}
+
+	#send(bytes: Uint8Array): boolean {
+		if (this.#socket.write(bytes)) return true;
+		this.#backpressure = true;
+		return false;
 	}
 
 	#statement(
@@ -852,7 +912,7 @@ export class Connection implements AsyncDisposable {
 			}
 			let values;
 			try {
-				values = encodeParams(sql, params);
+				values = encodeParams(sql, params, options?.paramTypes);
 			} catch (error) {
 				reject(error);
 				return;
@@ -868,6 +928,62 @@ export class Connection implements AsyncDisposable {
 			op.onTiming = options?.onTiming;
 			this.#enqueue(op, options?.signal, options?.timeout);
 		});
+	}
+
+	/**
+	 * @internal Runs statements under one Sync: once one fails, the server
+	 * skips the rest, and they reject with its error. One that can't be
+	 * sent skips the rest the same way.
+	 */
+	queryGroup(
+		statements: readonly GroupStatement[],
+	): Promise<QueryResult<unknown>>[] {
+		const ops: QueryOp[] = [];
+		let invalid: { error: unknown } | undefined;
+		const results = statements.map(
+			({ sql, params = [], options }) =>
+				new Promise<QueryResult<unknown>>((resolve, reject) => {
+					let values;
+					if (invalid === undefined) {
+						const error = invalidSql(sql);
+						if (error) invalid = { error };
+						else {
+							try {
+								values = encodeParams(sql, params);
+							} catch (caught) {
+								invalid = { error: caught };
+							}
+						}
+					}
+					if (invalid !== undefined || values === undefined) {
+						reject(invalid?.error);
+						return;
+					}
+					ops.push(
+						new QueryOp(
+							sql,
+							params,
+							values,
+							this.#options(options),
+							(result) => resolve(asResult(result)),
+							reject,
+							// a stale statement can't be retried alone: the ones after it were skipped
+							true,
+						),
+					);
+				}),
+		);
+		if (ops.length > 0) this.#enqueue(new SyncGroupOp(ops));
+		if (this.#config.telemetry === undefined && !this.#config.captureStack)
+			return results;
+		return results.map((result, i) =>
+			this.#observe(
+				statements[i]?.sql ?? '',
+				statements[i]?.options?.tag,
+				() => result,
+				(r) => r.rowCount,
+			),
+		);
 	}
 
 	async #queryWithTimeout<R>(
@@ -1015,7 +1131,7 @@ export class Connection implements AsyncDisposable {
 				const op = new CursorOp(
 					sql,
 					params,
-					encodeParams(sql, params),
+					encodeParams(sql, params, options?.paramTypes),
 					this.#options(options),
 					options?.batchSize ?? 1000,
 				);
@@ -1263,17 +1379,23 @@ export class Connection implements AsyncDisposable {
 		}
 	}
 
-	async #close(): Promise<void> {
+	#close(): Promise<void> {
+		if (this.#closed) return Promise.resolve();
+		this.#closing ??= this.#terminate();
+		return this.#closing;
+	}
+
+	async #terminate(): Promise<void> {
+		this.#ending = true;
+		await this.idle();
 		if (this.#closed) return;
-		if (!this.#ending) {
-			this.#ending = true;
-			await this.idle();
-			if (!this.#closed) {
-				this.#socket.write(fe.terminate(this.#writer).take());
-				this.#socket.end();
-			}
-		}
-		await this.#closedPromise;
+		this.#socket.write(fe.terminate(this.#writer).take());
+		// Like libpq, done once the Terminate is sent: waiting for the server
+		// to close the socket would wait for its backend to exit (~1.3 ms).
+		const sent = this.#socket.end();
+		await (sent === undefined
+			? this.#closedPromise
+			: Promise.race([sent, this.#closedPromise]));
 	}
 
 	/** Closes immediately, failing anything queued. */

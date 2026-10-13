@@ -53,7 +53,8 @@ export interface DatabaseOptions {
 	/**
 	 * Text parsers by type OID. Defaults to parsers that decode to the
 	 * TypeScript types quarry's columns declare: int8 and numeric as strings,
-	 * timestamptz as a Date, ranges as `Range`, pgvector as `number[]`.
+	 * timestamptz as a Date, ranges as `Range`, pgvector as `number[]` (of
+	 * the float32 values stored).
 	 */
 	readonly types?: TypeParsers | undefined;
 	/** Leave these types (or all, with `true`) as the server's text, for your own codecs. */
@@ -177,11 +178,12 @@ export class DriverExecutor implements TransactionExecutor {
 	#queryOptions(
 		options: ExecuteOptions,
 		onTiming: ((t: OpTiming) => void) | undefined,
-		tag: string | undefined,
+		{ tag, paramTypes }: CompiledQuery,
 	) {
 		return {
 			types: this.#types.parsers,
 			rowMode: options.rowMode ?? 'object',
+			...(paramTypes === undefined ? {} : { paramTypes }),
 			...(this.#options.prepare === undefined
 				? {}
 				: { prepare: this.#options.prepare }),
@@ -279,7 +281,7 @@ export class DriverExecutor implements TransactionExecutor {
 					this.#queryOptions(
 						options,
 						observe ? (t) => (timing = t) : undefined,
-						query.tag,
+						query,
 					),
 				);
 			});
@@ -359,7 +361,7 @@ export class DriverExecutor implements TransactionExecutor {
 				...this.#queryOptions(
 					{ ...options, timeout: undefined },
 					undefined,
-					query.tag,
+					query,
 				),
 				...(options.batchSize === undefined
 					? {}

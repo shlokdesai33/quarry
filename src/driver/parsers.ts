@@ -1,5 +1,5 @@
 import { DriverError } from './errors.js';
-import { parseArray, type TextParser, type TypeParsers } from './types.js';
+import { arrayParser, type TextParser, type TypeParsers } from './types.js';
 
 const TIMESTAMPTZ =
 	/^(\d{4,})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)(\.\d+)?([+-])(\d\d)(?::?(\d\d))?(?::?(\d\d))?( BC)?$/;
@@ -181,8 +181,20 @@ export function parseRange<T>(
 	};
 }
 
-/** pgvector's `vector` and `halfvec` output, `[1,2.5,3]`. */
-export const parseVector: TextParser = (text) => JSON.parse(text);
+/**
+ * pgvector's `vector` output, `[1,2.5,3]`, as the float32 values stored:
+ * `0.1` reads as `0.10000000149011612`. The text is the shortest decimal
+ * that rounds to each float32, so this matches the binary format exactly.
+ */
+export const parseVector: TextParser = (text) => {
+	const values: number[] = JSON.parse(text);
+	for (let i = 0; i < values.length; i++)
+		values[i] = Math.fround(values[i] ?? 0);
+	return values;
+};
+
+/** pgvector's `halfvec` output, `[1,2.5,3]`, as the decimals printed. */
+export const parseHalfvec: TextParser = (text) => JSON.parse(text);
 
 /** One row of the catalog query. */
 export interface CatalogType {
@@ -205,13 +217,14 @@ export function catalogTypes(
 ): TypeParsers {
 	const parsers: Record<number, TextParser> = {};
 	for (const type of catalog) {
-		if (type.elem === 0 && (type.name === 'vector' || type.name === 'halfvec'))
-			parsers[type.oid] = parseVector;
+		if (type.elem !== 0) continue;
+		if (type.name === 'vector') parsers[type.oid] = parseVector;
+		else if (type.name === 'halfvec') parsers[type.oid] = parseHalfvec;
 	}
 	for (const type of catalog) {
 		if (type.elem === 0 || base[type.oid] !== undefined) continue;
 		const element = base[type.elem] ?? parsers[type.elem];
-		parsers[type.oid] = (text) => parseArray(text, element, type.delim);
+		parsers[type.oid] = arrayParser(element, type.delim, type.elem);
 	}
 	return Object.freeze({ ...parsers, ...base });
 }
