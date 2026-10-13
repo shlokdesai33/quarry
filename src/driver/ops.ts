@@ -11,12 +11,18 @@ import * as fe from './protocol/frontend.js';
 import type { WireValue } from './protocol/frontend.js';
 import type { BackendMessage, Field } from './protocol/messages.js';
 import type { Writer } from './protocol/writer.js';
-import { formatPlan, type FormatPlan } from './binary.js';
+import {
+	binaryIsText,
+	binaryParser,
+	formatPlan,
+	type FormatPlan,
+} from './binary.js';
 import { rowDecoder, type RowDecoder, type RowMode } from './rows.js';
 import type { TypeParsers } from './types.js';
 
-/** A prepared statement cached on a connection. */
+/** A statement cached on a connection. */
 export interface Statement {
+	/** The server-side name; '' for SQL only ever sent unnamed, whose columns are still cached. */
 	readonly name: string;
 	readonly key: string;
 	/** Set once ParseComplete arrives. */
@@ -39,11 +45,21 @@ export interface Statement {
 export interface OpContext {
 	readonly writer: Writer;
 	readonly types: TypeParsers;
-	/** The cached statement for this SQL, created (and to be parsed) if new; undefined when not preparing. */
+	/**
+	 * The cached statement for this SQL, created if new. A `named` one is
+	 * created with a name, to be parsed; an unnamed entry is then replaced.
+	 */
 	statement(
 		sql: string,
 		types: readonly number[],
+		named: boolean,
 	): { statement: Statement; created: boolean };
+	/**
+	 * Whether a statement written now should be named. Behind a pooler that
+	 * rewrites named statements, a query pipelined with others is sent
+	 * unnamed instead; behind one that can't keep them, every query is.
+	 */
+	named(): boolean;
 	/** Drops a statement from the cache (it failed or went stale). */
 	forget(statement: Statement): void;
 	/**
@@ -201,6 +217,25 @@ function decoderFor(
 	return decoder;
 }
 
+/** Whether a portal's columns are a cached statement's: the same names, types and formats. */
+function sameColumns(
+	fields: readonly Field[],
+	cached: readonly Field[],
+): boolean {
+	if (fields.length !== cached.length) return false;
+	for (let i = 0; i < fields.length; i++) {
+		const a = fields[i];
+		const b = cached[i];
+		if (
+			a?.name !== b?.name ||
+			a?.typeOid !== b?.typeOid ||
+			a?.format !== b?.format
+		)
+			return false;
+	}
+	return true;
+}
+
 /**
  * Whether an error means a cached statement went stale, so preparing it
  * again (outside a transaction) can succeed: its plan no longer fits a
@@ -236,6 +271,10 @@ export class QueryOp extends Op {
 	#planFields: readonly Field[] | undefined;
 	#statement: Statement | undefined;
 	#createdStatement = false;
+	/** Sent unnamed with its cached statement's columns, which the portal's description must match. */
+	#unnamed = false;
+	/** Those columns, with the formats asked for; undefined when not known yet. */
+	#expected: readonly Field[] | undefined;
 	#types: TypeParsers | undefined;
 	#fields: readonly Field[] | undefined;
 	#decoder: RowDecoder | undefined;
@@ -278,11 +317,31 @@ export class QueryOp extends Op {
 			this.#options.prepare &&
 			ctx.preparable(this.#sql, this.#options.paramTypes)
 		) {
+			const named = ctx.named();
 			const { statement, created } = ctx.statement(
 				this.#sql,
 				this.#options.paramTypes,
+				named,
 			);
 			this.#statement = statement;
+			if (!named) {
+				this.#unnamed = true;
+				let formats: readonly number[] | 0 = 0;
+				const known = statement.fields;
+				if (known !== undefined && this.#options.binary) {
+					const plan = planFor(statement, known, this.#types);
+					formats = plan.formats;
+					this.#expected = plan.fields;
+				} else {
+					this.#expected = known;
+				}
+				fe.parse(w, '', this.#sql, this.#options.paramTypes);
+				fe.bind(w, '', '', this.#values, formats);
+				fe.describe(w, 'P', '');
+				fe.execute(w, '', 0);
+				if (sync) fe.sync(w);
+				return;
+			}
 			this.#createdStatement = created;
 			if (created) {
 				fe.parse(w, statement.name, this.#sql, this.#options.paramTypes);
@@ -320,7 +379,9 @@ export class QueryOp extends Op {
 		if (this.#decodeError !== undefined) return true;
 		let decoder = this.#decoder;
 		if (decoder === undefined) {
-			const fields = this.#planFields ?? this.#statement?.fields;
+			const fields = this.#unnamed
+				? this.#fields
+				: (this.#planFields ?? this.#statement?.fields);
 			if (fields === undefined)
 				throw new ProtocolError('DataRow before RowDescription');
 			this.#setFields(fields);
@@ -346,6 +407,8 @@ export class QueryOp extends Op {
 					this.#statement.parsed = true;
 				return false;
 			case 'BindComplete': {
+				// an unnamed one's columns come next, from the portal's description
+				if (this.#unnamed) return false;
 				const fields = this.#planFields ?? this.#statement?.fields;
 				if (this.#fields === undefined && fields !== undefined)
 					this.#setFields(fields);
@@ -363,11 +426,19 @@ export class QueryOp extends Op {
 					this.#statement.paramTypes = msg.typeOids;
 				return false;
 			case 'RowDescription':
+				if (this.#unnamed) {
+					this.#describedUnnamed(msg.fields, ctx);
+					return false;
+				}
 				if (this.#statement && this.#createdStatement)
 					this.#statement.fields = msg.fields;
 				this.#setFields(msg.fields);
 				return false;
 			case 'NoData':
+				if (this.#unnamed) {
+					this.#describedUnnamed([], ctx);
+					return false;
+				}
 				if (this.#statement && this.#createdStatement)
 					this.#statement.fields = [];
 				// no rows follow, so no decoder (building one compiles a function)
@@ -398,6 +469,57 @@ export class QueryOp extends Op {
 			default:
 				return this.unexpected(msg);
 		}
+	}
+
+	/**
+	 * The portal's columns, for a statement sent unnamed: decoded with the
+	 * cached statement's decoder when they are its columns. A schema change
+	 * since it was cached drops it; the rows are decoded by what the server
+	 * sent, unless a column asked for in binary changed to a type without a
+	 * binary decoder (and whose binary isn't its text): the statement has
+	 * run, but its rows can't be read.
+	 */
+	#describedUnnamed(fields: readonly Field[], ctx: OpContext): void {
+		const statement = this.#statement;
+		const expected = this.#expected;
+		const types = this.#types ?? {};
+		if (statement === undefined) return;
+		let columns = fields;
+		if (expected === undefined) {
+			// asked for in text, as a statement describes them
+			statement.fields ??= fields;
+		} else if (sameColumns(fields, expected)) {
+			columns = expected;
+		} else {
+			ctx.forget(statement);
+			let unreadable: Field | undefined;
+			columns = fields.map((field) => {
+				if (
+					field.format !== 1 ||
+					binaryParser(field.typeOid, types[field.typeOid]) !== undefined
+				)
+					return field;
+				if (binaryIsText(field.typeOid)) return { ...field, format: 0 };
+				unreadable ??= field;
+				return field;
+			});
+			if (unreadable !== undefined) {
+				this.#decodeError = new DecodeError(
+					unreadable.name,
+					unreadable.typeOid,
+					new DriverError(
+						'The column changed type since the statement was cached, and came in binary',
+					),
+				);
+			}
+			this.#fields = columns;
+			if (columns.length > 0)
+				this.#decoder = rowDecoder(columns, types, this.#options.rowMode);
+			return;
+		}
+		this.#fields = columns;
+		// no decoder for no columns until a row comes (building one compiles a function)
+		if (columns.length > 0) this.#setFields(columns);
 	}
 
 	#onError(error: PostgresError, ctx: OpContext): void {
@@ -440,6 +562,7 @@ export class QueryOp extends Op {
 		}
 		if (
 			this.#statement !== undefined &&
+			!this.#unnamed &&
 			status === 'I' &&
 			!this.#retried &&
 			staleStatement(error, this.#statement, this.#createdStatement)
@@ -755,10 +878,11 @@ export class CursorOp extends Op {
 	write(ctx: OpContext): void {
 		this.#ctx = ctx;
 		const w = ctx.writer;
-		if (this.#options.prepare) {
+		if (this.#options.prepare && ctx.named()) {
 			const { statement, created } = ctx.statement(
 				this.#sql,
 				this.#options.paramTypes,
+				true,
 			);
 			this.#statement = statement;
 			this.#created = created;

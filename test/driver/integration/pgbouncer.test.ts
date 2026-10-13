@@ -1,5 +1,7 @@
 /* oxlint-disable no-await-in-loop -- tests run their steps in order */
 import { describe, expect, it } from 'vitest';
+import { statementNames } from '../../../src/driver/capabilities.js';
+import { DecodeError } from '../../../src/driver/errors.js';
 import { versionAtLeast } from '../setup/cluster.js';
 import { cluster, open, pg, table } from './helpers.js';
 
@@ -14,6 +16,10 @@ const bouncer = () => ({
 	ssl: 'disable' as const,
 	prepare,
 });
+
+/** `n` queries issued together, so a connection pipelines them. */
+const pipelined = <R>(n: number, query: () => Promise<R>) =>
+	Promise.allSettled(Array.from({ length: n }, query));
 
 // PgBouncer runs in transaction mode with max_prepared_statements set, so
 // server connections are shared between clients between transactions.
@@ -127,6 +133,85 @@ describe.skipIf(!pg?.bouncerPort)('PgBouncer in transaction mode', () => {
 			for (let i = 0; i < 3; i++)
 				expect((await select()).rows).toEqual([{ x: '1' }]);
 			await conn.query(`drop table ${name}`);
+		},
+	);
+
+	// PgBouncer 1.26 reports itself at login, so pipelined queries go unnamed
+	describe.skipIf(!versionAtLeast(pg?.bouncerVersion, 1, 26))(
+		'pipelined queries, sent unnamed',
+		() => {
+			it('are detected from what PgBouncer reports', async () => {
+				await using conn = await open(bouncer());
+				expect(conn.capabilities.pgbouncer).toMatchObject({
+					poolMode: 'transaction',
+					maxPreparedStatements: 200,
+				});
+				expect(statementNames(conn.capabilities.pgbouncer)).toBe('rewritten');
+			});
+
+			it('are decoded with the cached columns, in binary', async () => {
+				await using conn = await open(bouncer());
+				const sql =
+					'select $1::int as i, $2::float8 as f, $3::bool as b, $4::text as s';
+				const params = [7, 1.5, true, 'x'];
+				const first = await conn.query(sql, params);
+				expect(first.fields.map((f) => f.format)).toEqual([0, 0, 0, 0]);
+				const results = await pipelined(20, () => conn.query(sql, params));
+				for (const result of results) {
+					expect(result).toMatchObject({
+						status: 'fulfilled',
+						value: { rows: [{ i: 7, f: 1.5, b: true, s: 'x' }] },
+					});
+					if (result.status === 'fulfilled')
+						expect(result.value.fields.map((f) => f.format)).toEqual([
+							1, 1, 1, 0,
+						]);
+				}
+			});
+
+			it('read the new columns after a schema change', async () => {
+				const name = table('bounce_pipe');
+				await using conn = await open(bouncer());
+				const select = () =>
+					conn.query<{ x: unknown; y: unknown }>(`select x, y from ${name}`);
+				await conn.query(`create table ${name} (x int, y int)`);
+				await conn.query(`insert into ${name} values (1, 2)`);
+				for (const r of await pipelined(5, select))
+					expect(r).toMatchObject({ value: { rows: [{ x: 1, y: 2 }] } });
+				await pipelined(5, select);
+				// to a type whose binary is its text, and one with a binary decoder
+				await conn.query(
+					`alter table ${name} alter column x type text, alter column y type float8`,
+				);
+				for (const r of await pipelined(5, select))
+					expect(r).toMatchObject({ value: { rows: [{ x: '1', y: 2 }] } });
+				for (const r of await pipelined(5, select))
+					expect(r).toMatchObject({ value: { rows: [{ x: '1', y: 2 }] } });
+				await conn.query(`drop table ${name}`);
+			});
+
+			it('fail alone when a column asked for in binary changed to a type read in text', async () => {
+				const name = table('bounce_pipe');
+				await using conn = await open(bouncer());
+				const select = () =>
+					conn.query<{ x: unknown }>(`select x from ${name}`);
+				await conn.query(`create table ${name} (x int)`);
+				await conn.query(`insert into ${name} values (1)`);
+				await select();
+				await conn.query(`alter table ${name} alter column x type numeric`);
+				const results = await pipelined(5, select);
+				for (const r of results) {
+					expect(r.status).toBe('rejected');
+					if (r.status === 'rejected') {
+						expect(r.reason).toBeInstanceOf(DecodeError);
+						expect(r.reason).toMatchObject({ column: 'x', typeOid: 1700 });
+					}
+				}
+				for (const r of await pipelined(5, select))
+					expect(r).toMatchObject({ value: { rows: [{ x: '1' }] } });
+				expect((await select()).rows).toEqual([{ x: '1' }]);
+				await conn.query(`drop table ${name}`);
+			});
 		},
 	);
 });

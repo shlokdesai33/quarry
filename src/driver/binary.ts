@@ -170,6 +170,9 @@ const textLike = new Set<number>([
 	oids.name,
 ]);
 
+/** Whether a type's binary format is its text, so a value of it reads the same in either. */
+export const binaryIsText = (oid: number): boolean => textLike.has(oid);
+
 /**
  * The binary decoder of an array element giving the same value as
  * `parser`: the scalar decoders, plus text-like types, int8 as a bigint and

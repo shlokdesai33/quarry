@@ -127,6 +127,15 @@ export interface ConnectionOptions {
 	/** The most prepared statements kept per connection (default 100). */
 	readonly statementCacheSize?: number | undefined;
 	/**
+	 * Use named statements for queries pipelined with others on the
+	 * connection too. Default: true, except behind a pooler that rewrites
+	 * them (PgBouncer 1.26+ in transaction mode says so at login), where
+	 * every named Bind costs it extra writes. Pipelined queries are then
+	 * sent unnamed, still with the cached columns and binary results. Set
+	 * false for PgBouncer 1.21–1.25 in transaction mode.
+	 */
+	readonly preparePipelined?: boolean | undefined;
+	/**
 	 * Receive columns in binary where the configured parser has a binary
 	 * twin (int2/int4/oid, float8, bool, bytea, timestamptz as Date),
 	 * from a cached statement's second run (default true). Values are
@@ -192,6 +201,8 @@ export interface ResolvedConfig {
 	readonly types: TypeParsers | undefined;
 	readonly prepare: boolean;
 	readonly statementCacheSize: number;
+	/** Undefined: decided by what the other end reports at login. */
+	readonly preparePipelined: boolean | undefined;
 	readonly binaryResults: boolean;
 	readonly telemetry: TelemetryOptions | undefined;
 	readonly captureStack: boolean;
@@ -619,6 +630,7 @@ export function resolveConfig(options: ConnectionOptions = {}): ResolvedConfig {
 		types: options.types,
 		prepare: options.prepare ?? true,
 		statementCacheSize: options.statementCacheSize ?? 100,
+		preparePipelined: options.preparePipelined,
 		binaryResults: options.binaryResults ?? true,
 		telemetry: options.telemetry,
 		captureStack: options.captureStack ?? false,

@@ -90,6 +90,12 @@ A query takes at most 65535 parameters, the protocol's limit; more are refused b
 
 Statements are prepared and cached per connection (100 by default; `statementCacheSize`, `prepare: false`). This is safe behind PgBouncer 1.21+ with `max_prepared_statements`. A cached statement that a schema change made stale (its result type or an inferred parameter type changed), or that the server no longer has (`DEALLOCATE`, `DISCARD ALL`), is retried once as an unnamed statement, outside a transaction. Behind PgBouncer, which maps a new Parse of the same text back to the statement it already prepared, SQL that still comes back stale is no longer prepared on that connection.
 
+Behind PgBouncer in transaction mode, a query pipelined with others on its connection is sent unnamed instead (Parse, Bind, and Describe of the portal), still with its cached columns and binary formats. A query alone on its connection stays named.
+
+- **Why:** PgBouncer rewrites the name in every named Bind. It flushes what it holds, then writes the new name apart from the rest, so each named query reaches the server in two writes instead of sharing one. Under load the single-threaded pooler is the bottleneck, and this costs it more than parsing again costs the server.
+- **Detection:** PgBouncer 1.26+ reports itself at login (`connection.capabilities.pgbouncer`). For 1.21–1.25, set `preparePipelined: false`; `true` keeps pipelined queries named. With `max_prepared_statements = 0`, no statement is named.
+- **Schema changes:** a pipelined query whose columns changed since they were cached is decoded by what the server sent, and the cache entry is dropped. If a column asked for in binary changed to a type without a binary decoder, that query fails with a `DecodeError` after running.
+
 From a cached statement's second run, columns whose parser has a binary twin are received in binary, which is cheaper to decode and gives identical values. These are:
 
 - int2/int4/oid, float8, bool, bytea, and timestamptz decoded to `Date`;
@@ -164,7 +170,7 @@ await pool.transaction(async (tx) => {
 ## Poolers and proxies
 
 - **Protocol version:** the driver asks for protocol 3.2 and accepts 3.0 from poolers that negotiate down. A pooler that rejects 3.2 outright gets one retry with 3.0; `minProtocolVersion` / `maxProtocolVersion` override this.
-- **PgBouncer in transaction mode** (tested with 1.26): named prepared statements work from 1.21 with `max_prepared_statements` set; with older versions, or other poolers without prepared-statement support, use `prepare: false`.
+- **PgBouncer in transaction mode** (tested with 1.26): named prepared statements work from 1.21 with `max_prepared_statements` set, and pipelined queries are sent unnamed (see [Queries](#queries); `preparePipelined: false` for 1.21–1.25). With older versions, or other poolers without prepared-statement support, use `prepare: false`; PgBouncer 1.26+ without `max_prepared_statements` is detected, and no statement is named.
 - **Session state** (`SET`, `LISTEN`, temporary tables, session advisory locks) doesn't survive between transactions in transaction mode. The driver's own settings never use it: `statementTimeout`, transaction `settings` and `timeout` all go through `set_config(…, true)` inside a transaction. `LISTEN` needs a direct or session-mode connection.
 - **RDS Proxy, Supavisor, Neon and other transaction poolers:** the same rules apply. Avoid session-level `SET`, which can pin a session to a server connection. If a proxy pins or rejects named prepared statements, use `prepare: false`.
 - **Version check:** a pooler that hides `server_version` skips the PostgreSQL 18 check.

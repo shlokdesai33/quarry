@@ -78,7 +78,10 @@ export {
 export {
 	detectCapabilities,
 	parseServerVersion,
+	statementNames,
 	type Capabilities,
+	type PgBouncerInfo,
+	type StatementNames,
 } from './capabilities.js';
 export type { AuthMethod, ProtocolVersion } from './config.js';
 export { LATEST_PROTOCOL_MINOR } from './protocol/frontend.js';

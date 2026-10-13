@@ -21,6 +21,53 @@ export interface Capabilities {
 	readonly reportsHotStandby: boolean;
 	/** SASL mechanisms offered during authentication, e.g. `SCRAM-SHA-256` and `SCRAM-SHA-256-PLUS`. */
 	readonly saslMechanisms: readonly string[];
+	/** PgBouncer in between, when it says so at login (1.26+). */
+	readonly pgbouncer: PgBouncerInfo | undefined;
+}
+
+/** What PgBouncer 1.26+ reports about itself at login. */
+export interface PgBouncerInfo {
+	/** e.g. `1.26.0`. */
+	readonly version: string;
+	/** `session`, `transaction` or `statement`. */
+	readonly poolMode: string | undefined;
+	/** Its `max_prepared_statements`: 0 when it doesn't track named prepared statements. */
+	readonly maxPreparedStatements: number | undefined;
+}
+
+/**
+ * How named prepared statements fare through the other end:
+ * - `kept`: as sent (a server, or a pooler in session mode);
+ * - `rewritten`: a pooler maps each one to its own statement on whichever
+ *   server connection runs it, rewriting every Bind (PgBouncer in
+ *   transaction or statement mode, with `max_prepared_statements`);
+ * - `unsupported`: a pooler switches server connections between
+ *   transactions without tracking them, so one may be missing.
+ */
+export type StatementNames = 'kept' | 'rewritten' | 'unsupported';
+
+export function statementNames(
+	pgbouncer: PgBouncerInfo | undefined,
+): StatementNames {
+	if (pgbouncer?.poolMode === undefined || pgbouncer.poolMode === 'session')
+		return 'kept';
+	return pgbouncer.maxPreparedStatements === 0 ? 'unsupported' : 'rewritten';
+}
+
+function pgbouncerInfo(
+	parameters: ReadonlyMap<string, string>,
+): PgBouncerInfo | undefined {
+	const version = parameters.get('pgbouncer.version');
+	if (version === undefined) return undefined;
+	const max = parameters.get('pgbouncer.max_prepared_statements');
+	const maxPreparedStatements = max === undefined ? undefined : Number(max);
+	return {
+		version,
+		poolMode: parameters.get('pgbouncer.pool_mode'),
+		maxPreparedStatements: Number.isNaN(maxPreparedStatements)
+			? undefined
+			: maxPreparedStatements,
+	};
 }
 
 /**
@@ -67,5 +114,6 @@ export function detectCapabilities(
 		serverVersion: parameters.get('server_version'),
 		reportsHotStandby: parameters.has('in_hot_standby'),
 		saslMechanisms,
+		pgbouncer: pgbouncerInfo(parameters),
 	};
 }
