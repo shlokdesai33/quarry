@@ -129,6 +129,17 @@ export type JoinNode = {
 };
 
 /**
+ * `for strength [of tables] [skip locked | nowait]`. `of` names tables as the
+ * query references them (an alias, for an aliased table); empty for every
+ * table of the query.
+ */
+export type LockNode = {
+	readonly strength: 'update' | 'no key update' | 'share' | 'key share';
+	readonly of: readonly string[];
+	readonly wait: 'skip locked' | 'nowait' | undefined;
+};
+
+/**
  * A `select` query. An empty select list is valid in postgres and yields
  * rows without columns.
  */
@@ -139,6 +150,8 @@ export type SelectNode = {
 	readonly joins: readonly JoinNode[];
 	readonly where: OperationNode | undefined;
 	readonly limit: number | undefined;
+	/** The locking clauses, in order. */
+	readonly locks: readonly LockNode[];
 	/** A label passed on with the compiled query, never rendered into its SQL. */
 	readonly tag: string | undefined;
 };

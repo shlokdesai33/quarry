@@ -24,6 +24,13 @@ describe('running a query', () => {
 		expectTypeOf(query.maybeOne()).toEqualTypeOf<Promise<Row | undefined>>();
 	});
 
+	it('runs a query with a locking clause like any other', () => {
+		const locked = query.forUpdate().of(users).skipLocked();
+		expectTypeOf(locked.all()).toEqualTypeOf<Promise<Row[]>>();
+		expectTypeOf(locked.first()).toEqualTypeOf<Promise<Row | undefined>>();
+		expectTypeOf(query.forShare().one()).toEqualTypeOf<Promise<Row>>();
+	});
+
 	it('gives the executor the tag, if any', () => {
 		databaseWith(
 			executorFrom(async (compiled) => {

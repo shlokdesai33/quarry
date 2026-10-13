@@ -1,6 +1,7 @@
 import type {
 	DeleteNode,
 	InsertNode,
+	LockNode,
 	OnConflictNode,
 	OperationNode,
 	RowsNode,
@@ -280,7 +281,46 @@ function renderSelect(node: SelectNode, params: Params): string {
 	if (node.limit !== undefined) {
 		sql += ` limit ${param(params, node.limit)}`;
 	}
+	if (node.locks.length > 0) {
+		if (node.selections.some((s) => hasAggregate(s.expression))) {
+			throw new Error(
+				'A locking clause (forUpdate() and the like) cannot be used with aggregate functions',
+			);
+		}
+		for (const lock of node.locks) sql += renderLock(lock);
+	}
 	return sql;
+}
+
+function renderLock(lock: LockNode): string {
+	let sql = ` for ${lock.strength}`;
+	if (lock.of.length > 0) sql += ` of ${lock.of.map(identifier).join(', ')}`;
+	if (lock.wait !== undefined) sql += ` ${lock.wait}`;
+	return sql;
+}
+
+/** The aggregate functions `eb.fn` builds. */
+const aggregates = new Set(['count', 'min', 'max']);
+
+/** Whether `node` calls an aggregate of its own query, not of a subquery's. */
+function hasAggregate(node: OperationNode): boolean {
+	switch (node.kind) {
+		case 'function':
+			return aggregates.has(node.name) || node.args.some(hasAggregate);
+		case 'binary':
+			return hasAggregate(node.left) || hasAggregate(node.right);
+		case 'and':
+		case 'or':
+			return node.operands.some(hasAggregate);
+		case 'not':
+			return hasAggregate(node.operand);
+		case 'value_list':
+			return node.values.some(hasAggregate);
+		case 'raw':
+			return node.nodes.some(hasAggregate);
+		default:
+			return false;
+	}
 }
 
 function renderTable(table: TableNode): string {
