@@ -204,9 +204,18 @@ describe('inc and dec', () => {
 				.update(stats)
 				.set({ views: inc(1), visits: inc('1') })
 				.where(where, 1)
-				.expectRows(1)
 				.returning(['stats.views', 'stats.visits'])
-				.one(),
+				.expectOne()
+				.execute(),
 		).toEqualTypeOf<Promise<{ views: number; visits: string }>>();
+		expectTypeOf(
+			db
+				.update(stats)
+				.set({ views: inc(1) })
+				.where(where, 1)
+				.returning(['stats.views'])
+				.expectRows(1)
+				.execute(),
+		).toEqualTypeOf<Promise<{ views: number }[]>>();
 	});
 });

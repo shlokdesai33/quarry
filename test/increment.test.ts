@@ -90,14 +90,12 @@ describe('inc and dec in an update', () => {
 
 	it('mix with plain values, returning and expectRows', () => {
 		expect(
-			compile(
-				update(posts)
-					.set({ title: 'Hello', views: inc(1) })
-					.where('posts.id', 7)
-					.expectRows(1)
-					.returning(['posts.views'])
-					.toNode(),
-			),
+			update(posts)
+				.set({ title: 'Hello', views: inc(1) })
+				.where('posts.id', 7)
+				.returning(['posts.views'])
+				.expectRows(1)
+				.toSQL(),
 		).toEqual({
 			sql: 'update "posts" set "title" = $1, "views" = "views" + $2 where "posts"."id" = $3 returning "posts"."views" as "views"',
 			params: ['Hello', 1, 7],
@@ -218,6 +216,7 @@ describe('inc and dec in updateMany', () => {
 				[1, 5],
 				['2', '3'],
 			],
+			paramTypes: [1007, 1009, 1007, 1016],
 		});
 	});
 
@@ -299,9 +298,9 @@ describe('running an increment', () => {
 				.update(posts)
 				.set({ views: inc(1) })
 				.where('posts.id', 7)
-				.expectRows(1)
 				.returning(['posts.views'])
-				.one(),
+				.expectOne()
+				.execute(),
 		).toEqual({ views: 8 });
 		expect(ran[0]?.sql).toBe(
 			'update "posts" set "views" = "views" + $1 where "posts"."id" = $2 returning "posts"."views" as "views"',
