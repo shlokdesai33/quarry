@@ -207,6 +207,8 @@ export interface QueryOpOptions {
 	readonly paramTypes: readonly number[];
 	/** Ask for binary results for columns with a matching binary decoder. */
 	readonly binary: boolean;
+	/** The rows kept, from the first; the others aren't decoded. */
+	readonly keepRows: number;
 }
 
 /** The result format plan for a described statement, cached per types. */
@@ -415,6 +417,7 @@ export class QueryOp extends Op {
 
 	override dataRow(bytes: Uint8Array, start: number, end: number): boolean {
 		if (this.#decodeError !== undefined) return true;
+		if ((this.#rows?.length ?? 0) >= this.#options.keepRows) return true;
 		let decoder = this.#decoder;
 		if (decoder === undefined) {
 			const fields = this.#unnamed
