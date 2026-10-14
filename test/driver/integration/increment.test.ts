@@ -76,7 +76,8 @@ describe.skipIf(noPg)('inc and dec on PostgreSQL', () => {
 			.insertInto(counters)
 			.values({ key, ...fresh })
 			.returning(['counters.id'])
-			.one()
+			.expectOne()
+			.execute()
 			.then((row) => row.id);
 
 	it('adds and subtracts exactly on every numeric type, returning the new values', async () => {
@@ -90,14 +91,14 @@ describe.skipIf(noPg)('inc and dec on PostgreSQL', () => {
 				ratio: inc(0.5),
 			})
 			.where('counters.id', id)
-			.expectRows(1)
 			.returning([
 				'counters.hits',
 				'counters.visits',
 				'counters.balance',
 				'counters.ratio',
 			])
-			.one();
+			.expectOne()
+			.execute();
 		expect(row).toEqual({
 			hits: 2,
 			// past Number.MAX_SAFE_INTEGER, kept exact as a string
@@ -107,6 +108,38 @@ describe.skipIf(noPg)('inc and dec on PostgreSQL', () => {
 		});
 	});
 
+	it('runs in an atomic batch, rolling back when a check fails', async () => {
+		const [from, to] = [await create('batch-from'), await create('batch-to')];
+		const move = (amount: string, check: number) =>
+			db.batch(
+				[
+					db
+						.update(counters)
+						.set({ balance: dec(amount) })
+						.where('counters.id', from)
+						.returning(['counters.balance'])
+						.expectValue(),
+					db
+						.update(counters)
+						.set({ balance: inc(amount) })
+						.where('counters.id', check)
+						.expectNonEmpty(),
+				],
+				{ transaction: true },
+			);
+		expect(await move('25.00', to)).toEqual(['75.00', { rowCount: 1 }]);
+		await expect(move('25.00', -1)).rejects.toThrow('affected no row');
+		const balances = await db
+			.selectFrom(counters)
+			.select(['counters.balance'])
+			.where((eb) => eb.ref('counters.id').in([from, to]))
+			.execute();
+		expect(balances.map((row) => row.balance).toSorted()).toEqual([
+			'125.00',
+			'75.00',
+		]);
+	});
+
 	it('leaves a null column null, unless `coalesce` counts it as 0', async () => {
 		const id = await create('nulls');
 		const plain = await db
@@ -114,7 +147,8 @@ describe.skipIf(noPg)('inc and dec on PostgreSQL', () => {
 			.set({ likes: inc(1), score: dec(1) })
 			.where('counters.id', id)
 			.returning(['counters.likes', 'counters.score'])
-			.one();
+			.expectOne()
+			.execute();
 		expect(plain).toEqual({ likes: null, score: null });
 		const coalesced = await db
 			.update(counters)
@@ -124,7 +158,8 @@ describe.skipIf(noPg)('inc and dec on PostgreSQL', () => {
 			})
 			.where('counters.id', id)
 			.returning(['counters.likes', 'counters.score'])
-			.one();
+			.expectOne()
+			.execute();
 		expect(coalesced).toEqual({ likes: 1, score: -1.5 });
 	});
 
@@ -151,7 +186,8 @@ describe.skipIf(noPg)('inc and dec on PostgreSQL', () => {
 					visits: inc('1'),
 				}))
 				.returning(['counters.hits', 'counters.likes', 'counters.visits'])
-				.one();
+				.expectOne()
+				.execute();
 		expect(await upsert('page', 3)).toEqual({
 			hits: 3,
 			likes: 3,
@@ -177,14 +213,14 @@ describe.skipIf(noPg)('inc and dec on PostgreSQL', () => {
 				{ by: 'id' },
 			)
 			.set({ visits: inc('10') })
-			.expectRows(2)
 			.returning([
 				'counters.key',
 				'counters.hits',
 				'counters.balance',
 				'counters.visits',
 			])
-			.all();
+			.expectRows(2)
+			.execute();
 		expect(rows.toSorted((x, y) => x.key.localeCompare(y.key))).toEqual([
 			{
 				key: 'many-a',
@@ -222,7 +258,8 @@ describe.skipIf(noPg)('inc and dec on PostgreSQL', () => {
 			.selectFrom(counters)
 			.select(['counters.hits', 'counters.visits', 'counters.balance'])
 			.where('counters.id', id)
-			.one();
+			.expectOne()
+			.execute();
 		expect(row).toEqual({
 			hits: count,
 			visits: '9007199254740790',
@@ -246,7 +283,8 @@ describe.skipIf(noPg)('inc and dec on PostgreSQL', () => {
 			.selectFrom(counters)
 			.select(['counters.hits'])
 			.where('counters.key', 'concurrent-upsert')
-			.one();
+			.expectOne()
+			.execute();
 		expect(row.hits).toBe(count);
 	});
 
@@ -270,7 +308,8 @@ describe.skipIf(noPg)('inc and dec on PostgreSQL', () => {
 			.set({ hits: inc(1) })
 			.where('counters.id', id)
 			.returning(['counters.hits'])
-			.one()
+			.expectOne()
+			.execute()
 			.finally(() => {
 				secondDone = true;
 			});
