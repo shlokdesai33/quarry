@@ -19,14 +19,16 @@ type Row = { id: number; email: string | null };
 
 describe('running a query', () => {
 	it('shapes the result of the select list, without running it', () => {
-		expectTypeOf(query.all()).toEqualTypeOf<Query<Row[]>>();
-		expectTypeOf(query.first()).toEqualTypeOf<Query<Row | undefined>>();
-		expectTypeOf(query.one()).toEqualTypeOf<Query<Row>>();
-		expectTypeOf(query.maybeOne()).toEqualTypeOf<Query<Row | undefined>>();
+		expectTypeOf(query.toQuery()).toEqualTypeOf<Query<Row[]>>();
+		expectTypeOf(query.takeFirst()).toEqualTypeOf<Query<Row | undefined>>();
+		expectTypeOf(query.expectOne()).toEqualTypeOf<Query<Row>>();
+		expectTypeOf(query.expectAtMostOne()).toEqualTypeOf<
+			Query<Row | undefined>
+		>();
 	});
 
 	it("doesn't run when awaited without execute()", async () => {
-		const awaited = await query.one();
+		const awaited = await query.expectOne();
 		expectTypeOf(awaited).toEqualTypeOf<NotExecuted>();
 		// @ts-expect-error not a row
 		void awaited.id;
@@ -38,18 +40,20 @@ describe('running a query', () => {
 
 	it('shapes and runs a query with a locking clause like any other', async () => {
 		const locked = query.forUpdate().of(users).skipLocked();
-		expectTypeOf(locked.all()).toEqualTypeOf<Query<Row[]>>();
-		expectTypeOf(locked.first()).toEqualTypeOf<Query<Row | undefined>>();
-		expectTypeOf(query.forShare().one()).toEqualTypeOf<Query<Row>>();
-		expectTypeOf(locked.first().execute()).toEqualTypeOf<
+		expectTypeOf(locked.toQuery()).toEqualTypeOf<Query<Row[]>>();
+		expectTypeOf(locked.limit(1).takeFirst()).toEqualTypeOf<
+			Query<Row | undefined>
+		>();
+		expectTypeOf(query.forShare().expectOne()).toEqualTypeOf<Query<Row>>();
+		expectTypeOf(locked.takeFirst().execute()).toEqualTypeOf<
 			Promise<Row | undefined>
 		>();
 		expectTypeOf(locked.execute()).toEqualTypeOf<Promise<Row[]>>();
 		expectTypeOf(
-			await db.batch([locked.first(), query.forShare().noWait()]),
+			await db.batch([locked.takeFirst(), query.forShare().noWait()]),
 		).toEqualTypeOf<[Row | undefined, Row[]]>();
 		// @ts-expect-error a shape takes no lock modifiers
-		void query.forUpdate().first().skipLocked();
+		void query.forUpdate().takeFirst().skipLocked();
 	});
 
 	it('gives the executor the tag, if any', () => {
@@ -64,10 +68,10 @@ describe('running a query', () => {
 	it('takes per-query options, streams rows and describes', () => {
 		const controller = new AbortController();
 		expectTypeOf(
-			query.all().execute({ signal: controller.signal, timeout: '2s' }),
+			query.execute({ signal: controller.signal, timeout: '2s' }),
 		).toEqualTypeOf<Promise<Row[]>>();
 		expectTypeOf(query.execute()).toEqualTypeOf<Promise<Row[]>>();
-		expectTypeOf(query.one().execute()).toEqualTypeOf<Promise<Row>>();
+		expectTypeOf(query.expectOne().execute()).toEqualTypeOf<Promise<Row>>();
 		expectTypeOf(query.stream({ batchSize: 100 })).toEqualTypeOf<
 			AsyncGenerator<Row, void, undefined>
 		>();

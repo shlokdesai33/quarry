@@ -93,6 +93,12 @@ export interface QueryOptions {
 	 * only cached statements, from their second run, use it.
 	 */
 	readonly binary?: boolean;
+	/**
+	 * Keeps only the first `keepRows` rows, without decoding the others; the
+	 * query still runs to completion, and `rowCount` counts every row. A
+	 * value that fails to decode in a row not kept goes unnoticed.
+	 */
+	readonly keepRows?: number;
 }
 
 /** A statement of `Connection.queryGroup`; per-query cancellation and timing don't apply. */
@@ -877,6 +883,7 @@ export class Connection implements AsyncDisposable {
 				this.#config.statementCacheSize > 0,
 			paramTypes: options?.paramTypes ?? [],
 			binary: options?.binary ?? this.#config.binaryResults,
+			keepRows: options?.keepRows ?? Infinity,
 		};
 	}
 

@@ -16,6 +16,7 @@ import {
 	type TypeParsers,
 } from './driver/index.js';
 import type {
+	BatchQuery,
 	ExecuteBatchOptions,
 	ExecuteOptions,
 	ExecuteResult,
@@ -196,6 +197,7 @@ export class DriverExecutor implements TransactionExecutor {
 		return {
 			types: this.#types.parsers,
 			rowMode: options.rowMode ?? 'object',
+			...(options.keepRows === undefined ? {} : { keepRows: options.keepRows }),
 			...(paramTypes === undefined ? {} : { paramTypes }),
 			...(this.#options.prepare === undefined
 				? {}
@@ -443,7 +445,7 @@ export class DriverExecutor implements TransactionExecutor {
 	 * savepoint.
 	 */
 	async batch(
-		queries: readonly CompiledQuery[],
+		batch: readonly BatchQuery[],
 		options: ExecuteBatchOptions = {},
 	): Promise<readonly PromiseSettledResult<ExecuteResult>[]> {
 		const { transaction, verify, signal, timeout } = options;
@@ -451,7 +453,7 @@ export class DriverExecutor implements TransactionExecutor {
 		const inTransaction = source instanceof Transaction;
 		if (inTransaction && transaction !== undefined) {
 			return this.transaction(
-				(tx) => tx.batch(queries, { ...options, transaction: undefined }),
+				(tx) => tx.batch(batch, { ...options, transaction: undefined }),
 				transaction,
 			);
 		}
@@ -464,10 +466,11 @@ export class DriverExecutor implements TransactionExecutor {
 		const observe = this.#options.onQuery !== undefined;
 		const start = observe ? performance.now() : 0;
 		let acquired = start;
-		const statements = queries.map((query) => ({
+		const queries = batch.map(({ query }) => query);
+		const statements = batch.map(({ query, rowMode, keepRows }) => ({
 			sql: query.sql,
 			params: query.params,
-			options: this.#queryOptions({}, undefined, query),
+			options: this.#queryOptions({ rowMode, keepRows }, undefined, query),
 		}));
 		/** Each query's outcome, reported to `onQuery`; `shared` when a failure skipped the rest with its error. */
 		const settle = async (
@@ -534,11 +537,15 @@ export class DriverExecutor implements TransactionExecutor {
 			}
 			if (transaction === undefined) {
 				return settle(
-					queries.map((query) =>
+					batch.map(({ query, rowMode, keepRows }) =>
 						runner.query<unknown>(
 							query.sql,
 							query.params,
-							this.#queryOptions(options, undefined, query),
+							this.#queryOptions(
+								{ ...options, rowMode, keepRows },
+								undefined,
+								query,
+							),
 						),
 					),
 					false,

@@ -1,11 +1,6 @@
 import type { AnyColumn } from './column/any-column.js';
-import { compile, type CompiledQuery } from './compile.js';
-import {
-	type Executor,
-	NoRowError,
-	RowCountError,
-	TooManyRowsError,
-} from './executor.js';
+import { compile } from './compile.js';
+import { type Executor, NoRowError, RowCountError } from './executor.js';
 import { Expression } from './expression.js';
 import { typedExpression } from './expression-methods.js';
 import type {
@@ -17,7 +12,15 @@ import type {
 	UpdateNode,
 } from './node.js';
 import type { Expr } from './operators.js';
-import { Query } from './query.js';
+import type { Query } from './query.js';
+import {
+	type ErrorFor,
+	expectNonEmpty,
+	failure,
+	type Shape,
+	type ShapeInput,
+	shapedQuery,
+} from './shape.js';
 import type { AnyTable } from './table.js';
 import type { Prettify } from './types.js';
 import { codeType, renderType } from './verify/sql-type.js';
@@ -179,33 +182,13 @@ export function rowCount(count: number): number {
 	return count;
 }
 
-/**
- * A write query, read by `read` once `expectRows` is checked; `checked`
- * when `read` itself can throw. The rows are typed by the caller's
- * `returning` list.
- */
-export function writeQuery<O, R>(
+/** A write query, read by `shape`. */
+export function writeQuery<R>(
 	executor: Executor | undefined,
 	node: InsertNode | UpdateNode | DeleteNode,
-	read: (written: WrittenRows<O>) => R,
-	checked = false,
+	shape: Shape<R>,
 ): Query<R> {
-	const query = compile(node);
-	const { expectRows, table } = node;
-	return new Query({
-		query,
-		executor,
-		checked: checked || expectRows !== undefined,
-		read: (result) => {
-			const count = result.rowCount ?? 0;
-			if (expectRows !== undefined && count !== expectRows) {
-				throw new RowCountError(query, expectRows, count, table.name);
-			}
-			// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the returning list supplies the row type
-			const rows = result.rows as O[];
-			return read({ query, rows, rowCount: count, table: table.name });
-		},
-	});
+	return shapedQuery(executor, compile(node), node.table.name, shape);
 }
 
 /**
@@ -215,46 +198,87 @@ export function writeQuery<O, R>(
  */
 export type WriteOutput<O> = [O] extends [undefined] ? WriteResult : O[];
 
+/**
+ * What a write query's `expectNonEmpty()` resolves to: its `returning`
+ * rows, one or more, or without `returning`, its row count.
+ */
+export type NonEmptyOutput<O> = [O] extends [undefined]
+	? WriteResult
+	: [O, ...O[]];
+
+/** The default shape's result, `WriteOutput`, of a query that ran. */
+function output<O>(
+	node: InsertNode | UpdateNode | DeleteNode,
+	input: ShapeInput,
+): WriteOutput<O> {
+	// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- `returning` is what makes `O` a row type
+	return (
+		node.returning.length > 0 ? input.rows : { rowCount: input.count }
+	) as WriteOutput<O>;
+}
+
 /** A write query in its default shape; see `WriteOutput`. */
 export function writeOutput<O>(
 	executor: Executor | undefined,
 	node: InsertNode | UpdateNode | DeleteNode,
 ): Query<WriteOutput<O>> {
-	const returns = node.returning.length > 0;
-	return writeQuery<O, WriteOutput<O>>(
-		executor,
-		node,
-		(written) =>
-			// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- `returning` is what makes `O` a row type
-			(returns
-				? written.rows
-				: { rowCount: written.rowCount }) as WriteOutput<O>,
-	);
+	return writeQuery(executor, node, {
+		read: (input) => output<O>(node, input),
+		checked: false,
+	});
 }
 
-/** A write query's `returning` rows, with the query, its row count and the table it wrote. */
-export interface WrittenRows<O> {
-	readonly query: CompiledQuery;
-	readonly rows: O[];
-	readonly rowCount: number;
-	readonly table: string;
+/**
+ * A write query that must affect one or more rows; see `NonEmptyOutput`.
+ * Throws `NoRowError`, or what `err` makes of it, otherwise.
+ */
+export function writeNonEmpty<O>(
+	executor: Executor | undefined,
+	node: InsertNode | UpdateNode | DeleteNode,
+	err: ErrorFor<NoRowError> | undefined,
+): Query<NonEmptyOutput<O>> {
+	if (node.returning.length > 0) {
+		// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- with `returning`, `O` is a row type
+		return writeQuery(executor, node, expectNonEmpty<O>(err)) as Query<
+			NonEmptyOutput<O>
+		>;
+	}
+	return writeQuery(executor, node, {
+		read: (input) => {
+			if (input.count === 0) {
+				throw failure(
+					err,
+					new NoRowError(input.query, input.table, 'at least one', 'affected'),
+				);
+			}
+			// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- without `returning`, `O` is `undefined`
+			return { rowCount: input.count } as NonEmptyOutput<O>;
+		},
+		checked: true,
+	});
 }
 
-/** The one row: throws `NoRowError` or `TooManyRowsError` otherwise. */
-export function exactlyOne<O>({ query, rows, table }: WrittenRows<O>): O {
-	const [row, ...rest] = rows;
-	if (row === undefined) throw new NoRowError(query, table);
-	if (rest.length > 0) throw new TooManyRowsError(query, table);
-	return row;
-}
-
-/** The row, if any: throws `TooManyRowsError` for several. */
-export function atMostOne<O>({
-	query,
-	rows,
-	table,
-}: WrittenRows<O>): O | undefined {
-	const [row, ...rest] = rows;
-	if (rest.length > 0) throw new TooManyRowsError(query, table);
-	return row;
+/**
+ * A write query that must affect exactly `count` rows, in its default
+ * shape. Throws `RowCountError`, or what `err` makes of it, otherwise.
+ */
+export function writeExpectRows<O>(
+	executor: Executor | undefined,
+	node: InsertNode | UpdateNode | DeleteNode,
+	count: number,
+	err: ErrorFor<RowCountError> | undefined,
+): Query<WriteOutput<O>> {
+	const expected = rowCount(count);
+	return writeQuery(executor, node, {
+		read: (input) => {
+			if (input.count !== expected) {
+				throw failure(
+					err,
+					new RowCountError(input.query, expected, input.count, input.table),
+				);
+			}
+			return output<O>(node, input);
+		},
+		checked: true,
+	});
 }

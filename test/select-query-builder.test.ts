@@ -313,9 +313,14 @@ describe('locking', () => {
 		);
 	});
 
-	it('renders after the limit `first` adds', () => {
-		const query = selectFrom(users).forUpdate().skipLocked().toNode();
-		expect(compile({ ...query, limit: 1 }).sql).toBe(
+	it('renders after the limit', () => {
+		expect(
+			compile(selectFrom(users).forUpdate().skipLocked().limit(1).toNode()),
+		).toEqual({
+			sql: 'select from "users" limit $1 for update skip locked',
+			params: [1],
+		});
+		expect(sql(selectFrom(users).limit(1).forUpdate().skipLocked())).toBe(
 			'select from "users" limit $1 for update skip locked',
 		);
 	});

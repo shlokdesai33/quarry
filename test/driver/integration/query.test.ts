@@ -27,6 +27,40 @@ describe.skipIf(noPg)('queries', () => {
 		await conn?.close();
 	});
 
+	it('keeps only the first `keepRows` rows, decoding no others', async () => {
+		let decoded = 0;
+		const types = {
+			...rawTypes,
+			[oids.int4]: (text: string) => {
+				decoded++;
+				if (text === '777') throw new Error('bad int');
+				return Number(text);
+			},
+		};
+		const sql = 'select n from (values (1), (2), (777), (4)) v (n)';
+		const kept = await conn.query(sql, [], { types, keepRows: 2 });
+		expect(kept.rows).toEqual([{ n: 1 }, { n: 2 }]);
+		expect(kept.rowCount).toBe(4);
+		expect(decoded).toBe(2);
+		const positional = await conn.query(sql, [], {
+			types,
+			keepRows: 1,
+			rowMode: 'array',
+		});
+		expect(positional.rows).toEqual([[1]]);
+		expect(positional.rowCount).toBe(4);
+		const [grouped] = conn.queryGroup([
+			{ sql, options: { types, keepRows: 1 } },
+		]);
+		expect((await grouped)?.rows).toEqual([{ n: 1 }]);
+		expect((await conn.query(sql, [], { types, keepRows: 0 })).rows).toEqual(
+			[],
+		);
+		await expect(conn.query(sql, [], { types })).rejects.toBeInstanceOf(
+			DecodeError,
+		);
+	});
+
 	it('fails only the query whose value a parser cannot decode', async () => {
 		const types = {
 			...rawTypes,

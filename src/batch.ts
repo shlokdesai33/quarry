@@ -61,7 +61,11 @@ export async function batchWith<const Q extends readonly Executable<unknown>[]>(
 				: {}),
 		};
 		const settled = await executor.batch(
-			queries.map((query) => query._quarry.query),
+			queries.map(({ _quarry: { query, rows } }) => ({
+				query,
+				rowMode: rows?.rowMode,
+				keepRows: rows?.keepRows,
+			})),
 			execute,
 		);
 		values ??= valuesOf(settled, read);

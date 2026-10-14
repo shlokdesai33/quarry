@@ -1,11 +1,11 @@
 import { compile, type CompiledQuery } from './compile.js';
 import type { DataType } from './data-type/data-type.js';
-import {
-	type Executor,
+import type {
+	Executor,
 	NoRowError,
-	type QueryDescription,
-	type RunOptions,
-	type StreamOptions,
+	QueryDescription,
+	RunOptions,
+	StreamOptions,
 	TooManyRowsError,
 } from './executor.js';
 import { Expression, type TypedExpression } from './expression.js';
@@ -22,7 +22,7 @@ import type {
 	TableNode,
 } from './node.js';
 import type { AnyPredicate, EqualsValue } from './operators.js';
-import { Query, rejectAwait } from './query.js';
+import { type Query, rejectAwait } from './query.js';
 import type { Ref, Refs, RefsOf } from './refs.js';
 import {
 	type AddRow,
@@ -30,6 +30,22 @@ import {
 	type Selection,
 	selectionNodes,
 } from './row.js';
+import {
+	allRows,
+	type ColumnValue,
+	type ErrorFor,
+	errorArg,
+	expectAtMostOne,
+	expectFirst,
+	expectNonEmpty,
+	expectOne,
+	expectValue,
+	type Shape,
+	shapedQuery,
+	takeFirst,
+	takeValue,
+	type ValueArgs,
+} from './shape.js';
 import { type AnyTable, tableNode } from './table.js';
 import type { Prettify } from './types.js';
 import {
@@ -257,15 +273,15 @@ export function selectFromWith<T extends AnyTable>(
  * whose result rows are `O`. Every reference is resolved against `T`, so a
  * column can only be used once its table has been joined.
  *
- * Nothing runs until `execute()` (or `stream`, or `db.batch`): `all`,
- * `first`, `one` and `maybeOne` only set the shape of the result, keeping
- * its locking clauses.
+ * Nothing runs until `execute()` (or `stream`, or `db.batch`): the
+ * `take…` and `expect…` shapes only set how the result is read, and never
+ * change the SQL.
  *
  * Immutable: every method returns a new builder. `L` is what its latest
  * locking clause still takes, if it has one.
  *
  * @example
- * const user = await db.selectFrom(users).where('users.id', id).select(['users.email']).one().execute();
+ * const user = await db.selectFrom(users).where('users.id', id).select(['users.email']).expectOne().execute();
  */
 export class SelectQueryBuilder<
 	T extends readonly AnyTable[],
@@ -399,8 +415,8 @@ export class SelectQueryBuilder<
 	 * strongest lock where they overlap. A query with a locking clause can't
 	 * select aggregates: compiling it throws.
 	 *
-	 * `one()` and `maybeOne()` fetch two rows to tell if there are several,
-	 * so they lock up to two; `first()` locks one.
+	 * The result shapes add no `limit`, so every row the query returns is
+	 * locked: `.limit(1)` locks one.
 	 *
 	 * @example .forUpdate()
 	 * @example .forUpdate().of(jobs).skipLocked()
@@ -465,7 +481,7 @@ export class SelectQueryBuilder<
 	 * Skips the rows another transaction has locked, rather than waiting for
 	 * them: for workers claiming jobs from a queue, each a different one.
 	 *
-	 * @example await tx.selectFrom(jobs).select(['jobs.id']).where('jobs.status', 'queued').forUpdate().skipLocked().first().execute()
+	 * @example await tx.selectFrom(jobs).select(['jobs.id']).where('jobs.status', 'queued').forUpdate().skipLocked().limit(1).takeFirst().execute()
 	 */
 	skipLocked(
 		this: SelectQueryBuilder<T, O, 'strength' | 'of'>,
@@ -494,51 +510,102 @@ export class SelectQueryBuilder<
 		return new SelectQueryBuilder<T, O, L>({ ...this.#state, tag: name });
 	}
 
-	/** Every row; runs with `execute()`. */
-	all(): Query<O[]> {
-		return this.#query(undefined, false, (rows) => rows);
+	/**
+	 * Adds `limit count`: the query returns at most `count` rows. No result
+	 * shape adds one. A later call replaces it.
+	 *
+	 * @example .forUpdate().skipLocked().limit(1)
+	 */
+	limit(count: number): SelectQueryBuilder<T, O, L> {
+		if (!Number.isInteger(count) || count < 0) {
+			throw new RangeError(`limit takes a whole number of rows, not ${count}`);
+		}
+		return new SelectQueryBuilder<T, O, L>({ ...this.#state, limit: count });
 	}
 
-	/** The row, if any, with `limit 1`; runs with `execute()`. */
-	first(): Query<O | undefined> {
-		return this.#query(1, false, (rows) => rows[0]);
+	/**
+	 * The first row, if any; runs with `execute()`. Never throws for the
+	 * number of rows, and adds no `limit`: the query returns every row it
+	 * finds and only the first is decoded. Add `.limit(1)` to fetch (or
+	 * lock) only one.
+	 *
+	 * @example await db.selectFrom(users).where('users.email', email).select(['users.id']).takeFirst().execute()
+	 */
+	takeFirst(): Query<O | undefined> {
+		return this.#query(takeFirst<O>());
+	}
+
+	/**
+	 * The value of the one selected column in the first row, if any; runs
+	 * with `execute()`. Never throws for the number of rows, and adds no
+	 * `limit`. The row must have one column, since its type doesn't record
+	 * which comes first.
+	 *
+	 * @example await db.selectFrom(users).select((eb) => [eb.fn.count().as('count')]).takeValue().execute()
+	 */
+	takeValue(
+		..._oneColumn: ValueArgs<O, []>
+	): Query<ColumnValue<O> | undefined> {
+		return this.#query(takeValue<ColumnValue<O>>());
+	}
+
+	/**
+	 * Every row, as a non-empty array; runs with `execute()`, which throws
+	 * `NoRowError` (or what `err` makes of it) when there is none.
+	 *
+	 * @example .expectNonEmpty(() => new HttpError(404, 'No posts'))
+	 */
+	expectNonEmpty(err?: ErrorFor<NoRowError>): Query<[O, ...O[]]> {
+		return this.#query(expectNonEmpty<O>(err));
+	}
+
+	/**
+	 * The first row; runs with `execute()`, which throws `NoRowError` (or
+	 * what `err` makes of it) when there is none. Other rows are ignored;
+	 * the shape adds no `limit`.
+	 */
+	expectFirst(err?: ErrorFor<NoRowError>): Query<O> {
+		return this.#query(expectFirst<O>(err));
 	}
 
 	/**
 	 * The one row; runs with `execute()`, which throws `NoRowError` when
-	 * there is none and `TooManyRowsError` when there are several. Fetches at
-	 * most two rows (`limit 2`), enough to tell.
+	 * there is none and `TooManyRowsError` when there are several, with
+	 * their `count`; `err` makes the error to throw instead. The shape adds
+	 * no `limit`, and decodes at most two rows.
+	 *
+	 * @example .expectOne()
+	 * @example .expectOne((error) => (error instanceof NoRowError ? new HttpError(404) : error))
 	 */
-	one(): Query<O> {
-		return this.#query(2, true, (rows, query) => {
-			const [row, ...rest] = rows;
-			if (row === undefined) {
-				throw new NoRowError(query, this.#state.from.name);
-			}
-			if (rest.length > 0) {
-				throw new TooManyRowsError(query, this.#state.from.name);
-			}
-			return row;
-		});
+	expectOne(err?: ErrorFor<NoRowError | TooManyRowsError>): Query<O> {
+		return this.#query(expectOne<O>(err));
 	}
 
 	/**
 	 * The row, if any; runs with `execute()`, which throws
-	 * `TooManyRowsError` when there are several. Fetches at most two rows.
+	 * `TooManyRowsError` (or what `err` makes of it) when there are
+	 * several. The shape adds no `limit`.
 	 */
-	maybeOne(): Query<O | undefined> {
-		return this.#query(2, true, (rows, query) => {
-			const [row, ...rest] = rows;
-			if (rest.length > 0) {
-				throw new TooManyRowsError(query, this.#state.from.name);
-			}
-			return row;
-		});
+	expectAtMostOne(err?: ErrorFor<TooManyRowsError>): Query<O | undefined> {
+		return this.#query(expectAtMostOne<O>(err));
 	}
 
-	/** Runs the query and returns every row, as `all().execute()` does. */
+	/**
+	 * The value of the one selected column in the first row; runs with
+	 * `execute()`, which throws `NoRowError` (or what `err` makes of it)
+	 * when there is no row. The row must have one column.
+	 *
+	 * @example .select(['users.email']).expectValue()
+	 */
+	expectValue(
+		...args: ValueArgs<O, [err?: ErrorFor<NoRowError>]>
+	): Query<ColumnValue<O>> {
+		return this.#query(expectValue<ColumnValue<O>>(errorArg(args)));
+	}
+
+	/** Runs the query and returns every row. */
 	execute(options?: RunOptions): Promise<O[]> {
-		return this.all().execute(options);
+		return this.toQuery().execute(options);
 	}
 
 	/** The SQL and parameters `execute()` sends. */
@@ -548,7 +615,7 @@ export class SelectQueryBuilder<
 
 	/** The query `execute()` runs: every row. */
 	toQuery(): Query<O[]> {
-		return this.all();
+		return this.#query(allRows<O>());
 	}
 
 	/** @deprecated A query runs with `execute()`; awaiting one rejects. */
@@ -650,25 +717,14 @@ export class SelectQueryBuilder<
 		return executor;
 	}
 
-	/** The query, fetching at most `limit` rows besides any limit of its own, read by `read`. */
-	#query<R>(
-		limit: number | undefined,
-		checked: boolean,
-		read: (rows: O[], query: CompiledQuery) => R,
-	): Query<R> {
-		const node = this.toNode();
-		const query = compile(
-			limit === undefined
-				? node
-				: { ...node, limit: Math.min(node.limit ?? limit, limit) },
+	/** The query, read by `shape`. */
+	#query<R>(shape: Shape<R>): Query<R> {
+		return shapedQuery(
+			this.#state.executor,
+			compile(this.toNode()),
+			this.#state.from.name,
+			shape,
 		);
-		return new Query({
-			query,
-			executor: this.#state.executor,
-			checked,
-			// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the select list supplies the row type
-			read: ({ rows }) => read(rows as O[], query),
-		});
 	}
 }
 

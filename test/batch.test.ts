@@ -29,7 +29,7 @@ function fake(
 	const db = databaseWith({
 		...executor,
 		batch: (queries, options = {}) => {
-			batches.push({ sql: queries.map((q) => q.sql), options });
+			batches.push({ sql: queries.map(({ query }) => query.sql), options });
 			return executor.batch(queries, options);
 		},
 	});
@@ -40,36 +40,39 @@ const byId = (id: number) =>
 	selectFrom(users).select(['users.email']).where('users.id', id);
 
 describe('result shapes', () => {
-	it('set the limit, run nothing, and run with execute', async () => {
+	it('run nothing, run with execute, and keep the SQL', async () => {
 		const { executor, ran } = fakeExecutor([{ email: 'a@x' }]);
 		const db = databaseWith(executor);
 		const query = db.selectFrom(users).select(['users.email']);
-		const shapes = [query.all(), query.first(), query.one(), query.maybeOne()];
+		const shapes = [
+			query,
+			query.takeFirst(),
+			query.takeValue(),
+			query.expectNonEmpty(),
+			query.expectFirst(),
+			query.expectOne(),
+			query.expectAtMostOne(),
+			query.expectValue(),
+		];
 		expect(ran).toEqual([]);
 		await Promise.all(shapes.map((shape) => shape.execute()));
-		expect(shapes.map((shape) => shape.toSQL())).toEqual(ran);
-		expect(ran.map((q) => q.sql.slice(q.sql.indexOf('from')))).toEqual([
-			'from "users"',
-			'from "users" limit $1',
-			'from "users" limit $1',
-			'from "users" limit $1',
-		]);
-		expect(ran.map((q) => q.params)).toEqual([[], [1], [2], [2]]);
-		expect(query.toSQL()).toEqual(query.all().toSQL());
+		expect(ran).toEqual(shapes.map(() => query.toSQL()));
+		expect(query.toSQL()).toEqual({
+			sql: 'select "users"."email" as "email" from "users"',
+			params: [],
+		});
 	});
 
 	it('default to every row', async () => {
 		const { executor } = fakeExecutor([{ email: 'a@x' }]);
 		const db = databaseWith(executor);
 		expect(
-			await db.selectFrom(users).select(['users.email']).one().execute(),
+			await db.selectFrom(users).select(['users.email']).expectOne().execute(),
 		).toEqual({ email: 'a@x' });
 		expect(
 			await db.selectFrom(users).select(['users.email']).execute(),
 		).toEqual([{ email: 'a@x' }]);
-		await expect(byId(1).all().execute()).rejects.toThrow(
-			/no database to run on/,
-		);
+		await expect(byId(1).execute()).rejects.toThrow(/no database to run on/);
 	});
 
 	it('default a write to its returning rows, or its row count', async () => {
@@ -85,7 +88,7 @@ describe('result shapes', () => {
 		const hint = /runs with execute\(\), not when awaited/;
 		await expect(async () => await insert).rejects.toThrow(hint);
 		await expect(
-			async () => await insert.returning(['users.id']).one(),
+			async () => await insert.returning(['users.id']).expectOne(),
 		).rejects.toThrow(hint);
 		await expect(
 			async () => await db.selectFrom(users).select(['users.email']),
@@ -96,28 +99,35 @@ describe('result shapes', () => {
 		expect(batches).toEqual([]);
 	});
 
-	it('mark the results checked after the statement ran', () => {
+	it('mark the expect shapes checked after the statement ran', () => {
 		const insert = insertInto(users).values({ email: 'a@x' });
+		const returning = insert.returning(['users.id']);
 		const checked = [
-			byId(1).all(),
-			byId(1).first(),
-			byId(1).one(),
-			byId(1).maybeOne(),
+			byId(1),
+			byId(1).takeFirst(),
+			byId(1).takeValue(),
 			insert,
-			insert.expectRows(1),
-			insert.returning(['users.id']).all(),
-			insert.returning(['users.id']).one(),
+			returning,
+			returning.takeFirst(),
+			returning.takeValue(),
 		].map((query) => query.toQuery()._quarry.checked);
-		expect(checked).toEqual([
-			false,
-			false,
-			true,
-			true,
-			false,
-			true,
-			false,
-			true,
-		]);
+		expect(checked).toEqual(checked.map(() => false));
+		const expecting = [
+			byId(1).expectNonEmpty(),
+			byId(1).expectFirst(),
+			byId(1).expectOne(),
+			byId(1).expectAtMostOne(),
+			byId(1).expectValue(),
+			insert.expectRows(1),
+			insert.expectNonEmpty(),
+			returning.expectNonEmpty(),
+			returning.expectFirst(),
+			returning.expectOne(),
+			returning.expectAtMostOne(),
+			returning.expectValue(),
+			returning.expectRows(1),
+		].map((query) => query._quarry.checked);
+		expect(expecting).toEqual(expecting.map(() => true));
 	});
 });
 
@@ -129,17 +139,33 @@ describe('db.batch', () => {
 				: { rows: [{ email: `${String(query.params[0])}@x` }] },
 		);
 		const results = await db.batch([
-			byId(1).one(),
-			byId(2).all(),
+			byId(1).expectOne(),
+			byId(2),
 			insertInto(users).values({ email: 'c@x' }),
+			byId(3).takeFirst(),
+			byId(4).takeValue(),
+			byId(5).expectNonEmpty(),
+			byId(6).expectFirst(),
+			byId(7).expectAtMostOne(),
+			byId(8).expectValue(),
+			insertInto(users).values({ email: 'd@x' }).expectNonEmpty(),
+			insertInto(users).values({ email: 'e@x' }).expectRows(1),
 		]);
 		expect(results).toEqual([
 			{ email: '1@x' },
 			[{ email: '2@x' }],
 			{ rowCount: 1 },
+			{ email: '3@x' },
+			'4@x',
+			[{ email: '5@x' }],
+			{ email: '6@x' },
+			{ email: '7@x' },
+			'8@x',
+			{ rowCount: 1 },
+			{ rowCount: 1 },
 		]);
 		expect(batches).toHaveLength(1);
-		expect(batches[0]?.sql).toHaveLength(3);
+		expect(batches[0]?.sql).toHaveLength(11);
 		// called only where the batch runs all or nothing
 		expect(batches[0]?.options).toEqual({ verify: expect.any(Function) });
 	});
@@ -157,7 +183,7 @@ describe('db.batch', () => {
 			return { rows: query.params[0] === 3 ? [] : [{ email: 'a@x' }] };
 		});
 		const error = await db
-			.batch([byId(1).one(), byId(2).one(), byId(3).one()])
+			.batch([byId(1).expectOne(), byId(2).expectOne(), byId(3).expectOne()])
 			.catch((e: unknown) => e);
 		expect(error).toBeInstanceOf(BatchError);
 		if (!(error instanceof BatchError)) return;
@@ -176,14 +202,14 @@ describe('db.batch', () => {
 
 	it('in a transaction, checks the results before it commits only when a shape can fail', async () => {
 		const { db, batches } = fake(() => ({ rows: [{ email: 'a@x' }] }));
-		await db.batch([byId(1).all(), byId(2).first()], {
+		await db.batch([byId(1), byId(2).takeFirst()], {
 			transaction: true,
 		});
-		await db.batch([byId(1).all(), byId(2).one()], {
+		await db.batch([byId(1), byId(2).expectOne()], {
 			transaction: { isolation: 'serializable' },
 			timeout: 100,
 		});
-		await db.batch([byId(1).all()], { transaction: false });
+		await db.batch([byId(1)], { transaction: false });
 		expect(batches.map((b) => b.options)).toEqual([
 			{ transaction: {} },
 			{
@@ -201,14 +227,11 @@ describe('db.batch', () => {
 			rowCount: query.sql.startsWith('insert') ? 0 : 1,
 		}));
 		await expect(
-			db.batch([byId(1).all(), byId(2).one()], { transaction: true }),
+			db.batch([byId(1), byId(2).expectOne()], { transaction: true }),
 		).rejects.toBeInstanceOf(NoRowError);
 		await expect(
 			db.batch(
-				[
-					byId(1).all(),
-					insertInto(users).values({ email: 'a@x' }).expectRows(1),
-				],
+				[byId(1), insertInto(users).values({ email: 'a@x' }).expectRows(1)],
 				{ transaction: true },
 			),
 		).rejects.toBeInstanceOf(RowCountError);

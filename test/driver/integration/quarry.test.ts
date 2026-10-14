@@ -31,7 +31,11 @@ import {
 	UniqueViolation,
 } from '../../../src/driver/errors.js';
 import { violatedColumns } from '../../../src/errors.js';
-import { NoRowError, RowCountError } from '../../../src/executor.js';
+import {
+	NoRowError,
+	RowCountError,
+	TooManyRowsError,
+} from '../../../src/executor.js';
 import { noPg, options, pg, rejection, table } from './helpers.js';
 
 const mood = defineEnum('quarry_mood', ['happy', 'sad']);
@@ -154,7 +158,7 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					'users.window',
 					'users.embedding',
 				])
-				.one()
+				.expectOne()
 				.execute();
 			expect(ada).toEqual({
 				id: 1,
@@ -186,7 +190,6 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					{ firstName: 'Cy', email: 'c@x', embedding: null },
 				])
 				.returning(['users.email', 'users.active', 'users.window'])
-				.all()
 				.execute();
 			expect(many).toEqual([
 				{
@@ -216,7 +219,7 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				.onConflict('email')
 				.merge(['firstName'])
 				.returning(['users.id', 'users.firstName'])
-				.one()
+				.expectOne()
 				.execute();
 			expect(merged).toEqual({ id: 1, firstName: 'Ada Lovelace' });
 			expect(
@@ -234,7 +237,7 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				.set({ visits: '42' })
 				.where('users.email', 'b@x')
 				.returning(['users.visits'])
-				.one()
+				.expectOne()
 				.execute();
 			expect(updated).toEqual({ visits: '42' });
 			expect(
@@ -248,7 +251,6 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 						{ by: 'id' },
 					)
 					.returning(['users.firstName'])
-					.all()
 					.execute(),
 			).toEqual(
 				expect.arrayContaining([{ firstName: 'Bea' }, { firstName: 'Cyd' }]),
@@ -257,7 +259,6 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				.deleteFrom(posts)
 				.where('posts.title', 'second')
 				.returning(['posts.title'])
-				.all()
 				.execute();
 			expect(removed).toEqual([{ title: 'second' }]);
 			await expect(
@@ -276,7 +277,6 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				.on('posts.userId', 'users.id')
 				.select(['users.email', 'posts.title'])
 				.where('users.admin', true)
-				.all()
 				.execute();
 			expect(titles).toEqual([{ email: 'a@x', title: 'first' }]);
 			await expect(
@@ -284,14 +284,14 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					.selectFrom(users)
 					.select(['users.id'])
 					.where('users.email', 'nobody')
-					.one()
+					.expectOne()
 					.execute(),
 			).rejects.toBeInstanceOf(NoRowError);
 			const first = await db
 				.selectFrom(users)
 				.select(['users.email'])
 				.where((eb) => eb.ref('users.roles').contains(['admin']))
-				.first()
+				.takeFirst()
 				.execute();
 			expect(first).toEqual({ email: 'a@x' });
 		});
@@ -327,18 +327,13 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				db
 					.selectFrom(slow)
 					.select(['slow.done'])
-					.all()
 					.execute({ signal: controller.signal }),
 				QueryCanceled,
 			);
 			setTimeout(() => controller.abort(), 100);
 			expect((await running).reason).toBe('abort');
 			const timedOut = await rejection(
-				db
-					.selectFrom(slow)
-					.select(['slow.done'])
-					.all()
-					.execute({ timeout: '100ms' }),
+				db.selectFrom(slow).select(['slow.done']).execute({ timeout: '100ms' }),
 				QueryCanceled,
 			);
 			expect(timedOut.reason).toBe('statement_timeout');
@@ -350,7 +345,6 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				.selectFrom(users)
 				.select(['users.id'])
 				.tag('users.ids')
-				.all()
 				.execute();
 			expect(events.find((e) => e.tag === 'users.ids')).toMatchObject({
 				kind: 'execute',
@@ -379,7 +373,6 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					.selectFrom(slow)
 					.select(['slow.done'])
 					.where('slow.done', 'secret-param')
-					.all()
 					.execute({ timeout: '50ms' }),
 				QueryCanceled,
 			);
@@ -432,7 +425,7 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					).rejects.toBeInstanceOf(RowCountError);
 					await tx.setLocal('app.user', 7);
 					return (
-						await tx.selectFrom(posts).select(['posts.title']).all().execute()
+						await tx.selectFrom(posts).select(['posts.title']).execute()
 					).map((r) => r.title);
 				},
 				{
@@ -457,9 +450,110 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					.selectFrom(posts)
 					.select(['posts.id'])
 					.where('posts.title', 'never')
-					.maybeOne()
+					.expectAtMostOne()
 					.execute(),
 			).toBeUndefined();
+		});
+
+		it('reads each result shape without changing the SQL', async () => {
+			const items = defineTable('items', {
+				columns: { id: integer().identity(), n: integer() },
+			});
+			await pool.simpleQuery(
+				'create table items (id int generated always as identity primary key, n int not null)',
+			);
+			let decoded = 0;
+			const counting = database(pool, {
+				types: {
+					23: (value: string) => {
+						decoded++;
+						return Number(value);
+					},
+				},
+			});
+			const none = counting.selectFrom(items).select(['items.n']);
+			expect(await none.takeFirst().execute()).toBeUndefined();
+			expect(await none.takeValue().execute()).toBeUndefined();
+			await expect(none.expectFirst().execute()).rejects.toBeInstanceOf(
+				NoRowError,
+			);
+			await expect(none.expectNonEmpty().execute()).rejects.toBeInstanceOf(
+				NoRowError,
+			);
+			expect(await none.expectAtMostOne().execute()).toBeUndefined();
+			const inserted = await counting
+				.insertInto(items)
+				.values([1, 2, 3, 4, 5].map((n) => ({ n })))
+				.returning(['items.n'])
+				.expectNonEmpty()
+				.execute();
+			expect(inserted).toHaveLength(5);
+
+			const ns = counting.selectFrom(items).select(['items.n']);
+			decoded = 0;
+			expect(await ns.takeFirst().execute()).toEqual({
+				n: expect.any(Number),
+			});
+			expect(await ns.takeValue().execute()).toEqual(expect.any(Number));
+			expect(await ns.expectFirst().execute()).toEqual({
+				n: expect.any(Number),
+			});
+			expect(decoded).toBe(3);
+			const several = await ns
+				.expectOne()
+				.execute()
+				.catch((e: unknown) => e);
+			expect(several).toBeInstanceOf(TooManyRowsError);
+			expect(several).toMatchObject({ count: 5, table: 'items' });
+			await expect(ns.expectAtMostOne().execute()).rejects.toMatchObject({
+				count: 5,
+			});
+			expect(decoded).toBe(7);
+			expect(await ns.expectNonEmpty().execute()).toHaveLength(5);
+			expect(await ns.where('items.n', 3).expectOne().execute()).toEqual({
+				n: 3,
+			});
+			expect(await ns.limit(2).execute()).toHaveLength(2);
+			expect(
+				await counting
+					.selectFrom(items)
+					.select((eb) => [eb.fn.count().as('count')])
+					.expectValue()
+					.execute(),
+			).toBe('5');
+
+			const seen: QueryEvent[] = [];
+			const observed = database(pool, { onQuery: (e) => seen.push(e) });
+			await observed
+				.selectFrom(items)
+				.select(['items.n'])
+				.takeFirst()
+				.execute();
+			expect(seen[0]).toMatchObject({
+				sql: 'select "items"."n" as "n" from "items"',
+				rowCount: 5,
+			});
+
+			const [first, value, count] = await counting.batch([
+				ns.takeFirst(),
+				ns.where('items.n', 4).takeValue(),
+				counting.update(items).set({ n: 0 }).where('items.n', 9).expectRows(0),
+			]);
+			expect(first).toEqual({ n: expect.any(Number) });
+			expect(value).toBe(4);
+			expect(count).toEqual({ rowCount: 0 });
+			await expect(
+				counting.batch(
+					[
+						counting
+							.update(items)
+							.set({ n: 0 })
+							.where('items.n', 9)
+							.expectNonEmpty(() => new Error('no item 9')),
+					],
+					{ transaction: true },
+				),
+			).rejects.toThrow('no item 9');
 		});
 
 		it('claims a different job per worker with for update skip locked', async () => {
@@ -467,7 +561,7 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				.insertInto(jobs)
 				.values([{ status: 'queued' }, { status: 'queued' }])
 				.execute();
-			// `first`, not `one`: `one` fetches two rows, and would lock both
+			// `limit(1)`: no shape adds a limit, and every row returned is locked
 			const claim = async (tx: DatabaseTransaction) =>
 				(
 					await tx
@@ -476,7 +570,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 						.where('jobs.status', 'queued')
 						.forUpdate()
 						.skipLocked()
-						.first()
+						.limit(1)
+						.takeFirst()
 						.execute()
 				)?.id;
 			let claimed!: (id: number | undefined) => void;
@@ -518,7 +613,7 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 						.where('jobs.id', held!)
 						.forNoKeyUpdate()
 						.noWait()
-						.first()
+						.takeFirst()
 						.execute(),
 					LockNotAvailable,
 				);
@@ -531,7 +626,7 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					.selectFrom(jobs)
 					.select(['jobs.status'])
 					.where('jobs.id', held!)
-					.one()
+					.expectOne()
 					.execute(),
 			).toEqual({ status: 'running' });
 		});
@@ -560,7 +655,7 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 							.selectFrom(posts)
 							.select(['posts.id'])
 							.where('posts.title', 'first')
-							.one()
+							.expectOne()
 							.execute(),
 					{ durable: true },
 				),
@@ -575,7 +670,7 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				.selectFrom(users)
 				.select(['users.createdAt', 'users.active', 'users.embedding'])
 				.where('users.id', 1)
-				.one()
+				.expectOne()
 				.execute();
 			expect(row).toEqual({
 				createdAt: '2024-01-02 03:04:05.678+00',
@@ -602,7 +697,7 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					.selectFrom(posts)
 					.select(['posts.title'])
 					.where('posts.title', 'first')
-					.one()
+					.expectOne()
 					.execute(),
 			).toEqual({ title: 'first' });
 			const c = pg;
@@ -614,7 +709,7 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					.selectFrom(users)
 					.select(['users.email'])
 					.where('users.id', 1)
-					.one()
+					.expectOne()
 					.execute(),
 			).toEqual({ email: 'a@x' });
 			await fromUrl.close();
