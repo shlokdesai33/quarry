@@ -209,8 +209,6 @@ export type OnConflictNode = {
 type WriteNode = {
 	readonly table: TableNode;
 	readonly returning: readonly SelectionNode[];
-	/** The number of rows the query must affect, as `expectRows` sets it. */
-	readonly expectRows: number | undefined;
 	readonly tag: string | undefined;
 };
 

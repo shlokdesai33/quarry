@@ -1,5 +1,11 @@
 import { compile, type CompiledQuery } from './compile.js';
-import type { Executor, RunOptions } from './executor.js';
+import type {
+	Executor,
+	NoRowError,
+	RowCountError,
+	RunOptions,
+	TooManyRowsError,
+} from './executor.js';
 import {
 	type ExpressionBuilder,
 	expressionBuilder,
@@ -19,6 +25,18 @@ import {
 	type Selection,
 	selectionNodes,
 } from './row.js';
+import {
+	type ColumnValue,
+	type ErrorFor,
+	errorArg,
+	expectAtMostOne,
+	expectFirst,
+	expectOne,
+	expectValue,
+	takeFirst,
+	takeValue,
+	type ValueArgs,
+} from './shape.js';
 import { type AnyTable, tableNode } from './table.js';
 import type { InferInsertType } from './types.js';
 import {
@@ -29,15 +47,15 @@ import {
 import {
 	type ColumnKey,
 	columnOf,
-	type Excluded,
 	excluded,
-	exactlyOne,
-	atMostOne,
-	rowCount,
+	type Excluded,
+	type NonEmptyOutput,
 	rowsNode,
-	type SetValues,
 	setNodes,
+	type SetValues,
 	type UpdateKey,
+	writeExpectRows,
+	writeNonEmpty,
 	writeOutput,
 	type WriteOutput,
 	writeQuery,
@@ -49,7 +67,6 @@ interface InsertState<T extends AnyTable> {
 	readonly values: InsertNode['values'];
 	readonly onConflict: OnConflictNode | undefined;
 	readonly returning: readonly SelectionNode[];
-	readonly expectRows: number | undefined;
 	readonly tag: string | undefined;
 	/** What the query runs on; `undefined` when it was built on its own. */
 	readonly executor: Executor | undefined;
@@ -94,7 +111,6 @@ export function insertIntoWith<T extends AnyTable>(
 		values: { columns: [], types: [], rows: [], strategy: 'values' },
 		onConflict: undefined,
 		returning: [],
-		expectRows: undefined,
 		tag: undefined,
 		executor,
 	});
@@ -106,7 +122,8 @@ export function insertIntoWith<T extends AnyTable>(
  * until `values` is called.
  *
  * It runs with `execute()` (or in `db.batch`), never when awaited;
- * `all`, `first`, `one` and `maybeOne` shape its `returning` rows.
+ * the `take…` and `expect…` shapes read its `returning` rows (and
+ * `expectNonEmpty` and `expectRows` its row count).
  *
  * Immutable: every method returns a new builder.
  */
@@ -181,17 +198,6 @@ export class InsertQueryBuilder<T extends AnyTable, O, M extends 'values'> {
 		});
 	}
 
-	/**
-	 * Requires the query to insert exactly `count` rows, e.g. `1` with
-	 * `onConflict(...).doNothing()` to know the row is new.
-	 */
-	expectRows(count: number): InsertQueryBuilder<T, O, M> {
-		return new InsertQueryBuilder({
-			...this.#state,
-			expectRows: rowCount(count),
-		});
-	}
-
 	/** Labels the query; see `SelectQueryBuilder.tag`. */
 	tag(name: string): InsertQueryBuilder<T, O, M> {
 		return new InsertQueryBuilder({ ...this.#state, tag: name });
@@ -210,47 +216,130 @@ export class InsertQueryBuilder<T extends AnyTable, O, M extends 'values'> {
 		return condition ? build(this) : this;
 	}
 
-	/** Every `returning` row; runs with `execute()`. */
-	all(this: InsertQueryBuilder<T, O & object, never>): Query<O[]> {
-		return writeQuery<O, O[]>(
+	/**
+	 * The first `returning` row, if any; runs with `execute()`. Never
+	 * throws for the number of rows, and doesn't change the SQL: the
+	 * statement writes every row it matches, and only the first is decoded.
+	 */
+	takeFirst(
+		this: InsertQueryBuilder<T, O & object, never>,
+	): Query<O | undefined> {
+		return writeQuery(this.#state.executor, this.toNode(), takeFirst<O>());
+	}
+
+	/**
+	 * The value of the one `returning` column of the first row, if any;
+	 * runs with `execute()`. Never throws for the number of rows, and
+	 * doesn't change the SQL: the statement writes every row it matches.
+	 *
+	 * @example .returning(['users.id']).takeValue()
+	 */
+	takeValue(
+		this: InsertQueryBuilder<T, O & object, never>,
+		..._oneColumn: ValueArgs<O, []>
+	): Query<ColumnValue<O> | undefined> {
+		return writeQuery(
 			this.#state.executor,
 			this.toNode(),
-			({ rows }) => rows,
+			takeValue<ColumnValue<O>>(),
 		);
 	}
 
-	/** The first `returning` row, if any; runs with `execute()`. */
-	first(this: InsertQueryBuilder<T, O & object, never>): Query<O | undefined> {
-		return writeQuery<O, O | undefined>(
-			this.#state.executor,
-			this.toNode(),
-			({ rows }) => rows[0],
-		);
+	/**
+	 * Requires the statement to insert one or more rows; runs with
+	 * `execute()`, which resolves to the `returning` rows, as a non-empty
+	 * array, or without `returning`, to the row count. Throws `NoRowError`
+	 * (or what `err` makes of it) after the statement ran, when it inserted
+	 * none; inside a transaction, that rolls it back.
+	 */
+	expectNonEmpty(
+		this: InsertQueryBuilder<T, O, never>,
+		err?: ErrorFor<NoRowError>,
+	): Query<NonEmptyOutput<O>> {
+		return writeNonEmpty<O>(this.#state.executor, this.toNode(), err);
+	}
+
+	/**
+	 * The first `returning` row; runs with `execute()`, which throws
+	 * `NoRowError` (or what `err` makes of it) when there is none, after
+	 * the statement ran. Other rows are ignored.
+	 */
+	expectFirst(
+		this: InsertQueryBuilder<T, O & object, never>,
+		err?: ErrorFor<NoRowError>,
+	): Query<O> {
+		return writeQuery(this.#state.executor, this.toNode(), expectFirst<O>(err));
 	}
 
 	/**
 	 * The one `returning` row; runs with `execute()`, which throws
-	 * `NoRowError` when there is none and `TooManyRowsError` when there are
-	 * several (after the statement has run).
+	 * `NoRowError` when there is none and `TooManyRowsError` (with the
+	 * `count`) when there are several, after the statement ran; `err`
+	 * makes the error to throw instead.
 	 */
-	one(this: InsertQueryBuilder<T, O & object, never>): Query<O> {
-		return writeQuery(this.#state.executor, this.toNode(), exactlyOne<O>, true);
-	}
-
-	/** The `returning` row, if any; runs with `execute()`, which throws `TooManyRowsError` when there are several. */
-	maybeOne(
+	expectOne(
 		this: InsertQueryBuilder<T, O & object, never>,
-	): Query<O | undefined> {
-		return writeQuery(this.#state.executor, this.toNode(), atMostOne<O>, true);
+		err?: ErrorFor<NoRowError | TooManyRowsError>,
+	): Query<O> {
+		return writeQuery(this.#state.executor, this.toNode(), expectOne<O>(err));
 	}
 
 	/**
-	 * Runs the query, resolving to every `returning` row, as `all()` does,
-	 * or without `returning`, to the number of rows inserted. Throws
-	 * `RowCountError` if `expectRows` was set and a different number was.
+	 * The `returning` row, if any; runs with `execute()`, which throws
+	 * `TooManyRowsError` (or what `err` makes of it) when there are
+	 * several, after the statement ran.
+	 */
+	expectAtMostOne(
+		this: InsertQueryBuilder<T, O & object, never>,
+		err?: ErrorFor<TooManyRowsError>,
+	): Query<O | undefined> {
+		return writeQuery(
+			this.#state.executor,
+			this.toNode(),
+			expectAtMostOne<O>(err),
+		);
+	}
+
+	/**
+	 * The value of the one `returning` column of the first row; runs with
+	 * `execute()`, which throws `NoRowError` (or what `err` makes of it)
+	 * when there is no row, after the statement ran.
+	 */
+	expectValue(
+		this: InsertQueryBuilder<T, O & object, never>,
+		...args: ValueArgs<O, [err?: ErrorFor<NoRowError>]>
+	): Query<ColumnValue<O>> {
+		return writeQuery(
+			this.#state.executor,
+			this.toNode(),
+			expectValue<ColumnValue<O>>(errorArg(args)),
+		);
+	}
+
+	/**
+	 * Requires the statement to insert exactly `count` rows; runs with
+	 * `execute()`, which resolves as it does without a shape, and throws
+	 * `RowCountError` (or what `err` makes of it) after the statement ran,
+	 * when it inserted a different number; inside a transaction, that rolls
+	 * it back.
+	 *
+	 * @example .onConflict('email').doNothing().expectRows(1)
+	 */
+	expectRows(
+		this: InsertQueryBuilder<T, O, never>,
+		count: number,
+		err?: ErrorFor<RowCountError>,
+	): Query<WriteOutput<O>> {
+		return writeExpectRows<O>(this.#state.executor, this.toNode(), count, err);
+	}
+
+	/**
+	 * Runs the query, resolving to every `returning` row, or without
+	 * `returning`, to the number of rows inserted. Never throws for the
+	 * number of rows: the `expect` shapes do.
 	 */
 	execute(
-		this: InsertQueryBuilder<T, unknown, never>,
+		this: InsertQueryBuilder<T, O, never>,
 		options?: RunOptions,
 	): Promise<WriteOutput<O>> {
 		return writeOutput<O>(this.#state.executor, this.toNode()).execute(options);
@@ -277,15 +366,13 @@ export class InsertQueryBuilder<T extends AnyTable, O, M extends 'values'> {
 
 	/** The whole query as one node. */
 	toNode(): InsertNode {
-		const { table, values, onConflict, returning, expectRows, tag } =
-			this.#state;
+		const { table, values, onConflict, returning, tag } = this.#state;
 		return {
 			kind: 'insert',
 			table: tableNode(table),
 			values,
 			onConflict,
 			returning,
-			expectRows,
 			tag,
 		};
 	}

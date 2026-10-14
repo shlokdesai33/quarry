@@ -62,7 +62,6 @@ describe('insertInto', () => {
 			},
 			onConflict: undefined,
 			returning: [],
-			expectRows: undefined,
 			tag: undefined,
 		});
 	});
@@ -86,11 +85,10 @@ describe('insertInto', () => {
 		});
 	});
 
-	it('records the returning list, expected rows and tag', () => {
+	it('records the returning list and tag', () => {
 		const node = insertInto(users)
 			.values({ email: 'ada@example.com', name: null })
 			.returning(['users.id', 'users.createdAt'])
-			.expectRows(1)
 			.tag('users.create')
 			.toNode();
 		expect(node.returning).toEqual([
@@ -103,7 +101,6 @@ describe('insertInto', () => {
 				alias: 'createdAt',
 			},
 		]);
-		expect(node.expectRows).toBe(1);
 		expect(node.tag).toBe('users.create');
 	});
 
@@ -194,21 +191,20 @@ describe('update', () => {
 	});
 
 	it('records an optimistic lock', () => {
-		const node = update(users)
+		const query = update(users)
 			.set({ name: 'Ada' })
 			.where('users.id', 1)
-			.where('users.email', 'ada@example.com')
-			.expectRows(1)
-			.toNode();
-		expect(sql(node.where)).toBe(
+			.where('users.email', 'ada@example.com');
+		expect(sql(query.toNode().where)).toBe(
 			'("users"."id" = $1 and "users"."email" = $2)',
 		);
-		expect(node.expectRows).toBe(1);
+		expect(query.expectRows(1).toSQL()).toEqual(query.toSQL());
 	});
 
 	it('takes a whole number of expected rows', () => {
-		expect(() => update(users).expectRows(1.5)).toThrow(RangeError);
-		expect(() => update(users).expectRows(-1)).toThrow(RangeError);
+		const query = update(users).set({ name: 'Ada' }).allRows();
+		expect(() => query.expectRows(1.5)).toThrow(RangeError);
+		expect(() => query.expectRows(-1)).toThrow(RangeError);
 	});
 
 	it('leaves the builder it was called on unchanged', () => {
@@ -253,17 +249,15 @@ describe('updateMany', () => {
 });
 
 describe('deleteFrom', () => {
-	it('records its `where`, returning list and expected rows', () => {
+	it('records its `where` and returning list', () => {
 		const node = deleteFrom(users)
 			.where('users.email', 'ada@example.com')
 			.returning(['users.id'])
-			.expectRows(1)
 			.toNode();
 		expect(node).toMatchObject({
 			kind: 'delete',
 			table: { name: 'users', alias: undefined },
 			allRows: false,
-			expectRows: 1,
 			tag: undefined,
 		});
 		expect(sql(node.where)).toBe('"users"."email" = $1');
@@ -411,7 +405,7 @@ describe('running a write query', () => {
 				.insertInto(users)
 				.values({ email: 'a', name: null })
 				.returning(['users.id'])
-				.one()
+				.expectOne()
 				.execute(),
 		).toEqual({ id: 7 });
 		expect(
@@ -420,7 +414,7 @@ describe('running a write query', () => {
 				.set({ name: 'A' })
 				.allRows()
 				.returning(['users.id'])
-				.first()
+				.takeFirst()
 				.execute(),
 		).toEqual({ id: 7 });
 		expect(ran.map((q) => q.sql.split(' ')[0])).toEqual([
@@ -453,7 +447,7 @@ describe('running a write query', () => {
 			.deleteFrom(users)
 			.where('users.id', 1)
 			.returning(['users.id'])
-			.one()
+			.expectOne()
 			.execute();
 		await expect(noRow).rejects.toBeInstanceOf(NoRowError);
 		await expect(noRow).rejects.toMatchObject({ table: 'users' });
@@ -462,10 +456,85 @@ describe('running a write query', () => {
 			.deleteFrom(users)
 			.allRows()
 			.returning(['users.id'])
-			.maybeOne()
+			.expectAtMostOne()
 			.execute();
 		await expect(several).rejects.toBeInstanceOf(TooManyRowsError);
-		await expect(several).rejects.toMatchObject({ table: 'users' });
+		await expect(several).rejects.toMatchObject({ table: 'users', count: 2 });
+	});
+
+	it('expects one or more rows written, with or without returning', async () => {
+		const none = databaseWith(
+			executorFrom(async () => ({ rows: [], rowCount: 0 })),
+		);
+		const some = databaseWith(
+			executorFrom(async () => ({ rows: [{ id: 1 }, { id: 2 }], rowCount: 2 })),
+		);
+		const remove = (db: typeof none) =>
+			db.deleteFrom(users).where('users.id', 1);
+		expect(await remove(some).expectNonEmpty().execute()).toEqual({
+			rowCount: 2,
+		});
+		expect(
+			await remove(some).returning(['users.id']).expectNonEmpty().execute(),
+		).toEqual([{ id: 1 }, { id: 2 }]);
+		await expect(remove(none).expectNonEmpty().execute()).rejects.toThrow(
+			new NoRowError(remove(none).toSQL(), 'users', 'at least one', 'affected'),
+		);
+		await expect(remove(none).expectNonEmpty().execute()).rejects.toMatchObject(
+			{
+				message:
+					'The query on "users" affected no row, where at least one was expected',
+			},
+		);
+		await expect(
+			remove(none).returning(['users.id']).expectNonEmpty().execute(),
+		).rejects.toBeInstanceOf(NoRowError);
+		await expect(
+			remove(none)
+				.expectNonEmpty(() => new Error('nothing deleted'))
+				.execute(),
+		).rejects.toThrow('nothing deleted');
+	});
+
+	it('reads the first returning row or value, never throwing for the count', async () => {
+		const some = databaseWith(
+			executorFrom(async () => ({ rows: [{ id: 1 }, { id: 2 }], rowCount: 2 })),
+		);
+		const none = databaseWith(
+			executorFrom(async () => ({ rows: [], rowCount: 0 })),
+		);
+		const returning = (db: typeof some) =>
+			db.update(users).set({ name: 'A' }).allRows().returning(['users.id']);
+		expect(await returning(some).takeFirst().execute()).toEqual({ id: 1 });
+		expect(await returning(some).takeValue().execute()).toBe(1);
+		expect(await returning(none).takeFirst().execute()).toBeUndefined();
+		expect(await returning(none).takeValue().execute()).toBeUndefined();
+		expect(await returning(some).expectFirst().execute()).toEqual({ id: 1 });
+		expect(await returning(some).expectValue().execute()).toBe(1);
+		await expect(
+			returning(none).expectValue().execute(),
+		).rejects.toBeInstanceOf(NoRowError);
+		await expect(
+			returning(some)
+				.expectOne((error) => new Error(`got ${error.message}`))
+				.execute(),
+		).rejects.toThrow(
+			'got The query on "users" returned 2 rows, where exactly one was expected',
+		);
+	});
+
+	it('makes expectRows a shape, resolving as execute() does', async () => {
+		const some = databaseWith(
+			executorFrom(async () => ({ rows: [{ id: 1 }], rowCount: 1 })),
+		);
+		const remove = some.deleteFrom(users).where('users.id', 1);
+		expect(await remove.expectRows(1).execute()).toEqual({ rowCount: 1 });
+		expect(
+			await remove.returning(['users.id']).expectRows(1).execute(),
+		).toEqual([{ id: 1 }]);
+		await expect(
+			remove.expectRows(2, (error) => new Error(`${error.actual}`)).execute(),
+		).rejects.toThrow('1');
 	});
 
 	// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the undefined a plain JS caller, or an `as` cast, can pass

@@ -132,22 +132,20 @@ describe.skipIf(noPg)('db.batch', () => {
 		it('sends reads and writes in one write, reading each by its shape', async () => {
 			const { value, error, trips, writes } = await measure(() =>
 				db.batch([
-					byId(1).one(),
+					byId(1).expectOne(),
 					db
 						.selectFrom(accounts)
 						.select(['accounts.id'])
-						.where((eb) => eb.ref('accounts.balance').gt(0))
-						.all(),
+						.where((eb) => eb.ref('accounts.balance').gt(0)),
 					db.insertInto(notes).values({ body: 'hello' }),
-					setBalance(2, 55).returning(['accounts.balance']).one(),
+					setBalance(2, 55).returning(['accounts.balance']).expectOne(),
 					db
 						.insertInto(notes)
 						.values([{ body: 'a' }, { body: 'b' }])
-						.returning(['notes.id'])
-						.all(),
+						.returning(['notes.id']),
 					db.deleteFrom(notes).where('notes.body', 'a'),
-					byId(3).maybeOne(),
-					byId(2).first(),
+					byId(3).expectAtMostOne(),
+					byId(2).takeFirst(),
 				]),
 			);
 			expect(error).toBeUndefined();
@@ -182,8 +180,8 @@ describe.skipIf(noPg)('db.batch', () => {
 					db.insertInto(notes).values({ body: 'kept' }),
 					db.insertInto(accounts).values({ id: 1, owner: 'dup', balance: 0 }),
 					setBalance(2, -50),
-					byId(9).one(),
-					setBalance(1, 101).returning(['accounts.balance']).one(),
+					byId(9).expectOne(),
+					setBalance(1, 101).returning(['accounts.balance']).expectOne(),
 				]),
 			);
 			expect(trips).toBe(1);
@@ -219,7 +217,10 @@ describe.skipIf(noPg)('db.batch', () => {
 		it('applies the timeout to each query', async () => {
 			const error = await rejection(
 				db.batch(
-					[db.selectFrom(slow).select(['slow.done']).one(), byId(1).one()],
+					[
+						db.selectFrom(slow).select(['slow.done']).expectOne(),
+						byId(1).expectOne(),
+					],
 					{ timeout: 100 },
 				),
 				BatchError,
@@ -241,8 +242,8 @@ describe.skipIf(noPg)('db.batch', () => {
 					.selectFrom(accounts)
 					.select(['accounts.owner'])
 					.where('accounts.id', 1)
-					.one(),
-				pooled.selectFrom(accounts).select(['accounts.owner']).all(),
+					.expectOne(),
+				pooled.selectFrom(accounts).select(['accounts.owner']),
 			]);
 			expect(one).toEqual({ owner: 'ada' });
 			expect(two).toHaveLength(2);
@@ -257,7 +258,7 @@ describe.skipIf(noPg)('db.batch', () => {
 						setBalance(1, 70),
 						setBalance(2, 80),
 						db.insertInto(notes).values({ body: 'transfer' }),
-						byId(2).all(),
+						byId(2),
 					],
 					{ transaction: true },
 				),
@@ -284,7 +285,7 @@ describe.skipIf(noPg)('db.batch', () => {
 						db.insertInto(notes).values({ body: 'dropped' }),
 						setBalance(2, 250),
 						setBalance(1, -100),
-						byId(1).all(),
+						byId(1),
 					],
 					{ transaction: true },
 				),
@@ -303,8 +304,8 @@ describe.skipIf(noPg)('db.batch', () => {
 			const ok = await measure(() =>
 				db.batch(
 					[
-						setBalance(1, 101).returning(['accounts.balance']).one(),
-						byId(2).one(),
+						setBalance(1, 101).returning(['accounts.balance']).expectOne(),
+						byId(2).expectOne(),
 					],
 					{ transaction: true },
 				),
@@ -317,7 +318,10 @@ describe.skipIf(noPg)('db.batch', () => {
 
 			const noRow = await measure(() =>
 				db.batch(
-					[db.insertInto(notes).values({ body: 'dropped' }), byId(9).one()],
+					[
+						db.insertInto(notes).values({ body: 'dropped' }),
+						byId(9).expectOne(),
+					],
 					{ transaction: true },
 				),
 			);
@@ -349,8 +353,7 @@ describe.skipIf(noPg)('db.batch', () => {
 				[
 					db
 						.selectFrom(settings)
-						.select(['settings.tenant', 'settings.isolation'])
-						.all(),
+						.select(['settings.tenant', 'settings.isolation']),
 				],
 				{
 					transaction: {
@@ -365,7 +368,7 @@ describe.skipIf(noPg)('db.batch', () => {
 				db.batch(
 					[
 						db.insertInto(notes).values({ body: 'dropped' }),
-						db.selectFrom(slow).select(['slow.done']).all(),
+						db.selectFrom(slow).select(['slow.done']),
 					],
 					{ transaction: true, timeout: 100 },
 				),
@@ -393,7 +396,8 @@ describe.skipIf(noPg)('db.batch', () => {
 
 	describe('with row locks', () => {
 		it('keeps the locking clause through the shape, and holds the locks in its transaction', async () => {
-			const claim = (id: number) => byId(id).forUpdate().skipLocked().first();
+			const claim = (id: number) =>
+				byId(id).forUpdate().skipLocked().limit(1).takeFirst();
 			expect(claim(1).toSQL().sql).toMatch(
 				/ limit \$\d+ for update skip locked$/,
 			);
@@ -415,14 +419,17 @@ describe.skipIf(noPg)('db.batch', () => {
 				expect(trips).toBe(1);
 				// a checked shape: COMMIT waits for it, and the lock error rolls back
 				await rejection(
-					db.batch([setBalance(2, 70), byId(1).forUpdate().noWait().one()], {
-						transaction: true,
-					}),
+					db.batch(
+						[setBalance(2, 70), byId(1).forUpdate().noWait().expectOne()],
+						{
+							transaction: true,
+						},
+					),
 					LockNotAvailable,
 				);
 				// outside a transaction, the lock is the statement's own
 				const error = await rejection(
-					db.batch([byId(1).forShare().noWait().all(), byId(2).forShare()]),
+					db.batch([byId(1).forShare().noWait(), byId(2).forShare()]),
 					BatchError,
 				);
 				expect(error.errors[0]).toBeInstanceOf(LockNotAvailable);
@@ -442,7 +449,7 @@ describe.skipIf(noPg)('db.batch', () => {
 				db.transaction((tx) =>
 					tx.batch([
 						tx.insertInto(notes).values({ body: 'in tx' }),
-						tx.selectFrom(notes).select(['notes.body']).all(),
+						tx.selectFrom(notes).select(['notes.body']),
 					]),
 				),
 			);
@@ -487,7 +494,7 @@ describe.skipIf(noPg)('db.batch', () => {
 
 		it('takes no timeout', async () => {
 			await rejection(
-				db.transaction((tx) => tx.batch([byId(1).all()], { timeout: 100 })),
+				db.transaction((tx) => tx.batch([byId(1)], { timeout: 100 })),
 				DriverError,
 			);
 		});

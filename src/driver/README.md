@@ -194,7 +194,9 @@ const db = database(process.env.DATABASE_URL, { onQuery: (e) => log(e) });
 const user = await db
 	.selectFrom(users)
 	.where('users.id', id)
-	.one({ signal: request.signal, timeout: '2s' });
+	.select(['users.email'])
+	.expectOne()
+	.execute({ signal: request.signal, timeout: '2s' });
 await db.transaction(async (tx) => {
 	await tx.insertInto(orders).values(order).execute();
 	tx.afterCommit(() => queue.publish('order.created'));

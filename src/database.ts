@@ -63,9 +63,9 @@ export interface Database extends AsyncDisposable {
 	): Promise<VerifyReport>;
 
 	/**
-	 * Starts a `select` from `table`, run on this database by `execute()`,
-	 * after a result shape (`all`, `first`, `one`, `maybeOne`) or without
-	 * one, for every row.
+	 * Starts a `select` from `table`, run on this database by `execute()`:
+	 * after a result shape (`takeFirst`, `expectOne`, …), or without one,
+	 * for every row.
 	 */
 	selectFrom<T extends AnyTable>(
 		table: T,
@@ -95,24 +95,26 @@ export interface Database extends AsyncDisposable {
 
 	/**
 	 * Runs `queries` in one round trip, on one connection, and resolves to
-	 * their results by position: each is a shaped query (`one()`, `all()`,
-	 * …) or a builder, read as its `execute()` would be. The batch runs them
-	 * on this database, wherever they were started.
+	 * their results by position: each is a shaped query (`takeFirst()`,
+	 * `expectOne()`, …) or a builder, read as its `execute()` would be. The
+	 * batch runs them on this database, wherever they were started.
 	 *
 	 * - Outside a transaction, each query runs on its own: when any fails
-	 *   (or `one` finds no row), the others still run and stay committed,
-	 *   and the batch rejects with a `BatchError` holding every outcome.
+	 *   (or `expectOne` finds no row), the others still run and stay
+	 *   committed, and the batch rejects with a `BatchError` holding every
+	 *   outcome.
 	 * - With `transaction`, they run all or nothing in one transaction,
 	 *   BEGIN and COMMIT included in the round trip; the batch rejects with
-	 *   the error that rolled it back. A result that `one`, `maybeOne`
-	 *   or `expectRows` checks makes COMMIT wait for it: a second round trip.
+	 *   the error that rolled it back. A result that an `expect…` shape
+	 *   checks makes COMMIT wait for it: a second round trip. The `take…`
+	 *   shapes check nothing, so COMMIT goes in the same round trip.
 	 * - Inside a transaction, they share one Sync: the first error skips
 	 *   the rest and rejects the batch, failing the transaction as any
 	 *   failed query does; `transaction` makes them a savepoint.
 	 *
 	 * @example
 	 * const [user, posts, { rowCount }] = await db.batch([
-	 *   db.selectFrom(users).where('users.id', id).select(['users.email']).one(),
+	 *   db.selectFrom(users).where('users.id', id).select(['users.email']).expectOne(),
 	 *   db.selectFrom(posts).where('posts.userId', id).select(['posts.title']),
 	 *   db.update(users).set({ seenAt: now }).where('users.id', id),
 	 * ]);
@@ -134,7 +136,7 @@ export interface Database extends AsyncDisposable {
 	 *
 	 * @example
 	 * await db.transaction(async (tx) => {
-	 *   const order = await tx.insertInto(orders).values(row).returning(['orders.id']).one().execute();
+	 *   const order = await tx.insertInto(orders).values(row).returning(['orders.id']).expectOne().execute();
 	 *   tx.afterCommit(() => queue.publish('order.created', order.id));
 	 * }, { isolation: 'serializable', retries: 3 });
 	 */
@@ -175,7 +177,7 @@ export type DatabaseSource =
  *
  * @example
  * const db = database(process.env.DATABASE_URL);
- * const user = await db.selectFrom(users).where('users.id', id).one().execute();
+ * const user = await db.selectFrom(users).where('users.id', id).select(['users.email']).expectOne().execute();
  */
 export function database(
 	source: DatabaseSource,
