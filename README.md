@@ -11,23 +11,23 @@ quarry ships two things in one package:
 import { database, defineTable, integer, text, timestamptz } from 'quarry';
 
 const users = defineTable('users', {
-	columns: {
-		id: integer().identity(),
-		email: text(),
-		name: text().nullable(),
-		createdAt: timestamptz().name('created_at').default(),
-	},
+  columns: {
+    id: integer().identity(),
+    email: text(),
+    name: text().nullable(),
+    createdAt: timestamptz().name('created_at').default(),
+  },
 });
 
 const db = database(process.env.DATABASE_URL);
 
-const user = await db
-	.selectFrom(users)
-	.where('users.email', 'ada@example.com')
-	.select(['users.id', 'users.name'])
-	.expectOne()
-	.execute();
 // user: { id: number; name: string | null }
+const user = await db
+  .selectFrom(users)
+  .where('users.email', 'ada@example.com')
+  .select(['users.id', 'users.name'])
+  .expectOne()
+  .execute();
 ```
 
 > **Status.** The driver is complete, tested against PostgreSQL 18 directly and through PgBouncer, and benchmarked. The query builder is **in active development**: the API documented below is the intended 1.0 surface, and details may still change before release.
@@ -35,7 +35,7 @@ const user = await db
 ## Contents
 
 - [Requirements](#requirements)
-- [Installation](#installation)
+- [Entry points](#entry-points)
 - **Part I: The driver**
   - [Overview](#overview)
   - [Benchmarks](#benchmarks)
@@ -79,14 +79,9 @@ const user = await db
 - **Node 22.12 or later.** Bun and Deno are supported (tested on Bun 1.4 and Deno 2.9), as is Cloudflare Workers.
 - **TypeScript with `strict` enabled**, for the query builder's types.
 
-## Installation
+## Entry points
 
-```sh
-pnpm add quarry
-# or: npm install quarry / bun add quarry / deno add npm:quarry
-```
-
-There are two entry points:
+The package has two entry points:
 
 | Import          | What it is                                                                           |
 | --------------- | ------------------------------------------------------------------------------------ |
@@ -290,6 +285,13 @@ Bun.sql, which is implemented natively inside the runtime, is the closest compet
 | `begin; insert; commit` (ops/s)                      |   **9,154** |   6,523 |      6,574 |       6,025 |
 | `select 1`, sequential (ops/s)                       |      17,356 | **20,290** |   19,115 |      18,914 |
 
+### Where quarry doesn't lead
+
+- **Sequential queries through PgBouncer.** quarry keeps 43–56% of its direct throughput through PgBouncer, the lowest share of any client, and `pg` is faster for a sequential `select 1` (20,290 vs 17,356 ops/s). Under concurrency, or with real rows to decode, quarry leads again.
+- **The extreme tail on trivial queries.** postgres.js has the best p99.9 latency for `select 1` and point lookups (156 µs vs quarry's 354 µs). quarry leads at p50, p90 and p99.
+- **Garbage collection on very large results.** Fetching 100,000 rows in one result, quarry spends 228 ms per second in GC against `pg`'s 143, with a longest pause of 34 ms on the 1M-row fetch. If you read huge results, use a [cursor](#cursors-streaming-and-copy): streaming 1M rows peaks at 147 MB with event-loop lag under 2 ms.
+- **Large `jsonb` values.** With 200 KB `jsonb` documents, `pg (named)` is slightly faster (23.5 ms vs 24.8 ms) and uses less memory. JSON parsing dominates and is the same `JSON.parse` for everyone.
+
 ### Running the benchmarks yourself
 
 ```sh
@@ -322,8 +324,8 @@ A pool, which is what most applications want:
 import { createPool } from 'quarry/driver';
 
 const pool = createPool({
-	connectionString: process.env.DATABASE_URL,
-	max: 20,
+  connectionString: process.env.DATABASE_URL,
+  max: 20,
 });
 
 await pool.query('select 1');
@@ -383,8 +385,8 @@ Options are resolved like libpq, in this order, the first one that sets a value 
 
 ```ts
 const pool = createPool({
-	host: 'db-1.internal,db-2.internal,db-3.internal',
-	targetSessionAttrs: 'read-write',
+  host: 'db-1.internal,db-2.internal,db-3.internal',
+  targetSessionAttrs: 'read-write',
 });
 ```
 
@@ -421,9 +423,9 @@ connect({ host: 'db.example.com', ssl: { mode: 'require', negotiation: 'direct' 
 
   ```ts
   createPool({
-  	host: 'mydb.cluster.us-east-1.rds.amazonaws.com',
-  	user: 'app',
-  	password: () => signer.getAuthToken(), // a fresh IAM token per connection
+    host: 'mydb.cluster.us-east-1.rds.amazonaws.com',
+    user: 'app',
+    password: () => signer.getAuthToken(), // a fresh IAM token per connection
   });
   ```
 
@@ -452,8 +454,8 @@ connect({ host: 'db.example.com', ssl: { mode: 'require', negotiation: 'direct' 
 
 ```ts
 const { rows, rowCount, command, fields } = await pool.query(
-	'select id, email from users where created_at > $1',
-	[since],
+  'select id, email from users where created_at > $1',
+  [since],
 );
 ```
 
@@ -470,16 +472,16 @@ Per-query options:
 
 ```ts
 await pool.query(sql, params, {
-	rowMode: 'array',       // positional rows
-	signal,                 // an AbortSignal that cancels the query
-	timeout: 5000,          // client-side deadline, in ms
-	statementTimeout: '2s', // server-side statement_timeout for this query only
-	paramTypes: [arrayOids.int4],
-	prepare: false,         // send this one unnamed
-	keepRows: 1,            // decode only the first row; rowCount still counts all
-	types: { ...defaultTypes, [oids.numeric]: Number }, // decoders for this query only
-	tag: 'orders.recent',   // a label for telemetry spans
-	onTiming: (t) => log(t), // where the query spent its time once it settles
+  rowMode: 'array',       // positional rows
+  signal,                 // an AbortSignal that cancels the query
+  timeout: 5000,          // client-side deadline, in ms
+  statementTimeout: '2s', // server-side statement_timeout for this query only
+  paramTypes: [arrayOids.int4],
+  prepare: false,         // send this one unnamed
+  keepRows: 1,            // decode only the first row; rowCount still counts all
+  types: { ...defaultTypes, [oids.numeric]: Number }, // decoders for this query only
+  tag: 'orders.recent',   // a label for telemetry spans
+  onTiming: (t) => log(t), // where the query spent its time once it settles
 });
 ```
 
@@ -514,9 +516,9 @@ Parameters are always sent separately from the SQL text, never interpolated.
 import { arrayOids } from 'quarry/driver';
 
 await pool.query(
-	'insert into items (id, name) select * from unnest($1::int4[], $2::text[])',
-	[ids, names],
-	{ paramTypes: [arrayOids.int4, arrayOids.text] },
+  'insert into items (id, name) select * from unnest($1::int4[], $2::text[])',
+  [ids, names],
+  { paramTypes: [arrayOids.int4, arrayOids.text] },
 );
 ```
 
@@ -538,11 +540,11 @@ Values are decoded per column type OID. Three choices:
 import { createPool, defaultTypes, oids, parseTimestamptz } from 'quarry/driver';
 
 const pool = createPool({
-	types: {
-		...defaultTypes,
-		[oids.timestamptz]: parseTimestamptz, // Date instead of text
-		[oids.numeric]: (text) => new Decimal(text),
-	},
+  types: {
+    ...defaultTypes,
+    [oids.timestamptz]: parseTimestamptz, // Date instead of text
+    [oids.numeric]: (text) => new Decimal(text),
+  },
 });
 ```
 
@@ -593,18 +595,18 @@ A cancelled query rejects with `QueryCanceled`, whose `reason` is `'abort'`, `'t
 ```ts
 // Batches of rows, fetched as you consume them:
 for await (const batch of conn.cursor('select * from events', [], { batchSize: 1000 })) {
-	await process(batch);
+  await process(batch);
 }
 
 // One row at a time (on a dedicated pool connection):
 for await (const row of pool.stream('select * from events where day = $1', [day])) {
-	await process(row);
+  await process(row);
 }
 
 // Bulk insert from arrays of values, encoded like parameters:
 await pool.copyRows('copy items (id, name) from stdin', [
-	[1, 'first'],
-	[2, 'second'],
+  [1, 'first'],
+  [2, 'second'],
 ]);
 
 // Raw COPY in, from any async iterable of chunks:
@@ -612,7 +614,7 @@ await pool.copyFrom('copy items from stdin with (format csv)', fs.createReadStre
 
 // Raw COPY out:
 for await (const chunk of pool.copyTo('copy items to stdout with (format csv)')) {
-	out.write(chunk);
+  out.write(chunk);
 }
 ```
 
@@ -622,7 +624,7 @@ A paused consumer pauses the socket: the driver doesn't read ahead of what you'v
 
 ```ts
 const unlisten = await pool.listen('orders', (notification) => {
-	console.log(notification.channel, notification.payload);
+  console.log(notification.channel, notification.payload);
 });
 
 await pool.query("select pg_notify('orders', $1)", [JSON.stringify(order)]);
@@ -637,17 +639,15 @@ await unlisten();
 
 ```ts
 const order = await pool.transaction(
-	async (tx) => {
-		const { rows } = await tx.query('insert into orders (total) values ($1) returning id', [total]);
-
-		await tx.transaction(async (sp) => {
-			await sp.query('insert into audit (order_id) values ($1)', [rows[0].id]);
-		}); // a savepoint
-		
-		tx.afterCommit(() => queue.publish('order.created', rows[0].id));
-		return rows[0];
-	},
-	{ isolation: 'serializable', retries: 3, settings: { 'app.tenant_id': tenantId } },
+  async (tx) => {
+    const { rows } = await tx.query('insert into orders (total) values ($1) returning id', [total]);
+    await tx.transaction(async (sp) => {
+      await sp.query('insert into audit (order_id) values ($1)', [rows[0].id]);
+    }); // a savepoint
+    tx.afterCommit(() => queue.publish('order.created', rows[0].id));
+    return rows[0];
+  },
+  { isolation: 'serializable', retries: 3, settings: { 'app.tenant_id': tenantId } },
 );
 ```
 
@@ -671,11 +671,11 @@ const order = await pool.transaction(
 
 ```ts
 const pool = createPool({
-	connectionString: process.env.DATABASE_URL,
-	max: 20,
-	min: 2,
-	idleTimeout: 30_000,
-	onConnect: (conn) => conn.query("set application_name = 'worker'"),
+  connectionString: process.env.DATABASE_URL,
+  max: 20,
+  min: 2,
+  idleTimeout: 30_000,
+  onConnect: (conn) => conn.query("set application_name = 'worker'"),
 });
 ```
 
@@ -773,10 +773,10 @@ Common SQLSTATEs have their own subclasses of `PostgresError`, so you can catch 
 import { UniqueViolation } from 'quarry/driver';
 
 try {
-	await pool.query('insert into users (email) values ($1)', [email]);
+  await pool.query('insert into users (email) values ($1)', [email]);
 } catch (error) {
-	if (error instanceof UniqueViolation) return { ok: false, reason: 'email taken' };
-	throw error;
+  if (error instanceof UniqueViolation) return { ok: false, reason: 'email taken' };
+  throw error;
 }
 ```
 
@@ -788,10 +788,10 @@ try {
 import { trace } from '@opentelemetry/api';
 
 createPool({
-	telemetry: {
-		tracer: trace.getTracer('app'),
-		queryText: true, // record the SQL; parameters are never recorded
-	},
+  telemetry: {
+    tracer: trace.getTracer('app'),
+    queryText: true, // record the SQL; parameters are never recorded
+  },
 });
 ```
 
@@ -818,45 +818,45 @@ The query builder turns table definitions into types, and types into checks. It 
 
 ```ts
 import {
-	array,
-	bigint,
-	boolean,
-	decimal,
-	defineEnum,
-	defineTable,
-	integer,
-	jsonb,
-	text,
-	timestamptz,
-	uuid,
-	varchar,
+  array,
+  bigint,
+  boolean,
+  decimal,
+  defineEnum,
+  defineTable,
+  integer,
+  jsonb,
+  text,
+  timestamptz,
+  uuid,
+  varchar,
 } from 'quarry';
 
 export const role = defineEnum('user_role', ['admin', 'member', 'guest']);
 
 export const users = defineTable('users', {
-	columns: {
-		id: integer().identity(),
-		email: varchar(320),
-		name: text().nullable(),
-		managerId: integer().name('manager_id').nullable(),
-		role: role().default(),
-		tags: array(text()).default(),
-		settings: jsonb<{ theme: 'light' | 'dark' }>().default(),
-		createdAt: timestamptz().name('created_at').default(),
-	},
+  columns: {
+    id: integer().identity(),
+    email: varchar(320),
+    name: text().nullable(),
+    managerId: integer().name('manager_id').nullable(),
+    role: role().default(),
+    tags: array(text()).default(),
+    settings: jsonb<{ theme: 'light' | 'dark' }>().default(),
+    createdAt: timestamptz().name('created_at').default(),
+  },
 });
 
 export const posts = defineTable('posts', {
-	columns: {
-		id: bigint().identity(),
-		authorId: integer().name('author_id'),
-		title: text(),
-		body: text(),
-		published: boolean().default(),
-		price: decimal(10, 2).nullable(),
-		publicId: uuid().name('public_id').default(),
-	},
+  columns: {
+    id: bigint().identity(),
+    authorId: integer().name('author_id'),
+    title: text(),
+    body: text(),
+    published: boolean().default(),
+    price: decimal(10, 2).nullable(),
+    publicId: uuid().name('public_id').default(),
+  },
 });
 ```
 
@@ -914,11 +914,11 @@ Every factory takes a type parameter that narrows its value, for branded ids and
 type UserId = number & { readonly __brand: 'UserId' };
 
 const users = defineTable('users', {
-	columns: {
-		id: integer<UserId>().identity(),
-		plan: text<'free' | 'pro' | 'team'>(),
-		level: smallint<1 | 2 | 3>().default(),
-	},
+  columns: {
+    id: integer<UserId>().identity(),
+    plan: text<'free' | 'pro' | 'team'>(),
+    level: smallint<1 | 2 | 3>().default(),
+  },
 });
 ```
 
@@ -938,12 +938,12 @@ legacyCode: text().typed<string, never, never>(),
 const status = defineEnum('order_status', ['pending', 'paid', 'shipped', 'cancelled']);
 
 const orders = defineTable('orders', {
-	columns: { status: status().default() },
+  columns: { status: status().default() },
 });
 
 // a column that only ever holds some of the labels
 const refunds = defineTable('refunds', {
-	columns: { status: status<'cancelled'>() },
+  columns: { status: status<'cancelled'>() },
 });
 ```
 
@@ -974,9 +974,9 @@ In `InferInsertType`, columns with a default are optional, nullable columns with
 const managers = users.as('managers');
 
 db.selectFrom(users)
-	.innerJoin(managers)
-	.on('managers.id', 'users.managerId')
-	.select(['users.name', 'managers.name']);
+  .innerJoin(managers)
+  .on('managers.id', 'users.managerId')
+  .select(['users.name', 'managers.name']);
 ```
 
 ## Opening a database
@@ -991,11 +991,11 @@ const db = database(process.env.DATABASE_URL);
 
 ```ts
 const db = database(
-	{ connectionString: process.env.DATABASE_URL, max: 20 },
-	{
-		onQuery: (event) => logger.debug(event),
-		callsites: true,
-	},
+  { connectionString: process.env.DATABASE_URL, max: 20 },
+  {
+    onQuery: (event) => logger.debug(event),
+    callsites: true,
+  },
 );
 ```
 
@@ -1014,15 +1014,15 @@ const db = database(
 
 ```ts
 const rows = await db
-	.selectFrom(posts)
-	.innerJoin(users)
-	.on('users.id', 'posts.authorId')
-	.where('posts.published', true)
-	.where((eb) => eb.ref('users.role').in(['admin', 'member']))
-	.select(['posts.id', 'posts.title', 'users.name'])
-	.orderBy('posts.id', 'desc')
-	.limit(20)
-	.execute();
+  .selectFrom(posts)
+  .innerJoin(users)
+  .on('users.id', 'posts.authorId')
+  .where('posts.published', true)
+  .where((eb) => eb.ref('users.role').in(['admin', 'member']))
+  .select(['posts.id', 'posts.title', 'users.name'])
+  .orderBy('posts.id', 'desc')
+  .limit(20)
+  .execute();
 // rows: { id: string; title: string; name: string | null }[]
 ```
 
@@ -1067,10 +1067,10 @@ To test for null, use `eb.ref('users.name').isNull()`: `= null` is never true in
 
 ```ts
 .innerJoin(memberships).on((eb) =>
-	eb.and([
-		eb.ref('memberships.userId').eq(eb.ref('users.id')),
-		eb.ref('memberships.active').isTrue(),
-	]),
+  eb.and([
+    eb.ref('memberships.userId').eq(eb.ref('users.id')),
+    eb.ref('memberships.active').isTrue(),
+  ]),
 )
 ```
 
@@ -1098,14 +1098,14 @@ For large tables, prefer keyset pagination to `offset`:
 
 ```ts
 const authors = await db
-	.selectFrom(users)
-	.leftJoin(posts)
-	.on('posts.authorId', 'users.id')
-	.select((eb) => ['users.id', 'users.name', eb.fn.count('posts.id').as('postCount')])
-	.groupBy(['users.id'])
-	.having((eb) => eb.fn.count('posts.id').gte(5))
-	.orderBy((eb) => eb.fn.count('posts.id'), 'desc')
-	.execute();
+  .selectFrom(users)
+  .leftJoin(posts)
+  .on('posts.authorId', 'users.id')
+  .select((eb) => ['users.id', 'users.name', eb.fn.count('posts.id').as('postCount')])
+  .groupBy(['users.id'])
+  .having((eb) => eb.fn.count('posts.id').gte(5))
+  .orderBy((eb) => eb.fn.count('posts.id'), 'desc')
+  .execute();
 // { id: number; name: string | null; postCount: string }[]
 ```
 
@@ -1125,11 +1125,11 @@ A query can appear wherever an expression of its type can.
 ```ts
 // exists / not exists
 .where((eb) =>
-	eb.exists(
-		db.selectFrom(posts)
-			.where((eb) => eb.ref('posts.authorId').eq(eb.ref('users.id')))
-			.where('posts.published', true),
-	),
+  eb.exists(
+    db.selectFrom(posts)
+      .where((eb) => eb.ref('posts.authorId').eq(eb.ref('users.id')))
+      .where('posts.published', true),
+  ),
 )
 
 // in (select …): the subquery must select one column of a comparable type
@@ -1137,12 +1137,12 @@ A query can appear wherever an expression of its type can.
 
 // a scalar subquery in the select list
 .select((eb) => [
-	'users.id',
-	eb.scalar(
-		db.selectFrom(posts)
-			.where((eb) => eb.ref('posts.authorId').eq(eb.ref('users.id')))
-			.select((eb) => [eb.fn.count()]),
-	).as('postCount'),
+  'users.id',
+  eb.scalar(
+    db.selectFrom(posts)
+      .where((eb) => eb.ref('posts.authorId').eq(eb.ref('users.id')))
+      .select((eb) => [eb.fn.count()]),
+  ).as('postCount'),
 ])
 ```
 
@@ -1156,19 +1156,19 @@ A subquery may reference the tables of the query around it (a correlated subquer
 import { cte } from 'quarry';
 
 const prolific = cte(
-	'prolific_authors',
-	db.selectFrom(posts)
-		.select((eb) => ['posts.authorId', eb.fn.count().as('total')])
-		.groupBy(['posts.authorId'])
-		.having((eb) => eb.fn.count().gt(100)),
+  'prolific_authors',
+  db.selectFrom(posts)
+    .select((eb) => ['posts.authorId', eb.fn.count().as('total')])
+    .groupBy(['posts.authorId'])
+    .having((eb) => eb.fn.count().gt(100)),
 );
 
 await db
-	.selectFrom(users)
-	.innerJoin(prolific)
-	.on('prolific_authors.authorId', 'users.id')
-	.select(['users.name', 'prolific_authors.total'])
-	.execute();
+  .selectFrom(users)
+  .innerJoin(prolific)
+  .on('prolific_authors.authorId', 'users.id')
+  .select(['users.name', 'prolific_authors.total'])
+  .execute();
 ```
 
 `cte(name, query, { materialized: true })` adds `materialized` (or `false` for `not materialized`), and `cteRecursive(name, (self) => base.unionAll(step(self)))` builds a recursive one.
@@ -1177,9 +1177,9 @@ await db
 
 ```ts
 const everyone = db
-	.selectFrom(users)
-	.select(['users.email'])
-	.union(db.selectFrom(subscribers).select(['subscribers.email']));
+  .selectFrom(users)
+  .select(['users.email'])
+  .union(db.selectFrom(subscribers).select(['subscribers.email']));
 ```
 
 `union`, `unionAll`, `intersect`, `intersectAll`, `except` and `exceptAll` take a query with the same columns and compatible types; anything else is a type error.
@@ -1188,17 +1188,17 @@ const everyone = db
 
 ```ts
 await db.transaction(async (tx) => {
-	const job = await tx
-		.selectFrom(jobs)
-		.where('jobs.status', 'queued')
-		.select(['jobs.id', 'jobs.payload'])
-		.orderBy('jobs.id')
-		.limit(1)
-		.forUpdate()
-		.skipLocked()
-		.takeFirst()
-		.execute();
-	// ...
+  const job = await tx
+    .selectFrom(jobs)
+    .where('jobs.status', 'queued')
+    .select(['jobs.id', 'jobs.payload'])
+    .orderBy('jobs.id')
+    .limit(1)
+    .forUpdate()
+    .skipLocked()
+    .takeFirst()
+    .execute();
+  // ...
 });
 ```
 
@@ -1212,9 +1212,9 @@ Locks last until the transaction ends, so run locking queries inside `db.transac
 
 ```ts
 db.selectFrom(users)
-	.select(['users.id'])
-	.when(filters.role !== undefined, (qb) => qb.where('users.role', filters.role!))
-	.when(includeEmail, (qb) => qb.select(['users.email']));
+  .select(['users.id'])
+  .when(filters.role !== undefined, (qb) => qb.where('users.role', filters.role!))
+  .when(includeEmail, (qb) => qb.select(['users.email']));
 // { id: number; email?: string }[]
 ```
 
@@ -1226,7 +1226,7 @@ import { fragment } from 'quarry';
 const published = fragment(posts, (qb) => qb.where('posts.published', true));
 
 const withAuthor = fragment(posts, (qb) =>
-	qb.innerJoin(users).on('users.id', 'posts.authorId').select(['users.name']),
+  qb.innerJoin(users).on('users.id', 'posts.authorId').select(['users.name']),
 );
 
 db.selectFrom(posts).pipe(published).pipe(withAuthor).select(['posts.title']);
@@ -1334,11 +1334,11 @@ Paths are checked against the column's declared document type `T` where it's kno
 
 ```ts
 eb.case()
-	.when(eb.ref('orders.total').gte(1000), 'large')
-	.when(eb.ref('orders.total').gte(100), 'medium')
-	.else('small')
-	.end()
-	.as('size')
+  .when(eb.ref('orders.total').gte(1000), 'large')
+  .when(eb.ref('orders.total').gte(100), 'medium')
+  .else('small')
+  .end()
+  .as('size')
 ```
 
 The result type is the union of the branches, plus `null` without an `else`.
@@ -1383,11 +1383,11 @@ The shape comes before `execute()`:
 
 ```ts
 const email = await db
-	.selectFrom(users)
-	.where('users.id', id)
-	.select(['users.email'])
-	.expectValue()
-	.execute(); // string
+  .selectFrom(users)
+  .where('users.id', id)
+  .select(['users.email'])
+  .expectValue()
+  .execute(); // string
 ```
 
 `takeValue` and `expectValue` require exactly one selected column; with more, the call fails to compile. Each `expect…` takes an optional function that maps the error it would throw to your own:
@@ -1400,11 +1400,11 @@ const email = await db
 
 ```ts
 const user = await db
-	.insertInto(users)
-	.values({ email: 'ada@example.com', name: 'Ada' })
-	.returning(['users.id', 'users.createdAt'])
-	.expectOne()
-	.execute();
+  .insertInto(users)
+  .values({ email: 'ada@example.com', name: 'Ada' })
+  .returning(['users.id', 'users.createdAt'])
+  .expectOne()
+  .execute();
 // { id: number; createdAt: Date }
 ```
 
@@ -1421,9 +1421,9 @@ await db.insertInto(users).values(rows).execute();
 
 ```ts
 await db
-	.insertInto(archivedPosts)
-	.fromSelect(db.selectFrom(posts).where((eb) => eb.ref('posts.createdAt').lt(cutoff)).selectAll())
-	.execute();
+  .insertInto(archivedPosts)
+  .fromSelect(db.selectFrom(posts).where((eb) => eb.ref('posts.createdAt').lt(cutoff)).selectAll())
+  .execute();
 ```
 
 ### Upserts
@@ -1440,11 +1440,11 @@ The conflict target must be columns of the table. `merge(columns)` is shorthand 
 
 ```ts
 await db
-	.insertInto(counters)
-	.values({ key: 'visits', value: 1 })
-	.onConflict('key')
-	.doUpdate((excluded, eb) => ({ value: eb.ref('counters.value').plus(excluded.value) }))
-	.execute();
+  .insertInto(counters)
+  .values({ key: 'visits', value: 1 })
+  .onConflict('key')
+  .doUpdate((excluded, eb) => ({ value: eb.ref('counters.value').plus(excluded.value) }))
+  .execute();
 ```
 
 `.onConflict('email').doNothing().expectRows(1)` throws a `RowCountError` when the row already existed, which is a compact way to say "insert, and tell me if it was a duplicate".
@@ -1453,10 +1453,10 @@ await db
 
 ```ts
 await db
-	.update(users)
-	.set({ name: 'Ada Lovelace' })
-	.where('users.id', id)
-	.execute();
+  .update(users)
+  .set({ name: 'Ada Lovelace' })
+  .where('users.id', id)
+  .execute();
 // { rowCount: 1 }
 ```
 
@@ -1464,9 +1464,9 @@ await db
 
 ```ts
 .set((eb) => ({
-	email: eb.fn.lower('users.email'),
-	loginCount: eb.ref('users.loginCount').plus(1),
-	lastSeenAt: eb.fn.now(),
+  email: eb.fn.lower('users.email'),
+  loginCount: eb.ref('users.loginCount').plus(1),
+  lastSeenAt: eb.fn.now(),
 }))
 ```
 
@@ -1480,12 +1480,12 @@ await db.update(users).set({ verified: false }).allRows().execute();
 
 ```ts
 await db
-	.update(docs)
-	.set({ body, version: version + 1 })
-	.where('docs.id', id)
-	.where('docs.version', version)
-	.expectRows(1) // RowCountError if someone else saved first
-	.execute();
+  .update(docs)
+  .set({ body, version: version + 1 })
+  .where('docs.id', id)
+  .where('docs.version', version)
+  .expectRows(1) // RowCountError if someone else saved first
+  .execute();
 ```
 
 ### Updating many rows to different values
@@ -1494,15 +1494,15 @@ await db
 
 ```ts
 await db
-	.updateMany(
-		products,
-		[
-			{ id: 1, price: '9.99', stock: 12 },
-			{ id: 2, price: '19.99', stock: 0 },
-		],
-		{ by: 'id' },
-	)
-	.execute();
+  .updateMany(
+    products,
+    [
+      { id: 1, price: '9.99', stock: 12 },
+      { id: 2, price: '19.99', stock: 0 },
+    ],
+    { by: 'id' },
+  )
+  .execute();
 // update "products" set "price" = "quarry_rows"."price", "stock" = "quarry_rows"."stock"
 // from unnest($1::integer[], $2::numeric[], $3::integer[]) as "quarry_rows"("id", "price", "stock")
 // where "products"."id" = "quarry_rows"."id"
@@ -1514,10 +1514,10 @@ await db
 
 ```ts
 const deleted = await db
-	.deleteFrom(sessions)
-	.where((eb) => eb.ref('sessions.expiresAt').lt(new Date()))
-	.returning(['sessions.id'])
-	.execute();
+  .deleteFrom(sessions)
+  .where((eb) => eb.ref('sessions.expiresAt').lt(new Date()))
+  .returning(['sessions.id'])
+  .execute();
 ```
 
 As with updates, a delete needs a `where` or an explicit `.allRows()` before it can run.
@@ -1545,7 +1545,7 @@ await query.execute({ signal: request.signal, timeout: '2s' });
 
 ```ts
 for await (const event of db.selectFrom(events).selectAll().stream({ batchSize: 1000 })) {
-	await handle(event);
+  await handle(event);
 }
 ```
 
@@ -1564,7 +1564,7 @@ const { params: paramTypes, columns } = await query.describe(); // types as the 
 import { selectFrom } from 'quarry';
 
 const byEmail = (email: string) =>
-	selectFrom(users).where('users.email', email).select(['users.id']).expectOne();
+  selectFrom(users).where('users.email', email).select(['users.id']).expectOne();
 
 const [user] = await db.batch([byEmail('ada@example.com')]);
 ```
@@ -1575,9 +1575,9 @@ const [user] = await db.batch([byEmail('ada@example.com')]);
 
 ```ts
 const [user, posts, { rowCount }] = await db.batch([
-	db.selectFrom(users).where('users.id', id).select(['users.email']).expectOne(),
-	db.selectFrom(posts).where('posts.authorId', id).select(['posts.title']),
-	db.update(users).set({ seenAt: new Date() }).where('users.id', id),
+  db.selectFrom(users).where('users.id', id).select(['users.email']).expectOne(),
+  db.selectFrom(posts).where('posts.authorId', id).select(['posts.title']),
+  db.update(users).set({ seenAt: new Date() }).where('users.id', id),
 ]);
 ```
 
@@ -1593,18 +1593,18 @@ await db.batch([debit, credit], { transaction: { isolation: 'serializable' } });
 
 ```ts
 const orderId = await db.transaction(
-	async (tx) => {
-		const order = await tx
-			.insertInto(orders)
-			.values({ userId, total })
-			.returning(['orders.id'])
-			.expectOne()
-			.execute();
-		await tx.insertInto(orderItems).values(items.map((item) => ({ ...item, orderId: order.id }))).execute();
-		tx.afterCommit(() => queue.publish('order.created', order.id));
-		return order.id;
-	},
-	{ isolation: 'serializable', retries: 3 },
+  async (tx) => {
+    const order = await tx
+      .insertInto(orders)
+      .values({ userId, total })
+      .returning(['orders.id'])
+      .expectOne()
+      .execute();
+    await tx.insertInto(orderItems).values(items.map((item) => ({ ...item, orderId: order.id }))).execute();
+    tx.afterCommit(() => queue.publish('order.created', order.id));
+    return order.id;
+  },
+  { isolation: 'serializable', retries: 3 },
 );
 ```
 
@@ -1633,12 +1633,12 @@ Database errors are the driver's [error classes](#errors), re-exported from `qua
 import { UniqueViolation, violatedColumns } from 'quarry';
 
 try {
-	await db.insertInto(users).values(input).execute();
+  await db.insertInto(users).values(input).execute();
 } catch (error) {
-	if (error instanceof UniqueViolation && violatedColumns(error, users)?.includes('email')) {
-		return reply.status(409).send({ field: 'email', message: 'Already registered' });
-	}
-	throw error;
+  if (error instanceof UniqueViolation && violatedColumns(error, users)?.includes('email')) {
+    return reply.status(409).send({ field: 'email', message: 'Already registered' });
+  }
+  throw error;
 }
 ```
 
@@ -1681,8 +1681,8 @@ import { database, defineConfig } from 'quarry';
 import * as schema from './src/schema.ts';
 
 export default defineConfig({
-	db: database(process.env.DATABASE_URL),
-	schema, // a module namespace or an array; values that aren't tables are ignored
+  db: database(process.env.DATABASE_URL),
+  schema, // a module namespace or an array; values that aren't tables are ignored
 });
 ```
 
