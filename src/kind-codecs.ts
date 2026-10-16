@@ -39,10 +39,10 @@ export const kindCodecs = {
 /** The kinds with a codec of their own; enums, arrays and custom types are given theirs. */
 export type CodecKind = keyof typeof kindCodecs;
 
-/** The codec a kind's values are sent and read with. */
 /** The kinds' codecs, as a table of every kind (no kind is an `Object` member). */
 const byKind: Partial<Record<Kind, Codec>> = kindCodecs;
 
+/** The codec a kind's values are sent and read with. */
 export function kindCodec(kind: Kind): Codec {
 	return byKind[kind] ?? codecs.raw;
 }

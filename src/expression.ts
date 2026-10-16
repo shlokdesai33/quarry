@@ -117,11 +117,7 @@ export class Param<T> extends Expression<T> {
 		 */
 		readonly $type?: T;
 		/**
-		 * Phantom: the value sent to the driver.
-		 */
-		readonly $value?: T;
-		/**
-		 * Phantom: the node the expression compiles to.
+		 * The node the expression compiles to.
 		 */
 		readonly node: OperationNode;
 		/**
