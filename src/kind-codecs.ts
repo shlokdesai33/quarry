@@ -50,7 +50,7 @@ export function kindCodec(kind: Kind): Codec {
 /**
  * How quarry reads a column no query chose a codec for (raw SQL, an
  * expression of unknown type): the driver's default codecs, with the
- * choices the column factories make, and pgvector's types.
+ * choices the column factories make, and pgvector's `vector`.
  */
 export const quarryRegistry = createCodecRegistry([
 	codecs.int8AsString,
@@ -58,5 +58,4 @@ export const quarryRegistry = createCodecRegistry([
 	codecs.daterange,
 	codecs.tstzrange,
 	codecs.vector,
-	codecs.halfvec,
 ]);

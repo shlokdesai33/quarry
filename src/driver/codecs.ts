@@ -307,18 +307,6 @@ const vector = Object.freeze<Codec<readonly number[], number[]>>({
 	decodeBinary: bin.vector,
 });
 
-const halfvec = Object.freeze<Codec<readonly number[], number[]>>({
-	name: 'halfvec',
-	oid: 0,
-	paramFormat: 'text',
-	resultFormat: 'text',
-	encode: vectorText,
-	decodeText: (output) => {
-		const values: number[] = JSON.parse(output);
-		return values;
-	},
-});
-
 const raw = Object.freeze<Codec<string, string>>({
 	name: '',
 	oid: 0,
@@ -343,7 +331,7 @@ for (const codec of [
 ])
 	sendArraysInBinary(codec);
 for (const codec of [jsonCodec, jsonb]) readArraysInBinary(codec);
-for (const codec of [jsonCodec, jsonb, vector, halfvec]) markArrayValued(codec);
+for (const codec of [jsonCodec, jsonb, vector]) markArrayValued(codec);
 
 /**
  * The built-in codecs, by type. Results are read in binary where that
@@ -399,8 +387,6 @@ export const codecs = Object.freeze({
 	tstzrangeAsString: textType('tstzrange', 3910, 3911),
 	/** pgvector's `vector`, as the float32 values stored (`0.1` reads as `0.10000000149011612`); read in binary. */
 	vector,
-	/** pgvector's `halfvec`, as the decimals printed. */
-	halfvec,
 	/** Any type, as the server's text both ways: the type of the column or parameter it is used for is inferred. */
 	raw,
 });
