@@ -11,8 +11,11 @@ import {
 	type CodecRegistry,
 	type Description,
 	type OpTiming,
+	type QueryOptions,
 	type QueryResult,
 } from './driver/index.js';
+
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
 import { quarryRegistry } from './kind-codecs.js';
 import type {
 	BatchQuery,
@@ -170,24 +173,24 @@ export class DriverExecutor implements TransactionExecutor {
 	#queryOptions(
 		options: ExecuteOptions,
 		onTiming: ((t: OpTiming) => void) | undefined,
-		{ tag, paramCodecs, resultCodecs }: CompiledQuery,
+		query: CompiledQuery,
 	) {
-		return {
+		// one object, filled in: this runs per query
+		const out: Mutable<QueryOptions> = {
 			codecs: this.#registry,
 			rowMode: options.rowMode ?? 'object',
-			...(options.keepRows === undefined ? {} : { keepRows: options.keepRows }),
-			...(paramCodecs === undefined ? {} : { paramCodecs }),
-			...(resultCodecs === undefined ? {} : { resultCodecs }),
-			...(this.#options.prepare === undefined
-				? {}
-				: { prepare: this.#options.prepare }),
-			...(options.signal === undefined ? {} : { signal: options.signal }),
-			...(options.timeout === undefined
-				? {}
-				: { statementTimeout: options.timeout }),
-			...(onTiming === undefined ? {} : { onTiming }),
-			...(tag === undefined ? {} : { tag }),
 		};
+		const { paramCodecs, resultCodecs, tag } = query;
+		if (options.keepRows !== undefined) out.keepRows = options.keepRows;
+		if (paramCodecs !== undefined) out.paramCodecs = paramCodecs;
+		if (resultCodecs !== undefined) out.resultCodecs = resultCodecs;
+		if (this.#options.prepare !== undefined)
+			out.prepare = this.#options.prepare;
+		if (options.signal !== undefined) out.signal = options.signal;
+		if (options.timeout !== undefined) out.statementTimeout = options.timeout;
+		if (onTiming !== undefined) out.onTiming = onTiming;
+		if (tag !== undefined) out.tag = tag;
+		return out;
 	}
 
 	/** Runs `fn` on a connection: borrowed from the pool, or the source itself. */

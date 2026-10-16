@@ -22,16 +22,16 @@ export interface CompiledQuery {
 	 * or expression it is compared with or written to, so the driver
 	 * encodes it once and declares its type. `undefined` where nothing
 	 * types it (`eb.val` on its own); absent when no parameter has one.
-	 * Like `resultCodecs`, not enumerable: a copy made by spreading the
-	 * query leaves the values to the driver's defaults.
+	 * Like `resultCodecs`, not an own property: a copy made by spreading
+	 * the query leaves the values to the driver's defaults.
 	 */
-	readonly paramCodecs?: readonly (Codec | undefined)[];
+	readonly paramCodecs?: readonly (Codec | undefined)[] | undefined;
 	/**
 	 * The codec of each result column, by position, where its SQL type is
 	 * known; `null` elsewhere. The driver asks for each column in its
 	 * codec's format from the first run, and reads it with that codec.
 	 */
-	readonly resultCodecs?: readonly (Codec | null)[];
+	readonly resultCodecs?: readonly (Codec | null)[] | undefined;
 	/** The query's label from `tag()`, if any. It is not part of `sql`. */
 	readonly tag?: string;
 }
@@ -73,21 +73,54 @@ export function compile(node: StatementNode): CompiledQuery {
 				  node.kind === 'delete'
 				? node.returning
 				: [];
-	const resultCodecs = selections.map((s) => s.codec ?? null);
-	const query: CompiledQuery = {
+	let resultCodecs: (Codec | null)[] | undefined;
+	for (let i = 0; i < selections.length; i++) {
+		const codec = selections[i]?.codec;
+		if (codec === undefined) continue;
+		resultCodecs ??= selections.map(() => null);
+		resultCodecs[i] = codec;
+	}
+	return new Compiled(
 		sql,
-		params: params.values,
-		...(tag === undefined ? {} : { tag }),
-	};
-	// not enumerable: what the executor reads, kept out of logs and comparisons
-	if (params.typed) hide(query, 'paramCodecs', params.codecs);
-	if (resultCodecs.some((codec) => codec !== null))
-		hide(query, 'resultCodecs', resultCodecs);
-	return query;
+		params.values,
+		tag,
+		params.typed ? params.codecs : undefined,
+		resultCodecs,
+	);
 }
 
-function hide(query: CompiledQuery, key: string, value: unknown): void {
-	Object.defineProperty(query, key, { value, enumerable: false });
+/**
+ * A compiled query. Its codecs are read through getters, not own
+ * properties: what the executor reads, kept out of logs and comparisons.
+ */
+class Compiled implements CompiledQuery {
+	readonly sql: string;
+	readonly params: readonly unknown[];
+	declare readonly tag?: string;
+	readonly #paramCodecs: readonly (Codec | undefined)[] | undefined;
+	readonly #resultCodecs: readonly (Codec | null)[] | undefined;
+
+	constructor(
+		sql: string,
+		params: readonly unknown[],
+		tag: string | undefined,
+		paramCodecs: readonly (Codec | undefined)[] | undefined,
+		resultCodecs: readonly (Codec | null)[] | undefined,
+	) {
+		this.sql = sql;
+		this.params = params;
+		if (tag !== undefined) Object.assign(this, { tag });
+		this.#paramCodecs = paramCodecs;
+		this.#resultCodecs = resultCodecs;
+	}
+
+	get paramCodecs(): readonly (Codec | undefined)[] | undefined {
+		return this.#paramCodecs;
+	}
+
+	get resultCodecs(): readonly (Codec | null)[] | undefined {
+		return this.#resultCodecs;
+	}
 }
 
 /** The parameters rendered so far, and the codec of each. */

@@ -40,9 +40,11 @@ export const kindCodecs = {
 export type CodecKind = keyof typeof kindCodecs;
 
 /** The codec a kind's values are sent and read with. */
+/** The kinds' codecs, as a table of every kind (no kind is an `Object` member). */
+const byKind: Partial<Record<Kind, Codec>> = kindCodecs;
+
 export function kindCodec(kind: Kind): Codec {
-	const byKind: Partial<Record<Kind, Codec>> = kindCodecs;
-	return (Object.hasOwn(byKind, kind) ? byKind[kind] : undefined) ?? codecs.raw;
+	return byKind[kind] ?? codecs.raw;
 }
 
 /**
