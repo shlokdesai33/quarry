@@ -124,7 +124,7 @@ await check(
 			JSON.stringify(row?.ids) === '[1,null,3]' &&
 				row?.at.getTime() === Date.UTC(2024, 5, 1) &&
 				JSON.stringify(row.r) === JSON.stringify(range) &&
-				row.inside === true &&
+				row.inside &&
 				JSON.stringify(row.tags) === '["a","b c","é😀"]' &&
 				row.bytes[1] === 255,
 			JSON.stringify(row),
