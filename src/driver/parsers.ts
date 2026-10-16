@@ -103,10 +103,6 @@ function fastTimestamptz(text: string): number | undefined {
 	);
 }
 
-/**
- * Parses range output (`[2024-01-01,2024-02-01)`, `(,"a b"]`, `empty`) into
- * a `RangeValue`, each bound through `parse`.
- */
 /** A range value: `empty`, or bounds (`null` when unbounded) with their inclusivity. */
 export type RangeValue<T> =
 	| {
@@ -117,6 +113,10 @@ export type RangeValue<T> =
 	  }
 	| { readonly empty: true };
 
+/**
+ * Parses range output (`[2024-01-01,2024-02-01)`, `(,"a b"]`, `empty`) into
+ * a `RangeValue`, each bound through `parse`.
+ */
 export function parseRange<T>(
 	text: string,
 	parse: (bound: string) => T,

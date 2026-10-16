@@ -239,16 +239,15 @@ function planOf(
 	statement: Statement | undefined,
 	fields: readonly Field[],
 	spec: ResultSpec,
-	requested: readonly number[] | 0 | 'fields' | undefined,
+	requested: readonly number[] | 0 | undefined,
 ): ResultPlan {
 	if (statement === undefined)
 		return resultPlan(fields, spec, requested ?? 'fields');
 	const plan = cachedPlan(statement.plans, fields, spec);
 	if (requested === undefined) return plan;
-	const asked = requested === 'fields' ? formatsOf(fields) : requested;
-	return sameFormats(plan.formats, asked)
+	return sameFormats(plan.formats, requested)
 		? plan
-		: resultPlan(fields, spec, asked);
+		: resultPlan(fields, spec, requested);
 }
 
 function formatsOf(fields: readonly Field[]): readonly number[] | 0 {
