@@ -229,7 +229,7 @@ describe('tolerating the unknown and refusing the unsafe', () => {
 		expect(conn.parameters.get('some_future_setting')).toBe('x');
 		expect(conn.capabilities).toMatchObject({
 			serverVersion: '18.1',
-			longCancelKeys: true,
+			protocol: '3.2',
 		});
 		const pending = conn.query('select 1');
 		await new Promise((r) => setTimeout(r, 20));

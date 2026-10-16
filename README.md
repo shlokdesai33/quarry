@@ -796,7 +796,7 @@ await pool.end({ timeout: 5000 }); // fail whatever is still running after 5 s
 
 **RDS Proxy, Supavisor, Neon and other transaction poolers** follow the same rules. Avoid session-level `SET`, which can pin a session to a server connection. If a proxy pins or rejects named prepared statements, use `prepare: false`.
 
-`connection.capabilities` reports what poolers and proxies may change: the negotiated `protocol`, `serverVersion` (when reported), `pgbouncer` (its version and settings, when detected), `longCancelKeys` (protocol 3.2's longer cancel keys) and the `saslMechanisms` the server offered.
+`connection.capabilities` reports what poolers and proxies may change: the negotiated `protocol`, `serverVersion` (when reported), `pgbouncer` (its version and settings, when detected) and the `saslMechanisms` the server offered.
 
 ## Errors
 

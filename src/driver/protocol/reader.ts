@@ -385,21 +385,15 @@ function parseMessage(
 		case 0x52: // R
 			return authentication(new Cursor(bytes, start, end));
 		case 0x47: // G
-		case 0x48: // H
-		case 0x57: {
-			// W
+		case 0x48: {
+			// H
 			const cursor = new Cursor(bytes, start, end);
 			const binary = cursor.int8() === 1;
 			const n = cursor.count();
 			const columnFormats: number[] = [];
 			for (let i = 0; i < n; i++) columnFormats.push(cursor.int16());
 			return {
-				type:
-					type === 0x47
-						? 'CopyInResponse'
-						: type === 0x48
-							? 'CopyOutResponse'
-							: 'CopyBothResponse',
+				type: type === 0x47 ? 'CopyInResponse' : 'CopyOutResponse',
 				binary,
 				columnFormats,
 			};
@@ -416,8 +410,6 @@ function parseMessage(
 			for (let i = 0; i < n; i++) unrecognized.push(cursor.cstring());
 			return { type: 'NegotiateProtocolVersion', minor, unrecognized };
 		}
-		case 0x56: // V
-			return { type: 'FunctionCallResponse' };
 		default:
 			throw new ProtocolError(
 				`Unknown message type 0x${type.toString(16).padStart(2, '0')}`,
