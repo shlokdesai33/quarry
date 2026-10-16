@@ -86,5 +86,3 @@ export type BackendMessage =
 	  }
 	| { readonly type: 'RowDescription'; readonly fields: readonly Field[] }
 	| { readonly type: 'FunctionCallResponse' };
-
-export type BackendMessageType = BackendMessage['type'];
