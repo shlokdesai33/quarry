@@ -8,7 +8,6 @@ import {
 } from '../../../src/driver/codec.js';
 import { codecs } from '../../../src/driver/codecs.js';
 import type { Connection } from '../../../src/driver/connection.js';
-import { DecodeError } from '../../../src/driver/errors.js';
 import { createPool } from '../../../src/driver/pool.js';
 import { createCodecRegistry } from '../../../src/driver/registry.js';
 import { int4 } from '../../../src/driver/binary.js';
@@ -210,11 +209,18 @@ describe.skipIf(noPg)('built-in codecs', () => {
 		read: Codec,
 		binary: boolean,
 	) {
-		const result = await c.query<{ v: unknown }>(
-			`select $1::${type} as v`,
-			[typed(value, codec)],
-			{ resultCodecs: [read], binary, prepare: false },
-		);
+		const run = () =>
+			c.query<{ v: unknown }>(
+				`select $1::${type} as v`,
+				[typed(value, codec)],
+				{
+					resultCodecs: [read],
+					binary,
+				},
+			);
+		// described by the first run, so the second asks for the codec's format
+		await run();
+		const result = await run();
 		return { value: result.rows[0]?.v, format: result.fields[0]?.format };
 	}
 
@@ -239,7 +245,7 @@ describe.skipIf(noPg)('built-in codecs', () => {
 					expect(binary).toEqual({ value: read, format: 1 });
 				}
 			}
-			// the format its results are asked for in, from the first run
+			// the format its results are asked for in, once described
 			expect(formats).toEqual(
 				new Set([codec.resultFormat === 'binary' ? 1 : 0]),
 			);
@@ -376,11 +382,11 @@ describe.skipIf(noPg)('result codecs', () => {
 		arrayOf(codecs.int4),
 	];
 
-	it('are asked for in binary on a statement’s first run, prepared or not', async () => {
+	it('are asked for in binary only once the statement is described, never unprepared', async () => {
 		for (const prepare of [true, false]) {
 			await using c = await open();
 			const first = await c.query(SQL, [], { resultCodecs: expected, prepare });
-			expect(first.fields.map((f) => f.format)).toEqual([1, 1, 0, 1]);
+			expect(first.fields.map((f) => f.format)).toEqual([0, 0, 0, 0]);
 			expect(first.rows).toEqual([
 				{
 					i: 7,
@@ -393,12 +399,14 @@ describe.skipIf(noPg)('result codecs', () => {
 				resultCodecs: expected,
 				prepare,
 			});
-			expect(second.fields.map((f) => f.format)).toEqual([1, 1, 0, 1]);
+			expect(second.fields.map((f) => f.format)).toEqual(
+				prepare ? [1, 1, 0, 1] : [0, 0, 0, 0],
+			);
 			expect(second.rows).toEqual(first.rows);
 		}
 	});
 
-	it('are read in binary from a cursor’s first batch', async () => {
+	it('are read with their codecs from a cursor', async () => {
 		await using c = await open();
 		const batches: unknown[][] = [];
 		for await (const batch of c.cursor(
@@ -423,33 +431,53 @@ describe.skipIf(noPg)('result codecs', () => {
 		expect(fields.map((f) => f.typeOid)).toEqual([20, 701]);
 	});
 
-	it('fail a run whose binary column has no reader, and read it as text next time', async () => {
+	it('read a column of a type without a codec as text, never asking for its binary', async () => {
 		await using c = await open();
 		const sql = `select 1.5::numeric as v`;
-		// numeric has no default codec, so its binary can't be read on the first run
-		await expect(
-			c.query(sql, [], { resultCodecs: [codecs.int4] }),
-		).rejects.toBeInstanceOf(DecodeError);
-		const again = await c.query(sql, [], { resultCodecs: [codecs.int4] });
-		expect(again.rows).toEqual([{ v: '1.5' }]);
-		expect(again.fields[0]?.format).toBe(0);
+		for (let run = 0; run < 3; run++) {
+			const result = await c.query(sql, [], { resultCodecs: [codecs.int4] });
+			expect(result.rows).toEqual([{ v: '1.5' }]);
+			expect(result.fields[0]?.format).toBe(0);
+		}
 	});
 
-	it('read the column changed under a cached statement with the registry', async () => {
-		await using c = await open();
-		const name = table('codec_drift');
-		await c.query(`create table ${name} (v int4)`);
-		await c.query(`insert into ${name} values (1)`);
-		const read = () =>
-			c.query<{ v: unknown }>(`select v from ${name}`, [], {
-				resultCodecs: [codecs.int4],
-			});
-		expect((await read()).rows).toEqual([{ v: 1 }]);
-		await c.query(`alter table ${name} alter column v type int8`);
-		// the stale plan is retried unprepared, and read with the registry's int8
-		expect((await read()).rows).toEqual([{ v: 1n }]);
-		expect((await read()).rows).toEqual([{ v: 1n }]);
-		await c.query(`drop table ${name}`);
+	it('decode a column whose type changed between runs, for selects and returning writes', async () => {
+		for (const prepare of [true, false]) {
+			await using c = await open();
+			const name = table('codec_drift');
+			await c.query(`create table ${name} (id int4, v int4)`);
+			const read = { resultCodecs: [codecs.int4], prepare };
+			const select = () =>
+				c.query<{ v: unknown }>(`select v from ${name} where id = 1`, [], read);
+			let id = 0;
+			const insert = () =>
+				c.query<{ v: unknown }>(
+					`insert into ${name} values ($1, 7) returning v`,
+					[typed(++id, codecs.int4)],
+					read,
+				);
+			// twice each, so the prepared statements are described and ask for binary
+			for (let run = 0; run < 2; run++) {
+				expect((await insert()).rows).toEqual([{ v: 7 }]);
+				expect((await select()).rows).toEqual([{ v: 7 }]);
+			}
+			await c.query(`alter table ${name} alter column v type int8`);
+			// the stale plans are prepared again, and read with the registry's int8
+			for (let run = 0; run < 2; run++) {
+				expect((await insert()).rows).toEqual([{ v: 7n }]);
+				expect((await select()).rows).toEqual([{ v: 7n }]);
+			}
+			await c.query(`alter table ${name} alter column v type numeric`);
+			// numeric has no default codec: text, never binary nobody reads
+			for (let run = 0; run < 2; run++) {
+				expect((await insert()).rows).toEqual([{ v: '7' }]);
+				expect((await select()).rows).toEqual([{ v: '7' }]);
+			}
+			expect(
+				(await c.query(`select count(*)::int as n from ${name}`)).rows,
+			).toEqual([{ n: 6 }]);
+			await c.query(`drop table ${name}`);
+		}
 	});
 });
 
@@ -503,9 +531,12 @@ describe.skipIf(noPg)('types looked up by name', () => {
 		expect(rows).toEqual([
 			{ a: 'codec_mood', b: 'codec_mood[]', c: 'codec_posint' },
 		]);
-		const read = await pool.query('select m, ms, n from feelings', [], {
-			resultCodecs: [mood, arrayOf(mood), posint],
-		});
+		const feelings = () =>
+			pool.query('select m, ms, n from feelings', [], {
+				resultCodecs: [mood, arrayOf(mood), posint],
+			});
+		await feelings();
+		const read = await feelings();
 		expect(read.rows).toEqual([{ m: 'happy', ms: ['happy', 'sad'], n: 3 }]);
 		// a domain's column is reported as its base type, which the codec reads in binary
 		expect(read.fields.map((f) => [f.typeOid, f.format])).toEqual([
@@ -516,6 +547,23 @@ describe.skipIf(noPg)('types looked up by name', () => {
 		// the registry's codec for the enum decodes it in raw SQL too, and its arrays
 		const raw = await pool.query('select m, ms from feelings');
 		expect(raw.rows).toEqual([{ m: 'happy', ms: ['happy', 'sad'] }]);
+	});
+
+	it('looks the types up again with reloadTypes, for types created since', async () => {
+		await using pool = createPool({ ...options(inSchema()), max: 1 });
+		const late = defineCodec({
+			name: 'codec_late',
+			encode: (value: string) => value,
+			decodeText: (text) => text,
+		});
+		await pool.loadTypes();
+		await pool.query(`create type ${schema}.codec_late as enum ('x')`);
+		const declared = () =>
+			pool.query('select pg_typeof($1)::text as t', [typed('x', late)]);
+		// not in the catalog loaded before it existed: its type is inferred
+		await expect(declared()).rejects.toMatchObject({ code: '42P18' });
+		await pool.reloadTypes();
+		expect((await declared()).rows).toEqual([{ t: 'codec_late' }]);
 	});
 
 	it('loads the catalog behind the first query that needs it, sending that one inferred', async () => {
@@ -538,15 +586,18 @@ describe.skipIf(noPg)('types looked up by name', () => {
 	});
 
 	it.skipIf(!hasVector)(
-		'resolves pgvector, reading vectors in binary from the first run',
+		'resolves pgvector, reading vectors in binary once described',
 		async () => {
 			await using c = await open({ codecs: [codecs.vector] });
 			await c.loadTypes();
-			const { rows, fields } = await c.query(
-				'select $1::vector as v, pg_typeof($1)::text as t',
-				[typed([0.5, 1, -2], codecs.vector)],
-				{ resultCodecs: [codecs.vector, codecs.text] },
-			);
+			const vectors = () =>
+				c.query(
+					'select $1::vector as v, pg_typeof($1)::text as t',
+					[typed([0.5, 1, -2], codecs.vector)],
+					{ resultCodecs: [codecs.vector, codecs.text] },
+				);
+			await vectors();
+			const { rows, fields } = await vectors();
 			expect(rows).toEqual([{ v: [0.5, 1, -2], t: 'vector' }]);
 			expect(fields[0]?.format).toBe(1);
 		},

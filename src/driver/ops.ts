@@ -14,7 +14,6 @@ import type { Writer } from './protocol/writer.js';
 import type { CodecRegistry, TypeCatalog } from './registry.js';
 import {
 	cachedPlan,
-	expectedFormats,
 	planDecoder,
 	resultPlan,
 	sameFormats,
@@ -378,14 +377,13 @@ export class QueryOp extends Op {
 			this.#statement = statement;
 			if (!named) {
 				this.#unnamed = true;
-				let formats: readonly number[] | 0;
+				// binary only for columns already described
+				let formats: readonly number[] | 0 = 0;
 				const known = statement.fields;
 				if (known !== undefined) {
 					const plan = cachedPlan(statement.plans, known, spec);
 					formats = plan.formats;
 					this.#expected = plan.fields;
-				} else {
-					formats = expectedFormats(spec);
 				}
 				fe.parse(w, '', this.#sql, types);
 				fe.bind(w, '', '', this.#values, formats);
@@ -408,16 +406,14 @@ export class QueryOp extends Op {
 				this.#plan = plan;
 				fe.bind(w, '', statement.name, this.#values, plan.formats);
 			} else {
-				// not yet: in the formats the expected codecs read, so even a first run gets binary
-				const formats = expectedFormats(spec);
-				this.#requested = formats;
-				fe.bind(w, '', statement.name, this.#values, formats);
+				// not yet described: text, never a format before the type is known
+				this.#requested = 0;
+				fe.bind(w, '', statement.name, this.#values);
 			}
 		} else {
-			const formats = expectedFormats(spec);
-			this.#requested = formats;
+			this.#requested = 0;
 			fe.parse(w, '', this.#sql, types);
-			fe.bind(w, '', '', this.#values, formats);
+			fe.bind(w, '', '', this.#values);
 			fe.describe(w, 'P', '');
 		}
 		fe.execute(w, '', 0);
@@ -1006,15 +1002,14 @@ export class CursorOp extends Op {
 			const known = created ? undefined : statement.fields;
 			const formats =
 				known === undefined
-					? expectedFormats(spec)
+					? 0
 					: cachedPlan(statement.plans, known, spec).formats;
 			this.#requested = formats;
 			fe.bind(w, '', statement.name, this.#values, formats);
 		} else {
-			const formats = expectedFormats(spec);
-			this.#requested = formats;
+			this.#requested = 0;
 			fe.parse(w, '', this.#sql, types);
-			fe.bind(w, '', '', this.#values, formats);
+			fe.bind(w, '', '', this.#values);
 			fe.describe(w, 'P', '');
 		}
 		fe.execute(w, '', this.#batchSize);

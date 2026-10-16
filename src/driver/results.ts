@@ -43,29 +43,6 @@ function binaryCodec(codec: Codec | undefined, oid: number): boolean {
 }
 
 /**
- * The formats to ask for before the columns are known (a statement's first
- * run, an unprepared one): binary where the expected codec reads it and its
- * type is known, so even a first run gets binary.
- */
-export function expectedFormats(spec: ResultSpec): readonly number[] | 0 {
-	const expected = spec.expected;
-	if (!spec.binary || expected === undefined) return 0;
-	let formats: number[] | undefined;
-	for (let i = 0; i < expected.length; i++) {
-		const codec = expected[i] ?? undefined;
-		if (
-			codec !== undefined &&
-			binaryCodec(codec, spec.catalog.resultOidOf(codec))
-		) {
-			// oxlint-disable-next-line unicorn/no-new-array -- sized up front, then filled
-			formats ??= new Array<number>(expected.length).fill(0);
-			formats[i] = 1;
-		}
-	}
-	return formats ?? 0;
-}
-
-/**
  * The codec column `i` is read with: the expected one when the column has
  * its type (or its type can't be checked: a codec for any type, or one not
  * looked up yet), the registry's for the column's type otherwise.

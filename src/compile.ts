@@ -28,8 +28,9 @@ export interface CompiledQuery {
 	readonly paramCodecs?: readonly (Codec | undefined)[] | undefined;
 	/**
 	 * The codec of each result column, by position, where its SQL type is
-	 * known; `null` elsewhere. The driver asks for each column in its
-	 * codec's format from the first run, and reads it with that codec.
+	 * known; `null` elsewhere. The driver reads each column with its codec
+	 * while the column has that type, in the codec's format once the
+	 * statement's columns are described.
 	 */
 	readonly resultCodecs?: readonly (Codec | null)[] | undefined;
 	/** The query's label from `tag()`, if any. It is not part of `sql`. */

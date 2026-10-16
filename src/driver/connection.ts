@@ -87,9 +87,9 @@ export interface QueryOptions {
 	 */
 	readonly paramCodecs?: ParamCodecs;
 	/**
-	 * The codec each result column is expected in, by position: asked for
-	 * in its format from the first run (binary where it reads it so), and
-	 * read with it while the column has its type. A missing entry, or a
+	 * The codec each result column is expected in, by position: read with
+	 * it while the column has its type (once a cached statement's columns
+	 * are described, in binary where it reads it so). A missing entry, or a
 	 * column of another type, is read with the registry's codec for its
 	 * type.
 	 */
@@ -117,9 +117,10 @@ export interface QueryOptions {
 	readonly tag?: string;
 	/**
 	 * Ask for binary results for columns whose codec reads them so (default:
-	 * the connection's `binaryResults`). Values decode the same. Columns
-	 * with an expected codec (`resultCodecs`) get it from the first run;
-	 * others once a cached statement's columns are known.
+	 * the connection's `binaryResults`). Values decode the same. Only a
+	 * statement whose columns the server has described asks for it, from a
+	 * cached statement's second run, so no format is requested before the
+	 * column's type is known.
 	 */
 	readonly binary?: boolean;
 	/**

@@ -372,7 +372,7 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 			);
 		});
 
-		it('asks for binary results on a fresh pool’s first query', async () => {
+		it('asks for binary results only once the statement is described', async () => {
 			let binary = 0;
 			const counted = defineCodec({
 				name: 'int4',
@@ -392,12 +392,15 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				max: 1,
 				params: { search_path: `${schema},public` },
 			});
-			const ids = await fresh
-				.selectFrom(countedUsers)
-				.select(['users.id'])
-				.where('users.id', 1)
-				.execute();
-			expect(ids).toEqual([{ id: 1 }]);
+			const read = () =>
+				fresh
+					.selectFrom(countedUsers)
+					.select(['users.id'])
+					.where('users.id', 1)
+					.execute();
+			expect(await read()).toEqual([{ id: 1 }]);
+			expect(binary).toBe(0);
+			expect(await read()).toEqual([{ id: 1 }]);
 			expect(binary).toBe(1);
 		});
 

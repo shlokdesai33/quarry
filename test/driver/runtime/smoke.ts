@@ -83,7 +83,7 @@ await check('SCRAM over TCP, typed rows', async () => {
 });
 
 await check(
-	'codecs: typed parameters, binary results from the first run',
+	'codecs: typed parameters, binary results once described',
 	async () => {
 		await using conn = await connect(base);
 		const range = {
@@ -92,33 +92,36 @@ await check(
 			upper: new Date(Date.UTC(10000, 0, 1)),
 			bounds: '[)',
 		} as const;
-		const { rows, fields } = await conn.query<{
-			ids: number[];
-			at: Date;
-			r: unknown;
-			inside: boolean;
-			tags: string[];
-			bytes: Uint8Array;
-		}>(
-			'select $1::int4[] as ids, $2::timestamptz as at, $3::tstzrange as r, $3 @> $2 as inside, $4::text[] as tags, $5::bytea as bytes',
-			[
-				typed([1, null, 3], arrayOf(codecs.int4)),
-				typed(new Date(Date.UTC(2024, 5, 1)), codecs.timestamptz),
-				typed(range, codecs.tstzrange),
-				typed(['a', 'b c', 'é😀'], arrayOf(codecs.text)),
-				typed(new Uint8Array([0, 255]), codecs.bytea),
-			],
-			{
-				resultCodecs: [
-					arrayOf(codecs.int4),
-					codecs.timestamptz,
-					codecs.tstzrange,
-					codecs.bool,
-					arrayOf(codecs.text),
-					codecs.bytea,
+		const run = () =>
+			conn.query<{
+				ids: number[];
+				at: Date;
+				r: unknown;
+				inside: boolean;
+				tags: string[];
+				bytes: Uint8Array;
+			}>(
+				'select $1::int4[] as ids, $2::timestamptz as at, $3::tstzrange as r, $3 @> $2 as inside, $4::text[] as tags, $5::bytea as bytes',
+				[
+					typed([1, null, 3], arrayOf(codecs.int4)),
+					typed(new Date(Date.UTC(2024, 5, 1)), codecs.timestamptz),
+					typed(range, codecs.tstzrange),
+					typed(['a', 'b c', 'é😀'], arrayOf(codecs.text)),
+					typed(new Uint8Array([0, 255]), codecs.bytea),
 				],
-			},
-		);
+				{
+					resultCodecs: [
+						arrayOf(codecs.int4),
+						codecs.timestamptz,
+						codecs.tstzrange,
+						codecs.bool,
+						arrayOf(codecs.text),
+						codecs.bytea,
+					],
+				},
+			);
+		await run();
+		const { rows, fields } = await run();
 		const row = rows[0];
 		assert(
 			JSON.stringify(row?.ids) === '[1,null,3]' &&

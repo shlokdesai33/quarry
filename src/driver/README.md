@@ -93,7 +93,7 @@ Behind PgBouncer in transaction mode, a query pipelined with others on its conne
 - **Detection:** PgBouncer 1.26+ reports itself at login (`connection.capabilities.pgbouncer`). For 1.21–1.25, set `preparePipelined: false`; `true` keeps pipelined queries named. With `max_prepared_statements = 0`, no statement is named.
 - **Schema changes:** a pipelined query whose columns changed since they were cached is decoded by what the server sent, and the cache entry is dropped. If a column asked for in binary changed to a type without a binary decoder, that query fails with a `DecodeError` after running.
 
-Columns are received in binary where their codec reads them so, which is cheaper to decode and gives identical values: int2/int4/oid, int8 as a `bigint`, float8, bool, bytea, timestamptz as a `Date`, pgvector's `vector`, and arrays of those, of text-like types and of json/jsonb. A column the query expects a codec for (`resultCodecs`) gets it from the first run, prepared or not; others from a cached statement's second run. Turn it off with `binaryResults: false`.
+Columns are received in binary where their codec reads them so, which is cheaper to decode and gives identical values: int2/int4/oid, int8 as a `bigint`, float8, bool, bytea, timestamptz as a `Date`, pgvector's `vector`, and arrays of those, of text-like types and of json/jsonb. A format is only asked for once the server has described the statement's columns, from a cached statement's second run; each column is then read with the codec the query expects for it (`resultCodecs`) when its type matches, and with the registry's codec for its type otherwise. Turn it off with `binaryResults: false`.
 
 `codecs.vector` returns the float32 values stored, on every path: `[0.1]` reads as `[0.10000000149011612]`, the value pgvector holds and the value its binary format carries.
 
@@ -102,10 +102,9 @@ Columns are received in binary where their codec reads them so, which is cheaper
 The driver owns the codecs: one object per type with `name`, `oid` (0 to look it up by name), `paramFormat`, `resultFormat`, `encode`, `decodeText` and an optional `decodeBinary`. `codecs` has the built-in ones, `arrayOf(codec)` the codec of a type's arrays, `defineCodec({ name, encode, decodeText })` one of your own. Each result column is read with the codec the query expects for it (checked against the column's type OID at RowDescription), or the registry's codec for its type:
 
 - **`defaultCodecs`** (the default, lossless): int2/int4/float become numbers, int8 a `bigint`, bool, json/jsonb parsed, bytea a `Uint8Array`, and arrays of those and of the text types. numeric, dates and times stay as text.
-- **`codecs: [...]`** on the pool, or per query: registered over the defaults, each for its type (and its arrays), e.g. `[codecs.int8AsString, codecs.timestamptz]`.
-- **`types`**: a table of text parsers by OID (`defaultTypes`, `rawTypes`, or your own), as before codecs.
+- **`codecs: [...]`** on the pool, or per query: registered over the defaults, each for its type (and its arrays), e.g. `[codecs.int8AsString, codecs.timestamptz]`; or a registry built once with `createCodecRegistry(list, base?)` (`null` base: every other value as text).
 
-Enums, domains and extension types have no fixed OIDs. A codec for one (`oid: 0`) is resolved through `pg_type` once per pool: behind the first query that needs it, or up front with `loadTypes()`.
+Enums, domains and extension types have no fixed OIDs. A codec for one (`oid: 0`) is resolved through `pg_type` once per pool: behind the first query that needs it, or up front with `loadTypes()`; `reloadTypes()` looks them up again for types created since.
 
 ### Cancelling and timeouts
 

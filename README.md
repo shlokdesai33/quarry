@@ -366,8 +366,7 @@ Options are resolved like libpq, in this order, the first one that sets a value 
 | `params`             |                            | Startup parameters, e.g. `{ search_path: 'app', timezone: 'UTC' }`.                                                                |
 | `options`            |                            | Command-line options for the server, as `PGOPTIONS` (e.g. `'-c statement_timeout=5s'`).                                            |
 | `passfile`           | `PGPASSFILE` / `~/.pgpass` | A password file in `.pgpass` format.                                                                                               |
-| `codecs`             | `defaultCodecs`            | Codecs to read result columns with, by type, over the defaults. See [Decoding results](#decoding-results).                         |
-| `types`              |                            | Text parsers by type OID instead of the default codecs (`rawTypes` for all text). Kept for parsers written before codecs.          |
+| `codecs`             | `defaultCodecs`            | Codecs to read result columns with, by type, over the defaults, or a registry. See [Decoding results](#decoding-results).          |
 | `prepare`            | `true`                     | Use named prepared statements, cached per connection.                                                                              |
 | `statementCacheSize` | `100`                      | Prepared statements kept per connection (least recently used are deallocated).                                                     |
 | `preparePipelined`   | detected                   | Use named statements for pipelined queries too. See [Poolers and proxies](#poolers-and-proxies).                                   |
@@ -593,15 +592,13 @@ A codec is one type's encoding, both ways:
 
 Which types are binary follows what is cheaper in JavaScript: binary where the value is a number, a `Date`, bytes, or an array of those (and pgvector's vectors), text where the value is a string anyway (`int8` as a string, `numeric`, `uuid`, dates, text types, enums) or the binary format carries the same text (`jsonb`).
 
-**Types looked up by name.** A codec whose `oid` is 0 is resolved through `pg_type` once per pool: the first query that needs one loads the catalog behind it (that query still runs, its parameter's type inferred and its column read as text), or `pool.loadTypes()` loads it up front. A domain's columns are reported as its base type, so its codec is the base type's.
+**Types looked up by name.** A codec whose `oid` is 0 is resolved through `pg_type` once per pool: the first query that needs one loads the catalog behind it (that query still runs, its parameter's type inferred and its column read as text), or `pool.loadTypes()` loads it up front; `pool.reloadTypes()` looks them up again, for types created since. A domain's columns are reported as its base type, so its codec is the base type's.
 
-**`types`.** A table of text parsers by OID (`defaultTypes`, `rawTypes` for every value as text, or your own `Record<oid, (text) => unknown>`) still works in place of codecs, per pool or per query. The driver's own parsers keep their binary formats; other parsers get text.
+The module also exports `oids` and `arrayOids` (type OIDs by name), helpers for your own codecs (`parseArray`, `parseRange`, `parseTimestamptz`, `parseBytea`, `formatTimestamp`), and `createCodecRegistry(list, base?)`, to build a registry once and pass it per pool or per query (`createCodecRegistry([], null)` reads every value as the server's text).
 
-The module also exports `oids` and `arrayOids` (type OIDs by name), the parsers (`parseInteger`, `parseBigInt`, `parseFloat`, `parseBool`, `parseJson`, `parseBytea`, `parseTimestamptz`, `parseRange`, `parseVector`, `parseHalfvec`, `parseArray`) and `createCodecRegistry(list)`, to build a registry once and pass it per query.
+**Binary results.** Columns are received in binary where their codec reads them so; the values are identical, only the cost differs. A format is only asked for once the server has described the statement's columns: from a cached statement's second run, never on a first run or an unprepared query. Each column is read with the codec the query expects for it (`resultCodecs`) when the described type is that codec's, and with the registry's codec for the described type otherwise, so a column whose type changed (schema drift) still decodes. Turn binary off with `binaryResults: false`.
 
-**Binary results.** Columns are received in binary where their codec reads them so; the values are identical, only the cost differs. A column whose codec the query names (`resultCodecs`) gets it from the statement's first run, prepared or not, and from a cursor's first batch. Other columns get it once a cached statement's columns are known, from its second run. At RowDescription each expected codec is checked against the column's type: a column of another type (schema drift) is read with the registry's codec for it, and one sent in binary that nothing can read fails that run with a `DecodeError`, its statement then asking for text. Turn binary off with `binaryResults: false`.
-
-**pgvector.** `codecs.vector` (and `parseVector`) returns the float32 values pgvector stores, on every path: `[0.1]` reads as `[0.10000000149011612]`, the value pgvector holds and the value its binary format carries.
+**pgvector.** `codecs.vector` returns the float32 values pgvector stores, on every path: `[0.1]` reads as `[0.10000000149011612]`, the value pgvector holds and the value its binary format carries.
 
 **Decode errors** fail only the query they belong to, with a `DecodeError` naming the column and type (never the value). The connection stays usable.
 
@@ -1025,7 +1022,7 @@ An enum is declared once and backs any number of columns. Its labels are ordered
 
 ### Codecs on columns
 
-Every column type has a [driver codec](#codecs) that sends its values and reads them back, and its TypeScript type is that codec's: `integer()` is `codecs.int4`, `bigint()` `codecs.int8AsString`, `timestamptz()` `codecs.timestamptz`. The query builder only chooses codecs; the driver encodes each parameter once with its column's codec (declaring its type), and asks for each selected column in its codec's format from the first run.
+Every column type has a [driver codec](#codecs) that sends its values and reads them back, and its TypeScript type is that codec's: `integer()` is `codecs.int4`, `bigint()` `codecs.int8AsString`, `timestamptz()` `codecs.timestamptz`. The query builder only chooses codecs; the driver encodes each parameter once with its column's codec (declaring its type), and reads each selected column with its codec, in the codec's format once the statement's columns are described.
 
 `.useCodec(codec)` swaps a column's codec, and its types with it:
 

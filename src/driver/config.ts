@@ -150,9 +150,9 @@ export interface ConnectionOptions {
 	/**
 	 * Receive columns in binary where their codec reads them so (int2,
 	 * int4, oid, int8 as a bigint, float8, bool, bytea, timestamptz, vector,
-	 * and arrays), default true: from the first run for columns a query
-	 * expects a codec for (`resultCodecs`), otherwise from a cached
-	 * statement's second run. Values are identical either way.
+	 * and arrays), default true: from a cached statement's second run, once
+	 * the server has described its columns. Values are identical either
+	 * way.
 	 */
 	readonly binaryResults?: boolean | undefined;
 	/**

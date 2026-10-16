@@ -175,22 +175,35 @@ describe.skipIf(!pg?.bouncerPort)('PgBouncer in transaction mode', () => {
 				}
 			});
 
-			it('are asked for in their codecs’ formats on the first run', async () => {
+			it('ask for their codecs’ formats once described, and read a changed column by its new type', async () => {
+				const name = table('bounce_codecs');
 				await using conn = await open(bouncer());
-				const sql = 'select $1::int as i, $2::text as s, now() as t';
-				const params = [typed(7, codecs.int4), 'x'];
+				await conn.query(`create table ${name} (i int4, s text)`);
+				await conn.query(`insert into ${name} values (7, 'x')`);
+				const sql = `select i, s, now() as t from ${name} where i = $1`;
+				const params = [typed(7, codecs.int4)];
 				const resultCodecs = [codecs.int4, codecs.text, codecs.timestamptz];
-				const results = await pipelined(10, () =>
-					conn.query(sql, params, { resultCodecs }),
-				);
-				for (const result of results) {
-					expect(result).toMatchObject({
-						status: 'fulfilled',
-						value: { rows: [{ i: 7, s: 'x', t: expect.any(Date) }] },
-					});
-					if (result.status === 'fulfilled')
-						expect(result.value.fields.map((f) => f.format)).toEqual([1, 0, 1]);
-				}
+				const first = await conn.query(sql, params, { resultCodecs });
+				expect(first.fields.map((f) => f.format)).toEqual([0, 0, 0]);
+				const check = async (i: unknown, formats?: number[]) => {
+					for (const result of await pipelined(10, () =>
+						conn.query(sql, params, { resultCodecs }),
+					)) {
+						expect(result).toMatchObject({
+							status: 'fulfilled',
+							value: { rows: [{ i, s: 'x', t: expect.any(Date) }] },
+						});
+						if (result.status === 'fulfilled' && formats !== undefined)
+							expect(result.value.fields.map((f) => f.format)).toEqual(formats);
+					}
+				};
+				await check(7, [1, 0, 1]);
+				await conn.query(`alter table ${name} alter column i type int8`);
+				// read by the registry's int8 (a bigint): stale named ones are prepared
+				// again, unnamed ones read by the portal's description
+				await check(7n);
+				await check(7n);
+				await conn.query(`drop table ${name}`);
 			});
 
 			it('read the new columns after a schema change', async () => {
