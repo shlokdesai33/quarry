@@ -38,7 +38,6 @@ const user = await db
 - [Entry points](#entry-points)
 - **Part I: The driver**
   - [Overview](#overview)
-  - [Benchmarks](#benchmarks)
   - [Connecting](#connecting)
   - [TLS](#tls)
   - [Authentication](#authentication)
@@ -116,199 +115,6 @@ const { rows } = await pool.query(
 	[42],
 );
 ```
-
-## Benchmarks
-
-The driver is measured by an independent benchmark suite (`bench/driver/suite`) against the clients people actually use: `pg` (with unnamed and named statements), `pg-native` (libpq), postgres.js, Bun.sql, `@neondatabase/serverless` and deno-postgres, on Node, Bun and Deno.
-
-The numbers below come from the latest full run, `2026-10-13-af58bb2` (the driver at commit `af58bb2`), with every result checked for equality across clients.
-
-### How it was measured
-
-| Setting   | Value                                                                                                                                                                                                 |
-| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Machine   | 8-core Intel Xeon VM, 47 GB RAM, Ubuntu 24.04, kernel 6.12                                                                                                                                            |
-| Pinning   | Client on cores 0–2, proxies on core 3, PostgreSQL on cores 4–7                                                                                                                                       |
-| Server    | PostgreSQL 18.6 on localhost, TLS on, `synchronous_commit = off`, `autovacuum = off`, `jit = off`, `shared_buffers = 2GB`                                                                             |
-| Network   | Direct, through PgBouncer 1.26 (transaction mode), and at simulated round-trip times of 0, 1, 5 and 20 ms (Toxiproxy 2.12)                                                                            |
-| Runtimes  | Node 24.21, Bun 1.4.3, Deno 2.9.7                                                                                                                                                                     |
-| Clients   | pg 8.23.1, pg-native 3.9.1 (libpq 18), postgres.js 3.4.9, `@neondatabase/serverless` 1.2.0 (through Neon's `wsproxy` on localhost), Bun.sql (built into Bun 1.4.3), deno-postgres 0.19.5              |
-| Procedure | Each cell runs in a fresh process, in a seeded random order, after a warm-up. Five runs per cell; tables show the **median**, with **±** giving the half-width of a bootstrap 95% confidence interval |
-| Fairness  | quarry is configured to decode like `pg` does (int8 and numeric as strings, timestamptz as `Date`). Every client's results are compared in canonical form: **608 results checked, 0 differ**          |
-
-Two things to keep in mind when reading the tables. First, this is a localhost benchmark with durability relaxed, so it isolates client cost: the gaps here are larger than you'll see when the server is doing real work or the network adds milliseconds. Second, µs figures are per operation and lower is better; ops/s figures are higher is better.
-
-### Single queries (Node 24, one at a time)
-
-Median latency per operation:
-
-| Scenario                              |      quarry |      pg | pg (named) | pg-native | postgres.js |
-| ------------------------------------- | ----------: | ------: | ---------: | --------: | ----------: |
-| `select 1`                            | **23.0 µs** | 25.9 µs |    25.9 µs |   31.2 µs |     27.8 µs |
-| Point lookup by primary key           | **28.1 µs** | 46.0 µs |    35.3 µs |   49.9 µs |     32.9 µs |
-| Range scan, 100 rows                  | **93.2 µs** |  188 µs |     184 µs |    195 µs |      163 µs |
-| Fetch 1,000 rows (6 columns)          |  **322 µs** | 1.34 ms |    1.27 ms |   1.62 ms |      965 µs |
-| Insert one row                        | **28.3 µs** | 38.6 µs |    30.1 µs |   44.1 µs |     33.0 µs |
-| Update one row                        | **32.0 µs** | 45.4 µs |    34.7 µs |   51.2 µs |     36.0 µs |
-| `begin; insert; commit`               | **52.7 µs** | 81.2 µs |    72.0 µs |   97.1 µs |     86.0 µs |
-| A query that fails, connection reused | **35.4 µs** | 2.30 ms |    2.35 ms |   4.81 ms |     54.0 µs |
-
-**What the numbers mean.**
-
-- **`select 1` is the floor.** It measures nothing but the client's own overhead per round trip. quarry's 23.0 µs against pg's 25.9 µs says the per-query bookkeeping is about 11% cheaper before any real work happens.
-- **Point lookups show where the time goes.** `pg` by default sends an unnamed statement, so the server parses and plans the query every time: it spends **26.0 µs of server CPU** per lookup against quarry's **13.6 µs**. `pg (named)` avoids that, but still spends **25.5 µs of client CPU** per lookup against quarry's **17.7 µs**, mostly in decoding. quarry wins on both sides of the socket.
-- **Row-heavy queries are where it pulls away.** Fetching 1,000 rows takes 322 µs, three to five times faster than the others, because quarry receives the integer, float, boolean and timestamp columns in binary from the statement's second run. Its client spends **328 µs of CPU** on that fetch; every other client spends about **1,200 µs**. In throughput terms, quarry decodes **2.83 million rows per second**, against 0.63–0.89 million for the others.
-- **Transactions save a round trip.** quarry sends `BEGIN` together with the first statement under one Sync, so a transaction costs two round trips instead of three. On localhost that is 52.7 µs against 72–97 µs; on a real network it is worth a full RTT per transaction (see [Network latency](#network-latency) below).
-- **Errors are cheap.** A failing query (division by zero) costs quarry one round trip, and the connection carries straight on: **26,347 failing queries per second**, against 423 for `pg`. If your workload hits unique violations routinely, for example in insert-or-skip logic, this matters.
-
-Per-type decoding cost, in nanoseconds per value (100,000 rows × 1 column):
-
-| Type          |  quarry |    pg | pg-native | postgres.js |
-| ------------- | ------: | ----: | --------: | ----------: |
-| `int4`        |  **77** |   194 |       200 |         266 |
-| `int8`        | **112** |   226 |       215 |         260 |
-| `float8`      |  **82** |   210 |       232 |         297 |
-| `numeric`     | **137** |   176 |       238 |         259 |
-| `text`        | **113** |   173 |       203 |         249 |
-| `timestamptz` | **111** |   677 |       728 |         439 |
-| `date`        | **112** |   500 |       451 |         363 |
-| `uuid`        | **126** |   209 |       233 |         257 |
-| `jsonb`       | **383** |   439 |       553 |         506 |
-| `int4[5]`     | **276** | 1,291 |     1,223 |         635 |
-| `bytea`       | **170** |   386 |       388 |         376 |
-
-The biggest gaps are in timestamps and arrays. `timestamptz` arrives as an 8-byte integer in binary, so quarry builds a `Date` from one number instead of parsing a string; arrays arrive with their element types and lengths up front instead of as a literal to tokenize.
-
-### Concurrency and pipelining
-
-Point lookups per second, Node 24, as the number of concurrent callers grows:
-
-| Callers | quarry, pool 10 | quarry, pool 10, `pipeline: false` | pg, pool 10 | postgres.js, pool 10 | quarry, **1 connection** | pg, 1 connection |
-| ------: | --------------: | ---------------------------------: | ----------: | -------------------: | -----------------------: | ---------------: |
-|       1 |          33,041 |                             32,853 |      19,922 |               27,803 |                   33,312 |           19,989 |
-|      10 |          94,609 |                             94,438 |      65,842 |               65,087 |                  109,616 |           20,745 |
-|     100 |     **293,716** |                             90,955 |      64,659 |               41,742 |                  117,012 |           20,854 |
-|     500 |     **318,929** |                             86,819 |      62,346 |              113,087 |                  115,396 |           20,622 |
-|   1,000 |     **300,677** |                             84,411 |      61,003 |              130,367 |                  115,076 |           20,323 |
-
-**What the numbers mean.**
-
-- **With `pipeline: false`, quarry behaves like `pg`**: each query checks a connection out, so throughput stops at roughly _connections ÷ round trip_. Both plateau as soon as all ten connections are busy; quarry's plateau is higher only because each query is cheaper.
-- **With pipelining (the default)**, once the ten connections are busy, further queries share them instead of queueing in the client. Throughput keeps climbing to about **300,000 lookups per second, roughly 5× `pg`**, and stays there at 1,000 callers. The p99 latency at 1,000 callers is **7.6 ms** against `pg`'s 24.1 ms, because queries wait on the socket rather than in a JavaScript queue.
-- **A single connection** does 115,000 lookups per second with quarry, against 20,000 for `pg`. One pipelined connection outperforms ten unpipelined ones.
-
-### Network latency
-
-On localhost, round trips are nearly free. The cells below add a simulated network round trip with Toxiproxy, which is where the design choices pay off.
-
-| Scenario (Node 24)                                  | RTT   |       quarry |       pg | postgres.js |
-| --------------------------------------------------- | ----- | -----------: | -------: | ----------: |
-| `begin; insert; commit`, sequential (latency)       | 5 ms  | **11.75 ms** | 17.50 ms |    17.57 ms |
-|                                                     | 20 ms | **41.73 ms** | 62.70 ms |    62.62 ms |
-| Point lookup, 50 callers, pool 10 (ops/s)           | 5 ms  |    **8,200** |    1,652 |       6,834 |
-|                                                     | 20 ms |    **2,354** |      473 |       1,967 |
-| Point lookup, 500 callers, **1 connection** (ops/s) | 5 ms  |   **79,879** |      169 |       7,848 |
-|                                                     | 20 ms |   **23,078** |     47.8 |       2,337 |
-
-**What the numbers mean.**
-
-- **Transactions:** at 20 ms, every client but quarry takes 62.7 ms, which is exactly three round trips (`BEGIN`, `INSERT`, `COMMIT`). quarry takes 41.7 ms: two. The saving is one full RTT per transaction, regardless of how fast the server is.
-- **A client that waits for each reply** can do at most one query per round trip per connection. At 20 ms that is 1 ÷ 0.0209 s ≈ **48 queries per second per connection**, and `pg` measures 47.8. With ten connections, ten times that: `pg` measures 473.
-- **A pipelining client** is limited by how many queries it keeps in flight. quarry's depth adapts per connection, from 100 up to 1,000 in flight while the network rather than the server is the bottleneck. With 500 callers on one connection at 20 ms, the ceiling is 500 ÷ 0.0209 s ≈ 23,900 per second; quarry measures **23,078, 97% of it**, and about **480× `pg`**. postgres.js also pipelines on each connection, and reaches about a tenth of that here.
-- **Sequential latency is the same for everyone** at 1 ms and above (a `select 1` takes 20.84 ms with quarry and 20.89 ms with `pg` at 20 ms RTT): one query alone can't go faster than one round trip, whatever the client.
-
-How the adaptive depth compares to fixed depths, on one connection with 100 concurrent lookups:
-
-| `pipeline` depth   | 0 ms RTT (ops/s) | 5 ms RTT (ops/s) |
-| ------------------ | ---------------: | ---------------: |
-| 1                  |           20,745 |              171 |
-| 8                  |          108,505 |            1,341 |
-| 32                 |          111,610 |            5,126 |
-| 100                |          107,268 |           16,185 |
-| adaptive (default) |      **114,468** |       **16,139** |
-
-On localhost, depth stops mattering past 8, because the server becomes the bottleneck; at 5 ms, throughput grows almost linearly with depth. The adaptive default matches the best fixed setting in both cases without tuning.
-
-### Large results, bulk writes and memory
-
-| Scenario (Node 24, median time)                |       quarry |       pg | pg-native | postgres.js |
-| ---------------------------------------------- | -----------: | -------: | --------: | ----------: |
-| Fetch 100,000 rows                             | **37.09 ms** |   131 ms |    144 ms |    97.26 ms |
-| Fetch 1,000,000 rows (one result)              |   **487 ms** | 1,293 ms |  1,517 ms |    1,078 ms |
-| Wide rows: 1,000 rows × 100 columns            |  **3.64 ms** | 14.53 ms |  21.14 ms |    14.83 ms |
-| Arrays: 1,000 rows of `int4[100]` + `text[20]` |  **3.25 ms** | 22.38 ms |  25.88 ms |     8.32 ms |
-| 10 × 1 MB `bytea` values                       |  **3.63 ms** | 17.39 ms |  33.23 ms |    15.70 ms |
-| Stream 1M rows with a cursor                   |   **737 ms** | 1,283 ms |       n/a |    1,047 ms |
-| Bulk insert 10k rows (`unnest`, JS arrays)     | **12.79 ms** | 15.97 ms |  15.56 ms |    15.97 ms |
-| Bulk insert 10k rows (`COPY FROM STDIN`)       |     12.85 ms | 12.95 ms |       n/a |    55.88 ms |
-
-| Peak RSS at equal work (MB)           |  quarry |    pg | pg-native | postgres.js |
-| ------------------------------------- | ------: | ----: | --------: | ----------: |
-| Fetch 1M rows, 3 times                | **999** | 1,369 |     1,665 |       1,119 |
-| Arrays, 50 times                      | **156** |   325 |       258 |         266 |
-| Stream 1M rows with a cursor, 3 times | **147** |   210 |       n/a |         245 |
-
-**What the numbers mean.**
-
-- **`bytea` and arrays** arrive in binary, so a 1 MB `bytea` arrives as raw bytes rather than as a hex string twice its size to parse. That is the 4.8× on large `bytea` values and the 6.9× on arrays.
-- **Bulk inserts with JS arrays** are about 20% faster because quarry sends typed arrays (`int4[]`, `text[]`, `float8[]`, …) in binary, which the server reads without parsing a literal. COPY is at parity: the work is on the server.
-- **Memory is compared at equal work**: every client runs the same number of operations after the same warm-up. (Comparing peak memory within a fixed time window favours slower clients, which simply do less in the window.) quarry uses the least memory in every row-heavy scenario except large `jsonb` values.
-- **Backpressure works**: when a consumer pauses mid-stream for 3 seconds, RSS grows by **0.0 MB**. The driver stops reading the socket until the consumer catches up.
-
-### Connections
-
-| Scenario (Node 24, median)                            |      quarry |      pg | pg-native | postgres.js |
-| ----------------------------------------------------- | ----------: | ------: | --------: | ----------: |
-| connect + `select 1` + close (no TLS, trust)          | **2.38 ms** | 3.99 ms |   4.79 ms |     6.86 ms |
-| connect + `select 1` + close (no TLS, SCRAM)          | **2.81 ms** | 5.41 ms |   7.37 ms |     7.83 ms |
-| connect + `select 1` + close (TLS verify-full, SCRAM) | **5.27 ms** | 6.63 ms |   7.42 ms |    53.33 ms |
-| New pool (max 10), 10 concurrent `select 1`           | **7.90 ms** | 8.62 ms |  13.63 ms |    15.04 ms |
-
-SCRAM is computed with the platform's native crypto, TLS is loaded lazily and its contexts are cached, which matters for serverless functions that open a connection per invocation. After `pg_ctl restart -m fast`, a quarry pool serves its first successful query **3 ms** after the server is back (postgres.js: 55 ms).
-
-### Other runtimes
-
-Throughput in operations per second:
-
-| Scenario                | quarry (Bun) | Bun.sql | pg (Bun) | quarry (Deno) | pg (Deno) | deno-postgres |
-| ----------------------- | -----------: | ------: | -------: | ------------: | --------: | ------------: |
-| Point lookup            |   **38,433** |  33,692 |   23,179 |    **29,272** |    18,637 |        12,874 |
-| Fetch 1,000 rows        |    **3,468** |   2,505 |      996 |     **2,870** |       700 |           123 |
-| Insert, 50 callers      |  **254,789** | 135,225 |  100,868 |   **183,080** |    69,959 |        21,855 |
-| `begin; insert; commit` |   **20,036** |  11,184 |   13,431 |    **16,092** |    10,589 |         8,428 |
-
-Bun.sql, which is implemented natively inside the runtime, is the closest competitor; quarry still leads it on every row above. The same JavaScript is fastest on Bun, followed by Node and then Deno.
-
-### Through PgBouncer
-
-| Scenario (Node 24, PgBouncer 1.26, transaction mode) |     quarry |         pg | pg (named) | postgres.js |
-| ---------------------------------------------------- | ---------: | ---------: | ---------: | ----------: |
-| Point lookup, 50 callers (ops/s)                     | **77,192** |     67,533 |     61,375 |      38,633 |
-| Fetch 1,000 rows (ops/s)                             |  **2,543** |        721 |        736 |         791 |
-| `begin; insert; commit` (ops/s)                      |  **9,154** |      6,523 |      6,574 |       6,025 |
-| `select 1`, sequential (ops/s)                       |     17,356 | **20,290** |     19,115 |      18,914 |
-
-### Where quarry doesn't lead
-
-- **Sequential queries through PgBouncer.** quarry keeps 43–56% of its direct throughput through PgBouncer, the lowest share of any client, and `pg` is faster for a sequential `select 1` (20,290 vs 17,356 ops/s). Under concurrency, or with real rows to decode, quarry leads again.
-- **The extreme tail on trivial queries.** postgres.js has the best p99.9 latency for `select 1` and point lookups (156 µs vs quarry's 354 µs). quarry leads at p50, p90 and p99.
-- **Garbage collection on very large results.** Fetching 100,000 rows in one result, quarry spends 228 ms per second in GC against `pg`'s 143, with a longest pause of 34 ms on the 1M-row fetch. If you read huge results, use a [cursor](#cursors-streaming-and-copy): streaming 1M rows peaks at 147 MB with event-loop lag under 2 ms.
-- **Large `jsonb` values.** With 200 KB `jsonb` documents, `pg (named)` is slightly faster (23.5 ms vs 24.8 ms) and uses less memory. JSON parsing dominates and is the same `JSON.parse` for everyone.
-
-### Running the benchmarks yourself
-
-```sh
-cd bench/driver/suite
-./setup.sh                                   # PostgreSQL 18, PgBouncer, Toxiproxy, wsproxy, runtimes
-node orchestrate.ts --id run1                # every cell, resumable
-node footprint.ts --id run1                  # install size, bundle size, cold start
-node analyze.ts --id run1                    # the tables above
-python3 charts.py results/run1/summary.json charts/
-```
-
-Set `QUARRY_DIST` to benchmark a different build of the driver, and `QUARRY_DIST_CANDIDATE` to run a before/after comparison of a change in the same session (`compare.ts` reports the differences with confidence intervals). Snapshots of earlier runs are kept in `bench/driver/suite/results-snapshots/`.
-
-A quicker comparison against `pg` and postgres.js lives in the repository root: `pnpm bench:driver`.
 
 ## Connecting
 
@@ -616,7 +422,7 @@ Queries issued concurrently on one connection are pipelined: they go out in shar
 
 Writes respect backpressure. A long queue goes out in 64 KiB chunks, and once the socket's buffer is full, the remaining queries wait unencoded until it drains, so a deep pipeline or large parameters can't pile up in memory.
 
-On a pool, pipelining kicks in once every connection is busy; see [`pipeline`](#pool-options). The benchmarks show what it's worth: [about 5× the throughput of `pg` on ten connections, and 480× on one connection over a 20 ms network](#concurrency-and-pipelining).
+On a pool, pipelining kicks in once every connection is busy; see [`pipeline`](#pool-options).
 
 ## Cancellation and timeouts
 
@@ -1919,7 +1725,7 @@ pnpm format
 | `pnpm test:compat`   | Runs node-postgres's and postgres.js's own test suites against this driver through test-only shims, on PostgreSQL 18 (`--bouncer` adds a pass through PgBouncer). `test/driver/compat/expectations.ts` lists every test allowed to fail, and why.                               |
 | `pnpm test:runtimes` | The same smoke test on Node, Bun and Deno.                                                                                                                                                                                                                                      |
 | `pnpm test:workers`  | The smoke test inside workerd (set `MINIFLARE_FROM` to a Miniflare install).                                                                                                                                                                                                    |
-| `pnpm bench:driver`  | A quick comparison against `pg` and postgres.js. The full suite is in `bench/driver/suite`; see [Benchmarks](#benchmarks).                                                                                                                                                      |
+| `pnpm bench:driver`  | A quick comparison against `pg` and postgres.js.                                                                                                                                                                                                                                |
 | `pnpm bench:types`   | Measures type-checking cost on generated schemas.                                                                                                                                                                                                                               |
 | `pnpm bench:lsp`     | Measures editor latency (completions, hovers) through the language server.                                                                                                                                                                                                      |
 | `pnpm build`         | Builds `dist/` with tsdown and emits declarations.                                                                                                                                                                                                                              |
