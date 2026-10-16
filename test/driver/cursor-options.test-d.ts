@@ -43,7 +43,7 @@ describe('cursor options', () => {
 	});
 
 	it('still take keepRows on a query', () => {
-		conn.query('select 1', [], { keepRows: 1 });
-		pool.query('select 1', [], { keepRows: 1 });
+		void conn.query('select 1', [], { keepRows: 1 });
+		void pool.query('select 1', [], { keepRows: 1 });
 	});
 });
