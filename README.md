@@ -604,7 +604,7 @@ The module also exports `oids` and `arrayOids` (type OIDs by name), helpers for 
 
 ## Prepared statements
 
-Statements are prepared and cached per connection: up to `statementCacheSize` (100), least recently used first out. A repeated query then skips parsing and planning on the server, and its result columns are known in advance, so even columns the query names no codec for are received in binary.
+Statements are prepared and cached per connection: up to `statementCacheSize` (100), least recently used first out. A repeated query then skips parsing and planning on the server, and its result columns are known in advance, which is what makes binary results possible.
 
 - **Schema changes.** A cached statement that a schema change made stale (its result type or an inferred parameter type changed), or that the server no longer has (`DEALLOCATE`, `DISCARD ALL`), is retried once as an unnamed statement, outside a transaction.
 - **Opting out.** `prepare: false` on the connection or pool, or per query.
