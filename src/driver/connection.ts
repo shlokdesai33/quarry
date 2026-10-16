@@ -811,7 +811,6 @@ export class Connection implements AsyncDisposable {
 			unwritten: true,
 			parsed: false,
 			fields: undefined,
-			paramTypes: undefined,
 			error: undefined,
 			plans: [],
 		};
