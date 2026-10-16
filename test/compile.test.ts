@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { compile } from '../src/compile.js';
 import {
 	array,
@@ -9,11 +9,13 @@ import {
 	text,
 	timestamptz,
 	tstzrange,
-	vector,
 } from '../src/column-factories.js';
-import { DataType } from '../src/data-type/data-type.js';
-import { JsonbType } from '../src/data-type/jsonb.js';
 import { defineTable } from '../src/define-table.js';
+import { binaryArray } from '../src/driver/array-params.js';
+import { codecs } from '../src/driver/codecs.js';
+import { encodeParams, paramOids } from '../src/driver/params.js';
+import { TypeCatalog } from '../src/driver/registry.js';
+import { arrayOids, oids } from '../src/driver/types.js';
 import type { Expression } from '../src/expression.js';
 import { expressionBuilder } from '../src/expression-builder.js';
 import type { Range } from '../src/range.js';
@@ -49,6 +51,30 @@ const eb = expressionBuilder(users);
 
 const compiled = (expression: Expression<unknown>) =>
 	compile(expression._quarry.node);
+
+/** Copies bytes out of a pooled buffer, to compare. */
+const bytes = (value: unknown) =>
+	value instanceof Uint8Array ? [...value] : value;
+
+/** An expression's SQL, its parameters as the driver sends them, and the type OIDs it declares. */
+function wire(expression: Expression<unknown>) {
+	const query = compiled(expression);
+	return {
+		sql: query.sql,
+		params: encodeParams(
+			query.sql,
+			query.params,
+			query.paramCodecs,
+			undefined,
+		).map(bytes),
+		types: paramOids(
+			query.params,
+			query.paramCodecs,
+			undefined,
+			new TypeCatalog(),
+		),
+	};
+}
 
 describe('comparisons', () => {
 	it('parameterises the value and maps the column name', () => {
@@ -107,15 +133,20 @@ describe('comparisons', () => {
 
 	it('renders `in` against an array expression as `= any` / `<> all`', () => {
 		// an integer column's array is declared int4[], so it goes in binary
-		expect(compiled(eb.ref('users.age').in(eb.val([1, 2])))).toEqual({
+		expect(wire(eb.ref('users.age').in(eb.val([1, 2])))).toEqual({
 			sql: '"users"."age" = any($1)',
-			params: [[1, 2]],
-			paramTypes: [1007],
+			params: [bytes(binaryArray([1, 2], arrayOids.int4))],
+			types: [arrayOids.int4],
 		});
 		expect(compiled(eb.ref('users.age').notIn(eb.val([1, 2])))).toEqual({
 			sql: '"users"."age" <> all($1)',
 			params: [[1, 2]],
-			paramTypes: [1007],
+		});
+		// a text column's array is left to the server to type, as a literal
+		expect(wire(eb.ref('users.firstName').in(eb.val(['a', 'b c'])))).toEqual({
+			sql: '"users"."first_name" = any($1)',
+			params: ['{a,"b c"}'],
+			types: [],
 		});
 		expect(
 			compiled(eb.ref('users.firstName').in(eb.ref('users.tags'))),
@@ -213,9 +244,11 @@ describe('comparisons', () => {
 			{
 				sql: '"users"."age" > any($1)',
 				params: [[1, 2]],
-				paramTypes: [1007],
 			},
 		);
+		expect(
+			wire(eb.ref('users.age').gt(eb.fn.any(eb.val([1, 2])))).types,
+		).toEqual([arrayOids.int4]);
 	});
 
 	it('renders `any` / `all` of an array expression in place', () => {
@@ -249,27 +282,49 @@ describe('value encoding', () => {
 		upper: feb,
 		bounds: '[)',
 	};
+	const literal = '["2024-01-01 00:00:00.000+00","2024-02-01 00:00:00.000+00")';
 
-	it('serialises a range operand as a range literal', () => {
-		expect(compiled(eb.ref('users.active').overlaps(january))).toEqual({
+	it('encodes a range operand as a range literal, with the range type', () => {
+		expect(wire(eb.ref('users.active').overlaps(january))).toEqual({
 			sql: '"users"."active" && $1',
-			params: ['["2024-01-01T00:00:00.000Z","2024-02-01T00:00:00.000Z")'],
+			params: [literal],
+			types: [oids.tstzrange],
 		});
 	});
 
-	it('sends a point operand of a range as its text', () => {
-		expect(compiled(eb.ref('users.active').contains(jan))).toEqual({
+	it('encodes a point operand of a range with the point type, so `@>` takes it', () => {
+		expect(wire(eb.ref('users.active').contains(jan))).toEqual({
 			sql: '"users"."active" @> $1',
-			params: ['2024-01-01T00:00:00.000Z'],
+			params: ['2024-01-01 00:00:00.000+00'],
+			types: [oids.timestamptz],
 		});
-		expect(
-			compiled(eb.ref('users.vacation').contains('2024-01-01')).params,
-		).toEqual(['2024-01-01']);
+		expect(wire(eb.ref('users.vacation').contains('2024-01-01'))).toMatchObject(
+			{
+				params: ['2024-01-01'],
+				types: [oids.date],
+			},
+		);
+		// a range on the right is still a range
+		expect(wire(eb.ref('users.active').contains(january)).types).toEqual([
+			oids.tstzrange,
+		]);
 	});
 
-	it('serialises unbounded and empty ranges', () => {
+	it('writes tstzrange bounds past the year 9999 and before 1 as postgres reads them', () => {
+		const far: Range<Date> = {
+			empty: false,
+			lower: new Date(Date.UTC(-1, 0, 1)),
+			upper: new Date(Date.UTC(10000, 0, 1)),
+			bounds: '[)',
+		};
+		expect(wire(eb.ref('users.active').eq(far)).params).toEqual([
+			'["0002-01-01 00:00:00.000+00 BC","10000-01-01 00:00:00.000+00")',
+		]);
+	});
+
+	it('encodes unbounded and empty ranges', () => {
 		expect(
-			compiled(
+			wire(
 				eb.ref('users.vacation').eq({
 					empty: false,
 					lower: null,
@@ -278,14 +333,14 @@ describe('value encoding', () => {
 				}),
 			).params,
 		).toEqual(['(,"2024-02-01"]']);
-		expect(
-			compiled(eb.ref('users.vacation').eq({ empty: true })).params,
-		).toEqual(['empty']);
+		expect(wire(eb.ref('users.vacation').eq({ empty: true })).params).toEqual([
+			'empty',
+		]);
 	});
 
 	it('escapes quotes and backslashes inside range bounds', () => {
 		expect(
-			compiled(
+			wire(
 				eb.ref('users.vacation').eq({
 					empty: false,
 					lower: 'a"b\\c',
@@ -296,39 +351,64 @@ describe('value encoding', () => {
 		).toEqual(['["a\\"b\\\\c",]']);
 	});
 
-	it('serialises jsonb values, including top-level arrays', () => {
-		expect(
-			compiled(eb.ref('users.settings').eq({ theme: 'dark' })).params,
-		).toEqual(['{"theme":"dark"}']);
-		expect(compiled(eb.ref('users.settings').eq(['a', 'b'])).params).toEqual([
+	it('encodes jsonb values, including top-level arrays and strings', () => {
+		expect(wire(eb.ref('users.settings').eq({ theme: 'dark' }))).toEqual({
+			sql: '"users"."settings" = $1',
+			params: ['{"theme":"dark"}'],
+			types: [oids.jsonb],
+		});
+		expect(wire(eb.ref('users.settings').eq(['a', 'b'])).params).toEqual([
 			'["a","b"]',
 		]);
 		expect(
-			compiled(eb.ref('users.settings').contains({ theme: 'dark' })).params,
+			wire(eb.ref('users.settings').contains({ theme: 'dark' })).params,
 		).toEqual(['{"theme":"dark"}']);
 	});
 
 	it('encodes each element of an `in` list', () => {
 		expect(
-			compiled(eb.ref('users.settings').in([{ theme: 'dark' }, ['a']])),
+			wire(eb.ref('users.settings').in([{ theme: 'dark' }, ['a']])),
 		).toEqual({
 			sql: '"users"."settings" in ($1, $2)',
 			params: ['{"theme":"dark"}', '["a"]'],
+			types: [oids.jsonb, oids.jsonb],
 		});
 	});
 
 	it('sends null as SQL null, not as JSON null', () => {
-		expect(new JsonbType().serialize(null)).toBeNull();
 		expect(
-			compiled(eb.ref('users.settings').contains({ theme: null })).params,
+			wire(eb.ref('users.settings').contains({ theme: null })).params,
 		).toEqual(['{"theme":null}']);
+		expect(
+			wire(eb.ref('users.settings').isNotDistinctFrom(null)).params,
+		).toEqual([null]);
 	});
 
 	it('encodes values by the SQL type of an expression, not only a column', () => {
 		const vacation = eb.fn.coalesce('users.vacation', eb.val(null));
-		expect(compiled(vacation.eq({ empty: true }))).toEqual({
+		expect(wire(vacation.eq({ empty: true }))).toEqual({
 			sql: 'coalesce("users"."vacation", $1) = $2',
 			params: [null, 'empty'],
+			types: [oids.daterange, oids.daterange],
+		});
+	});
+
+	it('encodes a coalesce fallback parameter by the first argument’s codec', () => {
+		const active = eb.fn.coalesce('users.active', eb.val(january));
+		expect(wire(active.isNotNull())).toEqual({
+			sql: 'coalesce("users"."active", $1) is not null',
+			params: [literal],
+			types: [oids.tstzrange],
+		});
+	});
+
+	it('encodes a parameter outside a comparison by the codec it is given, or its JavaScript type', () => {
+		expect(
+			wire(eb.fn.concat(eb.val(january, codecs.tstzrange)).isNotNull()),
+		).toMatchObject({ params: [literal], types: [oids.tstzrange] });
+		expect(wire(eb.fn.concat(eb.val('a')).isNotNull())).toMatchObject({
+			params: ['a'],
+			types: [],
 		});
 	});
 
@@ -339,64 +419,61 @@ describe('value encoding', () => {
 	});
 
 	it('encodes the items of an array parameter given to `in`', () => {
-		expect(compiled(eb.ref('users.settings').in(eb.val([['a']])))).toEqual({
+		expect(wire(eb.ref('users.settings').in(eb.val([['a']])))).toEqual({
 			sql: '"users"."settings" = any($1)',
-			params: [['["a"]']],
+			params: [bytes(binaryArray([['a']], arrayOids.jsonb, true))],
+			types: [arrayOids.jsonb],
 		});
 	});
 
 	it('encodes each value given to `any` / `all` as an operand of the operator', () => {
 		expect(
-			compiled(
+			wire(
 				eb
 					.ref('users.settings')
 					.contains(eb.fn.any([{ theme: 'dark' }, ['a']])),
 			).params,
-		).toEqual([['{"theme":"dark"}', '["a"]']]);
+		).toEqual([
+			bytes(binaryArray([{ theme: 'dark' }, ['a']], arrayOids.jsonb, true)),
+		]);
 		expect(
-			compiled(eb.ref('users.active').overlaps(eb.fn.any(eb.val([january]))))
+			wire(eb.ref('users.active').overlaps(eb.fn.any(eb.val([january]))))
 				.params,
-		).toEqual([['["2024-01-01T00:00:00.000Z","2024-02-01T00:00:00.000Z")']]);
+		).toEqual([`{"${literal.replaceAll('"', '\\"')}"}`]);
+		// points of a range
 		expect(
-			compiled(eb.ref('users.active').contains(eb.fn.any([jan]))).params,
-		).toEqual([['2024-01-01T00:00:00.000Z']]);
+			wire(eb.ref('users.active').contains(eb.fn.any([jan]))),
+		).toMatchObject({ types: [arrayOids.timestamptz] });
 	});
 
-	it('serializes a user-defined type by its option, never passing it null', () => {
-		const serialize = vi.fn((value: unknown) => JSON.stringify(value));
-		const type = new DataType('text', { serialize });
-		expect(type.serialize({ a: 1 })).toBe('{"a":1}');
-		expect(type.serialize(null)).toBeNull();
-		expect(serialize).toHaveBeenCalledTimes(1);
-		expect(new DataType('text').serialize(new Date(0))).toEqual(new Date(0));
-	});
-
-	it('serialises vectors in pgvector syntax', () => {
-		expect(vector()._quarry.dataType.serialize([1, 2.5, 3])).toBe('[1,2.5,3]');
+	it('encodes vectors in pgvector syntax', () => {
+		expect(codecs.vector.encode([1, 2.5, 3])).toBe('[1,2.5,3]');
 	});
 
 	it('encodes array elements by the element type', () => {
-		const literal = '["2024-01-01T00:00:00.000Z","2024-02-01T00:00:00.000Z")';
-		expect(
-			compiled(eb.ref('users.history').contains([january])).params,
-		).toEqual([[literal]]);
-		expect(compiled(eb.val(january).eq(eb.fn.any('users.history')))).toEqual({
+		expect(wire(eb.ref('users.history').contains([january])).params).toEqual([
+			`{"${literal.replaceAll('"', '\\"')}"}`,
+		]);
+		expect(wire(eb.val(january).eq(eb.fn.any('users.history')))).toEqual({
 			sql: '$1 = any("users"."history")',
 			params: [literal],
+			types: [oids.tstzrange],
 		});
 		expect(
-			compiled(eb.val({ id: 1 }).eq(eb.fn.any('users.documents'))).params,
+			wire(eb.val({ id: 1 }).eq(eb.fn.any('users.documents'))).params,
 		).toEqual(['{"id":1}']);
-		expect(
-			compiled(eb.ref('users.documents').overlaps([{ id: 1 }, { id: 2 }]))
-				.params,
-		).toEqual([['{"id":1}', '{"id":2}']]);
 	});
 
 	it('sends null elements as SQL null, not as encoded values', () => {
 		expect(
-			compiled(eb.ref('users.attachments').contains([null, { id: 1 }])).params,
-		).toEqual([[null, '{"id":1}']]);
+			wire(eb.ref('users.attachments').contains([null, { id: 1 }])).params,
+		).toEqual([bytes(binaryArray([null, { id: 1 }], arrayOids.jsonb, true))]);
+	});
+
+	it('writes integers without an exponent', () => {
+		expect(wire(eb.ref('users.age').eq(1e21)).params).toEqual([
+			'1000000000000000000000',
+		]);
 	});
 });
 
@@ -444,16 +521,14 @@ describe('jsonb functions', () => {
 			sql: '("users"."settings" ->> \'theme\') = $1',
 			params: ['dark'],
 		});
-		expect(compiled(eb.json.get('users.settings', 'theme').eq('dark'))).toEqual(
-			{
-				sql: '("users"."settings" -> \'theme\') = $1',
-				params: ['"dark"'],
-			},
-		);
+		expect(wire(eb.json.get('users.settings', 'theme').eq('dark'))).toEqual({
+			sql: '("users"."settings" -> \'theme\') = $1',
+			params: ['"dark"'],
+			types: [oids.jsonb],
+		});
 		expect(
-			compiled(
-				eb.json.get('users.profile', 'address').contains({ city: 'Oslo' }),
-			).params,
+			wire(eb.json.get('users.profile', 'address').contains({ city: 'Oslo' }))
+				.params,
 		).toEqual(['{"city":"Oslo"}']);
 	});
 
@@ -468,6 +543,11 @@ describe('jsonb functions', () => {
 			sql: '"users"."settings" ?| $1',
 			params: [['theme', 'lang']],
 		});
+		// keys are text, encoded as a text array; a path is a jsonpath
+		expect(
+			wire(eb.json.hasAnyKey('users.settings', ['theme', 'a "b"'])).params,
+		).toEqual(['{theme,"a \\"b\\""}']);
+		expect(wire(eb.json.pathExists('users.data', '$.a')).types).toEqual([4072]);
 		expect(
 			compiled(eb.json.hasAllKeys('users.settings', eb.val(['theme']))),
 		).toEqual({

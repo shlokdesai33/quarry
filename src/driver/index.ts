@@ -33,23 +33,14 @@ export { cloudflareSockets } from './cloudflare-socket.js';
 export {
 	arrayLiteral,
 	arrayOids,
-	arrayParser,
 	copyChunks,
 	copyLine,
-	defaultTypes,
 	encodeParam,
-	parseBigInt,
-	parseBool,
-	parseFloat,
-	parseInteger,
-	parseJson,
+	numberText,
 	formatTimestamp,
 	oids,
 	parseArray,
 	parseBytea,
-	rawTypes,
-	type TextParser,
-	type TypeParsers,
 } from './types.js';
 export {
 	createPool,
@@ -65,16 +56,30 @@ export {
 	type SettingValue,
 	type TransactionOptions,
 } from './transaction.js';
+export { parseRange, parseTimestamptz, type RangeValue } from './parsers.js';
+export {
+	arrayOf,
+	declareParamType,
+	defineCodec,
+	typed,
+	TypedValue,
+	type Codec,
+	type CodecFormat,
+	type CodecInput,
+	type CodecOutput,
+	type CodecSpec,
+} from './codec.js';
+export { codecs, defaultCodecs, type JsonValue } from './codecs.js';
 export {
 	catalogQuery,
-	catalogTypes,
-	parseRange,
-	parseTimestamptz,
-	parseHalfvec,
-	parseVector,
+	CodecRegistry,
+	createCodecRegistry,
+	defaultRegistry,
+	TypeCatalog,
 	type CatalogType,
-	type RangeValue,
-} from './parsers.js';
+} from './registry.js';
+export type { ParamCodecs } from './params.js';
+export type { ResultCodecs } from './results.js';
 export {
 	detectCapabilities,
 	parseServerVersion,

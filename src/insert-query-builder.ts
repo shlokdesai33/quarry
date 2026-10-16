@@ -108,7 +108,13 @@ export function insertIntoWith<T extends AnyTable>(
 ): InsertQueryBuilder<T, undefined, 'values'> {
 	return new InsertQueryBuilder({
 		table,
-		values: { columns: [], types: [], rows: [], strategy: 'values' },
+		values: {
+			columns: [],
+			types: [],
+			codecs: [],
+			rows: [],
+			strategy: 'values',
+		},
 		onConflict: undefined,
 		returning: [],
 		tag: undefined,

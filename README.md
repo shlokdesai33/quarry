@@ -11,23 +11,23 @@ quarry ships two things in one package:
 import { database, defineTable, integer, text, timestamptz } from 'quarry';
 
 const users = defineTable('users', {
-  columns: {
-    id: integer().identity(),
-    email: text(),
-    name: text().nullable(),
-    createdAt: timestamptz().name('created_at').default(),
-  },
+	columns: {
+		id: integer().identity(),
+		email: text(),
+		name: text().nullable(),
+		createdAt: timestamptz().name('created_at').default(),
+	},
 });
 
 const db = database(process.env.DATABASE_URL);
 
 // user: { id: number; name: string | null }
 const user = await db
-  .selectFrom(users)
-  .where('users.email', 'ada@example.com')
-  .select(['users.id', 'users.name'])
-  .expectOne()
-  .execute();
+	.selectFrom(users)
+	.where('users.email', 'ada@example.com')
+	.select(['users.id', 'users.name'])
+	.expectOne()
+	.execute();
 ```
 
 > **Status.** The driver is complete, tested against PostgreSQL 18 directly and through PgBouncer, and benchmarked. The query builder is **in active development**: the API documented below is the intended 1.0 surface, and details may still change before release.
@@ -86,7 +86,7 @@ The package has two entry points:
 | Import          | What it is                                                                           |
 | --------------- | ------------------------------------------------------------------------------------ |
 | `quarry`        | The query builder, `database()`, schema verification, and the driver's error classes |
-| `quarry/driver` | The driver on its own: `connect`, `createPool`, type parsers and everything else     |
+| `quarry/driver` | The driver on its own: `connect`, `createPool`, codecs and everything else           |
 
 The package also installs a `quarry` binary, used for [`quarry verify`](#schema-verification).
 
@@ -111,7 +111,10 @@ import { connect, createPool } from 'quarry/driver';
 
 const pool = createPool({ connectionString: process.env.DATABASE_URL });
 
-const { rows } = await pool.query('select id, email from users where id = $1', [42]);
+const { rows } = await pool.query(
+	'select id, email from users where id = $1',
+	[42],
+);
 ```
 
 ## Benchmarks
@@ -122,16 +125,16 @@ The numbers below come from the latest full run, `2026-10-13-af58bb2` (the drive
 
 ### How it was measured
 
-| Setting   | Value                                                                                                                                                                                                      |
-| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Machine   | 8-core Intel Xeon VM, 47 GB RAM, Ubuntu 24.04, kernel 6.12                                                                                                                                                 |
-| Pinning   | Client on cores 0–2, proxies on core 3, PostgreSQL on cores 4–7                                                                                                                                            |
-| Server    | PostgreSQL 18.6 on localhost, TLS on, `synchronous_commit = off`, `autovacuum = off`, `jit = off`, `shared_buffers = 2GB`                                                                                  |
-| Network   | Direct, through PgBouncer 1.26 (transaction mode), and at simulated round-trip times of 0, 1, 5 and 20 ms (Toxiproxy 2.12)                                                                                 |
-| Runtimes  | Node 24.21, Bun 1.4.3, Deno 2.9.7                                                                                                                                                                          |
-| Clients   | pg 8.23.1, pg-native 3.9.1 (libpq 18), postgres.js 3.4.9, `@neondatabase/serverless` 1.2.0 (through Neon's `wsproxy` on localhost), Bun.sql (built into Bun 1.4.3), deno-postgres 0.19.5                  |
-| Procedure | Each cell runs in a fresh process, in a seeded random order, after a warm-up. Five runs per cell; tables show the **median**, with **±** giving the half-width of a bootstrap 95% confidence interval      |
-| Fairness  | quarry is configured to decode like `pg` does (int8 and numeric as strings, timestamptz as `Date`). Every client's results are compared in canonical form: **608 results checked, 0 differ**               |
+| Setting   | Value                                                                                                                                                                                                 |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Machine   | 8-core Intel Xeon VM, 47 GB RAM, Ubuntu 24.04, kernel 6.12                                                                                                                                            |
+| Pinning   | Client on cores 0–2, proxies on core 3, PostgreSQL on cores 4–7                                                                                                                                       |
+| Server    | PostgreSQL 18.6 on localhost, TLS on, `synchronous_commit = off`, `autovacuum = off`, `jit = off`, `shared_buffers = 2GB`                                                                             |
+| Network   | Direct, through PgBouncer 1.26 (transaction mode), and at simulated round-trip times of 0, 1, 5 and 20 ms (Toxiproxy 2.12)                                                                            |
+| Runtimes  | Node 24.21, Bun 1.4.3, Deno 2.9.7                                                                                                                                                                     |
+| Clients   | pg 8.23.1, pg-native 3.9.1 (libpq 18), postgres.js 3.4.9, `@neondatabase/serverless` 1.2.0 (through Neon's `wsproxy` on localhost), Bun.sql (built into Bun 1.4.3), deno-postgres 0.19.5              |
+| Procedure | Each cell runs in a fresh process, in a seeded random order, after a warm-up. Five runs per cell; tables show the **median**, with **±** giving the half-width of a bootstrap 95% confidence interval |
+| Fairness  | quarry is configured to decode like `pg` does (int8 and numeric as strings, timestamptz as `Date`). Every client's results are compared in canonical form: **608 results checked, 0 differ**          |
 
 Two things to keep in mind when reading the tables. First, this is a localhost benchmark with durability relaxed, so it isolates client cost: the gaps here are larger than you'll see when the server is doing real work or the network adds milliseconds. Second, µs figures are per operation and lower is better; ops/s figures are higher is better.
 
@@ -139,16 +142,16 @@ Two things to keep in mind when reading the tables. First, this is a localhost b
 
 Median latency per operation:
 
-| Scenario                       |    quarry |      pg | pg (named) | pg-native | postgres.js |
-| ------------------------------ | --------: | ------: | ---------: | --------: | ----------: |
-| `select 1`                     | **23.0 µs** | 25.9 µs |    25.9 µs |   31.2 µs |     27.8 µs |
-| Point lookup by primary key    | **28.1 µs** | 46.0 µs |    35.3 µs |   49.9 µs |     32.9 µs |
-| Range scan, 100 rows           | **93.2 µs** |  188 µs |     184 µs |    195 µs |      163 µs |
-| Fetch 1,000 rows (6 columns)   |  **322 µs** | 1.34 ms |    1.27 ms |   1.62 ms |      965 µs |
-| Insert one row                 | **28.3 µs** | 38.6 µs |    30.1 µs |   44.1 µs |     33.0 µs |
-| Update one row                 | **32.0 µs** | 45.4 µs |    34.7 µs |   51.2 µs |     36.0 µs |
-| `begin; insert; commit`        | **52.7 µs** | 81.2 µs |    72.0 µs |   97.1 µs |     86.0 µs |
-| A query that fails, connection reused | **35.4 µs** | 2.30 ms | 2.35 ms | 4.81 ms | 54.0 µs |
+| Scenario                              |      quarry |      pg | pg (named) | pg-native | postgres.js |
+| ------------------------------------- | ----------: | ------: | ---------: | --------: | ----------: |
+| `select 1`                            | **23.0 µs** | 25.9 µs |    25.9 µs |   31.2 µs |     27.8 µs |
+| Point lookup by primary key           | **28.1 µs** | 46.0 µs |    35.3 µs |   49.9 µs |     32.9 µs |
+| Range scan, 100 rows                  | **93.2 µs** |  188 µs |     184 µs |    195 µs |      163 µs |
+| Fetch 1,000 rows (6 columns)          |  **322 µs** | 1.34 ms |    1.27 ms |   1.62 ms |      965 µs |
+| Insert one row                        | **28.3 µs** | 38.6 µs |    30.1 µs |   44.1 µs |     33.0 µs |
+| Update one row                        | **32.0 µs** | 45.4 µs |    34.7 µs |   51.2 µs |     36.0 µs |
+| `begin; insert; commit`               | **52.7 µs** | 81.2 µs |    72.0 µs |   97.1 µs |     86.0 µs |
+| A query that fails, connection reused | **35.4 µs** | 2.30 ms |    2.35 ms |   4.81 ms |     54.0 µs |
 
 **What the numbers mean.**
 
@@ -160,19 +163,19 @@ Median latency per operation:
 
 Per-type decoding cost, in nanoseconds per value (100,000 rows × 1 column):
 
-| Type          | quarry |  pg | pg-native | postgres.js |
-| ------------- | -----: | --: | --------: | ----------: |
-| `int4`        | **77** | 194 |       200 |         266 |
-| `int8`        | **112** | 226 |      215 |         260 |
-| `float8`      | **82** | 210 |       232 |         297 |
-| `numeric`     | **137** | 176 |      238 |         259 |
-| `text`        | **113** | 173 |      203 |         249 |
-| `timestamptz` | **111** | 677 |      728 |         439 |
-| `date`        | **112** | 500 |      451 |         363 |
-| `uuid`        | **126** | 209 |      233 |         257 |
-| `jsonb`       | **383** | 439 |      553 |         506 |
-| `int4[5]`     | **276** | 1,291 |  1,223 |         635 |
-| `bytea`       | **170** | 386 |       388 |         376 |
+| Type          |  quarry |    pg | pg-native | postgres.js |
+| ------------- | ------: | ----: | --------: | ----------: |
+| `int4`        |  **77** |   194 |       200 |         266 |
+| `int8`        | **112** |   226 |       215 |         260 |
+| `float8`      |  **82** |   210 |       232 |         297 |
+| `numeric`     | **137** |   176 |       238 |         259 |
+| `text`        | **113** |   173 |       203 |         249 |
+| `timestamptz` | **111** |   677 |       728 |         439 |
+| `date`        | **112** |   500 |       451 |         363 |
+| `uuid`        | **126** |   209 |       233 |         257 |
+| `jsonb`       | **383** |   439 |       553 |         506 |
+| `int4[5]`     | **276** | 1,291 |     1,223 |         635 |
+| `bytea`       | **170** |   386 |       388 |         376 |
 
 The biggest gaps are in timestamps and arrays. `timestamptz` arrives as an 8-byte integer in binary, so quarry builds a `Date` from one number instead of parsing a string; arrays arrive with their element types and lengths up front instead of as a literal to tokenize.
 
@@ -180,17 +183,17 @@ The biggest gaps are in timestamps and arrays. `timestamptz` arrives as an 8-byt
 
 Point lookups per second, Node 24, as the number of concurrent callers grows:
 
-| Callers | quarry, pool 10 | quarry, pool 10, `pipeline: false` |  pg, pool 10 | postgres.js, pool 10 | quarry, **1 connection** | pg, 1 connection |
-| ------: | --------------: | ---------------------------------: | -----------: | -------------------: | -----------------------: | ---------------: |
-|       1 |          33,041 |                             32,853 |       19,922 |               27,803 |                   33,312 |           19,989 |
-|      10 |          94,609 |                             94,438 |       65,842 |               65,087 |                  109,616 |           20,745 |
-|     100 |     **293,716** |                             90,955 |       64,659 |               41,742 |                  117,012 |           20,854 |
-|     500 |     **318,929** |                             86,819 |       62,346 |              113,087 |                  115,396 |           20,622 |
-|   1,000 |     **300,677** |                             84,411 |       61,003 |              130,367 |                  115,076 |           20,323 |
+| Callers | quarry, pool 10 | quarry, pool 10, `pipeline: false` | pg, pool 10 | postgres.js, pool 10 | quarry, **1 connection** | pg, 1 connection |
+| ------: | --------------: | ---------------------------------: | ----------: | -------------------: | -----------------------: | ---------------: |
+|       1 |          33,041 |                             32,853 |      19,922 |               27,803 |                   33,312 |           19,989 |
+|      10 |          94,609 |                             94,438 |      65,842 |               65,087 |                  109,616 |           20,745 |
+|     100 |     **293,716** |                             90,955 |      64,659 |               41,742 |                  117,012 |           20,854 |
+|     500 |     **318,929** |                             86,819 |      62,346 |              113,087 |                  115,396 |           20,622 |
+|   1,000 |     **300,677** |                             84,411 |      61,003 |              130,367 |                  115,076 |           20,323 |
 
 **What the numbers mean.**
 
-- **With `pipeline: false`, quarry behaves like `pg`**: each query checks a connection out, so throughput stops at roughly *connections ÷ round trip*. Both plateau as soon as all ten connections are busy; quarry's plateau is higher only because each query is cheaper.
+- **With `pipeline: false`, quarry behaves like `pg`**: each query checks a connection out, so throughput stops at roughly _connections ÷ round trip_. Both plateau as soon as all ten connections are busy; quarry's plateau is higher only because each query is cheaper.
 - **With pipelining (the default)**, once the ten connections are busy, further queries share them instead of queueing in the client. Throughput keeps climbing to about **300,000 lookups per second, roughly 5× `pg`**, and stays there at 1,000 callers. The p99 latency at 1,000 callers is **7.6 ms** against `pg`'s 24.1 ms, because queries wait on the socket rather than in a JavaScript queue.
 - **A single connection** does 115,000 lookups per second with quarry, against 20,000 for `pg`. One pipelined connection outperforms ten unpipelined ones.
 
@@ -198,14 +201,14 @@ Point lookups per second, Node 24, as the number of concurrent callers grows:
 
 On localhost, round trips are nearly free. The cells below add a simulated network round trip with Toxiproxy, which is where the design choices pay off.
 
-| Scenario (Node 24)                                   | RTT   |       quarry |       pg | postgres.js |
-| ---------------------------------------------------- | ----- | -----------: | -------: | ----------: |
-| `begin; insert; commit`, sequential (latency)        | 5 ms  | **11.75 ms** | 17.50 ms |    17.57 ms |
-|                                                      | 20 ms | **41.73 ms** | 62.70 ms |    62.62 ms |
-| Point lookup, 50 callers, pool 10 (ops/s)            | 5 ms  |    **8,200** |    1,652 |       6,834 |
-|                                                      | 20 ms |    **2,354** |      473 |       1,967 |
-| Point lookup, 500 callers, **1 connection** (ops/s)  | 5 ms  |   **79,879** |      169 |       7,848 |
-|                                                      | 20 ms |   **23,078** |     47.8 |       2,337 |
+| Scenario (Node 24)                                  | RTT   |       quarry |       pg | postgres.js |
+| --------------------------------------------------- | ----- | -----------: | -------: | ----------: |
+| `begin; insert; commit`, sequential (latency)       | 5 ms  | **11.75 ms** | 17.50 ms |    17.57 ms |
+|                                                     | 20 ms | **41.73 ms** | 62.70 ms |    62.62 ms |
+| Point lookup, 50 callers, pool 10 (ops/s)           | 5 ms  |    **8,200** |    1,652 |       6,834 |
+|                                                     | 20 ms |    **2,354** |      473 |       1,967 |
+| Point lookup, 500 callers, **1 connection** (ops/s) | 5 ms  |   **79,879** |      169 |       7,848 |
+|                                                     | 20 ms |   **23,078** |     47.8 |       2,337 |
 
 **What the numbers mean.**
 
@@ -228,22 +231,22 @@ On localhost, depth stops mattering past 8, because the server becomes the bottl
 
 ### Large results, bulk writes and memory
 
-| Scenario (Node 24, median time)              |       quarry |       pg | pg-native | postgres.js |
-| -------------------------------------------- | -----------: | -------: | --------: | ----------: |
-| Fetch 100,000 rows                           | **37.09 ms** |   131 ms |    144 ms |    97.26 ms |
-| Fetch 1,000,000 rows (one result)            |   **487 ms** | 1,293 ms |  1,517 ms |    1,078 ms |
-| Wide rows: 1,000 rows × 100 columns          |  **3.64 ms** | 14.53 ms |  21.14 ms |    14.83 ms |
-| Arrays: 1,000 rows of `int4[100]` + `text[20]` | **3.25 ms** | 22.38 ms | 25.88 ms |     8.32 ms |
-| 10 × 1 MB `bytea` values                     |  **3.63 ms** | 17.39 ms |  33.23 ms |    15.70 ms |
-| Stream 1M rows with a cursor                 |   **737 ms** | 1,283 ms |       n/a |    1,047 ms |
-| Bulk insert 10k rows (`unnest`, JS arrays)   | **12.79 ms** | 15.97 ms |  15.56 ms |    15.97 ms |
-| Bulk insert 10k rows (`COPY FROM STDIN`)     |     12.85 ms | 12.95 ms |       n/a |    55.88 ms |
+| Scenario (Node 24, median time)                |       quarry |       pg | pg-native | postgres.js |
+| ---------------------------------------------- | -----------: | -------: | --------: | ----------: |
+| Fetch 100,000 rows                             | **37.09 ms** |   131 ms |    144 ms |    97.26 ms |
+| Fetch 1,000,000 rows (one result)              |   **487 ms** | 1,293 ms |  1,517 ms |    1,078 ms |
+| Wide rows: 1,000 rows × 100 columns            |  **3.64 ms** | 14.53 ms |  21.14 ms |    14.83 ms |
+| Arrays: 1,000 rows of `int4[100]` + `text[20]` |  **3.25 ms** | 22.38 ms |  25.88 ms |     8.32 ms |
+| 10 × 1 MB `bytea` values                       |  **3.63 ms** | 17.39 ms |  33.23 ms |    15.70 ms |
+| Stream 1M rows with a cursor                   |   **737 ms** | 1,283 ms |       n/a |    1,047 ms |
+| Bulk insert 10k rows (`unnest`, JS arrays)     | **12.79 ms** | 15.97 ms |  15.56 ms |    15.97 ms |
+| Bulk insert 10k rows (`COPY FROM STDIN`)       |     12.85 ms | 12.95 ms |       n/a |    55.88 ms |
 
-| Peak RSS at equal work (MB)                  | quarry |    pg | pg-native | postgres.js |
-| -------------------------------------------- | -----: | ----: | --------: | ----------: |
-| Fetch 1M rows, 3 times                       | **999** | 1,369 |    1,665 |       1,119 |
-| Arrays, 50 times                             | **156** |   325 |       258 |         266 |
-| Stream 1M rows with a cursor, 3 times        | **147** |   210 |       n/a |         245 |
+| Peak RSS at equal work (MB)           |  quarry |    pg | pg-native | postgres.js |
+| ------------------------------------- | ------: | ----: | --------: | ----------: |
+| Fetch 1M rows, 3 times                | **999** | 1,369 |     1,665 |       1,119 |
+| Arrays, 50 times                      | **156** |   325 |       258 |         266 |
+| Stream 1M rows with a cursor, 3 times | **147** |   210 |       n/a |         245 |
 
 **What the numbers mean.**
 
@@ -254,12 +257,12 @@ On localhost, depth stops mattering past 8, because the server becomes the bottl
 
 ### Connections
 
-| Scenario (Node 24, median)                          |      quarry |      pg | pg-native | postgres.js |
-| --------------------------------------------------- | ----------: | ------: | --------: | ----------: |
-| connect + `select 1` + close (no TLS, trust)        | **2.38 ms** | 3.99 ms |   4.79 ms |     6.86 ms |
-| connect + `select 1` + close (no TLS, SCRAM)        | **2.81 ms** | 5.41 ms |   7.37 ms |     7.83 ms |
-| connect + `select 1` + close (TLS verify-full, SCRAM) | **5.27 ms** | 6.63 ms | 7.42 ms |    53.33 ms |
-| New pool (max 10), 10 concurrent `select 1`         | **7.90 ms** | 8.62 ms |  13.63 ms |    15.04 ms |
+| Scenario (Node 24, median)                            |      quarry |      pg | pg-native | postgres.js |
+| ----------------------------------------------------- | ----------: | ------: | --------: | ----------: |
+| connect + `select 1` + close (no TLS, trust)          | **2.38 ms** | 3.99 ms |   4.79 ms |     6.86 ms |
+| connect + `select 1` + close (no TLS, SCRAM)          | **2.81 ms** | 5.41 ms |   7.37 ms |     7.83 ms |
+| connect + `select 1` + close (TLS verify-full, SCRAM) | **5.27 ms** | 6.63 ms |   7.42 ms |    53.33 ms |
+| New pool (max 10), 10 concurrent `select 1`           | **7.90 ms** | 8.62 ms |  13.63 ms |    15.04 ms |
 
 SCRAM is computed with the platform's native crypto, TLS is loaded lazily and its contexts are cached, which matters for serverless functions that open a connection per invocation. After `pg_ctl restart -m fast`, a quarry pool serves its first successful query **3 ms** after the server is back (postgres.js: 55 ms).
 
@@ -267,23 +270,23 @@ SCRAM is computed with the platform's native crypto, TLS is loaded lazily and it
 
 Throughput in operations per second:
 
-| Scenario                     | quarry (Bun) | Bun.sql | pg (Bun) | quarry (Deno) | pg (Deno) | deno-postgres |
-| ---------------------------- | -----------: | ------: | -------: | ------------: | --------: | ------------: |
-| Point lookup                 |   **38,433** |  33,692 |   23,179 |    **29,272** |    18,637 |        12,874 |
-| Fetch 1,000 rows             |    **3,468** |   2,505 |      996 |     **2,870** |       700 |           123 |
-| Insert, 50 callers           |  **254,789** | 135,225 |  100,868 |   **183,080** |    69,959 |        21,855 |
-| `begin; insert; commit`      |   **20,036** |  11,184 |   13,431 |    **16,092** |    10,589 |         8,428 |
+| Scenario                | quarry (Bun) | Bun.sql | pg (Bun) | quarry (Deno) | pg (Deno) | deno-postgres |
+| ----------------------- | -----------: | ------: | -------: | ------------: | --------: | ------------: |
+| Point lookup            |   **38,433** |  33,692 |   23,179 |    **29,272** |    18,637 |        12,874 |
+| Fetch 1,000 rows        |    **3,468** |   2,505 |      996 |     **2,870** |       700 |           123 |
+| Insert, 50 callers      |  **254,789** | 135,225 |  100,868 |   **183,080** |    69,959 |        21,855 |
+| `begin; insert; commit` |   **20,036** |  11,184 |   13,431 |    **16,092** |    10,589 |         8,428 |
 
 Bun.sql, which is implemented natively inside the runtime, is the closest competitor; quarry still leads it on every row above. The same JavaScript is fastest on Bun, followed by Node and then Deno.
 
 ### Through PgBouncer
 
-| Scenario (Node 24, PgBouncer 1.26, transaction mode) |      quarry |      pg | pg (named) | postgres.js |
-| ---------------------------------------------------- | ----------: | ------: | ---------: | ----------: |
-| Point lookup, 50 callers (ops/s)                     |  **77,192** |  67,533 |     61,375 |      38,633 |
-| Fetch 1,000 rows (ops/s)                             |   **2,543** |     721 |        736 |         791 |
-| `begin; insert; commit` (ops/s)                      |   **9,154** |   6,523 |      6,574 |       6,025 |
-| `select 1`, sequential (ops/s)                       |      17,356 | **20,290** |   19,115 |      18,914 |
+| Scenario (Node 24, PgBouncer 1.26, transaction mode) |     quarry |         pg | pg (named) | postgres.js |
+| ---------------------------------------------------- | ---------: | ---------: | ---------: | ----------: |
+| Point lookup, 50 callers (ops/s)                     | **77,192** |     67,533 |     61,375 |      38,633 |
+| Fetch 1,000 rows (ops/s)                             |  **2,543** |        721 |        736 |         791 |
+| `begin; insert; commit` (ops/s)                      |  **9,154** |      6,523 |      6,574 |       6,025 |
+| `select 1`, sequential (ops/s)                       |     17,356 | **20,290** |     19,115 |      18,914 |
 
 ### Where quarry doesn't lead
 
@@ -324,8 +327,8 @@ A pool, which is what most applications want:
 import { createPool } from 'quarry/driver';
 
 const pool = createPool({
-  connectionString: process.env.DATABASE_URL,
-  max: 20,
+	connectionString: process.env.DATABASE_URL,
+	max: 20,
 });
 
 await pool.query('select 1');
@@ -345,39 +348,39 @@ Options are resolved like libpq, in this order, the first one that sets a value 
 
 ### Connection options
 
-| Option                  | Default                     | Description                                                                                                                         |
-| ----------------------- | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `connectionString`      |                             | A `postgres://` URL or a `key=value` string. Explicit options override it.                                                          |
-| `host`                  | `localhost`                 | Host name, IP address, or Unix-socket directory (starting with `/`). Comma-separated for failover.                                  |
-| `port`                  | `5432`                      | Port, or comma-separated ports matching `host`.                                                                                     |
-| `user`                  | the OS user                 |                                                                                                                                     |
-| `password`              |                             | A string, or a function returning one (or a promise of one), called for every new connection. Use this for short-lived IAM tokens.  |
-| `database`              | the user name               |                                                                                                                                     |
-| `applicationName`       |                             | Shown in `pg_stat_activity`.                                                                                                        |
-| `ssl`                   | see [TLS](#tls)             | An `sslmode` string, or an options object.                                                                                          |
-| `channelBinding`        | `'prefer'`                  | SCRAM channel binding: `'disable'`, `'prefer'` or `'require'`.                                                                      |
-| `requireAuth`           |                             | Authentication methods to accept, as libpq's `require_auth`. See [Authentication](#authentication).                                 |
-| `connectTimeout`        | `30000`                     | Milliseconds allowed to connect and authenticate. `0` for none.                                                                     |
-| `keepAlive`             | `true`                      | TCP keep-alive, with `keepAliveInitialDelay` in milliseconds.                                                                       |
-| `targetSessionAttrs`    | `'any'`                     | With several hosts: `'any'`, `'read-write'`, `'read-only'`, `'primary'`, `'standby'` or `'prefer-standby'`.                         |
-| `params`                |                             | Startup parameters, e.g. `{ search_path: 'app', timezone: 'UTC' }`.                                                                 |
-| `options`               |                             | Command-line options for the server, as `PGOPTIONS` (e.g. `'-c statement_timeout=5s'`).                                             |
-| `passfile`              | `PGPASSFILE` / `~/.pgpass`  | A password file in `.pgpass` format.                                                                                                |
-| `types`                 | `defaultTypes`              | Result decoders by type OID. See [Decoding results](#decoding-results).                                                             |
-| `prepare`               | `true`                      | Use named prepared statements, cached per connection.                                                                               |
-| `statementCacheSize`    | `100`                       | Prepared statements kept per connection (least recently used are deallocated).                                                     |
-| `preparePipelined`      | detected                    | Use named statements for pipelined queries too. See [Poolers and proxies](#poolers-and-proxies).                                    |
-| `binaryResults`         | `true`                      | Receive columns in binary where a binary decoder exists.                                                                            |
-| `protocol`              | `'auto'`                    | `'auto'` asks for 3.2 and accepts what the server negotiates; `'3.0'` or `'3.2'` insists on that version.                           |
-| `minProtocolVersion`    | `'3.0'`                     | The oldest protocol version to accept.                                                                                              |
-| `maxProtocolVersion`    | `'latest'`                  | The newest protocol version to ask for.                                                                                             |
-| `telemetry`             |                             | An OpenTelemetry tracer. See [Observability](#observability).                                                                       |
-| `captureStack`          | `false`                     | Append the calling code's stack to query errors (a few hundred nanoseconds per query).                                              |
-| `onNotice`              |                             | Called with every `NOTICE`, `WARNING` and other non-error message the server sends.                                                 |
-| `onNotification`        |                             | Called with every `NOTIFY` delivered to the connection.                                                                             |
-| `maxMessageSize`        |                             | Refuse server messages larger than this many bytes.                                                                                 |
-| `socket`                | picked by runtime           | A `SocketFactory`, for runtimes other than Node, Bun, Deno and Workers.                                                             |
-| `env`                   | `process.env`               | The environment to read `PG*` variables from.                                                                                       |
+| Option               | Default                    | Description                                                                                                                        |
+| -------------------- | -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `connectionString`   |                            | A `postgres://` URL or a `key=value` string. Explicit options override it.                                                         |
+| `host`               | `localhost`                | Host name, IP address, or Unix-socket directory (starting with `/`). Comma-separated for failover.                                 |
+| `port`               | `5432`                     | Port, or comma-separated ports matching `host`.                                                                                    |
+| `user`               | the OS user                |                                                                                                                                    |
+| `password`           |                            | A string, or a function returning one (or a promise of one), called for every new connection. Use this for short-lived IAM tokens. |
+| `database`           | the user name              |                                                                                                                                    |
+| `applicationName`    |                            | Shown in `pg_stat_activity`.                                                                                                       |
+| `ssl`                | see [TLS](#tls)            | An `sslmode` string, or an options object.                                                                                         |
+| `channelBinding`     | `'prefer'`                 | SCRAM channel binding: `'disable'`, `'prefer'` or `'require'`.                                                                     |
+| `requireAuth`        |                            | Authentication methods to accept, as libpq's `require_auth`. See [Authentication](#authentication).                                |
+| `connectTimeout`     | `30000`                    | Milliseconds allowed to connect and authenticate. `0` for none.                                                                    |
+| `keepAlive`          | `true`                     | TCP keep-alive, with `keepAliveInitialDelay` in milliseconds.                                                                      |
+| `targetSessionAttrs` | `'any'`                    | With several hosts: `'any'`, `'read-write'`, `'read-only'`, `'primary'`, `'standby'` or `'prefer-standby'`.                        |
+| `params`             |                            | Startup parameters, e.g. `{ search_path: 'app', timezone: 'UTC' }`.                                                                |
+| `options`            |                            | Command-line options for the server, as `PGOPTIONS` (e.g. `'-c statement_timeout=5s'`).                                            |
+| `passfile`           | `PGPASSFILE` / `~/.pgpass` | A password file in `.pgpass` format.                                                                                               |
+| `codecs`             | `defaultCodecs`            | Codecs to read result columns with, by type, over the defaults, or a registry. See [Decoding results](#decoding-results).          |
+| `prepare`            | `true`                     | Use named prepared statements, cached per connection.                                                                              |
+| `statementCacheSize` | `100`                      | Prepared statements kept per connection (least recently used are deallocated).                                                     |
+| `preparePipelined`   | detected                   | Use named statements for pipelined queries too. See [Poolers and proxies](#poolers-and-proxies).                                   |
+| `binaryResults`      | `true`                     | Receive columns in binary where their codec reads them so.                                                                         |
+| `protocol`           | `'auto'`                   | `'auto'` asks for 3.2 and accepts what the server negotiates; `'3.0'` or `'3.2'` insists on that version.                          |
+| `minProtocolVersion` | `'3.0'`                    | The oldest protocol version to accept.                                                                                             |
+| `maxProtocolVersion` | `'latest'`                 | The newest protocol version to ask for.                                                                                            |
+| `telemetry`          |                            | An OpenTelemetry tracer. See [Observability](#observability).                                                                      |
+| `captureStack`       | `false`                    | Append the calling code's stack to query errors (a few hundred nanoseconds per query).                                             |
+| `onNotice`           |                            | Called with every `NOTICE`, `WARNING` and other non-error message the server sends.                                                |
+| `onNotification`     |                            | Called with every `NOTIFY` delivered to the connection.                                                                            |
+| `maxMessageSize`     |                            | Refuse server messages larger than this many bytes.                                                                                |
+| `socket`             | picked by runtime          | A `SocketFactory`, for runtimes other than Node, Bun, Deno and Workers.                                                            |
+| `env`                | `process.env`              | The environment to read `PG*` variables from.                                                                                      |
 
 `createPool` accepts all of these, plus the [pool options](#pool-options).
 
@@ -385,8 +388,8 @@ Options are resolved like libpq, in this order, the first one that sets a value 
 
 ```ts
 const pool = createPool({
-  host: 'db-1.internal,db-2.internal,db-3.internal',
-  targetSessionAttrs: 'read-write',
+	host: 'db-1.internal,db-2.internal,db-3.internal',
+	targetSessionAttrs: 'read-write',
 });
 ```
 
@@ -396,21 +399,27 @@ Hosts are tried in order. With `targetSessionAttrs`, a host that is reachable bu
 
 `ssl` takes libpq's `sslmode` values:
 
-| Mode          | Encrypts         | Verifies the certificate | Verifies the host name |
-| ------------- | ---------------- | ------------------------ | ---------------------- |
-| `disable`     | no               | no                       | no                     |
-| `allow`       | if required      | no                       | no                     |
-| `prefer`      | if available     | no                       | no                     |
-| `require`     | yes              | no                       | no                     |
-| `verify-ca`   | yes              | yes                      | no                     |
-| `verify-full` | yes              | yes                      | yes                    |
+| Mode          | Encrypts     | Verifies the certificate | Verifies the host name |
+| ------------- | ------------ | ------------------------ | ---------------------- |
+| `disable`     | no           | no                       | no                     |
+| `allow`       | if required  | no                       | no                     |
+| `prefer`      | if available | no                       | no                     |
+| `require`     | yes          | no                       | no                     |
+| `verify-ca`   | yes          | yes                      | no                     |
+| `verify-full` | yes          | yes                      | yes                    |
 
 **The default is `verify-full` for remote hosts**, and `prefer` for `localhost` and Unix sockets. Unlike libpq's historical `prefer` default, a remote connection is never silently unencrypted or unverified.
 
 ```ts
 connect({ host: 'db.example.com', ssl: { mode: 'verify-full', ca: pem } });
-connect({ host: 'db.example.com', ssl: { mode: 'verify-full', rootCertFile: 'system' } });
-connect({ host: 'db.example.com', ssl: { mode: 'require', negotiation: 'direct' } });
+connect({
+	host: 'db.example.com',
+	ssl: { mode: 'verify-full', rootCertFile: 'system' },
+});
+connect({
+	host: 'db.example.com',
+	ssl: { mode: 'require', negotiation: 'direct' },
+});
 ```
 
 - **Trust roots.** The verify modes use, in order: `ca` (PEM, or an array of PEMs), `rootCertFile` (a path, or `'system'` for the platform's store), `~/.postgresql/root.crt`, and finally the platform's CA store.
@@ -423,9 +432,9 @@ connect({ host: 'db.example.com', ssl: { mode: 'require', negotiation: 'direct' 
 
   ```ts
   createPool({
-    host: 'mydb.cluster.us-east-1.rds.amazonaws.com',
-    user: 'app',
-    password: () => signer.getAuthToken(), // a fresh IAM token per connection
+  	host: 'mydb.cluster.us-east-1.rds.amazonaws.com',
+  	user: 'app',
+  	password: () => signer.getAuthToken(), // a fresh IAM token per connection
   });
   ```
 
@@ -442,46 +451,48 @@ connect({ host: 'db.example.com', ssl: { mode: 'require', negotiation: 'direct' 
 
 ## Runtimes
 
-| Runtime            | Socket                       | Notes                                                                                                                                                                                        |
-| ------------------ | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Node               | `node:net` / `node:tls`      | Every feature.                                                                                                                                                                               |
-| Bun                | `node:net` / `node:tls`      | Every feature.                                                                                                                                                                               |
-| Deno               | `node:net` / `node:tls`      | Every feature.                                                                                                                                                                               |
-| Cloudflare Workers | `cloudflare:sockets`         | Picked automatically. Workers' TLS always verifies against public CAs and doesn't expose the server certificate, so custom CAs, client certificates, direct TLS and channel binding are unavailable. |
-| Anything else      | your `SocketFactory`         | Pass `socket`. The interface is small: connect, write, read, upgrade to TLS, close.                                                                                                          |
+| Runtime            | Socket                  | Notes                                                                                                                                                                                                |
+| ------------------ | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Node               | `node:net` / `node:tls` | Every feature.                                                                                                                                                                                       |
+| Bun                | `node:net` / `node:tls` | Every feature.                                                                                                                                                                                       |
+| Deno               | `node:net` / `node:tls` | Every feature.                                                                                                                                                                                       |
+| Cloudflare Workers | `cloudflare:sockets`    | Picked automatically. Workers' TLS always verifies against public CAs and doesn't expose the server certificate, so custom CAs, client certificates, direct TLS and channel binding are unavailable. |
+| Anything else      | your `SocketFactory`    | Pass `socket`. The interface is small: connect, write, read, upgrade to TLS, close.                                                                                                                  |
 
 ## Queries
 
 ```ts
 const { rows, rowCount, command, fields } = await pool.query(
-  'select id, email from users where created_at > $1',
-  [since],
+	'select id, email from users where created_at > $1',
+	[since],
 );
 ```
 
 A `QueryResult` has:
 
-| Field      | Description                                                                          |
-| ---------- | ------------------------------------------------------------------------------------ |
-| `rows`     | The decoded rows: objects keyed by column name, or arrays with `rowMode: 'array'`.   |
-| `rowCount` | Rows returned or affected, from the command tag; `null` for commands without one.    |
-| `command`  | The command tag's verb: `SELECT`, `INSERT`, `UPDATE`, …                              |
-| `fields`   | Each column's name, type OID, type modifier, and source table and column.            |
+| Field      | Description                                                                        |
+| ---------- | ---------------------------------------------------------------------------------- |
+| `rows`     | The decoded rows: objects keyed by column name, or arrays with `rowMode: 'array'`. |
+| `rowCount` | Rows returned or affected, from the command tag; `null` for commands without one.  |
+| `command`  | The command tag's verb: `SELECT`, `INSERT`, `UPDATE`, …                            |
+| `fields`   | Each column's name, type OID, type modifier, and source table and column.          |
 
 Per-query options:
 
 ```ts
 await pool.query(sql, params, {
-  rowMode: 'array',       // positional rows
-  signal,                 // an AbortSignal that cancels the query
-  timeout: 5000,          // client-side deadline, in ms
-  statementTimeout: '2s', // server-side statement_timeout for this query only
-  paramTypes: [arrayOids.int4],
-  prepare: false,         // send this one unnamed
-  keepRows: 1,            // decode only the first row; rowCount still counts all
-  types: { ...defaultTypes, [oids.numeric]: Number }, // decoders for this query only
-  tag: 'orders.recent',   // a label for telemetry spans
-  onTiming: (t) => log(t), // where the query spent its time once it settles
+	rowMode: 'array', // positional rows
+	signal, // an AbortSignal that cancels the query
+	timeout: 5000, // client-side deadline, in ms
+	statementTimeout: '2s', // server-side statement_timeout for this query only
+	paramTypes: [arrayOids.int4],
+	paramCodecs: [codecs.int4], // encode $1 with this codec, and declare its type
+	resultCodecs: [codecs.int4, codecs.timestamptz], // the codec each column is expected in
+	codecs: [codecs.int8AsString], // codecs by type for this query only
+	prepare: false, // send this one unnamed
+	keepRows: 1, // decode only the first row; rowCount still counts all
+	tag: 'orders.recent', // a label for telemetry spans
+	onTiming: (t) => log(t), // where the query spent its time once it settles
 });
 ```
 
@@ -489,70 +500,105 @@ Other ways to run SQL:
 
 ```ts
 // Several statements, no parameters (the simple query protocol):
-const results = await pool.simpleQuery('create table t (id int); insert into t values (1);');
+const results = await pool.simpleQuery(
+	'create table t (id int); insert into t values (1);',
+);
 
 // A statement's parameter and result types, without running it:
-const { paramTypes, fields } = await pool.describe('select * from users where id = $1');
+const { paramTypes, fields } = await pool.describe(
+	'select * from users where id = $1',
+);
 ```
 
 ## Parameters
 
 Parameters are always sent separately from the SQL text, never interpolated.
 
-| JavaScript value          | Sent as                                                                                          |
-| ------------------------- | ------------------------------------------------------------------------------------------------ |
-| `string`                  | Unchanged.                                                                                       |
-| `number`, `bigint`        | Their decimal text.                                                                              |
-| `boolean`                 | `t` / `f`.                                                                                       |
-| `Date`                    | A UTC timestamp. A `timestamp without time zone` column receives the UTC wall-clock time, whatever the process's time zone. |
-| `null`, `undefined`       | SQL `NULL`.                                                                                      |
-| `Uint8Array`              | Binary, as is.                                                                                   |
-| Arrays                    | A Postgres array literal, or binary when the type is declared (below).                           |
-| Other objects             | JSON.                                                                                            |
+| JavaScript value    | Sent as                                                                                                                     |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `string`            | Unchanged.                                                                                                                  |
+| `number`, `bigint`  | Their decimal text.                                                                                                         |
+| `boolean`           | `t` / `f`.                                                                                                                  |
+| `Date`              | A UTC timestamp. A `timestamp without time zone` column receives the UTC wall-clock time, whatever the process's time zone. |
+| `null`, `undefined` | SQL `NULL`.                                                                                                                 |
+| `Uint8Array`        | Binary, as is.                                                                                                              |
+| Arrays              | A Postgres array literal, or binary when the type is declared (below).                                                      |
+| Other objects       | JSON.                                                                                                                       |
 
-**Binary arrays.** When a parameter's type is declared in `paramTypes` and its elements fit that type, the array is sent in binary, which the server reads far more cheaply than a literal. This applies to arrays of `bool`, `int2`, `int4`, `int8`, `float8`, `timestamptz` (from `Date`s), `uuid`, `text`, `varchar`, `char`, `jsonb` (from JSON text) and `bytea`. Anything else falls back to a literal.
+**Typed parameters.** `typed(value, codec)` gives a parameter a [codec](#codecs): the value is encoded by it, once, and its type is declared at Parse, so Postgres doesn't have to infer it. That is how a range is tested against a single instant, where an untyped point would be read as a range:
 
 ```ts
-import { arrayOids } from 'quarry/driver';
+import { arrayOf, codecs, typed } from 'quarry/driver';
+
+await pool.query('select $1 @> $2 as inside', [
+	typed(range, codecs.tstzrange),
+	typed(new Date(), codecs.timestamptz),
+]);
 
 await pool.query(
-  'insert into items (id, name) select * from unnest($1::int4[], $2::text[])',
-  [ids, names],
-  { paramTypes: [arrayOids.int4, arrayOids.text] },
+	'insert into items (id, name) select * from unnest($1::int4[], $2::text[])',
+	[typed(ids, arrayOf(codecs.int4)), typed(names, arrayOf(codecs.text))],
 );
 ```
 
-The query builder declares these types for you, for multi-row inserts, `updateMany` and `column = any($1)`.
+Text-like codecs (`text`, `varchar`, `char`, `name`, and `codecs.raw`) leave the parameter's type to the server, so a string still goes into a `citext`, enum or `char(n)` column as before. Types looked up by name (enums, domains, extensions) declare their OID once the pool's catalog has it. The statement cache keys on the declared types, so the same SQL with differently typed parameters is prepared once per typing.
+
+**Binary arrays.** Arrays of `bool`, `int2`, `int4`, `int8`, `float8`, `timestamptz` (from `Date`s), `uuid`, `jsonb` and `bytea` are sent in binary by their `arrayOf` codec (and, without a codec, when `paramTypes` declares the array's type), which the server reads far more cheaply than a literal. An element that doesn't fit falls back to a literal. Text arrays go as literals of a type the server infers.
+
+The query builder gives every parameter its column's codec: multi-row inserts and `updateMany` send each column as `arrayOf` its codec, and `column = any($1)` the same.
 
 A query takes at most 65,535 parameters, the protocol's limit; more are refused before anything is sent. For more rows than that, use `unnest` with array parameters, or `COPY`.
 
 ## Decoding results
 
-Values are decoded per column type OID. Three choices:
+Values are decoded per column by a codec: the one the query expects for that column (`resultCodecs`, as the query builder always gives), or the registry's codec for the column's type OID. A type without one is the server's text.
 
-| `types`             | Behaviour                                                                                                                                                                         |
-| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `defaultTypes`      | The default, and lossless: `int2`/`int4`/`float4`/`float8` become numbers, `int8` a `bigint`, `bool` a boolean, `json`/`jsonb` parsed, `bytea` a `Uint8Array`, arrays of those. `numeric`, dates and times stay as text, since no JavaScript type holds them exactly. |
-| `rawTypes`          | Every value is the server's text.                                                                                                                                                 |
-| your own            | Any `Record<oid, (text: string) => unknown>`. Spread `defaultTypes` and override what you need.                                                                                   |
+| `codecs`        | Behaviour                                                                                                                                                                                                                                                                                    |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `defaultCodecs` | The default, and lossless: `int2`/`int4`/`float4`/`float8` become numbers, `int8` a `bigint`, `bool` a boolean, `json`/`jsonb` parsed, `bytea` a `Uint8Array`, arrays of those and of text-like types. `numeric`, dates and times stay as text, since no JavaScript type holds them exactly. |
+| a list          | Codecs registered over the defaults, by type: each overrides the default for its type, and brings its array type's codec.                                                                                                                                                                    |
 
 ```ts
-import { createPool, defaultTypes, oids, parseTimestamptz } from 'quarry/driver';
+import { codecs, createPool, defineCodec } from 'quarry/driver';
+
+const decimal = defineCodec({
+	name: 'numeric',
+	oid: 1700,
+	arrayOid: 1231,
+	encode: (value: Decimal) => value.toString(),
+	decodeText: (text) => new Decimal(text),
+});
 
 const pool = createPool({
-  types: {
-    ...defaultTypes,
-    [oids.timestamptz]: parseTimestamptz, // Date instead of text
-    [oids.numeric]: (text) => new Decimal(text),
-  },
+	codecs: [codecs.int8AsString, codecs.timestamptz, decimal],
 });
 ```
 
-The module exports the building blocks: `oids` and `arrayOids` (type OIDs by name), parsers (`parseInteger`, `parseBigInt`, `parseFloat`, `parseBool`, `parseJson`, `parseBytea`, `parseTimestamptz`, `parseRange`, `parseVector`, `parseHalfvec`) and `arrayParser(element)` to build an array decoder for any element parser. `catalogTypes` looks up the OIDs of extension and enum array types in `pg_type`, which have no fixed OIDs.
+### Codecs
 
-**Binary results.** From a cached statement's second run, columns whose decoder has a binary twin are requested in binary. The values are identical; only the cost differs. That covers `int2`, `int4`, `oid`, `float8`, `bool`, `bytea` and `timestamptz` (as `Date`); arrays of those and of text-like types, `json`/`jsonb` and `int8` (as `bigint`) when the array decoder is the driver's own; and pgvector's `vector`. Custom decoders always receive text. Turn it off with `binaryResults: false`.
+A codec is one type's encoding, both ways:
 
-**pgvector.** `parseVector` returns the float32 values pgvector stores, on every path: `[0.1]` reads as `[0.10000000149011612]`, the value pgvector holds and the value its binary format carries.
+| Field                         | Meaning                                                                                                           |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `name`, `oid`, `arrayOid`     | The type. `oid: 0` means it is looked up by `name` in `pg_type` (enums, domains, extension types), once per pool. |
+| `paramFormat`                 | `'text'` or `'binary'`: what `encode` returns.                                                                    |
+| `resultFormat`                | The format its results are asked for in. `'binary'` needs `decodeBinary`.                                         |
+| `inferParamType`              | Leave a parameter's type to the server instead of declaring `oid`.                                                |
+| `encode(value)`               | A non-null value as a string, or bytes in the binary format.                                                      |
+| `decodeText(text)`            | A non-null value from the server's text.                                                                          |
+| `decodeBinary(b, start, end)` | Optional: a non-null value from its binary format.                                                                |
+
+`codecs` holds the built-in ones, by type: `bool`, `int2`, `int4`, `oid`, `int8` (a `bigint`), `int8AsString`, `float4`, `float8`, `numeric` (a string), `text`, `varchar`, `bpchar`, `name`, `char`, `uuid`, `bytea`, `json`, `jsonb`, `timestamptz` (a `Date`), `timestamptzAsString`, `date`, `time`, `timetz`, `timestamp`, `interval`, `inet`, `cidr`, `macaddr`, `money`, `xml`, `bit`, `varbit`, `point`, `box`, `tsvector`, `tsquery`, `jsonpath`, `daterange` and `tstzrange` (as `RangeValue`), pgvector's `vector` and `halfvec`, and `raw`, which keeps any type as the server's text both ways. `arrayOf(codec)` is the codec of its arrays, of any number of dimensions. `defineCodec({ name, encode, decodeText })` fills in the rest of a codec for a type of your own, looked up by name.
+
+Which types are binary follows what is cheaper in JavaScript: binary where the value is a number, a `Date`, bytes, or an array of those (and pgvector's vectors), text where the value is a string anyway (`int8` as a string, `numeric`, `uuid`, dates, text types, enums) or the binary format carries the same text (`jsonb`).
+
+**Types looked up by name.** A codec whose `oid` is 0 is resolved through `pg_type` once per pool: the first query that needs one loads the catalog behind it (that query still runs, its parameter's type inferred and its column read as text), or `pool.loadTypes()` loads it up front; `pool.reloadTypes()` looks them up again, for types created since. A domain's columns are reported as its base type, so its codec is the base type's.
+
+The module also exports `oids` and `arrayOids` (type OIDs by name), helpers for your own codecs (`parseArray`, `parseRange`, `parseTimestamptz`, `parseBytea`, `formatTimestamp`), and `createCodecRegistry(list, base?)`, to build a registry once and pass it per pool or per query (`createCodecRegistry([], null)` reads every value as the server's text).
+
+**Binary results.** Columns are received in binary where their codec reads them so; the values are identical, only the cost differs. A format is only asked for once the server has described the statement's columns: from a cached statement's second run, never on a first run or an unprepared query. Each column is read with the codec the query expects for it (`resultCodecs`) when the described type is that codec's, and with the registry's codec for the described type otherwise, so a column whose type changed (schema drift) still decodes. Turn binary off with `binaryResults: false`.
+
+**pgvector.** `codecs.vector` returns the float32 values pgvector stores, on every path: `[0.1]` reads as `[0.10000000149011612]`, the value pgvector holds and the value its binary format carries.
 
 **Decode errors** fail only the query they belong to, with a `DecodeError` naming the column and type (never the value). The connection stays usable.
 
@@ -581,12 +627,12 @@ setTimeout(() => controller.abort(), 1000);
 await pool.query('select pg_sleep(10)', [], { signal: controller.signal });
 ```
 
-| Mechanism                | Enforced by | Behaviour                                                                                                                                                  |
-| ------------------------ | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `signal`                 | client      | Cancels a running query (with a cancel request over a new connection), or drops one not yet sent. A query pipelined behind others is cancelled when the server reaches it, never one ahead of it. |
-| `timeout`                | client      | A deadline that cancels the query, as `signal` would.                                                                                                      |
-| `statementTimeout`       | server      | Sets `statement_timeout` with `set_config(…, true)`, local to the query's transaction, so it never leaks into other sessions behind a pooler.              |
-| `conn.cancel()`          | client      | Cancels whatever is running on the connection.                                                                                                             |
+| Mechanism          | Enforced by | Behaviour                                                                                                                                                                                         |
+| ------------------ | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `signal`           | client      | Cancels a running query (with a cancel request over a new connection), or drops one not yet sent. A query pipelined behind others is cancelled when the server reaches it, never one ahead of it. |
+| `timeout`          | client      | A deadline that cancels the query, as `signal` would.                                                                                                                                             |
+| `statementTimeout` | server      | Sets `statement_timeout` with `set_config(…, true)`, local to the query's transaction, so it never leaks into other sessions behind a pooler.                                                     |
+| `conn.cancel()`    | client      | Cancels whatever is running on the connection.                                                                                                                                                    |
 
 A cancelled query rejects with `QueryCanceled`, whose `reason` is `'abort'`, `'timeout'`, `'statement_timeout'` or `'user'`.
 
@@ -594,27 +640,36 @@ A cancelled query rejects with `QueryCanceled`, whose `reason` is `'abort'`, `'t
 
 ```ts
 // Batches of rows, fetched as you consume them:
-for await (const batch of conn.cursor('select * from events', [], { batchSize: 1000 })) {
-  await process(batch);
+for await (const batch of conn.cursor('select * from events', [], {
+	batchSize: 1000,
+})) {
+	await process(batch);
 }
 
 // One row at a time (on a dedicated pool connection):
-for await (const row of pool.stream('select * from events where day = $1', [day])) {
-  await process(row);
+for await (const row of pool.stream('select * from events where day = $1', [
+	day,
+])) {
+	await process(row);
 }
 
 // Bulk insert from arrays of values, encoded like parameters:
 await pool.copyRows('copy items (id, name) from stdin', [
-  [1, 'first'],
-  [2, 'second'],
+	[1, 'first'],
+	[2, 'second'],
 ]);
 
 // Raw COPY in, from any async iterable of chunks:
-await pool.copyFrom('copy items from stdin with (format csv)', fs.createReadStream('items.csv'));
+await pool.copyFrom(
+	'copy items from stdin with (format csv)',
+	fs.createReadStream('items.csv'),
+);
 
 // Raw COPY out:
-for await (const chunk of pool.copyTo('copy items to stdout with (format csv)')) {
-  out.write(chunk);
+for await (const chunk of pool.copyTo(
+	'copy items to stdout with (format csv)',
+)) {
+	out.write(chunk);
 }
 ```
 
@@ -624,7 +679,7 @@ A paused consumer pauses the socket: the driver doesn't read ahead of what you'v
 
 ```ts
 const unlisten = await pool.listen('orders', (notification) => {
-  console.log(notification.channel, notification.payload);
+	console.log(notification.channel, notification.payload);
 });
 
 await pool.query("select pg_notify('orders', $1)", [JSON.stringify(order)]);
@@ -639,28 +694,35 @@ await unlisten();
 
 ```ts
 const order = await pool.transaction(
-  async (tx) => {
-    const { rows } = await tx.query('insert into orders (total) values ($1) returning id', [total]);
-    await tx.transaction(async (sp) => {
-      await sp.query('insert into audit (order_id) values ($1)', [rows[0].id]);
-    }); // a savepoint
-    tx.afterCommit(() => queue.publish('order.created', rows[0].id));
-    return rows[0];
-  },
-  { isolation: 'serializable', retries: 3, settings: { 'app.tenant_id': tenantId } },
+	async (tx) => {
+		const { rows } = await tx.query(
+			'insert into orders (total) values ($1) returning id',
+			[total],
+		);
+		await tx.transaction(async (sp) => {
+			await sp.query('insert into audit (order_id) values ($1)', [rows[0].id]);
+		}); // a savepoint
+		tx.afterCommit(() => queue.publish('order.created', rows[0].id));
+		return rows[0];
+	},
+	{
+		isolation: 'serializable',
+		retries: 3,
+		settings: { 'app.tenant_id': tenantId },
+	},
 );
 ```
 
-| Option        | Description                                                                                                         |
-| ------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `isolation`   | `'read uncommitted'`, `'read committed'`, `'repeatable read'` or `'serializable'`.                                  |
-| `readOnly`    | Start a read-only transaction.                                                                                      |
-| `deferrable`  | With `serializable` and `readOnly`: wait for a snapshot that can't fail.                                            |
-| `retries`     | Re-run the callback after a serialization failure or deadlock, up to this many times. Nothing else is retried.     |
-| `retryDelay`  | Milliseconds before retry `attempt` (1-based). Defaults to jittered exponential backoff.                            |
-| `settings`    | Transaction-local settings, applied with `set_config(…, true)` and bound parameters, e.g. for row-level security.   |
-| `timeout`     | End the transaction if it runs longer than this: milliseconds, or an interval string like `'30s'`.                  |
-| `durable`     | Throw if a transaction is already open, instead of nesting as a savepoint.                                          |
+| Option       | Description                                                                                                       |
+| ------------ | ----------------------------------------------------------------------------------------------------------------- |
+| `isolation`  | `'read uncommitted'`, `'read committed'`, `'repeatable read'` or `'serializable'`.                                |
+| `readOnly`   | Start a read-only transaction.                                                                                    |
+| `deferrable` | With `serializable` and `readOnly`: wait for a snapshot that can't fail.                                          |
+| `retries`    | Re-run the callback after a serialization failure or deadlock, up to this many times. Nothing else is retried.    |
+| `retryDelay` | Milliseconds before retry `attempt` (1-based). Defaults to jittered exponential backoff.                          |
+| `settings`   | Transaction-local settings, applied with `set_config(…, true)` and bound parameters, e.g. for row-level security. |
+| `timeout`    | End the transaction if it runs longer than this: milliseconds, or an interval string like `'30s'`.                |
+| `durable`    | Throw if a transaction is already open, instead of nesting as a savepoint.                                        |
 
 - **Commit and rollback.** The transaction commits when the callback resolves and rolls back when it throws.
 - **Two round trips.** `BEGIN`, with its settings, is sent together with the callback's first statement under one Sync. If `BEGIN` fails, the server skips that statement and the transaction rejects with `BEGIN`'s error. Savepoint `RELEASE`s aren't waited for: if one fails, the next statement or the `COMMIT` reports it.
@@ -671,26 +733,26 @@ const order = await pool.transaction(
 
 ```ts
 const pool = createPool({
-  connectionString: process.env.DATABASE_URL,
-  max: 20,
-  min: 2,
-  idleTimeout: 30_000,
-  onConnect: (conn) => conn.query("set application_name = 'worker'"),
+	connectionString: process.env.DATABASE_URL,
+	max: 20,
+	min: 2,
+	idleTimeout: 30_000,
+	onConnect: (conn) => conn.query("set application_name = 'worker'"),
 });
 ```
 
 ### Pool options
 
-| Option           | Default     | Description                                                                                                                         |
-| ---------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `max`            | `10`        | The most connections open at once.                                                                                                  |
-| `min`            | `0`         | Connections kept open even when idle.                                                                                               |
-| `idleTimeout`    | `30000`     | Close connections idle this long (ms). `0` never.                                                                                   |
-| `maxLifetime`    | `3600000`   | Replace connections older than this (ms), with up to 10% jitter so they don't all recycle at once. Applies to idle ones too. `0` never. |
-| `acquireTimeout` | `30000`     | How long `acquire` waits for a free connection (ms). `0` forever.                                                                   |
-| `maxWaiting`     | unlimited   | The most callers waiting before `acquire` fails fast.                                                                               |
-| `pipeline`       | adaptive    | How queries share connections once all are busy (below).                                                                            |
-| `onConnect`      |             | Runs on each new connection before it is used.                                                                                      |
+| Option           | Default   | Description                                                                                                                             |
+| ---------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `max`            | `10`      | The most connections open at once.                                                                                                      |
+| `min`            | `0`       | Connections kept open even when idle.                                                                                                   |
+| `idleTimeout`    | `30000`   | Close connections idle this long (ms). `0` never.                                                                                       |
+| `maxLifetime`    | `3600000` | Replace connections older than this (ms), with up to 10% jitter so they don't all recycle at once. Applies to idle ones too. `0` never. |
+| `acquireTimeout` | `30000`   | How long `acquire` waits for a free connection (ms). `0` forever.                                                                       |
+| `maxWaiting`     | unlimited | The most callers waiting before `acquire` fails fast.                                                                                   |
+| `pipeline`       | adaptive  | How queries share connections once all are busy (below).                                                                                |
+| `onConnect`      |           | Runs on each new connection before it is used.                                                                                          |
 
 **`pipeline`.** Once every connection is busy, `query`, `simpleQuery` and `describe` are pipelined onto shared connections; beyond the depth limit, they wait in line for the next free slot.
 
@@ -714,7 +776,7 @@ Connections that die, or are released mid-transaction, are discarded rather than
 ```ts
 pool.stats; // { total, idle, busy, waiting }
 
-await pool.end();                  // finish issued work, then close
+await pool.end(); // finish issued work, then close
 await pool.end({ timeout: 5000 }); // fail whatever is still running after 5 s
 ```
 
@@ -740,43 +802,44 @@ await pool.end({ timeout: 5000 }); // fail whatever is still running after 5 s
 
 Errors the server reports are `PostgresError`s; errors raised in the client are `DriverError`s.
 
-| Class                | When                                                                                                         |
-| -------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `PostgresError`      | The server reported an error. `isRetryable` is true for serialization failures and deadlocks. Carries every field the server sent (`code`, `detail`, `hint`, `schema`, `table`, `column`, `constraint`, `position`, …) plus `query`, which is non-enumerable so parameters don't leak into logs. |
-| `ConnectionError`    | Connecting, TLS or authentication failed, or the connection was lost. `code` says which.                    |
-| `ProtocolError`      | The server sent something the protocol doesn't allow.                                                        |
-| `AbortError`         | A query was dropped before it was sent.                                                                      |
-| `UndefinedParameterError` | The SQL refers to a `$n` parameter that wasn't supplied, caught before anything is sent.                  |
-| `DecodeError`        | A result value couldn't be decoded. Names the column and type, never the value.                              |
-| `TransactionRolledBack` | A `COMMIT` turned into a `ROLLBACK` because an error inside the transaction was swallowed.                |
+| Class                     | When                                                                                                                                                                                                                                                                                             |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `PostgresError`           | The server reported an error. `isRetryable` is true for serialization failures and deadlocks. Carries every field the server sent (`code`, `detail`, `hint`, `schema`, `table`, `column`, `constraint`, `position`, …) plus `query`, which is non-enumerable so parameters don't leak into logs. |
+| `ConnectionError`         | Connecting, TLS or authentication failed, or the connection was lost. `code` says which.                                                                                                                                                                                                         |
+| `ProtocolError`           | The server sent something the protocol doesn't allow.                                                                                                                                                                                                                                            |
+| `AbortError`              | A query was dropped before it was sent.                                                                                                                                                                                                                                                          |
+| `UndefinedParameterError` | The SQL refers to a `$n` parameter that wasn't supplied, caught before anything is sent.                                                                                                                                                                                                         |
+| `DecodeError`             | A result value couldn't be decoded. Names the column and type, never the value.                                                                                                                                                                                                                  |
+| `TransactionRolledBack`   | A `COMMIT` turned into a `ROLLBACK` because an error inside the transaction was swallowed.                                                                                                                                                                                                       |
 
 Common SQLSTATEs have their own subclasses of `PostgresError`, so you can catch them with `instanceof`. The constraint violations share a base class, `IntegrityConstraintViolation`, whose `columns` getter lists the columns the error names (from its `column` field, or parsed from its detail):
 
-| Class                     | SQLSTATE | Notes                              |
-| ------------------------- | -------- | ---------------------------------- |
-| `UniqueViolation`         | `23505`  | `columns`                          |
-| `ForeignKeyViolation`     | `23503`  | `columns`                          |
-| `NotNullViolation`        | `23502`  | `columns`                          |
-| `CheckViolation`          | `23514`  | `columns`, when the error names any |
-| `ExclusionViolation`      | `23P01`  | `columns`                          |
-| `SerializationFailure`    | `40001`  | `isRetryable` is true              |
-| `DeadlockDetected`        | `40P01`  | `isRetryable` is true              |
-| `QueryCanceled`           | `57014`  | `reason` says why                  |
-| `LockNotAvailable`        | `55P03`  |                                    |
-| `ReadOnlyTransaction`     | `25006`  |                                    |
-| `IdleInTransactionTimeout`| `25P03`  |                                    |
-| `TransactionTimeout`      | `25P04`  |                                    |
-| `UndefinedTable`          | `42P01`  |                                    |
-| `UndefinedColumn`         | `42703`  |                                    |
+| Class                      | SQLSTATE | Notes                               |
+| -------------------------- | -------- | ----------------------------------- |
+| `UniqueViolation`          | `23505`  | `columns`                           |
+| `ForeignKeyViolation`      | `23503`  | `columns`                           |
+| `NotNullViolation`         | `23502`  | `columns`                           |
+| `CheckViolation`           | `23514`  | `columns`, when the error names any |
+| `ExclusionViolation`       | `23P01`  | `columns`                           |
+| `SerializationFailure`     | `40001`  | `isRetryable` is true               |
+| `DeadlockDetected`         | `40P01`  | `isRetryable` is true               |
+| `QueryCanceled`            | `57014`  | `reason` says why                   |
+| `LockNotAvailable`         | `55P03`  |                                     |
+| `ReadOnlyTransaction`      | `25006`  |                                     |
+| `IdleInTransactionTimeout` | `25P03`  |                                     |
+| `TransactionTimeout`       | `25P04`  |                                     |
+| `UndefinedTable`           | `42P01`  |                                     |
+| `UndefinedColumn`          | `42703`  |                                     |
 
 ```ts
 import { UniqueViolation } from 'quarry/driver';
 
 try {
-  await pool.query('insert into users (email) values ($1)', [email]);
+	await pool.query('insert into users (email) values ($1)', [email]);
 } catch (error) {
-  if (error instanceof UniqueViolation) return { ok: false, reason: 'email taken' };
-  throw error;
+	if (error instanceof UniqueViolation)
+		return { ok: false, reason: 'email taken' };
+	throw error;
 }
 ```
 
@@ -788,10 +851,10 @@ try {
 import { trace } from '@opentelemetry/api';
 
 createPool({
-  telemetry: {
-    tracer: trace.getTracer('app'),
-    queryText: true, // record the SQL; parameters are never recorded
-  },
+	telemetry: {
+		tracer: trace.getTracer('app'),
+		queryText: true, // record the SQL; parameters are never recorded
+	},
 });
 ```
 
@@ -818,45 +881,45 @@ The query builder turns table definitions into types, and types into checks. It 
 
 ```ts
 import {
-  array,
-  bigint,
-  boolean,
-  decimal,
-  defineEnum,
-  defineTable,
-  integer,
-  jsonb,
-  text,
-  timestamptz,
-  uuid,
-  varchar,
+	array,
+	bigint,
+	boolean,
+	decimal,
+	defineEnum,
+	defineTable,
+	integer,
+	jsonb,
+	text,
+	timestamptz,
+	uuid,
+	varchar,
 } from 'quarry';
 
 export const role = defineEnum('user_role', ['admin', 'member', 'guest']);
 
 export const users = defineTable('users', {
-  columns: {
-    id: integer().identity(),
-    email: varchar(320),
-    name: text().nullable(),
-    managerId: integer().name('manager_id').nullable(),
-    role: role().default(),
-    tags: array(text()).default(),
-    settings: jsonb<{ theme: 'light' | 'dark' }>().default(),
-    createdAt: timestamptz().name('created_at').default(),
-  },
+	columns: {
+		id: integer().identity(),
+		email: varchar(320),
+		name: text().nullable(),
+		managerId: integer().name('manager_id').nullable(),
+		role: role().default(),
+		tags: array(text()).default(),
+		settings: jsonb<{ theme: 'light' | 'dark' }>().default(),
+		createdAt: timestamptz().name('created_at').default(),
+	},
 });
 
 export const posts = defineTable('posts', {
-  columns: {
-    id: bigint().identity(),
-    authorId: integer().name('author_id'),
-    title: text(),
-    body: text(),
-    published: boolean().default(),
-    price: decimal(10, 2).nullable(),
-    publicId: uuid().name('public_id').default(),
-  },
+	columns: {
+		id: bigint().identity(),
+		authorId: integer().name('author_id'),
+		title: text(),
+		body: text(),
+		published: boolean().default(),
+		price: decimal(10, 2).nullable(),
+		publicId: uuid().name('public_id').default(),
+	},
 });
 ```
 
@@ -864,61 +927,64 @@ Each column is declared under the key you'll use in TypeScript. `.name('created_
 
 ### Column types
 
-| Factory              | SQL type                 | TypeScript value   | Notes                                                                                |
-| -------------------- | ------------------------ | ------------------ | ------------------------------------------------------------------------------------ |
-| `smallint()`         | `smallint`               | `number`           | Can be an identity.                                                                  |
-| `integer()`          | `integer`                | `number`           | Can be an identity.                                                                  |
-| `bigint()`           | `bigint`                 | `string`           | A string, because the range exceeds what a JS number holds exactly. Can be an identity. |
-| `real()`             | `real`                   | `number`           | Inexact; use `decimal()` for money.                                                  |
-| `doublePrecision()`  | `double precision`       | `number`           | Inexact.                                                                             |
-| `decimal(p?, s?)`    | `numeric(p, s)`          | `string`           | Exact; a string so no digits are lost.                                               |
-| `boolean()`          | `boolean`                | `boolean`          |                                                                                      |
-| `text()`             | `text`                   | `string`           |                                                                                      |
-| `varchar(n?)`        | `varchar(n)`             | `string`           |                                                                                      |
-| `uuid()`             | `uuid`                   | `string`           | Hyphenated form.                                                                     |
-| `bytea()`            | `bytea`                  | `Uint8Array`       |                                                                                      |
-| `date()`             | `date`                   | `string`           | `'2026-10-14'`; no time zone to get wrong.                                           |
-| `time()`             | `time`                   | `string`           |                                                                                      |
-| `timestamp()`        | `timestamp`              | `string`           | Wall-clock time without a zone, kept as text.                                        |
-| `timestamptz()`      | `timestamptz`            | `Date`             |                                                                                      |
-| `interval()`         | `interval`               | `string`           |                                                                                      |
-| `jsonb<T>()`         | `jsonb`                  | `T`                | `T` describes the document.                                                          |
-| `inet()`             | `inet`                   | `string`           |                                                                                      |
-| `tsvector()`         | `tsvector`               | `string`           | Usually `generated()`.                                                               |
-| `daterange()`        | `daterange`              | `Range<string>`    |                                                                                      |
-| `tstzrange()`        | `tstzrange`              | `Range<Date>`      |                                                                                      |
-| `vector()`           | `vector` (pgvector)      | `number[]`         | The extension must be installed.                                                     |
-| `array(column)`      | `element[]`              | `element[]`        | `array(text().nullable())` is `(string \| null)[]`. One dimension.                   |
-| `defineEnum(...)()`  | your enum type           | union of labels    | See [Enums](#enums).                                                                 |
+| Factory             | SQL type            | TypeScript value | Notes                                                                                   |
+| ------------------- | ------------------- | ---------------- | --------------------------------------------------------------------------------------- |
+| `smallint()`        | `smallint`          | `number`         | Can be an identity.                                                                     |
+| `integer()`         | `integer`           | `number`         | Can be an identity.                                                                     |
+| `bigint()`          | `bigint`            | `string`         | A string, because the range exceeds what a JS number holds exactly. Can be an identity. |
+| `real()`            | `real`              | `number`         | Inexact; use `decimal()` for money.                                                     |
+| `doublePrecision()` | `double precision`  | `number`         | Inexact.                                                                                |
+| `decimal(p?, s?)`   | `numeric(p, s)`     | `string`         | Exact; a string so no digits are lost.                                                  |
+| `boolean()`         | `boolean`           | `boolean`        |                                                                                         |
+| `text()`            | `text`              | `string`         |                                                                                         |
+| `varchar(n?)`       | `varchar(n)`        | `string`         |                                                                                         |
+| `uuid()`            | `uuid`              | `string`         | Hyphenated form.                                                                        |
+| `bytea()`           | `bytea`             | `Uint8Array`     | Read as a plain `Uint8Array`, never a `Buffer`, so it isn't narrowed. Binary both ways. |
+| `date()`            | `date`              | `string`         | `'2026-10-14'`; no time zone to get wrong.                                              |
+| `time()`            | `time`              | `string`         |                                                                                         |
+| `timestamp()`       | `timestamp`         | `string`         | Wall-clock time without a zone, kept as text.                                           |
+| `timestamptz()`     | `timestamptz`       | `Date`           |                                                                                         |
+| `interval()`        | `interval`          | `string`         |                                                                                         |
+| `jsonb<T>()`        | `jsonb`             | `T`, `JsonValue` | `T` describes the document. Untyped, any JSON value, JSON `null` included.              |
+| `inet()`            | `inet`              | `string`         |                                                                                         |
+| `tsvector()`        | `tsvector`          | `string`         | Usually `generated()`.                                                                  |
+| `daterange()`       | `daterange`         | `Range<string>`  |                                                                                         |
+| `tstzrange()`       | `tstzrange`         | `Range<Date>`    |                                                                                         |
+| `vector()`          | `vector` (pgvector) | `number[]`       | The extension must be installed.                                                        |
+| `array(column)`     | `element[]`         | `element[]`      | `array(text().nullable())` is `(string \| null)[]`. One dimension.                      |
+| `defineEnum(...)()` | your enum type      | union of labels  | See [Enums](#enums).                                                                    |
+
+Each factory's TypeScript type is its codec's: what the driver decodes the column to (see [Codecs on columns](#codecs-on-columns)).
 
 A `Range<T>` is either `{ empty: true }` or `{ empty: false, lower, upper, bounds }`, where `lower` and `upper` are `null` when unbounded and `bounds` is `'[)'`, `'(]'`, `'[]'` or `'()'`. Modelling the empty range as its own variant means you can't read a bound before ruling it out.
 
 ### Modifiers
 
-| Modifier        | Meaning                                                    | Effect on types                                            |
-| --------------- | ---------------------------------------------------------- | ---------------------------------------------------------- |
-| `.nullable()`   | The column allows `NULL`.                                  | Adds `null` to the select, insert and update types.        |
-| `.default()`    | The database has a default.                                | Optional on insert.                                        |
-| `.generated()`  | `generated always as (…) stored`.                          | Never written: excluded from inserts and updates.          |
-| `.identity()`   | `generated always as identity` (integer types only).       | Never written: excluded from inserts and updates.          |
-| `.name(n)`      | The column's name in the database.                         | None.                                                      |
-| `.typed<S, I, U>()` | Narrow the select, insert and update types.            | Each may only narrow the current type.                     |
+| Modifier            | Meaning                                              | Effect on types                                     |
+| ------------------- | ---------------------------------------------------- | --------------------------------------------------- |
+| `.nullable()`       | The column allows `NULL`.                            | Adds `null` to the select, insert and update types. |
+| `.default()`        | The database has a default.                          | Optional on insert.                                 |
+| `.generated()`      | `generated always as (…) stored`.                    | Never written: excluded from inserts and updates.   |
+| `.identity()`       | `generated always as identity` (integer types only). | Never written: excluded from inserts and updates.   |
+| `.name(n)`          | The column's name in the database.                   | None.                                               |
+| `.typed<S, I, U>()` | Narrow the select, insert and update types.          | Each may only narrow the current type.              |
+| `.useCodec(codec)`  | Send and read the column with another codec.         | The codec's output on select, its input on writes.  |
 
 Modifiers form a state machine that mirrors what Postgres allows. `nullable` combines with `default` or `generated`; `default` and `generated` exclude each other; `identity` excludes everything. Each modifier returns a column that only has the modifiers still valid, so an invalid chain isn't a type error on some method: the method isn't there.
 
 ### Narrowing types
 
-Every factory takes a type parameter that narrows its value, for branded ids and literal unions:
+Every factory but `bytea()` takes a type parameter that narrows its value, for branded ids and literal unions:
 
 ```ts
 type UserId = number & { readonly __brand: 'UserId' };
 
 const users = defineTable('users', {
-  columns: {
-    id: integer<UserId>().identity(),
-    plan: text<'free' | 'pro' | 'team'>(),
-    level: smallint<1 | 2 | 3>().default(),
-  },
+	columns: {
+		id: integer<UserId>().identity(),
+		plan: text<'free' | 'pro' | 'team'>(),
+		level: smallint<1 | 2 | 3>().default(),
+	},
 });
 ```
 
@@ -935,19 +1001,67 @@ legacyCode: text().typed<string, never, never>(),
 ### Enums
 
 ```ts
-const status = defineEnum('order_status', ['pending', 'paid', 'shipped', 'cancelled']);
+const status = defineEnum('order_status', [
+	'pending',
+	'paid',
+	'shipped',
+	'cancelled',
+]);
 
 const orders = defineTable('orders', {
-  columns: { status: status().default() },
+	columns: { status: status().default() },
 });
 
 // a column that only ever holds some of the labels
 const refunds = defineTable('refunds', {
-  columns: { status: status<'cancelled'>() },
+	columns: { status: status<'cancelled'>() },
 });
 ```
 
 An enum is declared once and backs any number of columns. Its labels are ordered as declared, as in Postgres, so `<` and `>` compare by position. `quarry verify` checks the labels and their order.
+
+### Codecs on columns
+
+Every column type has a [driver codec](#codecs) that sends its values and reads them back, and its TypeScript type is that codec's: `integer()` is `codecs.int4`, `bigint()` `codecs.int8AsString`, `timestamptz()` `codecs.timestamptz`. The query builder only chooses codecs; the driver encodes each parameter once with its column's codec (declaring its type), and reads each selected column with its codec, in the codec's format once the statement's columns are described.
+
+`.useCodec(codec)` swaps a column's codec, and its types with it:
+
+```ts
+import { codecs } from 'quarry';
+
+const events = defineTable('events', {
+	columns: {
+		id: bigint().identity().useCodec(codecs.int8), // a bigint, not a string
+		at: timestamptz().useCodec(codecs.raw), // the server's text, typed as string
+	},
+});
+```
+
+`codecs.raw` keeps any type as the server's text, both ways, for a column you parse yourself.
+
+`defineType({ sql, codec })` declares a type quarry has no factory for (an extension's, a domain, your own), once, and returns its column factory. Its columns admit every operator, with values of the codec's type:
+
+```ts
+import { codecs, defineCodec, defineType } from 'quarry';
+
+const citext = defineType({ sql: 'citext', codec: codecs.text });
+const positive = defineType({ sql: 'positive_int', codec: codecs.int4 }); // a domain
+
+const point = defineType({
+	sql: 'point',
+	codec: defineCodec({
+		name: 'point',
+		oid: 600,
+		encode: ({ x, y }: { x: number; y: number }) => `(${x},${y})`,
+		decodeText: (text) => {
+			const [x, y] = text.slice(1, -1).split(',').map(Number);
+			return { x: x ?? 0, y: y ?? 0 };
+		},
+	}),
+});
+```
+
+`db.verify` checks a `defineType` column against its type's name, or the domain it is declared with.
 
 ### Inferring row types
 
@@ -974,9 +1088,9 @@ In `InferInsertType`, columns with a default are optional, nullable columns with
 const managers = users.as('managers');
 
 db.selectFrom(users)
-  .innerJoin(managers)
-  .on('managers.id', 'users.managerId')
-  .select(['users.name', 'managers.name']);
+	.innerJoin(managers)
+	.on('managers.id', 'users.managerId')
+	.select(['users.name', 'managers.name']);
 ```
 
 ## Opening a database
@@ -991,22 +1105,21 @@ const db = database(process.env.DATABASE_URL);
 
 ```ts
 const db = database(
-  { connectionString: process.env.DATABASE_URL, max: 20 },
-  {
-    onQuery: (event) => logger.debug(event),
-    callsites: true,
-  },
+	{ connectionString: process.env.DATABASE_URL, max: 20 },
+	{
+		onQuery: (event) => logger.debug(event),
+		callsites: true,
+	},
 );
 ```
 
-| Option      | Default                 | Description                                                                                                                                                     |
-| ----------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `onQuery`   |                         | Called once per query when it settles, with its SQL, parameters, tag, command, row count, error, and timings (`acquireMs`, `queuedMs`, `execMs`, `durationMs`). |
-| `callsites` | `true`                  | Append the stack of the code that ran a query to its error.                                                                                                     |
-| `types`     | quarry's decoders       | Text parsers by type OID. The defaults decode to the TypeScript types the columns declare.                                                                      |
-| `raw`       |                         | Leave these types (by name or OID), or all with `true`, as the server's text.                                                                                   |
-| `catalog`   | `true`                  | Look up array, enum-array and pgvector type OIDs in `pg_type` once, before the first query, so they decode.                                                     |
-| `prepare`   | the connection's        | Use cached prepared statements.                                                                                                                                 |
+| Option      | Default          | Description                                                                                                                                                     |
+| ----------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `onQuery`   |                  | Called once per query when it settles, with its SQL, parameters, tag, command, row count, error, and timings (`acquireMs`, `queuedMs`, `execMs`, `durationMs`). |
+| `callsites` | `true`           | Append the stack of the code that ran a query to its error.                                                                                                     |
+| `codecs`    | quarry's codecs  | Codecs for result columns no query types (raw SQL, expressions of unknown type). Columns always use their own codec, so their types hold.                       |
+| `catalog`   | `true`           | Look up the types codecs name (enums, pgvector, custom types and their arrays) in `pg_type` once per pool, before the first query.                              |
+| `prepare`   | the connection's | Use cached prepared statements.                                                                                                                                 |
 
 `Database` implements `AsyncDisposable`: `await using db = database(url)` closes it at the end of the scope.
 
@@ -1014,15 +1127,15 @@ const db = database(
 
 ```ts
 const rows = await db
-  .selectFrom(posts)
-  .innerJoin(users)
-  .on('users.id', 'posts.authorId')
-  .where('posts.published', true)
-  .where((eb) => eb.ref('users.role').in(['admin', 'member']))
-  .select(['posts.id', 'posts.title', 'users.name'])
-  .orderBy('posts.id', 'desc')
-  .limit(20)
-  .execute();
+	.selectFrom(posts)
+	.innerJoin(users)
+	.on('users.id', 'posts.authorId')
+	.where('posts.published', true)
+	.where((eb) => eb.ref('users.role').in(['admin', 'member']))
+	.select(['posts.id', 'posts.title', 'users.name'])
+	.orderBy('posts.id', 'desc')
+	.limit(20)
+	.execute();
 // rows: { id: string; title: string; name: string | null }[]
 ```
 
@@ -1098,14 +1211,18 @@ For large tables, prefer keyset pagination to `offset`:
 
 ```ts
 const authors = await db
-  .selectFrom(users)
-  .leftJoin(posts)
-  .on('posts.authorId', 'users.id')
-  .select((eb) => ['users.id', 'users.name', eb.fn.count('posts.id').as('postCount')])
-  .groupBy(['users.id'])
-  .having((eb) => eb.fn.count('posts.id').gte(5))
-  .orderBy((eb) => eb.fn.count('posts.id'), 'desc')
-  .execute();
+	.selectFrom(users)
+	.leftJoin(posts)
+	.on('posts.authorId', 'users.id')
+	.select((eb) => [
+		'users.id',
+		'users.name',
+		eb.fn.count('posts.id').as('postCount'),
+	])
+	.groupBy(['users.id'])
+	.having((eb) => eb.fn.count('posts.id').gte(5))
+	.orderBy((eb) => eb.fn.count('posts.id'), 'desc')
+	.execute();
 // { id: number; name: string | null; postCount: string }[]
 ```
 
@@ -1156,19 +1273,20 @@ A subquery may reference the tables of the query around it (a correlated subquer
 import { cte } from 'quarry';
 
 const prolific = cte(
-  'prolific_authors',
-  db.selectFrom(posts)
-    .select((eb) => ['posts.authorId', eb.fn.count().as('total')])
-    .groupBy(['posts.authorId'])
-    .having((eb) => eb.fn.count().gt(100)),
+	'prolific_authors',
+	db
+		.selectFrom(posts)
+		.select((eb) => ['posts.authorId', eb.fn.count().as('total')])
+		.groupBy(['posts.authorId'])
+		.having((eb) => eb.fn.count().gt(100)),
 );
 
 await db
-  .selectFrom(users)
-  .innerJoin(prolific)
-  .on('prolific_authors.authorId', 'users.id')
-  .select(['users.name', 'prolific_authors.total'])
-  .execute();
+	.selectFrom(users)
+	.innerJoin(prolific)
+	.on('prolific_authors.authorId', 'users.id')
+	.select(['users.name', 'prolific_authors.total'])
+	.execute();
 ```
 
 `cte(name, query, { materialized: true })` adds `materialized` (or `false` for `not materialized`), and `cteRecursive(name, (self) => base.unionAll(step(self)))` builds a recursive one.
@@ -1177,9 +1295,9 @@ await db
 
 ```ts
 const everyone = db
-  .selectFrom(users)
-  .select(['users.email'])
-  .union(db.selectFrom(subscribers).select(['subscribers.email']));
+	.selectFrom(users)
+	.select(['users.email'])
+	.union(db.selectFrom(subscribers).select(['subscribers.email']));
 ```
 
 `union`, `unionAll`, `intersect`, `intersectAll`, `except` and `exceptAll` take a query with the same columns and compatible types; anything else is a type error.
@@ -1188,17 +1306,17 @@ const everyone = db
 
 ```ts
 await db.transaction(async (tx) => {
-  const job = await tx
-    .selectFrom(jobs)
-    .where('jobs.status', 'queued')
-    .select(['jobs.id', 'jobs.payload'])
-    .orderBy('jobs.id')
-    .limit(1)
-    .forUpdate()
-    .skipLocked()
-    .takeFirst()
-    .execute();
-  // ...
+	const job = await tx
+		.selectFrom(jobs)
+		.where('jobs.status', 'queued')
+		.select(['jobs.id', 'jobs.payload'])
+		.orderBy('jobs.id')
+		.limit(1)
+		.forUpdate()
+		.skipLocked()
+		.takeFirst()
+		.execute();
+	// ...
 });
 ```
 
@@ -1212,9 +1330,11 @@ Locks last until the transaction ends, so run locking queries inside `db.transac
 
 ```ts
 db.selectFrom(users)
-  .select(['users.id'])
-  .when(filters.role !== undefined, (qb) => qb.where('users.role', filters.role!))
-  .when(includeEmail, (qb) => qb.select(['users.email']));
+	.select(['users.id'])
+	.when(filters.role !== undefined, (qb) =>
+		qb.where('users.role', filters.role!),
+	)
+	.when(includeEmail, (qb) => qb.select(['users.email']));
 // { id: number; email?: string }[]
 ```
 
@@ -1226,7 +1346,7 @@ import { fragment } from 'quarry';
 const published = fragment(posts, (qb) => qb.where('posts.published', true));
 
 const withAuthor = fragment(posts, (qb) =>
-  qb.innerJoin(users).on('users.id', 'posts.authorId').select(['users.name']),
+	qb.innerJoin(users).on('users.id', 'posts.authorId').select(['users.name']),
 );
 
 db.selectFrom(posts).pipe(published).pipe(withAuthor).select(['posts.title']);
@@ -1238,15 +1358,15 @@ db.selectFrom(posts).pipe(published).pipe(withAuthor).select(['posts.title']);
 
 The expression builder `eb`, passed to every callback, builds typed SQL expressions. Its members don't depend on `this`, so it can be destructured: `.where(({ ref, or }) => …)`.
 
-| Member              | Description                                                                                                 |
-| ------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `eb.ref(column)`    | A column reference, with the comparison methods of its SQL type.                                            |
-| `eb.val(value)`     | A parameter, for positions that take a reference by default (`eb.fn.concat('users.first', eb.val(' '), …)`). |
-| `eb.and([...])`, `eb.or([...])`, `eb.not(p)` | Combine predicates.                                                                |
-| `eb.fn`             | SQL functions and aggregates.                                                                               |
-| `eb.json`           | jsonb accessors and tests.                                                                                  |
-| `eb.exists(q)`, `eb.notExists(q)`, `eb.scalar(q)` | Subqueries.                                                                   |
-| `eb.case()`         | `case when … then … else … end`.                                                                            |
+| Member                                            | Description                                                                                                                                                                                                         |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `eb.ref(column)`                                  | A column reference, with the comparison methods of its SQL type.                                                                                                                                                    |
+| `eb.val(value, codec?)`                           | A parameter, for positions that take a reference by default (`eb.fn.concat('users.first', eb.val(' '), …)`). In a comparison or `coalesce` it is encoded by the other side's codec; elsewhere by `codec`, if given. |
+| `eb.and([...])`, `eb.or([...])`, `eb.not(p)`      | Combine predicates.                                                                                                                                                                                                 |
+| `eb.fn`                                           | SQL functions and aggregates.                                                                                                                                                                                       |
+| `eb.json`                                         | jsonb accessors and tests.                                                                                                                                                                                          |
+| `eb.exists(q)`, `eb.notExists(q)`, `eb.scalar(q)` | Subqueries.                                                                                                                                                                                                         |
+| `eb.case()`                                       | `case when … then … else … end`.                                                                                                                                                                                    |
 
 `expressionBuilder(...tables)` creates one outside a query, for building predicates in advance.
 
@@ -1254,78 +1374,83 @@ The expression builder `eb`, passed to every callback, builds typed SQL expressi
 
 A comparison is a method of an expression, and each SQL type has exactly the comparisons Postgres defines for it. Every method accepts a plain value of the column's type or an expression of a compatible SQL type.
 
-| Applies to                        | Methods                                                                                                     |
-| --------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| Every type                        | `eq`, `ne`, `in`, `notIn`, `isNull`, `isNotNull`, `isDistinctFrom`, `isNotDistinctFrom`                     |
-| Ordered types (numbers, text, dates and times, intervals, `inet`, enums) | `gt`, `gte`, `lt`, `lte`, `between`, `notBetween`                    |
-| `text`, `varchar`                 | `like`, `notLike`, `ilike`, `notIlike`, `regex`, `notRegex`, `iregex`, `notIregex`, `startsWith`            |
-| `boolean`                         | `isTrue`, `isNotTrue`, `isFalse`, `isNotFalse`                                                              |
-| Arrays                            | `contains` (`@>`), `containedBy` (`<@`), `overlaps` (`&&`)                                                  |
-| `jsonb`                           | `contains`, `containedBy`                                                                                   |
-| Ranges                            | `contains` (a range or a single value), `containedBy`, `overlaps`, `strictlyLeftOf`, `strictlyRightOf`, `doesNotExtendRightOf`, `doesNotExtendLeftOf`, `adjacentTo` |
-| `inet`                            | `isSubnetOf`, `isSubnetOrEqual`, `isSupernetOf`, `isSupernetOrEqual`, `overlaps`                            |
-| `tsvector`                        | `matches(query)` (`@@` against a tsquery string, e.g. `'fat & rat'`)                                        |
-| `vector`                          | `l2Distance`, `cosineDistance`, `innerProduct`, which return `double precision` expressions                 |
-| Numeric types                     | `plus`, `minus`, `times`, `dividedBy`, `mod`, which return expressions of the wider operand's type          |
-| Dates and times                   | `plus(interval)`, `minus(interval)`, and `minus` between two timestamps (an `interval`)                     |
+| Applies to                                                               | Methods                                                                                                                                                             |
+| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Every type                                                               | `eq`, `ne`, `in`, `notIn`, `isNull`, `isNotNull`, `isDistinctFrom`, `isNotDistinctFrom`                                                                             |
+| Ordered types (numbers, text, dates and times, intervals, `inet`, enums) | `gt`, `gte`, `lt`, `lte`, `between`, `notBetween`                                                                                                                   |
+| `text`, `varchar`                                                        | `like`, `notLike`, `ilike`, `notIlike`, `regex`, `notRegex`, `iregex`, `notIregex`, `startsWith`                                                                    |
+| `boolean`                                                                | `isTrue`, `isNotTrue`, `isFalse`, `isNotFalse`                                                                                                                      |
+| Arrays                                                                   | `contains` (`@>`), `containedBy` (`<@`), `overlaps` (`&&`)                                                                                                          |
+| `jsonb`                                                                  | `contains`, `containedBy`                                                                                                                                           |
+| Ranges                                                                   | `contains` (a range or a single value), `containedBy`, `overlaps`, `strictlyLeftOf`, `strictlyRightOf`, `doesNotExtendRightOf`, `doesNotExtendLeftOf`, `adjacentTo` |
+| `inet`                                                                   | `isSubnetOf`, `isSubnetOrEqual`, `isSupernetOf`, `isSupernetOrEqual`, `overlaps`                                                                                    |
+| `tsvector`                                                               | `matches(query)` (`@@` against a tsquery string, e.g. `'fat & rat'`)                                                                                                |
+| `vector`                                                                 | `l2Distance`, `cosineDistance`, `innerProduct`, which return `double precision` expressions                                                                         |
+| Numeric types                                                            | `plus`, `minus`, `times`, `dividedBy`, `mod`, which return expressions of the wider operand's type                                                                  |
+| Dates and times                                                          | `plus(interval)`, `minus(interval)`, and `minus` between two timestamps (an `interval`)                                                                             |
 
 Numeric types compare with each other, `text` with `varchar`, and `date` with `timestamp` and `timestamptz`, because Postgres allows those without a cast. Anything else, such as `uuid` against `text`, is rejected at compile time.
 
 ```ts
-eb.ref('users.email').like('%@example.com')
-eb.ref('users.age').between([18, eb.ref('users.maxAge')])
-eb.ref('users.tags').contains(['beta'])
-eb.ref('bookings.during').overlaps({ empty: false, lower: start, upper: end, bounds: '[)' })
-eb.ref('posts.search').matches('postgres & !mysql')
-eb.ref('users.firstName').eq(eb.ref('users.lastName'))
+eb.ref('users.email').like('%@example.com');
+eb.ref('users.age').between([18, eb.ref('users.maxAge')]);
+eb.ref('users.tags').contains(['beta']);
+eb.ref('bookings.during').overlaps({
+	empty: false,
+	lower: start,
+	upper: end,
+	bounds: '[)',
+});
+eb.ref('posts.search').matches('postgres & !mysql');
+eb.ref('users.firstName').eq(eb.ref('users.lastName'));
 ```
 
 **`any` and `all`.** Compare against every element of an array, from a value or an array column:
 
 ```ts
-eb.ref('users.email').like(eb.fn.any(['%@a.com', '%@b.com']))
-eb.val('admin').eq(eb.fn.any('users.roles'))
-eb.ref('users.score').gt(eb.fn.all('users.thresholds'))
+eb.ref('users.email').like(eb.fn.any(['%@a.com', '%@b.com']));
+eb.val('admin').eq(eb.fn.any('users.roles'));
+eb.ref('users.score').gt(eb.fn.all('users.thresholds'));
 ```
 
 `in` with a JavaScript array compiles to `= any($1)` with one array parameter, sent in binary, so a list of 10,000 ids is one parameter, not 10,000.
 
 ### Functions
 
-| Function                          | Returns                    |
-| --------------------------------- | -------------------------- |
-| `lower`, `upper`                  | `text`                     |
-| `length`                          | `integer`                  |
-| `concat(...parts)`                | `text`, never null (nulls are skipped) |
-| `coalesce(...values)`             | the first argument's type, non-null if any argument is |
-| `now()`                           | `timestamptz`              |
-| `cast(value, type)`               | the named type             |
-| `count(value?)`                   | `bigint`                   |
-| `sum`, `avg`                      | see [aggregates](#grouping-and-aggregates) |
-| `min`, `max`                      | the argument's type        |
-| `arrayAgg(value)`                 | an array of the argument's type |
-| `jsonbAgg(value)`, `jsonbBuildObject({...})` | `jsonb`         |
-| `any(array)`, `all(array)`        | a quantified operand for comparisons |
+| Function                                     | Returns                                                |
+| -------------------------------------------- | ------------------------------------------------------ |
+| `lower`, `upper`                             | `text`                                                 |
+| `length`                                     | `integer`                                              |
+| `concat(...parts)`                           | `text`, never null (nulls are skipped)                 |
+| `coalesce(...values)`                        | the first argument's type, non-null if any argument is |
+| `now()`                                      | `timestamptz`                                          |
+| `cast(value, type)`                          | the named type                                         |
+| `count(value?)`                              | `bigint`                                               |
+| `sum`, `avg`                                 | see [aggregates](#grouping-and-aggregates)             |
+| `min`, `max`                                 | the argument's type                                    |
+| `arrayAgg(value)`                            | an array of the argument's type                        |
+| `jsonbAgg(value)`, `jsonbBuildObject({...})` | `jsonb`                                                |
+| `any(array)`, `all(array)`                   | a quantified operand for comparisons                   |
 
 ```ts
-eb.fn.coalesce('users.name', eb.val('anonymous'))
-eb.fn.cast(eb.fn.count(), 'integer')
-eb.fn.jsonbBuildObject({ id: 'users.id', email: 'users.email' }).as('user')
+eb.fn.coalesce('users.name', eb.val('anonymous'));
+eb.fn.cast(eb.fn.count(), 'integer');
+eb.fn.jsonbBuildObject({ id: 'users.id', email: 'users.email' }).as('user');
 ```
 
 ### jsonb
 
 ```ts
-eb.json.get('users.settings', 'theme')                 // -> jsonb
-eb.json.text('users.settings', 'theme').eq('dark')     // ->> text
-eb.json.get('users.settings', 'prefs', 'beta')         // a path
-eb.json.hasKey('users.settings', 'theme')               // ?
-eb.json.hasAnyKey('users.settings', ['theme', 'lang'])  // ?|
-eb.json.hasAllKeys('users.settings', ['theme', 'lang']) // ?&
-eb.json.pathExists('users.settings', '$.tags[*] ? (@ == "a")')
-eb.json.pathMatches('users.settings', '$.price > 10')
-eb.json.typeOf('users.settings')
-eb.json.length('users.settings')
+eb.json.get('users.settings', 'theme'); // -> jsonb
+eb.json.text('users.settings', 'theme').eq('dark'); // ->> text
+eb.json.get('users.settings', 'prefs', 'beta'); // a path
+eb.json.hasKey('users.settings', 'theme'); // ?
+eb.json.hasAnyKey('users.settings', ['theme', 'lang']); // ?|
+eb.json.hasAllKeys('users.settings', ['theme', 'lang']); // ?&
+eb.json.pathExists('users.settings', '$.tags[*] ? (@ == "a")');
+eb.json.pathMatches('users.settings', '$.price > 10');
+eb.json.typeOf('users.settings');
+eb.json.length('users.settings');
 ```
 
 Paths are checked against the column's declared document type `T` where it's known.
@@ -1334,11 +1459,11 @@ Paths are checked against the column's declared document type `T` where it's kno
 
 ```ts
 eb.case()
-  .when(eb.ref('orders.total').gte(1000), 'large')
-  .when(eb.ref('orders.total').gte(100), 'medium')
-  .else('small')
-  .end()
-  .as('size')
+	.when(eb.ref('orders.total').gte(1000), 'large')
+	.when(eb.ref('orders.total').gte(100), 'medium')
+	.else('small')
+	.end()
+	.as('size');
 ```
 
 The result type is the union of the branches, plus `null` without an `else`.
@@ -1358,7 +1483,9 @@ A whole statement runs with `db.sql`, and supports every [result shape](#result-
 
 ```ts
 const { rowCount } = await db.sql`vacuum analyze posts`.execute();
-const row = await db.sql<{ n: string }>`select count(*) as n from posts`.expectOne().execute();
+const row = await db.sql<{ n: string }>`select count(*) as n from posts`
+	.expectOne()
+	.execute();
 ```
 
 The type parameter is a promise you make; nothing checks it. Prefer the builder where it can express the query.
@@ -1367,27 +1494,27 @@ The type parameter is a promise you make; nothing checks it. Prefer the builder 
 
 How you want the result decides how you finish the query. A shape never changes the SQL: it only decides how the rows are read and what counts as an error.
 
-| Shape                | Resolves to                       | Throws                                    | Use for                                         |
-| -------------------- | --------------------------------- | ----------------------------------------- | ----------------------------------------------- |
-| `execute()`          | `Row[]`                           |                                           | Lists.                                          |
-| `takeFirst()`        | `Row \| undefined`                |                                           | "The first, if any." Add `.limit(1)` yourself.  |
-| `takeValue()`        | `Value \| undefined`              |                                           | One column of the first row.                    |
-| `expectFirst()`      | `Row`                             | `NoRowError`                              | "There must be at least one."                   |
-| `expectOne()`        | `Row`                             | `NoRowError`, `TooManyRowsError`          | Lookups by a unique key.                        |
-| `expectAtMostOne()`  | `Row \| undefined`                | `TooManyRowsError`                        | Optional lookups by a unique key.               |
-| `expectNonEmpty()`   | `[Row, ...Row[]]`                 | `NoRowError`                              | Lists that must not be empty.                   |
-| `expectValue()`      | `Value`                           | `NoRowError`                              | One column of a row that must exist.            |
-| `expectRows(n)`      | the write's result                | `RowCountError`                           | Writes that must affect exactly `n` rows.       |
+| Shape               | Resolves to          | Throws                           | Use for                                        |
+| ------------------- | -------------------- | -------------------------------- | ---------------------------------------------- |
+| `execute()`         | `Row[]`              |                                  | Lists.                                         |
+| `takeFirst()`       | `Row \| undefined`   |                                  | "The first, if any." Add `.limit(1)` yourself. |
+| `takeValue()`       | `Value \| undefined` |                                  | One column of the first row.                   |
+| `expectFirst()`     | `Row`                | `NoRowError`                     | "There must be at least one."                  |
+| `expectOne()`       | `Row`                | `NoRowError`, `TooManyRowsError` | Lookups by a unique key.                       |
+| `expectAtMostOne()` | `Row \| undefined`   | `TooManyRowsError`               | Optional lookups by a unique key.              |
+| `expectNonEmpty()`  | `[Row, ...Row[]]`    | `NoRowError`                     | Lists that must not be empty.                  |
+| `expectValue()`     | `Value`              | `NoRowError`                     | One column of a row that must exist.           |
+| `expectRows(n)`     | the write's result   | `RowCountError`                  | Writes that must affect exactly `n` rows.      |
 
 The shape comes before `execute()`:
 
 ```ts
 const email = await db
-  .selectFrom(users)
-  .where('users.id', id)
-  .select(['users.email'])
-  .expectValue()
-  .execute(); // string
+	.selectFrom(users)
+	.where('users.id', id)
+	.select(['users.email'])
+	.expectValue()
+	.execute(); // string
 ```
 
 `takeValue` and `expectValue` require exactly one selected column; with more, the call fails to compile. Each `expect…` takes an optional function that maps the error it would throw to your own:
@@ -1400,11 +1527,11 @@ const email = await db
 
 ```ts
 const user = await db
-  .insertInto(users)
-  .values({ email: 'ada@example.com', name: 'Ada' })
-  .returning(['users.id', 'users.createdAt'])
-  .expectOne()
-  .execute();
+	.insertInto(users)
+	.values({ email: 'ada@example.com', name: 'Ada' })
+	.returning(['users.id', 'users.createdAt'])
+	.expectOne()
+	.execute();
 // { id: number; createdAt: Date }
 ```
 
@@ -1421,9 +1548,14 @@ await db.insertInto(users).values(rows).execute();
 
 ```ts
 await db
-  .insertInto(archivedPosts)
-  .fromSelect(db.selectFrom(posts).where((eb) => eb.ref('posts.createdAt').lt(cutoff)).selectAll())
-  .execute();
+	.insertInto(archivedPosts)
+	.fromSelect(
+		db
+			.selectFrom(posts)
+			.where((eb) => eb.ref('posts.createdAt').lt(cutoff))
+			.selectAll(),
+	)
+	.execute();
 ```
 
 ### Upserts
@@ -1440,11 +1572,13 @@ The conflict target must be columns of the table. `merge(columns)` is shorthand 
 
 ```ts
 await db
-  .insertInto(counters)
-  .values({ key: 'visits', value: 1 })
-  .onConflict('key')
-  .doUpdate((excluded, eb) => ({ value: eb.ref('counters.value').plus(excluded.value) }))
-  .execute();
+	.insertInto(counters)
+	.values({ key: 'visits', value: 1 })
+	.onConflict('key')
+	.doUpdate((excluded, eb) => ({
+		value: eb.ref('counters.value').plus(excluded.value),
+	}))
+	.execute();
 ```
 
 `.onConflict('email').doNothing().expectRows(1)` throws a `RowCountError` when the row already existed, which is a compact way to say "insert, and tell me if it was a duplicate".
@@ -1453,10 +1587,10 @@ await db
 
 ```ts
 await db
-  .update(users)
-  .set({ name: 'Ada Lovelace' })
-  .where('users.id', id)
-  .execute();
+	.update(users)
+	.set({ name: 'Ada Lovelace' })
+	.where('users.id', id)
+	.execute();
 // { rowCount: 1 }
 ```
 
@@ -1480,12 +1614,12 @@ await db.update(users).set({ verified: false }).allRows().execute();
 
 ```ts
 await db
-  .update(docs)
-  .set({ body, version: version + 1 })
-  .where('docs.id', id)
-  .where('docs.version', version)
-  .expectRows(1) // RowCountError if someone else saved first
-  .execute();
+	.update(docs)
+	.set({ body, version: version + 1 })
+	.where('docs.id', id)
+	.where('docs.version', version)
+	.expectRows(1) // RowCountError if someone else saved first
+	.execute();
 ```
 
 ### Updating many rows to different values
@@ -1494,15 +1628,15 @@ await db
 
 ```ts
 await db
-  .updateMany(
-    products,
-    [
-      { id: 1, price: '9.99', stock: 12 },
-      { id: 2, price: '19.99', stock: 0 },
-    ],
-    { by: 'id' },
-  )
-  .execute();
+	.updateMany(
+		products,
+		[
+			{ id: 1, price: '9.99', stock: 12 },
+			{ id: 2, price: '19.99', stock: 0 },
+		],
+		{ by: 'id' },
+	)
+	.execute();
 // update "products" set "price" = "quarry_rows"."price", "stock" = "quarry_rows"."stock"
 // from unnest($1::integer[], $2::numeric[], $3::integer[]) as "quarry_rows"("id", "price", "stock")
 // where "products"."id" = "quarry_rows"."id"
@@ -1514,10 +1648,10 @@ await db
 
 ```ts
 const deleted = await db
-  .deleteFrom(sessions)
-  .where((eb) => eb.ref('sessions.expiresAt').lt(new Date()))
-  .returning(['sessions.id'])
-  .execute();
+	.deleteFrom(sessions)
+	.where((eb) => eb.ref('sessions.expiresAt').lt(new Date()))
+	.returning(['sessions.id'])
+	.execute();
 ```
 
 As with updates, a delete needs a `where` or an explicit `.allRows()` before it can run.
@@ -1534,9 +1668,9 @@ A builder runs when you call `execute()`, or a shape followed by `execute()`.
 await query.execute({ signal: request.signal, timeout: '2s' });
 ```
 
-| Option    | Description                                                         |
-| --------- | ------------------------------------------------------------------- |
-| `signal`  | An `AbortSignal` that cancels the query on the server.              |
+| Option    | Description                                                        |
+| --------- | ------------------------------------------------------------------ |
+| `signal`  | An `AbortSignal` that cancels the query on the server.             |
 | `timeout` | A deadline, in milliseconds or as an interval (`'2s'`, `'500ms'`). |
 
 **Awaiting a builder is an error.** `await db.selectFrom(users)` throws a `TypeError` explaining that queries run with `execute()`. A forgotten `execute()` can't silently do nothing.
@@ -1544,8 +1678,11 @@ await query.execute({ signal: request.signal, timeout: '2s' });
 **Streaming.** Large results stream through a cursor, a batch of rows per round trip:
 
 ```ts
-for await (const event of db.selectFrom(events).selectAll().stream({ batchSize: 1000 })) {
-  await handle(event);
+for await (const event of db
+	.selectFrom(events)
+	.selectAll()
+	.stream({ batchSize: 1000 })) {
+	await handle(event);
 }
 ```
 
@@ -1564,7 +1701,10 @@ const { params: paramTypes, columns } = await query.describe(); // types as the 
 import { selectFrom } from 'quarry';
 
 const byEmail = (email: string) =>
-  selectFrom(users).where('users.email', email).select(['users.id']).expectOne();
+	selectFrom(users)
+		.where('users.email', email)
+		.select(['users.id'])
+		.expectOne();
 
 const [user] = await db.batch([byEmail('ada@example.com')]);
 ```
@@ -1575,9 +1715,13 @@ const [user] = await db.batch([byEmail('ada@example.com')]);
 
 ```ts
 const [user, posts, { rowCount }] = await db.batch([
-  db.selectFrom(users).where('users.id', id).select(['users.email']).expectOne(),
-  db.selectFrom(posts).where('posts.authorId', id).select(['posts.title']),
-  db.update(users).set({ seenAt: new Date() }).where('users.id', id),
+	db
+		.selectFrom(users)
+		.where('users.id', id)
+		.select(['users.email'])
+		.expectOne(),
+	db.selectFrom(posts).where('posts.authorId', id).select(['posts.title']),
+	db.update(users).set({ seenAt: new Date() }).where('users.id', id),
 ]);
 ```
 
@@ -1593,28 +1737,31 @@ await db.batch([debit, credit], { transaction: { isolation: 'serializable' } });
 
 ```ts
 const orderId = await db.transaction(
-  async (tx) => {
-    const order = await tx
-      .insertInto(orders)
-      .values({ userId, total })
-      .returning(['orders.id'])
-      .expectOne()
-      .execute();
-    await tx.insertInto(orderItems).values(items.map((item) => ({ ...item, orderId: order.id }))).execute();
-    tx.afterCommit(() => queue.publish('order.created', order.id));
-    return order.id;
-  },
-  { isolation: 'serializable', retries: 3 },
+	async (tx) => {
+		const order = await tx
+			.insertInto(orders)
+			.values({ userId, total })
+			.returning(['orders.id'])
+			.expectOne()
+			.execute();
+		await tx
+			.insertInto(orderItems)
+			.values(items.map((item) => ({ ...item, orderId: order.id })))
+			.execute();
+		tx.afterCommit(() => queue.publish('order.created', order.id));
+		return order.id;
+	},
+	{ isolation: 'serializable', retries: 3 },
 );
 ```
 
 `tx` has the same query methods as `db`, plus:
 
-| Member                     | Description                                                                                           |
-| -------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `tx.transaction(fn, opts)` | A nested savepoint, or an error with `{ durable: true }`.                                              |
-| `tx.afterCommit(fn)`       | Runs once the outermost transaction commits; dropped on rollback or retry.                            |
-| `tx.afterRollback(fn)`     | Runs if this transaction or savepoint rolls back.                                                     |
+| Member                     | Description                                                                                                             |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `tx.transaction(fn, opts)` | A nested savepoint, or an error with `{ durable: true }`.                                                               |
+| `tx.afterCommit(fn)`       | Runs once the outermost transaction commits; dropped on rollback or retry.                                              |
+| `tx.afterRollback(fn)`     | Runs if this transaction or savepoint rolls back.                                                                       |
 | `tx.setLocal(name, value)` | Sets a run-time parameter until the transaction ends, with a bound value (e.g. `app.tenant_id` for row-level security). |
 
 The options are the driver's [transaction options](#transactions): `isolation`, `readOnly`, `deferrable`, `retries`, `settings`, `timeout` and `durable`. With `retries`, the callback may run more than once, so keep side effects in `afterCommit`.
@@ -1633,12 +1780,17 @@ Database errors are the driver's [error classes](#errors), re-exported from `qua
 import { UniqueViolation, violatedColumns } from 'quarry';
 
 try {
-  await db.insertInto(users).values(input).execute();
+	await db.insertInto(users).values(input).execute();
 } catch (error) {
-  if (error instanceof UniqueViolation && violatedColumns(error, users)?.includes('email')) {
-    return reply.status(409).send({ field: 'email', message: 'Already registered' });
-  }
-  throw error;
+	if (
+		error instanceof UniqueViolation &&
+		violatedColumns(error, users)?.includes('email')
+	) {
+		return reply
+			.status(409)
+			.send({ field: 'email', message: 'Already registered' });
+	}
+	throw error;
 }
 ```
 
@@ -1681,8 +1833,8 @@ import { database, defineConfig } from 'quarry';
 import * as schema from './src/schema.ts';
 
 export default defineConfig({
-  db: database(process.env.DATABASE_URL),
-  schema, // a module namespace or an array; values that aren't tables are ignored
+	db: database(process.env.DATABASE_URL),
+	schema, // a module namespace or an array; values that aren't tables are ignored
 });
 ```
 
@@ -1727,22 +1879,22 @@ Useful as a boot check or a test. The report has `ok`, a `summary` (counts of er
 
 ### What it checks
 
-| Code                          | Severity | Difference                                                                     |
-| ----------------------------- | -------- | ------------------------------------------------------------------------------ |
-| `table-missing`               | error    | A table in the code is missing from the database.                              |
-| `column-missing`              | error    | A column in the code is missing from the database.                             |
+| Code                          | Severity | Difference                                                                                  |
+| ----------------------------- | -------- | ------------------------------------------------------------------------------------------- |
+| `table-missing`               | error    | A table in the code is missing from the database.                                           |
+| `column-missing`              | error    | A column in the code is missing from the database.                                          |
 | `column-type-mismatch`        | error    | A column's SQL type, its modifiers (`varchar(n)`, `numeric(p, s)`) or its arrayness differ. |
-| `column-nullable-mismatch`    | error    | The database allows null in a column the code says is never null.              |
-| `column-not-null-mismatch`    | warning  | The code allows null in a column the database declares `not null`.             |
-| `column-default-missing`      | error    | The code declares `default()` but the database has no default.                 |
-| `column-default-undeclared`   | info     | The database fills in a column the code requires on insert.                    |
-| `column-identity-missing`     | error*   | The code declares `identity()` but the column isn't an identity.               |
-| `column-identity-undeclared`  | error    | The column is `generated always as identity`, but the code writes it.          |
-| `column-generated-missing`    | error*   | The code declares `generated()` but the column isn't generated.                |
-| `column-generated-undeclared` | error    | The column is generated, but the code writes it.                               |
-| `enum-label-mismatch`         | error    | An enum's labels differ.                                                       |
-| `enum-label-order`            | warning  | Same labels, different order, which changes how `<` compares them.             |
-| `column-extra`                | info*    | The database has a column the code doesn't declare.                            |
+| `column-nullable-mismatch`    | error    | The database allows null in a column the code says is never null.                           |
+| `column-not-null-mismatch`    | warning  | The code allows null in a column the database declares `not null`.                          |
+| `column-default-missing`      | error    | The code declares `default()` but the database has no default.                              |
+| `column-default-undeclared`   | info     | The database fills in a column the code requires on insert.                                 |
+| `column-identity-missing`     | error*   | The code declares `identity()` but the column isn't an identity.                            |
+| `column-identity-undeclared`  | error    | The column is `generated always as identity`, but the code writes it.                       |
+| `column-generated-missing`    | error*   | The code declares `generated()` but the column isn't generated.                             |
+| `column-generated-undeclared` | error    | The column is generated, but the code writes it.                                            |
+| `enum-label-mismatch`         | error    | An enum's labels differ.                                                                    |
+| `enum-label-order`            | warning  | Same labels, different order, which changes how `<` compares them.                          |
+| `column-extra`                | info*    | The database has a column the code doesn't declare.                                         |
 
 \* Severity depends on the case. `column-identity-missing` is a warning when the column still has some other way of being filled in (a default), and `column-generated-missing` is a warning when the column is nullable, since inserts still succeed. `column-extra` is a warning when the extra column is `not null` without a default, because every insert from the code will fail, and an error with `--strict`.
 
@@ -1760,17 +1912,17 @@ pnpm lint
 pnpm format
 ```
 
-| Script                 | What it does                                                                                                                                               |
-| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pnpm test`            | Runs every test, with type tests (`*.test-d.ts`). When PostgreSQL is installed, starts a throwaway cluster with TLS, a role per auth method, and PgBouncer; otherwise the integration tests are skipped. `PG_VERSION`, `PG_BIN` and `PGBOUNCER_BIN` select other installations. |
-| `pnpm test:types`      | Type tests only.                                                                                                                                           |
-| `pnpm test:compat`     | Runs node-postgres's and postgres.js's own test suites against this driver through test-only shims, on PostgreSQL 18 (`--bouncer` adds a pass through PgBouncer). `test/driver/compat/expectations.ts` lists every test allowed to fail, and why. |
-| `pnpm test:runtimes`   | The same smoke test on Node, Bun and Deno.                                                                                                                 |
-| `pnpm test:workers`    | The smoke test inside workerd (set `MINIFLARE_FROM` to a Miniflare install).                                                                               |
-| `pnpm bench:driver`    | A quick comparison against `pg` and postgres.js. The full suite is in `bench/driver/suite`; see [Benchmarks](#benchmarks).                                  |
-| `pnpm bench:types`     | Measures type-checking cost on generated schemas.                                                                                                          |
-| `pnpm bench:lsp`       | Measures editor latency (completions, hovers) through the language server.                                                                                 |
-| `pnpm build`           | Builds `dist/` with tsdown and emits declarations.                                                                                                         |
+| Script               | What it does                                                                                                                                                                                                                                                                    |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pnpm test`          | Runs every test, with type tests (`*.test-d.ts`). When PostgreSQL is installed, starts a throwaway cluster with TLS, a role per auth method, and PgBouncer; otherwise the integration tests are skipped. `PG_VERSION`, `PG_BIN` and `PGBOUNCER_BIN` select other installations. |
+| `pnpm test:types`    | Type tests only.                                                                                                                                                                                                                                                                |
+| `pnpm test:compat`   | Runs node-postgres's and postgres.js's own test suites against this driver through test-only shims, on PostgreSQL 18 (`--bouncer` adds a pass through PgBouncer). `test/driver/compat/expectations.ts` lists every test allowed to fail, and why.                               |
+| `pnpm test:runtimes` | The same smoke test on Node, Bun and Deno.                                                                                                                                                                                                                                      |
+| `pnpm test:workers`  | The smoke test inside workerd (set `MINIFLARE_FROM` to a Miniflare install).                                                                                                                                                                                                    |
+| `pnpm bench:driver`  | A quick comparison against `pg` and postgres.js. The full suite is in `bench/driver/suite`; see [Benchmarks](#benchmarks).                                                                                                                                                      |
+| `pnpm bench:types`   | Measures type-checking cost on generated schemas.                                                                                                                                                                                                                               |
+| `pnpm bench:lsp`     | Measures editor latency (completions, hovers) through the language server.                                                                                                                                                                                                      |
+| `pnpm build`         | Builds `dist/` with tsdown and emits declarations.                                                                                                                                                                                                                              |
 
 Type-checking speed is treated as a feature: the query builder's types are written to keep completions instant on schemas with hundreds of tables, and `bench:types` guards against regressions.
 

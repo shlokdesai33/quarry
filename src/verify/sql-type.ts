@@ -1,5 +1,6 @@
 import type { DataType } from '../data-type/data-type.js';
 import { ArrayType } from '../data-type/array.js';
+import { CustomType } from '../data-type/custom.js';
 import { EnumType } from '../data-type/enum.js';
 import type { Kind } from '../operators.js';
 import { quoteIdentifier } from './sql.js';
@@ -32,6 +33,14 @@ const kindNames: Partial<Record<Kind, string>> = { decimal: 'numeric' };
 export function codeType(dataType: DataType): SqlType {
 	if (dataType instanceof ArrayType) {
 		return { ...codeType(dataType.element), array: true };
+	}
+	if (dataType instanceof CustomType) {
+		return {
+			name: dataType.sqlName,
+			isEnum: false,
+			modifiers: dataType.modifiers,
+			array: false,
+		};
 	}
 	if (dataType instanceof EnumType) {
 		return {

@@ -7,9 +7,6 @@ import type { IntegerColumn } from '../src/column/integer-column.js';
 import type { ArrayType } from '../src/data-type/array.js';
 import type { DataType } from '../src/data-type/data-type.js';
 import type { EnumType } from '../src/data-type/enum.js';
-import type { JsonbType } from '../src/data-type/jsonb.js';
-import type { TstzRangeType } from '../src/data-type/range.js';
-import type { VectorType } from '../src/data-type/vector.js';
 import {
 	array,
 	bigint,
@@ -548,7 +545,7 @@ describe('jsonb functions', () => {
 		).toEqualTypeOf<string | null>();
 		expectTypeOf(
 			db.json.get('docs.profile', 'tags')._quarry.dataType,
-		).toEqualTypeOf<JsonbType>();
+		).toEqualTypeOf<DataType<'jsonb'>>();
 		expectTypeOf(
 			db.json.text('docs.profile', 'tags')._quarry.dataType,
 		).toEqualTypeOf<DataType<'text'>>();
@@ -1043,13 +1040,12 @@ describe('columns and data types', () => {
 		).toEqualTypeOf<GeneratedColumn<TextType, 'a' | null, never, never>>();
 	});
 
-	it('give the types that encode values their own class', () => {
-		expectTypeOf(jsonb()._quarry.dataType).toEqualTypeOf<JsonbType>();
-		expectTypeOf(tstzrange()._quarry.dataType).toEqualTypeOf<TstzRangeType>();
-		expectTypeOf(vector()._quarry.dataType).toEqualTypeOf<VectorType>();
-		// a plain jsonb data type would skip the JSON encoding
-		expectTypeOf<DataType<'jsonb'>>().not.toExtend<JsonbType>();
-		expectTypeOf<JsonbType>().toExtend<DataType<'jsonb'>>();
+	it('carry the kind of their SQL type, whose codec encodes values', () => {
+		expectTypeOf(jsonb()._quarry.dataType).toEqualTypeOf<DataType<'jsonb'>>();
+		expectTypeOf(tstzrange()._quarry.dataType).toEqualTypeOf<
+			DataType<'tstzrange'>
+		>();
+		expectTypeOf(vector()._quarry.dataType).toEqualTypeOf<DataType<'vector'>>();
 	});
 
 	it('type arrays by their element', () => {

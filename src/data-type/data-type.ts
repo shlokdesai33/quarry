@@ -1,16 +1,11 @@
+import type { Codec } from '../driver/codec.js';
+import { kindCodec } from '../kind-codecs.js';
 import type { Kind } from '../operators.js';
 
-/**
- * How a user-defined data type encodes values, where that differs from
- * passing them to the driver as they are.
- */
+/** What a data type is constructed from, besides its kind. */
 type Options = {
-	/**
-	 * The postgres input syntax of a non-null value of the type, for types the
-	 * driver would send wrongly. `null` is always SQL `NULL`, so it never
-	 * reaches this.
-	 */
-	readonly serialize?: (value: unknown) => string;
+	/** How values are sent and read; the kind's built-in codec by default. */
+	readonly codec?: Codec | undefined;
 	/**
 	 * The type modifiers, e.g. `[255]` for `varchar(255)` or `[10, 2]` for
 	 * `numeric(10, 2)`.
@@ -19,17 +14,16 @@ type Options = {
 };
 
 /**
- * A SQL type of kind `K`: how values of the type are encoded for the driver,
- * and, through `MethodsByKind`, the comparisons they admit. Columns and
+ * A SQL type of kind `K`: the codec its values are sent and read with, and,
+ * through `MethodsByKind`, the comparisons they admit. Columns and
  * expressions of the type share it, so a value is encoded the same way
- * whether it is compared against a column or against a computed expression.
+ * whether it is compared against a column or against a computed expression,
+ * and a selected column or expression is read with it.
  *
  * It says nothing about the TypeScript type of its values, which lives on
- * the column or expression instead: `text`, `text null` and `text` narrowed
- * to a union of literals are all the same SQL type.
- *
- * A user-defined type gives its encoding as an option; the built-in types
- * that need one override `serialize`, leaving `null` as SQL `NULL`.
+ * the column or expression instead (derived from the codec by the column
+ * factories): `text`, `text null` and `text` narrowed to a union of
+ * literals are all the same SQL type.
  *
  * Instances are immutable.
  */
@@ -49,32 +43,27 @@ export class DataType<K extends Kind = Kind> {
 	readonly modifiers: readonly number[] | undefined;
 
 	/**
-	 * How values are encoded, where they aren't sent as is.
+	 * The driver codec values of the type are sent and read with: chosen
+	 * here, owned by the driver.
 	 */
-	readonly #options: Options;
+	readonly codec: Codec;
 
 	/**
 	 * Creates a data type of the given kind.
 	 *
 	 * @param kind the name of the SQL type.
-	 * @param options how values are encoded, where they aren't sent as is,
-	 * and the type modifiers.
+	 * @param options its codec, if not the kind's, and its modifiers.
 	 */
 	constructor(kind: K, options: Options = {}) {
 		this.kind = kind;
 		this.modifiers = options.modifiers;
-		this.#options = options;
+		this.codec = options.codec ?? kindCodec(kind);
 	}
 
-	/**
-	 * Converts a value of this type into what the driver should send: the
-	 * `serialize` option's text, or the value as is, since the driver already
-	 * serialises strings, numbers, booleans, dates, byte arrays and plain
-	 * arrays. `null` is SQL `NULL`.
-	 */
-	serialize(value: unknown): unknown {
-		return this.#options.serialize && value !== null
-			? this.#options.serialize(value)
-			: value;
+	/** The same type, read and sent with `codec`. */
+	withCodec(codec: Codec): this {
+		// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- a copy of this instance, of its class
+		const copy = Object.create(Object.getPrototypeOf(this)) as this;
+		return Object.freeze(Object.assign(copy, this, { codec }));
 	}
 }

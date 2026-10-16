@@ -1,10 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import {
-	catalogTypes,
-	parseRange,
-	parseTimestamptz,
-} from '../../src/driver/parsers.js';
-import { initialTypes, quarryTypes } from '../../src/decode.js';
+import { parseRange, parseTimestamptz } from '../../src/driver/parsers.js';
+import { encodeParams as encode } from '../../src/driver/params.js';
 import {
 	DriverError,
 	UndefinedParameterError,
@@ -13,11 +9,8 @@ import { parseTag } from '../../src/driver/ops.js';
 import {
 	arrayLiteral,
 	copyLine,
-	defaultTypes,
 	encodeParam,
-	encodeParams,
 	formatTimestamp,
-	oids,
 	parseArray,
 	parseBytea,
 } from '../../src/driver/types.js';
@@ -92,6 +85,9 @@ describe('parseArray and arrayLiteral', () => {
 	});
 });
 
+const encodeParams = (sql: string, params: readonly unknown[]) =>
+	encode(sql, params, undefined, undefined);
+
 describe('parameters', () => {
 	it('encodes JavaScript values as Postgres input', () => {
 		expect(encodeParam(null)).toBeNull();
@@ -99,6 +95,8 @@ describe('parameters', () => {
 		expect(() => encodeParam([1, [undefined]])).toThrow(/undefined/);
 		expect(encodeParam('x')).toBe('x');
 		expect(encodeParam(1.5)).toBe('1.5');
+		expect(encodeParam(1e21)).toBe('1000000000000000000000');
+		expect(encodeParam(1e-7)).toBe('1e-7');
 		expect(encodeParam(Number.NaN)).toBe('NaN');
 		expect(encodeParam(12n)).toBe('12');
 		expect(encodeParam(true)).toBe('t');
@@ -228,30 +226,6 @@ describe('quarry parsers', () => {
 			bounds: '(]',
 		});
 		expect(() => parseRange('1,2', String)).toThrow();
-	});
-
-	it('completes parsers from the catalog without overriding known ones', () => {
-		const parsers = catalogTypes(quarryTypes, [
-			{ oid: 9000, name: 'vector', elem: 0, delim: ',' },
-			{ oid: 9001, name: '_vector', elem: 9000, delim: ',' },
-			{ oid: 9002, name: '_mood', elem: 9003, delim: ',' },
-			{ oid: 1016, name: '_int8', elem: 20, delim: ',' },
-		]);
-		expect(parsers[9000]?.('[1,2]')).toEqual([1, 2]);
-		expect(parsers[9001]?.('{"[1]","[2,3]"}')).toEqual([[1], [2, 3]]);
-		expect(parsers[9002]?.('{happy,sad}')).toEqual(['happy', 'sad']);
-		expect(parsers[1016]?.('{1,2}')).toEqual(['1', '2']);
-	});
-
-	it('removes raw types and their arrays', () => {
-		const parsers = initialTypes(undefined, ['timestamptz', oids.int4]);
-		expect(parsers[oids.timestamptz]).toBeUndefined();
-		expect(parsers[1185]).toBeUndefined();
-		expect(parsers[oids.int4]).toBeUndefined();
-		expect(parsers[oids.bool]).toBeDefined();
-		expect(initialTypes(undefined, true)).toEqual({});
-		expect(initialTypes(defaultTypes, undefined)[oids.int8]?.('5')).toBe(5n);
-		expect(initialTypes(undefined, undefined)[oids.int8]).toBeUndefined();
 	});
 });
 

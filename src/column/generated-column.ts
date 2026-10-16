@@ -1,5 +1,6 @@
 import type { DataType } from '../data-type/data-type.js';
-import { BaseColumn } from './base-column.js';
+import type { Codec } from '../driver/codec.js';
+import { BaseColumn, type SwapType } from './base-column.js';
 
 /**
  * A generated column. It may still be made nullable, which only affects
@@ -44,5 +45,17 @@ export class GeneratedColumn<D extends DataType, S, I, U>
 	 */
 	override typed<X extends S>() {
 		return new GeneratedColumn<D, X, I, U>(this._quarry);
+	}
+
+	override useCodec<In, Out>(codec: Codec<In, Out>) {
+		return new GeneratedColumn<
+			D,
+			SwapType<S, Out>,
+			SwapType<I, In>,
+			SwapType<U, In>
+		>({
+			...this._quarry,
+			dataType: this._quarry.dataType.withCodec(codec),
+		});
 	}
 }

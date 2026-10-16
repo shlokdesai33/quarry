@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { integer, jsonb, text, timestamptz } from '../src/column-factories.js';
 import { compile } from '../src/compile.js';
+import { arrayOf, declareParamType } from '../src/driver/codec.js';
+import { codecs } from '../src/driver/codecs.js';
+import { codecNames, plain } from './helpers/compiled.js';
 import { databaseWith } from '../src/database.js';
 import {
 	NoRowError,
@@ -31,7 +34,11 @@ const events = defineTable('events', {
 	},
 });
 
-const value = (v: unknown) => ({ kind: 'value', value: v });
+const value = (v: unknown, codec?: unknown) => ({
+	kind: 'value',
+	value: v,
+	codec,
+});
 const excluded = (column: string) => ({
 	kind: 'reference',
 	table: 'excluded',
@@ -41,7 +48,7 @@ const sql = (node: OperationNode | undefined) =>
 	node === undefined ? undefined : compile(node).sql;
 
 describe('insertInto', () => {
-	it('records one row by database column name, encoding values', () => {
+	it('records one row by database column name, each value with its column’s codec', () => {
 		const node = insertInto(users)
 			.values({
 				email: 'ada@example.com',
@@ -55,8 +62,13 @@ describe('insertInto', () => {
 			values: {
 				columns: ['email', 'name', 'settings'],
 				types: ['text', 'text', 'jsonb'],
+				codecs: [codecs.text, codecs.text, codecs.jsonb],
 				rows: [
-					[value('ada@example.com'), value(null), value('{"theme":"dark"}')],
+					[
+						value('ada@example.com', codecs.text),
+						value(null, codecs.text),
+						value({ theme: 'dark' }, codecs.jsonb),
+					],
 				],
 				strategy: 'values',
 			},
@@ -77,9 +89,18 @@ describe('insertInto', () => {
 		expect(values).toEqual({
 			columns: ['email', 'name', 'created_at'],
 			types: ['text', 'text', 'timestamptz'],
+			codecs: [codecs.text, codecs.text, codecs.timestamptz],
 			rows: [
-				[value('ada@example.com'), value('Ada'), undefined],
-				[value('alan@example.com'), value(null), value(at)],
+				[
+					value('ada@example.com', codecs.text),
+					value('Ada', codecs.text),
+					undefined,
+				],
+				[
+					value('alan@example.com', codecs.text),
+					value(null, codecs.text),
+					value(at, codecs.timestamptz),
+				],
 			],
 			strategy: 'unnest',
 		});
@@ -95,10 +116,12 @@ describe('insertInto', () => {
 			{
 				expression: { kind: 'reference', table: 'users', column: 'id' },
 				alias: 'id',
+				codec: codecs.int4,
 			},
 			{
 				expression: { kind: 'reference', table: 'users', column: 'created_at' },
 				alias: 'createdAt',
+				codec: codecs.timestamptz,
 			},
 		]);
 		expect(node.tag).toBe('users.create');
@@ -169,8 +192,8 @@ describe('update', () => {
 			.where('users.id', 1)
 			.toNode();
 		expect(node.set).toEqual([
-			{ column: 'name', value: value('Ada Lovelace') },
-			{ column: 'email', value: value('ada@example.com') },
+			{ column: 'name', value: value('Ada Lovelace', codecs.text) },
+			{ column: 'email', value: value('ada@example.com', codecs.text) },
 		]);
 		expect(sql(node.where)).toBe('"users"."id" = $1');
 		expect(node.allRows).toBe(false);
@@ -211,7 +234,7 @@ describe('update', () => {
 		const query = update(users).set({ name: 'Ada' });
 		query.set({ name: 'Alan' }).where('users.id', 1);
 		expect(query.toNode().set).toEqual([
-			{ column: 'name', value: value('Ada') },
+			{ column: 'name', value: value('Ada', codecs.text) },
 		]);
 		expect(query.toNode().where).toBeUndefined();
 	});
@@ -232,9 +255,14 @@ describe('updateMany', () => {
 			by: ['id'],
 			columns: ['id', 'name', 'created_at'],
 			types: ['integer', 'text', 'timestamptz'],
+			codecs: [codecs.int4, codecs.text, codecs.timestamptz],
 			rows: [
-				[value(1), value('Ada'), undefined],
-				[value(2), undefined, value(new Date(0))],
+				[value(1, codecs.int4), value('Ada', codecs.text), undefined],
+				[
+					value(2, codecs.int4),
+					undefined,
+					value(new Date(0), codecs.timestamptz),
+				],
 			],
 			strategy: 'unnest',
 		});
@@ -283,10 +311,14 @@ describe('compiling write queries', () => {
 				.tag('users.upsert')
 				.toNode(),
 		);
-		expect(query).toEqual({
+		expect(plain(query)).toEqual({
 			sql: 'insert into "users" ("email", "name") values ($1, $2) on conflict ("email") do update set "name" = excluded."name" returning "users"."id" as "id"',
 			params: ['ada@example.com', null],
 			tag: 'users.upsert',
+		});
+		expect(codecNames(query)).toEqual({
+			params: ['text', 'text'],
+			results: ['int4'],
 		});
 		expect(compile(insertInto(events).values({}).toNode()).sql).toBe(
 			'insert into "events" default values',
@@ -313,13 +345,22 @@ describe('compiling write queries', () => {
 				])
 				.toNode(),
 		);
-		expect(many).toEqual({
+		expect(plain(many)).toEqual({
 			sql: 'insert into "users" ("email", "name") select * from unnest($1::text[], $2::text[])',
 			params: [
 				['a', 'b'],
 				['A', null],
 			],
-			paramTypes: [1009, 1009],
+		});
+		// one array per column, of the column's codec, its type declared: the cast pins it
+		expect(many.paramCodecs).toEqual([
+			declareParamType(arrayOf(codecs.text)),
+			declareParamType(arrayOf(codecs.text)),
+		]);
+		expect(many.paramCodecs?.[0]).toMatchObject({
+			oid: 1009,
+			inferParamType: false,
+			paramFormat: 'binary',
 		});
 		// a row that leaves a column to its default can't go through unnest
 		const ragged = compile(
@@ -337,12 +378,14 @@ describe('compiling write queries', () => {
 
 	it('renders updates, updateMany and deletes', () => {
 		expect(
-			compile(
-				update(users)
-					.set({ name: 'Ada' })
-					.where('users.id', 1)
-					.returning(['users.name'])
-					.toNode(),
+			plain(
+				compile(
+					update(users)
+						.set({ name: 'Ada' })
+						.where('users.id', 1)
+						.returning(['users.name'])
+						.toNode(),
+				),
 			),
 		).toEqual({
 			sql: 'update "users" set "name" = $1 where "users"."id" = $2 returning "users"."name" as "name"',
@@ -351,25 +394,24 @@ describe('compiling write queries', () => {
 		expect(
 			compile(update(users).set({ name: null }).allRows().toNode()).sql,
 		).toBe('update "users" set "name" = $1');
-		expect(
-			compile(
-				updateMany(
-					users,
-					[
-						{ id: 1, name: 'A' },
-						{ id: 2, name: 'B' },
-					],
-					{ by: 'id' },
-				).toNode(),
-			),
-		).toEqual({
+		const many = compile(
+			updateMany(
+				users,
+				[
+					{ id: 1, name: 'A' },
+					{ id: 2, name: 'B' },
+				],
+				{ by: 'id' },
+			).toNode(),
+		);
+		expect(plain(many)).toEqual({
 			sql: 'update "users" set "name" = "quarry_rows"."name" from unnest($1::integer[], $2::text[]) as "quarry_rows"("id", "name") where "users"."id" = "quarry_rows"."id"',
 			params: [
 				[1, 2],
 				['A', 'B'],
 			],
-			paramTypes: [1007, 1009],
 		});
+		expect(codecNames(many).params).toEqual(['int4[]', 'text[]']);
 		expect(() =>
 			compile(
 				updateMany(users, [{ id: 1, name: 'A' }, { id: 2 }], {
@@ -542,30 +584,38 @@ describe('running a write query', () => {
 
 	it('leaves out columns whose value is undefined, never writing NULL for them', () => {
 		expect(
-			compile(insertInto(users).values({ email: 'a', name: missing }).toNode()),
+			plain(
+				compile(
+					insertInto(users).values({ email: 'a', name: missing }).toNode(),
+				),
+			),
 		).toEqual({
 			sql: 'insert into "users" ("email") values ($1)',
 			params: ['a'],
 		});
 		expect(
-			compile(
-				insertInto(users)
-					.values([
-						{ email: 'a', name: null },
-						{ email: 'b', name: missing },
-					])
-					.toNode(),
+			plain(
+				compile(
+					insertInto(users)
+						.values([
+							{ email: 'a', name: null },
+							{ email: 'b', name: missing },
+						])
+						.toNode(),
+				),
 			),
 		).toEqual({
 			sql: 'insert into "users" ("email", "name") values ($1, $2), ($3, default)',
 			params: ['a', null, 'b'],
 		});
 		expect(
-			compile(
-				update(users)
-					.set({ name: missing, email: 'b' })
-					.where('users.id', 1)
-					.toNode(),
+			plain(
+				compile(
+					update(users)
+						.set({ name: missing, email: 'b' })
+						.where('users.id', 1)
+						.toNode(),
+				),
 			),
 		).toEqual({
 			sql: 'update "users" set "email" = $1 where "users"."id" = $2',

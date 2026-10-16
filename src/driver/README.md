@@ -68,21 +68,18 @@ const { paramTypes, fields } = await conn.describe(sql); // without running it
 
 Parameters:
 
-- Strings pass through unchanged; quarry encodes values itself.
-- Numbers, bigints, booleans and `Date`s become their Postgres text. A `Date` is sent as a UTC timestamp, so a `timestamp without time zone` column receives the UTC wall-clock time whatever the process's time zone.
-- Arrays become array literals and other objects JSON.
-- `Uint8Array` is sent in binary.
-- An array whose type is declared in `paramTypes` is sent in binary when its elements fit the type, which is much cheaper for the server to read than a literal. This applies to bool, int2/int4/int8, float8, timestamptz (`Date`s), uuid, text/varchar/char, jsonb (JSON text) and bytea arrays. Anything else is sent as a literal, as before. Quarry declares the types of its `unnest` arrays (multi-row insert, `updateMany`) and of `column = any($1)` for integer and boolean columns.
+- A parameter with a codec (`typed(value, codec)`, or the query's `paramCodecs`, as quarry's builder gives every value compared with or written to a column) is encoded by it once, and its type OID declared at Parse, except for text-like codecs, whose type the server infers. Types looked up by name declare their OID once the pool's catalog has it.
 
   ```ts
-  await conn.query(
-  	'select * from unnest($1::int4[], $2::text[])',
-  	[ids, names],
-  	{
-  		paramTypes: [arrayOids.int4, arrayOids.text],
-  	},
-  );
+  await conn.query('select * from unnest($1::int4[], $2::text[])', [
+  	typed(ids, arrayOf(codecs.int4)),
+  	typed(names, arrayOf(codecs.text)),
+  ]);
   ```
+
+- Without one, a value is encoded by its JavaScript type: strings pass through unchanged; numbers (integers without an exponent), bigints, booleans and `Date`s become their Postgres text. A `Date` is sent as a UTC timestamp, so a `timestamp without time zone` column receives the UTC wall-clock time whatever the process's time zone. Arrays become array literals and other objects JSON. `Uint8Array` is sent in binary.
+- Arrays of bool, int2/int4/int8, float8, timestamptz (`Date`s), uuid, jsonb and bytea are sent in binary by their `arrayOf` codec, or untyped when `paramTypes` declares their type, which is much cheaper for the server to read than a literal. An element that doesn't fit falls back to a literal.
+- The statement cache keys on the declared types.
 
 Queries issued concurrently on one connection are pipelined into shared socket writes. Each still gets its own Sync, so one failing query doesn't fail its neighbours (outside a transaction). Writes respect backpressure: a long queue goes out in 64 KiB chunks, and once the socket's buffer is full, the remaining queries wait unencoded until it drains, so a deep pipeline or large parameters can't pile up in memory.
 
@@ -96,23 +93,18 @@ Behind PgBouncer in transaction mode, a query pipelined with others on its conne
 - **Detection:** PgBouncer 1.26+ reports itself at login (`connection.capabilities.pgbouncer`). For 1.21–1.25, set `preparePipelined: false`; `true` keeps pipelined queries named. With `max_prepared_statements = 0`, no statement is named.
 - **Schema changes:** a pipelined query whose columns changed since they were cached is decoded by what the server sent, and the cache entry is dropped. If a column asked for in binary changed to a type without a binary decoder, that query fails with a `DecodeError` after running.
 
-From a cached statement's second run, columns whose parser has a binary twin are received in binary, which is cheaper to decode and gives identical values. These are:
+Columns are received in binary where their codec reads them so, which is cheaper to decode and gives identical values: int2/int4/oid, int8 as a `bigint`, float8, bool, bytea, timestamptz as a `Date`, pgvector's `vector`, and arrays of those, of text-like types and of json/jsonb. A format is only asked for once the server has described the statement's columns, from a cached statement's second run; each column is then read with the codec the query expects for it (`resultCodecs`) when its type matches, and with the registry's codec for its type otherwise. Turn it off with `binaryResults: false`.
 
-- int2/int4/oid, float8, bool, bytea, and timestamptz decoded to `Date`;
-- arrays of those, and of text-like types, json/jsonb and int8 as `bigint`, when the array parser is the driver's own (`defaultTypes`, quarry's, the catalog's, or one built with `arrayParser`);
-- pgvector's `vector`.
+`codecs.vector` returns the float32 values stored, on every path: `[0.1]` reads as `[0.10000000149011612]`, the value pgvector holds and the value its binary format carries.
 
-Custom parsers and raw types always get text. Turn it off with `binaryResults: false`.
+### Codecs and decoding
 
-`parseVector` returns the float32 values stored, on every path: `[0.1]` reads as `[0.10000000149011612]`, the value pgvector holds and the value its binary format carries.
+The driver owns the codecs: one object per type with `name`, `oid` (0 to look it up by name), `paramFormat`, `resultFormat`, `encode`, `decodeText` and an optional `decodeBinary`. `codecs` has the built-in ones, `arrayOf(codec)` the codec of a type's arrays, `defineCodec({ name, encode, decodeText })` one of your own. Each result column is read with the codec the query expects for it (checked against the column's type OID at RowDescription), or the registry's codec for its type:
 
-### Decoding
+- **`defaultCodecs`** (the default, lossless): int2/int4/float become numbers, int8 a `bigint`, bool, json/jsonb parsed, bytea a `Uint8Array`, and arrays of those and of the text types. numeric, dates and times stay as text.
+- **`codecs: [...]`** on the pool, or per query: registered over the defaults, each for its type (and its arrays), e.g. `[codecs.int8AsString, codecs.timestamptz]`; or a registry built once with `createCodecRegistry(list, base?)` (`null` base: every other value as text).
 
-Results arrive in text format and are decoded per type OID:
-
-- **`defaultTypes`** (the default, lossless): int2/int4/float become numbers, int8 a `bigint`, bool, json/jsonb parsed, bytea a `Uint8Array`, and arrays of those. numeric, dates and times stay as text.
-- **`rawTypes`**: every value is the server's text.
-- **Your own**: any `Record<oid, (text) => value>`.
+Enums, domains and extension types have no fixed OIDs. A codec for one (`oid: 0`) is resolved through `pg_type` once per pool: behind the first query that needs it, or up front with `loadTypes()`; `reloadTypes()` looks them up again for types created since.
 
 ### Cancelling and timeouts
 

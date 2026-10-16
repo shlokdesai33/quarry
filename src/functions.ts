@@ -2,7 +2,7 @@ import { ArrayType } from './data-type/array.js';
 import { DataType } from './data-type/data-type.js';
 import {
 	Expression,
-	type Param,
+	Param,
 	Quantified,
 	TypedExpression,
 } from './expression.js';
@@ -253,8 +253,19 @@ export function functions<R extends Refs>({
 		upper: (text) => call('upper', [node(text)], new DataType('text')),
 		length: (text) => call('length', [node(text)], new DataType('integer')),
 		concat: (...parts) => call('concat', parts.map(node), new DataType('text')),
-		coalesce: (first, ...rest) =>
-			call('coalesce', [first, ...rest].map(node), dataType(first)),
+		coalesce: (first, ...rest) => {
+			const type = dataType(first);
+			// a fallback parameter is of the first argument's type
+			const fallback = (arg: Part<R>): OperationNode =>
+				arg instanceof Param
+					? {
+							kind: 'value',
+							value: arg._quarry.value,
+							codec: arg._quarry.codec ?? type.codec,
+						}
+					: node(arg);
+			return call('coalesce', [node(first), ...rest.map(fallback)], type);
+		},
 		count: (value) =>
 			call(
 				'count',

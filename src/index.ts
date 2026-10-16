@@ -31,7 +31,19 @@ export {
 	type DatabaseSource,
 	type DatabaseTransaction,
 } from './database.js';
-export type { RawTypes } from './decode.js';
+export {
+	arrayOf,
+	codecs,
+	defineCodec,
+	typed,
+	type Codec,
+	type CodecFormat,
+	type CodecInput,
+	type CodecOutput,
+	type CodecSpec,
+	type JsonValue,
+} from './driver/index.js';
+export { defineType, type TypeDefinition } from './define-type.js';
 export {
 	AbortError,
 	CheckViolation,

@@ -11,17 +11,28 @@ import type {
 	TableNode,
 	UpdateNode,
 } from './node.js';
-import { arrayOids } from './driver/types.js';
+import { arrayOf, declareParamType, type Codec } from './driver/codec.js';
 
 export interface CompiledQuery {
 	readonly sql: string;
+	/** The parameters' values, as given. */
 	readonly params: readonly unknown[];
 	/**
-	 * Type OIDs declared for the parameters, 0 where the server infers the
-	 * type; absent when none is declared. Only arrays are declared, where
-	 * the type is certain, so the driver can send them in binary.
+	 * The driver codec of each parameter, by position: chosen by the column
+	 * or expression it is compared with or written to, so the driver
+	 * encodes it once and declares its type. `undefined` where nothing
+	 * types it (`eb.val` on its own); absent when no parameter has one.
+	 * Like `resultCodecs`, not an own property: a copy made by spreading
+	 * the query leaves the values to the driver's defaults.
 	 */
-	readonly paramTypes?: readonly number[];
+	readonly paramCodecs?: readonly (Codec | undefined)[] | undefined;
+	/**
+	 * The codec of each result column, by position, where its SQL type is
+	 * known; `null` elsewhere. The driver reads each column with its codec
+	 * while the column has that type, in the codec's format once the
+	 * statement's columns are described.
+	 */
+	readonly resultCodecs?: readonly (Codec | null)[] | undefined;
 	/** The query's label from `tag()`, if any. It is not part of `sql`. */
 	readonly tag?: string;
 }
@@ -39,7 +50,7 @@ export type StatementNode =
  * is carried over as is.
  */
 export function compile(node: StatementNode): CompiledQuery {
-	const params: Params = { values: [], types: [] };
+	const params: Params = { values: [], codecs: [], typed: false };
 	let sql: string;
 	switch (node.kind) {
 		case 'insert':
@@ -55,43 +66,79 @@ export function compile(node: StatementNode): CompiledQuery {
 			sql = render(node, params);
 	}
 	const tag = 'tag' in node ? node.tag : undefined;
-	return {
+	const selections =
+		node.kind === 'select'
+			? node.selections
+			: node.kind === 'insert' ||
+				  node.kind === 'update' ||
+				  node.kind === 'delete'
+				? node.returning
+				: [];
+	let resultCodecs: (Codec | null)[] | undefined;
+	for (let i = 0; i < selections.length; i++) {
+		const codec = selections[i]?.codec;
+		if (codec === undefined) continue;
+		resultCodecs ??= selections.map(() => null);
+		resultCodecs[i] = codec;
+	}
+	return new Compiled(
 		sql,
-		params: params.values,
-		...(params.types.some((type) => type !== 0)
-			? { paramTypes: params.types }
-			: {}),
-		...(tag === undefined ? {} : { tag }),
-	};
+		params.values,
+		tag,
+		params.typed ? params.codecs : undefined,
+		resultCodecs,
+	);
 }
 
-/** The parameters rendered so far, and the type OID declared for each (0 for none). */
+/**
+ * A compiled query. Its codecs are read through getters, not own
+ * properties: what the executor reads, kept out of logs and comparisons.
+ */
+class Compiled implements CompiledQuery {
+	readonly sql: string;
+	readonly params: readonly unknown[];
+	declare readonly tag?: string;
+	readonly #paramCodecs: readonly (Codec | undefined)[] | undefined;
+	readonly #resultCodecs: readonly (Codec | null)[] | undefined;
+
+	constructor(
+		sql: string,
+		params: readonly unknown[],
+		tag: string | undefined,
+		paramCodecs: readonly (Codec | undefined)[] | undefined,
+		resultCodecs: readonly (Codec | null)[] | undefined,
+	) {
+		this.sql = sql;
+		this.params = params;
+		if (tag !== undefined) Object.assign(this, { tag });
+		this.#paramCodecs = paramCodecs;
+		this.#resultCodecs = resultCodecs;
+	}
+
+	get paramCodecs(): readonly (Codec | undefined)[] | undefined {
+		return this.#paramCodecs;
+	}
+
+	get resultCodecs(): readonly (Codec | null)[] | undefined {
+		return this.#resultCodecs;
+	}
+}
+
+/** The parameters rendered so far, and the codec of each. */
 interface Params {
 	readonly values: unknown[];
-	readonly types: number[];
+	readonly codecs: (Codec | undefined)[];
+	/** Whether any parameter has a codec. */
+	typed: boolean;
 }
 
 /** Adds a parameter and returns its placeholder. */
-function param(params: Params, value: unknown, type = 0): string {
+function param(params: Params, value: unknown, codec?: Codec): string {
 	params.values.push(value);
-	params.types.push(type);
+	params.codecs.push(codec);
+	if (codec !== undefined) params.typed = true;
 	return `$${params.values.length}`;
 }
-
-/** The array types `unnest` declares, by the cast's element type: those the driver sends in binary. */
-const unnestTypes: Readonly<Record<string, number>> = {
-	smallint: arrayOids.int2,
-	integer: arrayOids.int4,
-	bigint: arrayOids.int8,
-	'double precision': arrayOids.float8,
-	boolean: arrayOids.bool,
-	timestamptz: arrayOids.timestamptz,
-	text: arrayOids.text,
-	varchar: arrayOids.varchar,
-	uuid: arrayOids.uuid,
-	jsonb: arrayOids.jsonb,
-	bytea: arrayOids.bytea,
-};
 
 /** Whether rows can go as one array parameter per column: plain values only, no defaults, no array columns. */
 function unnestable(rows: RowsNode): boolean {
@@ -106,13 +153,17 @@ function unnestable(rows: RowsNode): boolean {
 function renderUnnest(rows: RowsNode, params: Params): string {
 	const arrays = rows.columns.map((_, i) => {
 		const type = rows.types[i] ?? '';
+		const codec = rows.codecs[i];
 		const placeholder = param(
 			params,
 			rows.rows.map((row) => {
 				const cell = row[i];
 				return cell?.kind === 'value' ? cell.value : null;
 			}),
-			unnestTypes[type],
+			// the cast pins the array's type, so it can be declared
+			codec === undefined || codec.element !== undefined
+				? undefined
+				: declareParamType(arrayOf(codec)),
 		);
 		return `${placeholder}::${type}[]`;
 	});
@@ -236,7 +287,7 @@ function render(node: OperationNode, params: Params): string {
 		case 'reference':
 			return `${identifier(node.table)}.${identifier(node.column)}`;
 		case 'value':
-			return param(params, node.value, node.typeOid);
+			return param(params, node.value, node.codec);
 		case 'value_list':
 			return `(${node.values.map((value) => render(value, params)).join(', ')})`;
 		case 'literal':

@@ -1,0 +1,28 @@
+{
+  "version": "5",
+  "specifiers": {
+    "jsr:@deno/installer-shell-setup@*": "0.3.4"
+  },
+  "jsr": {
+    "@deno/installer-shell-setup@0.3.4": {
+      "integrity": "48665d1a737d487cce6874bc97bba70a5aeffa7053aca3f60df93c6fab8963b4"
+    }
+  },
+  "workspace": {
+    "packageJson": {
+      "dependencies": [
+        "npm:@types/node@^26.4.0",
+        "npm:@types/pg@^8.23.1",
+        "npm:oxfmt@0.65",
+        "npm:oxlint-tsgolint@^7.0.2001",
+        "npm:oxlint@^1.80.0",
+        "npm:pg-protocol@^1.16.1",
+        "npm:pg@^8.23.1",
+        "npm:postgres@^3.4.9",
+        "npm:tsdown@~0.22.14",
+        "npm:typescript@^7.0.2",
+        "npm:vitest@^4.1.11"
+      ]
+    }
+  }
+}

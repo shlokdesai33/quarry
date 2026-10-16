@@ -1,12 +1,5 @@
-import { binaryArray } from './array-params.js';
-import { DriverError, UndefinedParameterError } from './errors.js';
+import { DriverError } from './errors.js';
 import type { WireValue } from './protocol/frontend.js';
-
-/** Turns one value's text output into a JavaScript value. */
-export type TextParser = (text: string) => unknown;
-
-/** Text parsers keyed by type OID. A type without one is returned as a string. */
-export type TypeParsers = Readonly<Record<number, TextParser>>;
 
 /** OIDs of the built-in types the driver knows. */
 export const oids = {
@@ -124,7 +117,7 @@ export function parseBytea(text: string): Uint8Array {
  */
 export function parseArray(
 	text: string,
-	parse: TextParser = (s) => s,
+	parse: (element: string) => unknown = (s) => s,
 	delimiter = ',',
 ): unknown[] {
 	let i = 0;
@@ -183,107 +176,6 @@ export function parseArray(
 	return result;
 }
 
-/** What an `arrayParser` was built from. */
-export interface ArrayParserInfo {
-	/** The element parser; undefined keeps elements as the server's text. */
-	readonly element: TextParser | undefined;
-	readonly delimiter: string;
-	/** The element type's OID, when known where the parser was built (the catalog). */
-	readonly elementOid: number | undefined;
-}
-
-const arrayParsers = new WeakMap<TextParser, ArrayParserInfo>();
-
-/**
- * A parser for array output, each element through `element` (or kept as
- * text). Unlike a hand-written `parseArray` closure, the driver recognises
- * it, so the array can be received in binary when the element type has a
- * binary decoder giving the same value.
- */
-export function arrayParser(
-	element?: TextParser,
-	delimiter = ',',
-	elementOid?: number,
-): TextParser {
-	const parse: TextParser = (text) => parseArray(text, element, delimiter);
-	arrayParsers.set(parse, { element, delimiter, elementOid });
-	return parse;
-}
-
-/** What `parser` was built from, if `arrayParser` built it. */
-export function arrayParserInfo(
-	parser: TextParser,
-): ArrayParserInfo | undefined {
-	return arrayParsers.get(parser);
-}
-
-const array = (parse?: TextParser, delimiter?: string): TextParser =>
-	arrayParser(parse, delimiter);
-
-/** Built-in text parsers. Shared, so a binary decoder can be matched to the parser it stands in for. */
-export const parseBool: TextParser = (text) => text === 't';
-export const parseInteger: TextParser = (text) => Number.parseInt(text, 10);
-export const parseFloat: TextParser = (text) => Number(text);
-export const parseBigInt: TextParser = (text) => BigInt(text);
-export const parseJson: TextParser = (text) => JSON.parse(text);
-const bool = parseBool;
-const int = parseInteger;
-const float = parseFloat;
-const bigint = parseBigInt;
-const json = parseJson;
-
-/**
- * The default parsers: lossless conversions only. int2, int4, oid and
- * floats become numbers, int8 a bigint, bool a boolean, json and jsonb are
- * parsed, bytea becomes a `Uint8Array`, and arrays of those (and of text-like
- * types) become arrays. numeric, dates, times and everything else stay as
- * the server's text, so no precision or time zone is lost.
- */
-export const defaultTypes: TypeParsers = Object.freeze({
-	[oids.bool]: bool,
-	[oids.int2]: int,
-	[oids.int4]: int,
-	[oids.oid]: int,
-	[oids.int8]: bigint,
-	[oids.float4]: float,
-	[oids.float8]: float,
-	[oids.json]: json,
-	[oids.jsonb]: json,
-	[oids.bytea]: parseBytea,
-	[arrayOids.bool]: array(bool),
-	[arrayOids.int2]: array(int),
-	[arrayOids.int4]: array(int),
-	[arrayOids.oid]: array(int),
-	[arrayOids.int8]: array(bigint),
-	[arrayOids.float4]: array(float),
-	[arrayOids.float8]: array(float),
-	[arrayOids.json]: array(json),
-	[arrayOids.jsonb]: array(json),
-	[arrayOids.bytea]: array(parseBytea),
-	[arrayOids.text]: array(),
-	[arrayOids.varchar]: array(),
-	[arrayOids.bpchar]: array(),
-	[arrayOids.char]: array(),
-	[arrayOids.name]: array(),
-	[arrayOids.uuid]: array(),
-	[arrayOids.numeric]: array(),
-	[arrayOids.date]: array(),
-	[arrayOids.time]: array(),
-	[arrayOids.timetz]: array(),
-	[arrayOids.timestamp]: array(),
-	[arrayOids.timestamptz]: array(),
-	[arrayOids.interval]: array(),
-	[arrayOids.inet]: array(),
-	[arrayOids.cidr]: array(),
-	[arrayOids.point]: array(),
-	[arrayOids.box]: array(undefined, ';'),
-	[arrayOids.daterange]: array(),
-	[arrayOids.tstzrange]: array(),
-});
-
-/** No parsers: every value is returned as the server's text, for codecs to decode. */
-export const rawTypes: TypeParsers = Object.freeze({});
-
 const pad = (n: number, width = 2) => String(n).padStart(width, '0');
 
 /**
@@ -310,12 +202,24 @@ const hexDigits = (bytes: Uint8Array): string => {
 	return out;
 };
 
+/**
+ * A number as Postgres reads it: integers without an exponent, so `1e21`
+ * is `1000000000000000000000` (which an integer type rejects as out of
+ * range rather than as malformed, and numeric reads exactly).
+ */
+export function numberText(value: number): string {
+	return Number.isInteger(value) && Math.abs(value) >= 1e21
+		? BigInt(value).toString()
+		: String(value);
+}
+
 /** The text of one value, for an array element or a text parameter. */
-function textOf(value: unknown): string {
+export function textOf(value: unknown): string {
 	switch (typeof value) {
 		case 'string':
 			return value;
 		case 'number':
+			return numberText(value);
 		case 'bigint':
 			return String(value);
 		case 'boolean':
@@ -365,7 +269,7 @@ export function encodeParam(value: unknown): WireValue {
 }
 
 /** `encodeParam` for a value already checked for `undefined`. */
-function encodeDefined(value: unknown): WireValue {
+export function encodeDefined(value: unknown): WireValue {
 	if (value === null || value === undefined) return null;
 	if (typeof value === 'string') return value;
 	if (value instanceof Uint8Array) return value;
@@ -376,51 +280,12 @@ function encodeDefined(value: unknown): WireValue {
 	return textOf(value);
 }
 
-/** The protocol counts parameters in 16 bits. */
-const MAX_PARAMETERS = 65535;
-
-const NO_TYPES: readonly number[] = [];
-const NO_VALUES: readonly WireValue[] = [];
-
-/**
- * Encodes a query's parameters with `encodeParam`, refusing `undefined`
- * (or an undefined array element) instead of sending it as NULL. An array
- * whose type `paramTypes` declares is sent in binary where the driver has
- * an encoder for it and every element fits.
- */
-export function encodeParams(
-	sql: string,
-	params: readonly unknown[],
-	paramTypes: readonly number[] = NO_TYPES,
-): readonly WireValue[] {
-	if (params.length === 0) return NO_VALUES;
-	if (params.length > MAX_PARAMETERS) {
-		throw new DriverError(
-			`A query can have at most ${MAX_PARAMETERS} parameters; this one has ${params.length}`,
-		);
-	}
-	// oxlint-disable-next-line unicorn/no-new-array -- sized up front: growing by push allocates room for 16 more
-	const values = new Array<WireValue>(params.length);
-	for (let i = 0; i < params.length; i++) {
-		const value = params[i];
-		const element = undefinedAt(value);
-		if (element !== undefined)
-			throw new UndefinedParameterError(sql, i + 1, element);
-		const type = paramTypes[i];
-		values[i] =
-			(type !== undefined && Array.isArray(value)
-				? binaryArray(value, type)
-				: undefined) ?? encodeDefined(value);
-	}
-	return values;
-}
-
 /**
  * Where `value` is `undefined`: `[]` for the value itself, the 1-based
  * indexes of an element within (nested) arrays, or `undefined` if nowhere.
  * Holes in sparse arrays count as undefined.
  */
-function undefinedAt(value: unknown): number[] | undefined {
+export function undefinedAt(value: unknown): number[] | undefined {
 	if (value === undefined) return [];
 	if (!Array.isArray(value)) return undefined;
 	for (let i = 0; i < value.length; i++) {

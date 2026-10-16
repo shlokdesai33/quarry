@@ -1,4 +1,5 @@
 import type { DataType } from './data-type/data-type.js';
+import type { Codec } from './driver/codec.js';
 import type { OperationNode } from './node.js';
 
 /**
@@ -94,10 +95,12 @@ export class TypedExpression<T, D extends DataType> extends Expression<T> {
 }
 
 /**
- * A parameter: a value sent alongside the query, whose SQL type postgres
- * infers from where it is used, as `eb.val` creates. As the array of `in` or
- * `any` / `all`, its items are encoded by the other side's SQL type, exactly
- * like a plain array's; elsewhere it is sent as is.
+ * A parameter: a value sent alongside the query, as `eb.val` creates. In a
+ * comparison it is encoded by the other side's codec (as the array of `in`
+ * or `any` / `all`, by `arrayOf` it), exactly like a plain value; as a
+ * `coalesce` fallback, by the first argument's. Elsewhere it is encoded by
+ * its own codec, if `eb.val` was given one, or by its JavaScript type, with
+ * its SQL type inferred by postgres.
  *
  * It has no SQL type of its own, so it is never a `TypedExpression`, and an
  * operand that takes a parameter does not thereby take an expression of any
@@ -125,12 +128,14 @@ export class Param<T> extends Expression<T> {
 		 * The value sent to the driver.
 		 */
 		readonly value: T;
+		/** The codec `eb.val` was given, if any. */
+		readonly codec: Codec | undefined;
 	};
 
-	constructor(value: T) {
-		const node = { kind: 'value', value } as const;
+	constructor(value: T, codec?: Codec) {
+		const node = { kind: 'value', value, codec } as const;
 		super(node);
-		this._quarry = { node, value };
+		this._quarry = { node, value, codec };
 	}
 }
 
