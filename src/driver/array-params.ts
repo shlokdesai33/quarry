@@ -1,9 +1,9 @@
 import { allocate, NodeBuffer } from './protocol/text.js';
 
 /*
- * Binary encoders for array parameters whose type is declared (a
- * `paramTypes` entry), so the server reads them with `array_recv` rather
- * than parsing a `{…}` literal. An encoder gives up (undefined) on any
+ * Binary encoders for array parameters of the built-in codecs (`arrayOf`),
+ * so the server reads them with `array_recv` rather than parsing a `{…}`
+ * literal. An encoder gives up (undefined) on any
  * element it can't encode exactly as the text path would be read, and the
  * array is then sent as a literal, as before.
  */
@@ -29,6 +29,8 @@ interface Variable {
 	readonly element: number;
 	/** jsonb's version byte, written before the text. */
 	readonly prefix: number | undefined;
+	/** jsonb: elements are JSON values to stringify (`values`), or already JSON text. */
+	readonly json: boolean;
 }
 
 /** bytea: byte arrays as they are. */
@@ -143,11 +145,11 @@ const codecs: Readonly<Record<number, Codec>> = {
 	// uuid[]
 	2951: fixed(2950, 16, writeUuid),
 	// text[], varchar[], bpchar[]
-	1009: { kind: 'variable', element: 25, prefix: undefined },
-	1015: { kind: 'variable', element: 1043, prefix: undefined },
-	1014: { kind: 'variable', element: 1042, prefix: undefined },
-	// jsonb[]: values are JSON text, as quarry sends them
-	3807: { kind: 'variable', element: 3802, prefix: 1 },
+	1009: { kind: 'variable', element: 25, prefix: undefined, json: false },
+	1015: { kind: 'variable', element: 1043, prefix: undefined, json: false },
+	1014: { kind: 'variable', element: 1042, prefix: undefined, json: false },
+	// jsonb[]: each element as its JSON text
+	3807: { kind: 'variable', element: 3802, prefix: 1, json: true },
 	// bytea[]
 	1001: { kind: 'bytes', element: 17 },
 };
@@ -201,8 +203,13 @@ function encodeFixed(
 
 function encodeVariable(
 	codec: Variable,
-	values: readonly unknown[],
+	input: readonly unknown[],
+	jsonValues: boolean,
 ): Uint8Array | undefined {
+	const values =
+		codec.json && jsonValues
+			? input.map((value) => (value === null ? value : JSON.stringify(value)))
+			: input;
 	const prefix = codec.prefix === undefined ? 0 : 1;
 	let size = 20;
 	let nulls = false;
@@ -279,11 +286,13 @@ function encodeBytes(
 /**
  * `values` in binary for the array type `arrayOid`, or undefined when the
  * type has no encoder or an element doesn't fit it (nested arrays, a value
- * of another JavaScript type, out of range).
+ * of another JavaScript type, out of range). jsonb elements are JSON text,
+ * or with `jsonValues`, JSON values to stringify.
  */
 export function binaryArray(
 	values: readonly unknown[],
 	arrayOid: number,
+	jsonValues = false,
 ): Uint8Array | undefined {
 	const codec = codecs[arrayOid];
 	if (codec === undefined) return undefined;
@@ -291,7 +300,7 @@ export function binaryArray(
 		case 'fixed':
 			return encodeFixed(codec, values);
 		case 'variable':
-			return encodeVariable(codec, values);
+			return encodeVariable(codec, values, jsonValues);
 		case 'bytes':
 			return encodeBytes(codec, values);
 	}

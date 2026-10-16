@@ -1,6 +1,13 @@
 /* oxlint-disable no-await-in-loop -- tests run their steps in order */
 import { inspect } from 'node:util';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import {
+	afterAll,
+	beforeAll,
+	describe,
+	expect,
+	expectTypeOf,
+	it,
+} from 'vitest';
 import {
 	array,
 	bigint,
@@ -22,6 +29,8 @@ import {
 import { defineEnum } from '../../../src/define-enum.js';
 import { defineTable } from '../../../src/define-table.js';
 import type { QueryEvent } from '../../../src/driver-executor.js';
+import { defineCodec } from '../../../src/driver/codec.js';
+import { codecs } from '../../../src/driver/codecs.js';
 import { createPool, type Pool } from '../../../src/driver/pool.js';
 import {
 	DriverError,
@@ -463,15 +472,20 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				'create table items (id int generated always as identity primary key, n int not null)',
 			);
 			let decoded = 0;
-			const counting = database(pool, {
-				types: {
-					23: (value: string) => {
-						decoded++;
-						return Number(value);
-					},
+			const counted = defineCodec({
+				name: 'int4',
+				oid: 23,
+				encode: (value: number) => String(value),
+				decodeText: (digits) => {
+					decoded++;
+					return Number(digits);
 				},
 			});
-			const none = counting.selectFrom(items).select(['items.n']);
+			const countedItems = defineTable('items', {
+				columns: { id: integer().identity(), n: integer().useCodec(counted) },
+			});
+			const counting = db;
+			const none = counting.selectFrom(countedItems).select(['items.n']);
 			expect(await none.takeFirst().execute()).toBeUndefined();
 			expect(await none.takeValue().execute()).toBeUndefined();
 			await expect(none.expectFirst().execute()).rejects.toBeInstanceOf(
@@ -482,14 +496,14 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 			);
 			expect(await none.expectAtMostOne().execute()).toBeUndefined();
 			const inserted = await counting
-				.insertInto(items)
+				.insertInto(countedItems)
 				.values([1, 2, 3, 4, 5].map((n) => ({ n })))
 				.returning(['items.n'])
 				.expectNonEmpty()
 				.execute();
 			expect(inserted).toHaveLength(5);
 
-			const ns = counting.selectFrom(items).select(['items.n']);
+			const ns = counting.selectFrom(countedItems).select(['items.n']);
 			decoded = 0;
 			expect(await ns.takeFirst().execute()).toEqual({
 				n: expect.any(Number),
@@ -662,21 +676,39 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 			).toMatchObject({ id: expect.any(Number) });
 		});
 
-		it('leaves opted-in types as text', async () => {
-			const raw = database(pool, {
-				raw: ['timestamptz', 'daterange', 'vector'],
+		it('leaves columns given the raw codec as the server’s text, typed as strings', async () => {
+			const rawUsers = defineTable('users', {
+				columns: {
+					id: integer().identity(),
+					createdAt: timestamptz().name('created_at').useCodec(codecs.raw),
+					active: daterange().useCodec(codecs.raw),
+					embedding: vector().nullable().useCodec(codecs.raw),
+				},
 			});
-			const row = await raw
-				.selectFrom(users)
+			const row = await db
+				.selectFrom(rawUsers)
 				.select(['users.createdAt', 'users.active', 'users.embedding'])
 				.where('users.id', 1)
 				.expectOne()
 				.execute();
+			expectTypeOf(row).toEqualTypeOf<{
+				createdAt: string;
+				active: string;
+				embedding: string | null;
+			}>();
 			expect(row).toEqual({
 				createdAt: '2024-01-02 03:04:05.678+00',
 				active: '[2024-01-01,2024-02-01)',
 				embedding: '[1,2.5,3]',
 			});
+			// and written as they are: the server reads the text as the column's type
+			const found = await db
+				.selectFrom(rawUsers)
+				.select(['users.id'])
+				.where('users.createdAt', '2024-01-02 03:04:05.678+00')
+				.takeFirst()
+				.execute();
+			expect(found).toEqual({ id: 1 });
 		});
 
 		it('verifies the schema through the driver', async () => {

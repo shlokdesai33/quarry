@@ -11,17 +11,27 @@ import type {
 	TableNode,
 	UpdateNode,
 } from './node.js';
-import { arrayOids } from './driver/types.js';
+import { arrayOf, type Codec } from './driver/codec.js';
 
 export interface CompiledQuery {
 	readonly sql: string;
+	/** The parameters' values, as given. */
 	readonly params: readonly unknown[];
 	/**
-	 * Type OIDs declared for the parameters, 0 where the server infers the
-	 * type; absent when none is declared. Only arrays are declared, where
-	 * the type is certain, so the driver can send them in binary.
+	 * The driver codec of each parameter, by position: chosen by the column
+	 * or expression it is compared with or written to, so the driver
+	 * encodes it once and declares its type. `undefined` where nothing
+	 * types it (`eb.val` on its own); absent when no parameter has one.
+	 * Like `resultCodecs`, not enumerable: a copy made by spreading the
+	 * query leaves the values to the driver's defaults.
 	 */
-	readonly paramTypes?: readonly number[];
+	readonly paramCodecs?: readonly (Codec | undefined)[];
+	/**
+	 * The codec of each result column, by position, where its SQL type is
+	 * known; `null` elsewhere. The driver asks for each column in its
+	 * codec's format from the first run, and reads it with that codec.
+	 */
+	readonly resultCodecs?: readonly (Codec | null)[];
 	/** The query's label from `tag()`, if any. It is not part of `sql`. */
 	readonly tag?: string;
 }
@@ -39,7 +49,7 @@ export type StatementNode =
  * is carried over as is.
  */
 export function compile(node: StatementNode): CompiledQuery {
-	const params: Params = { values: [], types: [] };
+	const params: Params = { values: [], codecs: [], typed: false };
 	let sql: string;
 	switch (node.kind) {
 		case 'insert':
@@ -55,43 +65,46 @@ export function compile(node: StatementNode): CompiledQuery {
 			sql = render(node, params);
 	}
 	const tag = 'tag' in node ? node.tag : undefined;
-	return {
+	const selections =
+		node.kind === 'select'
+			? node.selections
+			: node.kind === 'insert' ||
+				  node.kind === 'update' ||
+				  node.kind === 'delete'
+				? node.returning
+				: [];
+	const resultCodecs = selections.map((s) => s.codec ?? null);
+	const query: CompiledQuery = {
 		sql,
 		params: params.values,
-		...(params.types.some((type) => type !== 0)
-			? { paramTypes: params.types }
-			: {}),
 		...(tag === undefined ? {} : { tag }),
 	};
+	// not enumerable: what the executor reads, kept out of logs and comparisons
+	if (params.typed) hide(query, 'paramCodecs', params.codecs);
+	if (resultCodecs.some((codec) => codec !== null))
+		hide(query, 'resultCodecs', resultCodecs);
+	return query;
 }
 
-/** The parameters rendered so far, and the type OID declared for each (0 for none). */
+function hide(query: CompiledQuery, key: string, value: unknown): void {
+	Object.defineProperty(query, key, { value, enumerable: false });
+}
+
+/** The parameters rendered so far, and the codec of each. */
 interface Params {
 	readonly values: unknown[];
-	readonly types: number[];
+	readonly codecs: (Codec | undefined)[];
+	/** Whether any parameter has a codec. */
+	typed: boolean;
 }
 
 /** Adds a parameter and returns its placeholder. */
-function param(params: Params, value: unknown, type = 0): string {
+function param(params: Params, value: unknown, codec?: Codec): string {
 	params.values.push(value);
-	params.types.push(type);
+	params.codecs.push(codec);
+	if (codec !== undefined) params.typed = true;
 	return `$${params.values.length}`;
 }
-
-/** The array types `unnest` declares, by the cast's element type: those the driver sends in binary. */
-const unnestTypes: Readonly<Record<string, number>> = {
-	smallint: arrayOids.int2,
-	integer: arrayOids.int4,
-	bigint: arrayOids.int8,
-	'double precision': arrayOids.float8,
-	boolean: arrayOids.bool,
-	timestamptz: arrayOids.timestamptz,
-	text: arrayOids.text,
-	varchar: arrayOids.varchar,
-	uuid: arrayOids.uuid,
-	jsonb: arrayOids.jsonb,
-	bytea: arrayOids.bytea,
-};
 
 /** Whether rows can go as one array parameter per column: plain values only, no defaults, no array columns. */
 function unnestable(rows: RowsNode): boolean {
@@ -106,13 +119,16 @@ function unnestable(rows: RowsNode): boolean {
 function renderUnnest(rows: RowsNode, params: Params): string {
 	const arrays = rows.columns.map((_, i) => {
 		const type = rows.types[i] ?? '';
+		const codec = rows.codecs[i];
 		const placeholder = param(
 			params,
 			rows.rows.map((row) => {
 				const cell = row[i];
 				return cell?.kind === 'value' ? cell.value : null;
 			}),
-			unnestTypes[type],
+			codec === undefined || codec.element !== undefined
+				? undefined
+				: arrayOf(codec),
 		);
 		return `${placeholder}::${type}[]`;
 	});
@@ -236,7 +252,7 @@ function render(node: OperationNode, params: Params): string {
 		case 'reference':
 			return `${identifier(node.table)}.${identifier(node.column)}`;
 		case 'value':
-			return param(params, node.value, node.typeOid);
+			return param(params, node.value, node.codec);
 		case 'value_list':
 			return `(${node.values.map((value) => render(value, params)).join(', ')})`;
 		case 'literal':

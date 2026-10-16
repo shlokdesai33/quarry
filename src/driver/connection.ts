@@ -45,6 +45,7 @@ import {
 	type Statement,
 } from './ops.js';
 import * as fe from './protocol/frontend.js';
+import type { WireValue } from './protocol/frontend.js';
 import type { BackendMessage } from './protocol/messages.js';
 import { ChannelNames, decodeNotification, Reader } from './protocol/reader.js';
 import { Writer } from './protocol/writer.js';
@@ -53,23 +54,54 @@ import { asResult, asResultPromise, asRows, type RowMode } from './rows.js';
 import type { DriverSocket } from './socket.js';
 import { startQuerySpan } from './telemetry.js';
 import { Transaction, type TransactionOptions } from './transaction.js';
+import type { Codec } from './codec.js';
 import {
-	copyChunks,
-	defaultTypes,
 	encodeParams,
-	type TypeParsers,
-} from './types.js';
+	paramOids,
+	unresolvedParams,
+	type ParamCodecs,
+} from './params.js';
+import {
+	catalogQuery,
+	CodecRegistry,
+	createCodecRegistry,
+	defaultRegistry,
+	parsersRegistry,
+	type CatalogType,
+} from './registry.js';
+import type { ResultCodecs } from './results.js';
+import { copyChunks, type TypeParsers } from './types.js';
 
 export interface QueryOptions {
 	/** `object` (default) rows keyed by column name, or positional `array` rows. */
 	readonly rowMode?: RowMode;
-	/** Parsers for this query, overriding the connection's. */
+	/**
+	 * Codecs for this query's result columns, by type OID, over the
+	 * connection's: a registry (`createCodecRegistry`), or a list.
+	 */
+	readonly codecs?: CodecRegistry | readonly Codec[];
+	/** Text parsers by type OID for this query, instead of the connection's codecs (see `ConnectionOptions.types`). */
 	readonly types?: TypeParsers;
 	/** Use a cached named prepared statement (default: the connection's `prepare` option). */
 	readonly prepare?: boolean;
 	/**
+	 * The codec of each parameter, by position (as `typed` gives one): the
+	 * value is encoded by it, and its type declared unless the codec leaves
+	 * it to the server. A missing entry is encoded by its JavaScript type.
+	 */
+	readonly paramCodecs?: ParamCodecs;
+	/**
+	 * The codec each result column is expected in, by position: asked for
+	 * in its format from the first run (binary where it reads it so), and
+	 * read with it while the column has its type. A missing entry, or a
+	 * column of another type, is read with the registry's codec for its
+	 * type.
+	 */
+	readonly resultCodecs?: ResultCodecs;
+	/**
 	 * Parameter type OIDs; 0 or missing entries let the server infer. An
 	 * array whose type is declared here is sent in binary where it can be.
+	 * A parameter's codec declares its type itself.
 	 */
 	readonly paramTypes?: readonly number[];
 	/** Cancels the query when aborted. A query not yet sent is dropped without contacting the server. */
@@ -88,9 +120,10 @@ export interface QueryOptions {
 	/** A label for telemetry: the span name and `db.query.summary` (quarry's `tag()`). */
 	readonly tag?: string;
 	/**
-	 * Ask for binary results for columns whose parser has a binary twin
-	 * (default: the connection's `binaryResults`). Values decode the same;
-	 * only cached statements, from their second run, use it.
+	 * Ask for binary results for columns whose codec reads them so (default:
+	 * the connection's `binaryResults`). Values decode the same. Columns
+	 * with an expected codec (`resultCodecs`) get it from the first run;
+	 * others once a cached statement's columns are known.
 	 */
 	readonly binary?: boolean;
 	/**
@@ -145,7 +178,6 @@ export class Connection implements AsyncDisposable {
 	readonly #info: OpenInfo;
 	readonly #reader: Reader;
 	readonly #writer = new Writer();
-	readonly #types: TypeParsers;
 	readonly #queue = new Queue<Op>();
 	/** How many operations at the front of the queue have been written. */
 	#written = 0;
@@ -206,7 +238,6 @@ export class Connection implements AsyncDisposable {
 		this.#config = config;
 		this.#info = info;
 		this.#reader = new Reader(config.maxMessageSize);
-		this.#types = config.types ?? defaultTypes;
 		this.#protocolMinor = info.version & 0xffff;
 		this.#closedPromise = new Promise((resolve) => {
 			this.#resolveClosed = resolve;
@@ -224,7 +255,8 @@ export class Connection implements AsyncDisposable {
 		});
 		this.#ctx = {
 			writer: this.#writer,
-			types: this.#types,
+			registry: config.registry,
+			catalog: config.catalog,
 			statement: (sql, types, named) => this.#statement(sql, types, named),
 			// alone: nothing else in flight or waiting on the connection, nor
 			// another statement under its Sync that may be named
@@ -770,8 +802,7 @@ export class Connection implements AsyncDisposable {
 			fields: undefined,
 			paramTypes: undefined,
 			error: undefined,
-			decoders: new Map(),
-			plans: new Map(),
+			plans: [],
 		};
 		if (this.#statements.size >= this.#config.statementCacheSize) {
 			let oldest: Statement | undefined;
@@ -873,18 +904,102 @@ export class Connection implements AsyncDisposable {
 	}
 
 	#options(options: QueryOptions | undefined): QueryOpOptions {
-		if (options === undefined)
-			return (this.#defaultOptions ??= this.#options({}));
+		if (
+			options === undefined ||
+			(options.codecs === undefined &&
+				options.types === undefined &&
+				options.resultCodecs === undefined &&
+				options.prepare === undefined &&
+				options.binary === undefined &&
+				options.keepRows === undefined &&
+				options.rowMode === undefined)
+		)
+			return (this.#defaultOptions ??= this.#optionsOf({}));
+		return this.#optionsOf(options);
+	}
+
+	#optionsOf(options: QueryOptions): QueryOpOptions {
 		return {
-			rowMode: options?.rowMode ?? 'object',
-			types: options?.types,
+			rowMode: options.rowMode ?? 'object',
+			registry: this.#registryOf(options),
+			resultCodecs: options.resultCodecs,
 			prepare:
-				(options?.prepare ?? this.#config.prepare) &&
+				(options.prepare ?? this.#config.prepare) &&
 				this.#config.statementCacheSize > 0,
-			paramTypes: options?.paramTypes ?? [],
-			binary: options?.binary ?? this.#config.binaryResults,
-			keepRows: options?.keepRows ?? Infinity,
+			binary: options.binary ?? this.#config.binaryResults,
+			keepRows: options.keepRows ?? Infinity,
 		};
+	}
+
+	/** The registry a query's options name; undefined for the connection's. */
+	#registryOf(
+		options: Pick<QueryOptions, 'codecs' | 'types'> | undefined,
+	): CodecRegistry | undefined {
+		const codecs = options?.codecs;
+		if (codecs instanceof CodecRegistry) return codecs;
+		if (codecs !== undefined) {
+			let registry = listRegistries.get(codecs);
+			if (registry === undefined) {
+				registry = createCodecRegistry(codecs, this.#config.registry);
+				listRegistries.set(codecs, registry);
+			}
+			return registry;
+		}
+		return options?.types === undefined
+			? undefined
+			: parsersRegistry(options.types);
+	}
+
+	/** Encodes a query's parameters with their codecs, and the type OIDs they declare. */
+	#encode(
+		sql: string,
+		params: readonly unknown[],
+		options: QueryOptions | undefined,
+	): { values: readonly WireValue[]; types: readonly number[] } {
+		const codecs = options?.paramCodecs;
+		const paramTypes = options?.paramTypes;
+		return {
+			values: encodeParams(sql, params, codecs, paramTypes),
+			types: paramOids(params, codecs, paramTypes, this.#config.catalog),
+		};
+	}
+
+	/**
+	 * Loads the catalog behind a query that needs it (a codec for a type
+	 * looked up by name): after the query, which goes out with that type
+	 * inferred and its columns read as text, so queries keep their order.
+	 */
+	#loadTypesAfter(
+		params: readonly unknown[],
+		options: QueryOptions | undefined,
+	): void {
+		const catalog = this.#config.catalog;
+		if (catalog.loaded || catalog.loading || this.#status === 'E') return;
+		const registry = this.#registryOf(options) ?? this.#config.registry;
+		let needed =
+			registry.needsCatalog ||
+			unresolvedParams(params, options?.paramCodecs, catalog);
+		needed ||=
+			options?.resultCodecs?.some(
+				(codec) =>
+					codec !== undefined && codec !== null && catalog.unresolved(codec),
+			) ?? false;
+		if (needed) this.loadTypes().catch(() => {});
+	}
+
+	/**
+	 * Looks up the types the codecs name (enums, domains, extension types
+	 * and their arrays) in `pg_type`, once for the pool: queries then declare
+	 * their parameters' types and read their columns in binary. Queries load
+	 * it on their own the first time they need it; this loads it before.
+	 */
+	loadTypes(): Promise<void> {
+		return this.#config.catalog.load(() =>
+			this.#query<CatalogType>(catalogQuery, [], {
+				prepare: false,
+				codecs: defaultRegistry,
+			}).then(({ rows }) => rows),
+		);
 	}
 
 	// --- public API --------------------------------------------------------
@@ -989,10 +1104,12 @@ export class Connection implements AsyncDisposable {
 		try {
 			const invalid = invalidSql(sql);
 			if (invalid) throw invalid;
+			const { values, types } = this.#encode(sql, params, options);
 			op = new QueryOp(
 				sql,
 				params,
-				encodeParams(sql, params, options?.paramTypes),
+				values,
+				types,
 				this.#options(options),
 				resolve,
 				reject,
@@ -1000,6 +1117,7 @@ export class Connection implements AsyncDisposable {
 			op.onTiming = options?.onTiming;
 			op.onDone = onDone;
 			this.#enqueue(op, options?.signal, options?.timeout);
+			if (!this.#config.catalog.loaded) this.#loadTypesAfter(params, options);
 		} catch (error) {
 			// thrown before the operation was queued: nothing else ends it
 			if (op === undefined) onDone?.();
@@ -1023,19 +1141,19 @@ export class Connection implements AsyncDisposable {
 		const results = statements.map(
 			({ sql, params = [], options }) =>
 				new Promise<QueryResult<unknown>>((resolve, reject) => {
-					let values;
+					let encoded;
 					if (invalid === undefined) {
 						const error = invalidSql(sql);
 						if (error) invalid = { error };
 						else {
 							try {
-								values = encodeParams(sql, params);
+								encoded = this.#encode(sql, params, options);
 							} catch (caught) {
 								invalid = { error: caught };
 							}
 						}
 					}
-					if (invalid !== undefined || values === undefined) {
+					if (invalid !== undefined || encoded === undefined) {
 						reject(invalid?.error);
 						return;
 					}
@@ -1043,7 +1161,8 @@ export class Connection implements AsyncDisposable {
 						new QueryOp(
 							sql,
 							params,
-							values,
+							encoded.values,
+							encoded.types,
 							this.#options(options),
 							(result) => resolve(asResult(result)),
 							reject,
@@ -1054,6 +1173,10 @@ export class Connection implements AsyncDisposable {
 				}),
 		);
 		if (ops.length > 0) this.#enqueue(new SyncGroupOp(ops), signal);
+		if (!this.#config.catalog.loaded) {
+			for (const { params = [], options } of statements)
+				this.#loadTypesAfter(params, options);
+		}
 		if (this.#config.telemetry === undefined && !this.#config.captureStack)
 			return results;
 		return results.map((result, i) =>
@@ -1133,7 +1256,7 @@ export class Connection implements AsyncDisposable {
 		sql: string,
 		options?: Pick<
 			QueryOptions,
-			'rowMode' | 'types' | 'signal' | 'timeout' | 'tag'
+			'rowMode' | 'codecs' | 'types' | 'signal' | 'timeout' | 'tag'
 		>,
 	): Promise<QueryResult<R>[]> {
 		if (this.#config.telemetry === undefined && !this.#config.captureStack)
@@ -1149,7 +1272,10 @@ export class Connection implements AsyncDisposable {
 	#simpleQuery<R>(
 		sql: string,
 		options:
-			| Pick<QueryOptions, 'rowMode' | 'types' | 'signal' | 'timeout'>
+			| Pick<
+					QueryOptions,
+					'rowMode' | 'codecs' | 'types' | 'signal' | 'timeout'
+			  >
 			| undefined,
 	): Promise<QueryResult<R>[]> {
 		return new Promise((resolve, reject) => {
@@ -1160,7 +1286,7 @@ export class Connection implements AsyncDisposable {
 			}
 			const op = new SimpleQueryOp(
 				sql,
-				options?.types,
+				this.#registryOf(options),
 				options?.rowMode ?? 'object',
 				(results) => resolve(results.map((r) => asResult<R>(r))),
 				reject,
@@ -1208,10 +1334,12 @@ export class Connection implements AsyncDisposable {
 		}
 		return {
 			[Symbol.asyncIterator]: () => {
+				const { values, types } = this.#encode(sql, params, options);
 				const op = new CursorOp(
 					sql,
 					params,
-					encodeParams(sql, params, options?.paramTypes),
+					values,
+					types,
 					this.#options(options),
 					options?.batchSize ?? 1000,
 				);
@@ -1226,6 +1354,8 @@ export class Connection implements AsyncDisposable {
 						original(error);
 					};
 					this.#enqueue(op, options?.signal, options?.timeout);
+					if (!this.#config.catalog.loaded)
+						this.#loadTypesAfter(params, options);
 				};
 				return {
 					next: async (): Promise<IteratorResult<R[]>> => {
@@ -1543,7 +1673,10 @@ const capture = (
 	capturedReject = reject;
 };
 
-/** The statement cache's key: the SQL, prefixed with explicit parameter types. */
+/** Registries of the codec lists queries name, made once per list. */
+const listRegistries = new WeakMap<readonly Codec[], CodecRegistry>();
+
+/** The statement cache's key: the SQL, prefixed with the parameter types declared. */
 function statementKey(sql: string, types: readonly number[]): string {
 	return types.length === 0 ? sql : `${types.join(',')}\0${sql}`;
 }

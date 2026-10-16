@@ -903,11 +903,23 @@ export class Pool implements AsyncDisposable {
 
 	simpleQuery<R = Record<string, unknown>>(
 		sql: string,
-		options?: Pick<QueryOptions, 'rowMode' | 'types' | 'signal' | 'timeout'>,
+		options?: Pick<
+			QueryOptions,
+			'rowMode' | 'codecs' | 'types' | 'signal' | 'timeout'
+		>,
 	): Promise<QueryResult<R>[]> {
 		return this.#withShared(options?.signal, (connection) =>
 			connection.simpleQuery<R>(sql, options),
 		);
+	}
+
+	/**
+	 * Looks up the types the pool's and queries' codecs name in `pg_type`,
+	 * once for the pool; see `Connection.loadTypes`.
+	 */
+	loadTypes(): Promise<void> {
+		if (this.#config.catalog.loaded) return Promise.resolve();
+		return this.#withShared(undefined, (connection) => connection.loadTypes());
 	}
 
 	describe(

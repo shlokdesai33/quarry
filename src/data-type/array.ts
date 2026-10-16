@@ -1,8 +1,10 @@
+import { arrayOf } from '../driver/codec.js';
 import { DataType } from './data-type.js';
 
 /**
- * An array of `E`, e.g. `text[]`. Elements are encoded by `E`, so an array
- * of ranges or of jsonb is sent as the element literals postgres expects.
+ * An array of `E`, e.g. `text[]`. Its codec is `arrayOf` the element's, so
+ * an array of ranges or of jsonb is sent as the element literals postgres
+ * expects, and read back element by element.
  *
  * Postgres has no arrays of arrays: `integer[][]` is the same type as
  * `integer[]`, with the dimensions as metadata on the value. So `E` is never
@@ -20,13 +22,7 @@ export class ArrayType<E extends DataType> extends DataType<'array'> {
 	 * @param element the type of the elements.
 	 */
 	constructor(element: E) {
-		super('array');
+		super('array', { codec: arrayOf(element.codec) });
 		this.element = element;
-	}
-
-	override serialize(value: unknown) {
-		return Array.isArray(value)
-			? value.map((item: unknown) => this.element.serialize(item))
-			: value;
 	}
 }

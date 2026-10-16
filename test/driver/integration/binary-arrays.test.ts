@@ -16,18 +16,16 @@ import {
 } from '../../../src/column-factories.js';
 import { compile } from '../../../src/compile.js';
 import { database, type Database } from '../../../src/database.js';
-import { quarryTypes } from '../../../src/decode.js';
 import { defineTable } from '../../../src/define-table.js';
 import { binaryArray } from '../../../src/driver/array-params.js';
 import type { Connection } from '../../../src/driver/connection.js';
 import { PostgresError } from '../../../src/driver/errors.js';
-import {
-	catalogQuery,
-	catalogTypes,
-	parseVector,
-	type CatalogType,
-} from '../../../src/driver/parsers.js';
+import { parseVector } from '../../../src/driver/parsers.js';
 import { createPool, type Pool } from '../../../src/driver/pool.js';
+import {
+	defaultRegistry,
+	type CodecRegistry,
+} from '../../../src/driver/registry.js';
 import {
 	arrayLiteral,
 	arrayOids,
@@ -37,6 +35,7 @@ import {
 	parseInteger,
 	type TypeParsers,
 } from '../../../src/driver/types.js';
+import { quarryRegistry } from '../../../src/kind-codecs.js';
 import { noPg, open, options, pg, table } from './helpers.js';
 
 const hasVector = pg?.extensions.includes('vector') ?? false;
@@ -62,10 +61,18 @@ afterAll(async () => {
 });
 
 /** The rows of `sql` in text, and in binary (from its second run), on one connection. */
-async function bothWays(c: Connection, sql: string, types: TypeParsers) {
-	const asText = await c.query(sql, [], { types, binary: false });
-	await c.query(sql, [], { types }); // describes the statement
-	const binary = await c.query(sql, [], { types });
+async function bothWays(
+	c: Connection,
+	sql: string,
+	codecs: CodecRegistry | TypeParsers,
+) {
+	const read =
+		codecs instanceof Object && 'codecFor' in codecs
+			? { codecs }
+			: { types: codecs };
+	const asText = await c.query(sql, [], { ...read, binary: false });
+	await c.query(sql, [], read); // describes the statement
+	const binary = await c.query(sql, [], read);
 	return {
 		text: asText.rows,
 		binary: binary.rows,
@@ -99,18 +106,17 @@ order by id`;
 
 describe.skipIf(noPg)('binary arrays', () => {
 	let c: Connection;
-	let catalog: CatalogType[];
 
 	beforeAll(async () => {
 		c = await open(here);
-		catalog = (await c.query<CatalogType>(catalogQuery)).rows;
+		await c.loadTypes();
 	});
 	afterAll(async () => {
 		await c?.close();
 	});
 
-	it('decodes arrays in binary exactly as from text, with quarry’s parsers', async () => {
-		const types = catalogTypes(quarryTypes, catalog);
+	it('decodes arrays in binary exactly as from text, with quarry’s codecs', async () => {
+		const types = quarryRegistry;
 		const {
 			text: asText,
 			binary,
@@ -165,7 +171,7 @@ describe.skipIf(noPg)('binary arrays', () => {
 	});
 
 	it('decodes arrays in binary exactly as from text, with the driver’s defaults', async () => {
-		const types = catalogTypes(defaultTypes, catalog);
+		const types = defaultRegistry;
 		const {
 			text: asText,
 			binary,
@@ -173,7 +179,7 @@ describe.skipIf(noPg)('binary arrays', () => {
 		} = await bothWays(c, RESULT_ARRAYS, types);
 		expect(formats['i8']).toBe(1);
 		expect(formats['t']).toBe(1);
-		// defaultTypes leave timestamptz as text, and so its arrays
+		// the default codecs leave timestamptz as text, and so its arrays
 		expect(formats['ts']).toBe(0);
 		expect(binary).toEqual(asText);
 		expect(binary[0]?.['i8']).toEqual([
@@ -188,8 +194,9 @@ describe.skipIf(noPg)('binary arrays', () => {
 
 	it('keeps arrays in text for custom, hand-written or raw parsers', async () => {
 		const sql = `select '{1,2}'::int4[] as mine, '{3}'::int4[] as theirs, '{a}'::text[] as raw, '{4}'::int2[] as custom`;
-		const types = {
-			...quarryTypes,
+		const { [arrayOids.text]: _text, ...rest } = defaultTypes;
+		const types: TypeParsers = {
+			...rest,
 			[arrayOids.int4]: (t: string) => parseArray(t, parseInteger),
 			[arrayOids.int2]: arrayParser((t) => `#${t}`),
 		};
@@ -203,8 +210,7 @@ describe.skipIf(noPg)('binary arrays', () => {
 	it.skipIf(!hasVector)(
 		'decodes vectors in binary as the float32 values text gives',
 		async () => {
-			const vectors = (await c.query<CatalogType>(catalogQuery)).rows;
-			const types = catalogTypes(quarryTypes, vectors);
+			const types = quarryRegistry;
 			const sql = `select '[0.1,1e-45,3.4028235e38,-0,1,-2.5]'::vector as v,
 				array['[1,0.2]'::vector, null] as va, '[0.1,2]'::halfvec as h
 				union all select '[3]', '{}', null`;
@@ -231,10 +237,7 @@ describe.skipIf(noPg)('binary arrays', () => {
 		const floats = Array.from(new Float32Array(bits.buffer)).filter((f) =>
 			Number.isFinite(f),
 		);
-		const types = catalogTypes(
-			quarryTypes,
-			(await c.query<CatalogType>(catalogQuery)).rows,
-		);
+		const codecs = quarryRegistry;
 		for (let i = 0; i < floats.length; i += 16_000) {
 			const chunk = floats.slice(i, i + 16_000);
 			const sql = `select $1::float4[]::vector as v`;
@@ -242,11 +245,11 @@ describe.skipIf(noPg)('binary arrays', () => {
 			const { rows: textRows } = await c.query<{ v: number[] }>(
 				sql,
 				[literal],
-				{ types, binary: false },
+				{ codecs, binary: false },
 			);
-			await c.query(sql, [literal], { types });
+			await c.query(sql, [literal], { codecs });
 			const { rows } = await c.query<{ v: number[] }>(sql, [literal], {
-				types,
+				codecs,
 			});
 			expect(rows[0]?.v).toEqual(chunk);
 			expect(textRows[0]?.v).toEqual(chunk);
@@ -382,12 +385,12 @@ describe.skipIf(noPg)('binary arrays', () => {
 					const binary = await c.query<{ v: unknown; same: boolean }>(
 						sql,
 						[value, arrayLiteral(value)],
-						{ paramTypes: [oid], types: quarryTypes },
+						{ paramTypes: [oid], codecs: quarryRegistry },
 					);
 					const asText = await c.query<{ v: unknown }>(
 						`select $1::${type}[] as v`,
 						[value],
-						{ types: quarryTypes },
+						{ codecs: quarryRegistry },
 					);
 					expect(binary.rows[0]?.same).toBe(true);
 					expect(binary.rows[0]?.v).toEqual(asText.rows[0]?.v);
@@ -428,15 +431,15 @@ describe.skipIf(noPg)('binary arrays', () => {
 				[['1'], ['+1'], ['a0eebc999c0b4ef8bb6d6bb9bd380a11'], [1]],
 				{
 					paramTypes: [arrayOids.int4, arrayOids.int8, arrayOids.uuid],
-					types: quarryTypes,
+					codecs: quarryRegistry,
 				},
 			);
 			expect(rows).toEqual([
 				{
 					a: [1],
 					b: ['1'],
-					c: '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}',
-					d: '{1}',
+					c: ['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'],
+					d: ['1'],
 				},
 			]);
 			await expect(
@@ -460,7 +463,7 @@ describe.skipIf(noPg)('binary arrays', () => {
 			const { rows } = await c.query<{ v: number[] }>(
 				'select $1::float8[] as v',
 				[[-0]],
-				{ paramTypes: [arrayOids.float8], types: quarryTypes },
+				{ paramTypes: [arrayOids.float8], codecs: quarryRegistry },
 			);
 			expect(Object.is(rows[0]?.v[0], 0)).toBe(true);
 		});
@@ -567,8 +570,20 @@ describe.skipIf(noPg)('quarry’s binary array parameters', () => {
 
 	it('inserts many rows in binary, as single-row inserts store them', async () => {
 		const query = compile(db.insertInto(items).values(rows).toNode());
-		expect(query.paramTypes).toEqual([
-			1007, 1015, 1005, 1016, 1022, 1000, 1185, 1009, 2951, 3807, 1001,
+		// each column as an array of its codec: binary where the driver has an
+		// encoder, text-like ones as literals of a type the server infers
+		expect(query.paramCodecs?.map((codec) => codec?.paramFormat)).toEqual([
+			'binary',
+			'text',
+			'binary',
+			'binary',
+			'binary',
+			'binary',
+			'binary',
+			'text',
+			'binary',
+			'binary',
+			'binary',
 		]);
 		await db.insertInto(items).values(rows).execute();
 		for (const row of rows) await pool.query(SINGLE_INSERT, singleValues(row));
@@ -606,7 +621,7 @@ describe.skipIf(noPg)('quarry’s binary array parameters', () => {
 		const { rows: stored } = await pool.query(
 			'select id, big, at, flag from items where id = any($1) order by id',
 			[[1, 2]],
-			{ types: quarryTypes },
+			{ codecs: quarryRegistry },
 		);
 		expect(stored).toEqual([
 			{ id: 1, big: '1', at: new Date(0), flag: null },

@@ -1,20 +1,19 @@
 import type { CompiledQuery } from './compile.js';
-import { completedTypes, initialTypes, type RawTypes } from './decode.js';
 import {
-	catalogQuery,
 	Connection,
-	defaultTypes,
+	createCodecRegistry,
 	DriverError,
 	Pool,
 	PoolClient,
 	PostgresError,
 	Transaction,
-	type CatalogType,
+	type Codec,
+	type CodecRegistry,
 	type Description,
 	type OpTiming,
 	type QueryResult,
-	type TypeParsers,
 } from './driver/index.js';
+import { quarryRegistry } from './kind-codecs.js';
 import type {
 	BatchQuery,
 	ExecuteBatchOptions,
@@ -53,18 +52,19 @@ export interface QueryEvent {
 /** How a database decodes, reports and annotates its queries. */
 export interface DatabaseOptions {
 	/**
-	 * Text parsers by type OID. Defaults to parsers that decode to the
-	 * TypeScript types quarry's columns declare: int8 and numeric as strings,
-	 * timestamptz as a Date, ranges as `Range`, pgvector as `number[]` (of
-	 * the float32 values stored).
+	 * Codecs for result columns no query types: raw SQL, expressions whose
+	 * SQL type isn't known. Columns and typed expressions are always read
+	 * with their own codec (set with `useCodec` or `defineType`), so their
+	 * TypeScript types hold. By default: the driver's codecs, with int8 and
+	 * numeric as strings, timestamptz as a Date, ranges as `Range`, and
+	 * pgvector as `number[]` (of the float32 values stored).
 	 */
-	readonly types?: TypeParsers | undefined;
-	/** Leave these types (or all, with `true`) as the server's text, for your own codecs. */
-	readonly raw?: RawTypes | undefined;
+	readonly codecs?: readonly Codec[] | undefined;
 	/**
-	 * Look up array and pgvector types in `pg_type` once, before the first
-	 * query, so arrays of any type (enums included) and vectors are decoded
-	 * (default true, unless `raw` is `true`).
+	 * Look up the types codecs name (enums, pgvector, custom types and
+	 * their arrays) in `pg_type` once per pool, before the first query
+	 * (default true). Without it, the driver looks them up behind the
+	 * first query that needs one.
 	 */
 	readonly catalog?: boolean | undefined;
 	/** Called once per query with its SQL, tag, timings, row count and error. */
@@ -78,13 +78,6 @@ export interface DatabaseOptions {
 /** What a `DriverExecutor` runs on. */
 export type DriverSource = Pool | PoolClient | Connection | Transaction;
 
-/** Parsers shared by an executor and those derived from it, completed from the catalog once. */
-interface TypeState {
-	parsers: TypeParsers;
-	loading: Promise<void> | undefined;
-	loaded: boolean;
-}
-
 interface Runner {
 	query<R>(
 		sql: string,
@@ -97,6 +90,7 @@ interface Runner {
 		options?: Record<string, unknown>,
 	): AsyncIterable<R[]>;
 	describe(sql: string): Promise<Description>;
+	loadTypes?(): Promise<void>;
 	queryGroup(
 		statements: readonly GroupStatement[],
 		options?: { signal?: AbortSignal | undefined },
@@ -144,61 +138,46 @@ const interval = (timeout: number | string) =>
 export class DriverExecutor implements TransactionExecutor {
 	readonly #source: DriverSource;
 	readonly #options: DatabaseOptions;
-	readonly #types: TypeState;
+	readonly #registry: CodecRegistry;
 	readonly #owned: boolean;
+	/** Whether the catalog was looked up (or isn't to be). */
+	#ready: boolean;
 
 	constructor(
 		source: DriverSource,
 		options: DatabaseOptions = {},
 		owned = false,
-		types?: TypeState,
+		registry?: CodecRegistry,
 	) {
 		this.#source = source;
 		this.#options = options;
 		this.#owned = owned;
-		this.#types = types ?? {
-			parsers: initialTypes(options.types, options.raw),
-			loading: undefined,
-			loaded: options.raw === true || options.catalog === false,
-		};
+		this.#registry =
+			registry ??
+			(options.codecs === undefined || options.codecs.length === 0
+				? quarryRegistry
+				: createCodecRegistry(options.codecs, quarryRegistry));
+		this.#ready = options.catalog === false;
 	}
 
-	/** Completes the parsers from the catalog, once; on failure the static parsers stay. */
-	async #ready(runner: Runner): Promise<void> {
-		const state = this.#types;
-		if (state.loaded) return;
-		state.loading ??= runner
-			.query<CatalogType>(catalogQuery, [], {
-				types: defaultTypes,
-				prepare: false,
-			})
-			.then(
-				({ rows }) => {
-					state.parsers = completedTypes(
-						this.#options.types,
-						this.#options.raw,
-						rows,
-					);
-					return undefined;
-				},
-				() => undefined,
-			)
-			.finally(() => {
-				state.loaded = true;
-			});
-		await state.loading;
+	/** Looks up the types codecs name, once per pool; a failure leaves them to the driver. */
+	async #prepare(runner: Runner): Promise<void> {
+		if (this.#ready || runner.loadTypes === undefined) return;
+		await runner.loadTypes();
+		this.#ready = true;
 	}
 
 	#queryOptions(
 		options: ExecuteOptions,
 		onTiming: ((t: OpTiming) => void) | undefined,
-		{ tag, paramTypes }: CompiledQuery,
+		{ tag, paramCodecs, resultCodecs }: CompiledQuery,
 	) {
 		return {
-			types: this.#types.parsers,
+			codecs: this.#registry,
 			rowMode: options.rowMode ?? 'object',
 			...(options.keepRows === undefined ? {} : { keepRows: options.keepRows }),
-			...(paramTypes === undefined ? {} : { paramTypes }),
+			...(paramCodecs === undefined ? {} : { paramCodecs }),
+			...(resultCodecs === undefined ? {} : { resultCodecs }),
 			...(this.#options.prepare === undefined
 				? {}
 				: { prepare: this.#options.prepare }),
@@ -219,12 +198,12 @@ export class DriverExecutor implements TransactionExecutor {
 		const source = this.#source;
 		if (!(source instanceof Pool)) {
 			const runner = source instanceof PoolClient ? source.connection : source;
-			await this.#ready(runner);
+			await this.#prepare(runner);
 			return fn(runner);
 		}
 		const client = await source.acquire(signal === undefined ? {} : { signal });
 		try {
-			await this.#ready(client.connection);
+			await this.#prepare(client.connection);
 			return await fn(client.connection);
 		} finally {
 			client.release();
@@ -362,7 +341,7 @@ export class DriverExecutor implements TransactionExecutor {
 		let failure: unknown;
 		let opened = false;
 		try {
-			await this.#ready(runner);
+			await this.#prepare(runner);
 			if (options.timeout !== undefined) {
 				if (runner.transactionStatus === 'idle') {
 					await runner.query('begin');
@@ -586,7 +565,7 @@ export class DriverExecutor implements TransactionExecutor {
 		options: TransactionOptions = {},
 	): Promise<T> {
 		const run = (tx: Transaction) =>
-			fn(new DriverExecutor(tx, this.#options, false, this.#types));
+			fn(new DriverExecutor(tx, this.#options, false, this.#registry));
 		const source = this.#source;
 		if (source instanceof Transaction) {
 			for (const key of [

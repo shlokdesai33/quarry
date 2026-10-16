@@ -1,4 +1,6 @@
 import type { DataType } from '../data-type/data-type.js';
+import type { Codec } from '../driver/codec.js';
+import type { SwapType } from './base-column.js';
 import { IdentityColumn } from './identity-column.js';
 import { Column } from './column.js';
 
@@ -32,5 +34,17 @@ export class IntegerColumn<D extends DataType, S, I = S, U = I>
 
 	override typed<X extends S, Y extends I, Z extends U>() {
 		return new IntegerColumn<D, X, Y, Z>(this._quarry);
+	}
+
+	override useCodec<In, Out>(codec: Codec<In, Out>) {
+		return new IntegerColumn<
+			D,
+			SwapType<S, Out>,
+			SwapType<I, In>,
+			SwapType<U, In>
+		>({
+			...this._quarry,
+			dataType: this._quarry.dataType.withCodec(codec),
+		});
 	}
 }

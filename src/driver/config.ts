@@ -3,6 +3,14 @@ import { LATEST_PROTOCOL_MINOR } from './protocol/frontend.js';
 import type { Notice, Notification } from './notice.js';
 import type { SocketFactory } from './socket.js';
 import type { TelemetryOptions } from './telemetry.js';
+import type { Codec } from './codec.js';
+import {
+	createCodecRegistry,
+	defaultRegistry,
+	parsersRegistry,
+	TypeCatalog,
+	type CodecRegistry,
+} from './registry.js';
 import type { TypeParsers } from './types.js';
 
 /** How hard to insist on TLS, with libpq's meanings. */
@@ -120,7 +128,19 @@ export interface ConnectionOptions {
 	readonly targetSessionAttrs?: TargetSessionAttrs | undefined;
 	/** A password file in `.pgpass` format; defaults to `PGPASSFILE` or `~/.pgpass`. */
 	readonly passfile?: string | undefined;
-	/** How result values are decoded: `defaultTypes` (default), `rawTypes`, or your own. */
+	/**
+	 * Codecs to read result columns with, by type, over the driver's
+	 * `defaultCodecs` (or `types`): to add types (an extension's, an enum)
+	 * or override built-in ones, e.g. `[codecs.int8AsString]` for int8 as
+	 * digits. Codecs for types looked up by name make the pool load the
+	 * catalog once.
+	 */
+	readonly codecs?: readonly Codec[] | undefined;
+	/**
+	 * Text parsers by type OID, instead of the default codecs: `rawTypes`
+	 * keeps every value the server's text. Kept for parsers written before
+	 * codecs; the driver's own parsers still read in binary.
+	 */
 	readonly types?: TypeParsers | undefined;
 	/** Use named prepared statements, cached per connection (default true). */
 	readonly prepare?: boolean | undefined;
@@ -136,10 +156,11 @@ export interface ConnectionOptions {
 	 */
 	readonly preparePipelined?: boolean | undefined;
 	/**
-	 * Receive columns in binary where the configured parser has a binary
-	 * twin (int2/int4/oid, float8, bool, bytea, timestamptz as Date),
-	 * from a cached statement's second run (default true). Values are
-	 * identical either way; custom and raw types always stay text.
+	 * Receive columns in binary where their codec reads them so (int2,
+	 * int4, oid, int8 as a bigint, float8, bool, bytea, timestamptz, vector,
+	 * and arrays), default true: from the first run for columns a query
+	 * expects a codec for (`resultCodecs`), otherwise from a cached
+	 * statement's second run. Values are identical either way.
 	 */
 	readonly binaryResults?: boolean | undefined;
 	/**
@@ -198,7 +219,10 @@ export interface ResolvedConfig {
 	readonly requireAuth: ReadonlySet<AuthMethod> | undefined;
 	readonly params: Readonly<Record<string, string>>;
 	readonly targetSessionAttrs: TargetSessionAttrs;
-	readonly types: TypeParsers | undefined;
+	/** How result columns are read where a query doesn't say. */
+	readonly registry: CodecRegistry;
+	/** The types looked up by name, shared by the connections of a pool. */
+	readonly catalog: TypeCatalog;
 	readonly prepare: boolean;
 	readonly statementCacheSize: number;
 	/** Undefined: decided by what the other end reports at login. */
@@ -503,6 +527,17 @@ function isLocalHost(host: string): boolean {
 }
 
 /** Applies the connection string, `PG*` environment variables and defaults to `options`. */
+/** The registry of `codecs` over `types` (or the default codecs). */
+function registryOf(options: ConnectionOptions): CodecRegistry {
+	const base =
+		options.types === undefined
+			? defaultRegistry
+			: parsersRegistry(options.types);
+	return options.codecs === undefined || options.codecs.length === 0
+		? base
+		: createCodecRegistry(options.codecs, base);
+}
+
 export function resolveConfig(options: ConnectionOptions = {}): ResolvedConfig {
 	const env = options.env ?? processEnv();
 	const fromEnv: Record<string, string> = {};
@@ -627,7 +662,8 @@ export function resolveConfig(options: ConnectionOptions = {}): ResolvedConfig {
 			TARGETS,
 			'target_session_attrs',
 		),
-		types: options.types,
+		registry: registryOf(options),
+		catalog: new TypeCatalog(),
 		prepare: options.prepare ?? true,
 		statementCacheSize: options.statementCacheSize ?? 100,
 		preparePipelined: options.preparePipelined,

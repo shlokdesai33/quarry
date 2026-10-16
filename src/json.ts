@@ -1,7 +1,8 @@
 import type { ArrayType } from './data-type/array.js';
 import { DataType } from './data-type/data-type.js';
-import { JsonbType } from './data-type/jsonb.js';
-import { Expression, type Param, type TypedExpression } from './expression.js';
+import { arrayOf, type Codec } from './driver/codec.js';
+import { codecs } from './driver/codecs.js';
+import { Expression, Param, type TypedExpression } from './expression.js';
 import { typedExpression } from './expression-methods.js';
 import type { Scope } from './functions.js';
 import type { OperationNode } from './node.js';
@@ -85,7 +86,7 @@ export interface JsonFunctions<in out R extends Refs> {
 	get<A extends Operand<R, Jsonb>, const P extends readonly [Key, ...Key[]]>(
 		json: A,
 		...path: P & PathIn<JsonOf<R, A>, P>
-	): Expr<Exclude<At<JsonOf<R, A>, P>, undefined> | null, JsonbType>;
+	): Expr<Exclude<At<JsonOf<R, A>, P>, undefined> | null, Jsonb>;
 
 	/**
 	 * `json -> ... ->> key`: the value at the path as text, null where it is
@@ -178,10 +179,22 @@ function key(value: Key): OperationNode {
 	return { kind: 'literal', value };
 }
 
-/** A key or path operand: values and parameters are sent as is, as text. */
-function operand(value: unknown): OperationNode {
-	return Expression.is(value) ? value._quarry.node : { kind: 'value', value };
+/** A key or path operand: values and parameters encoded by `codec` (a parameter's own, if it has one). */
+function operand(value: unknown, codec: Codec): OperationNode {
+	if (value instanceof Param)
+		return {
+			kind: 'value',
+			value: value._quarry.value,
+			codec: value._quarry.codec ?? codec,
+		};
+	return Expression.is(value)
+		? value._quarry.node
+		: { kind: 'value', value, codec };
 }
+
+const keyCodec = codecs.text;
+const keysCodec = arrayOf(codecs.text);
+const pathCodec = codecs.jsonpath;
 
 export function jsonFunctions<R extends Refs>({
 	node,
@@ -203,9 +216,15 @@ export function jsonFunctions<R extends Refs>({
 			);
 
 	const test =
-		(operator: string) => (json: Operand<R, Jsonb>, right: unknown) =>
+		(operator: string, codec: Codec) =>
+		(json: Operand<R, Jsonb>, right: unknown) =>
 			typedExpression(
-				{ kind: 'binary', left: node(json), operator, right: operand(right) },
+				{
+					kind: 'binary',
+					left: node(json),
+					operator,
+					right: operand(right, codec),
+				},
 				new DataType('boolean'),
 			);
 
@@ -213,13 +232,13 @@ export function jsonFunctions<R extends Refs>({
 		typedExpression({ kind: 'function', name, args: [node(json)] }, type);
 
 	return {
-		get: walk('->', new JsonbType()),
+		get: walk('->', new DataType('jsonb')),
 		text: walk('->>', new DataType('text')),
-		hasKey: test('?'),
-		hasAnyKey: test('?|'),
-		hasAllKeys: test('?&'),
-		pathExists: test('@?'),
-		pathMatches: test('@@'),
+		hasKey: test('?', keyCodec),
+		hasAnyKey: test('?|', keysCodec),
+		hasAllKeys: test('?&', keysCodec),
+		pathExists: test('@?', pathCodec),
+		pathMatches: test('@@', pathCodec),
 		typeOf: call('jsonb_typeof', new DataType('text')),
 		length: call('jsonb_array_length', new DataType('integer')),
 	};

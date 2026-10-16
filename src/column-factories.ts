@@ -3,11 +3,12 @@ import { Column } from './column/column.js';
 import { IntegerColumn } from './column/integer-column.js';
 import { ArrayType } from './data-type/array.js';
 import { DataType } from './data-type/data-type.js';
+import type { CodecOutput } from './driver/codec.js';
+import type { CodecKind, kindCodecs } from './kind-codecs.js';
 import type { Kind } from './operators.js';
-import { JsonbType } from './data-type/jsonb.js';
-import { DateRangeType, TstzRangeType } from './data-type/range.js';
-import { VectorType } from './data-type/vector.js';
-import type { Range } from './range.js';
+
+/** What a kind's codec reads: the TypeScript type of its columns, which `T` may narrow. */
+type Out<K extends CodecKind> = CodecOutput<(typeof kindCodecs)[K]>;
 
 /**
  * A `smallint` column: a two-byte integer from -32768 to 32767, whose value
@@ -21,7 +22,7 @@ import type { Range } from './range.js';
  * @example level: smallint<1 | 2 | 3>().default()
  * @example id: smallint().identity()
  */
-export function smallint<T extends number>() {
+export function smallint<T extends Out<'smallint'> = Out<'smallint'>>() {
 	return new IntegerColumn<DataType<'smallint'>, T>({
 		dataType: new DataType('smallint'),
 		site: captureCallSite(smallint),
@@ -39,7 +40,7 @@ export function smallint<T extends number>() {
  * @example id: integer().identity()
  * @example authorId: integer<UserId>().name('author_id')
  */
-export function integer<T extends number>() {
+export function integer<T extends Out<'integer'> = Out<'integer'>>() {
 	return new IntegerColumn<DataType<'integer'>, T>({
 		dataType: new DataType('integer'),
 		site: captureCallSite(integer),
@@ -60,7 +61,7 @@ export function integer<T extends number>() {
  * @example views: bigint()
  * @example id: bigint<OrderId>().identity()
  */
-export function bigint<T extends string>() {
+export function bigint<T extends Out<'bigint'> = Out<'bigint'>>() {
 	return new IntegerColumn<DataType<'bigint'>, T>({
 		dataType: new DataType('bigint'),
 		site: captureCallSite(bigint),
@@ -78,7 +79,7 @@ export function bigint<T extends string>() {
  * @example ratio: real()
  * @example weight: real().nullable()
  */
-export function real<T extends number>() {
+export function real<T extends Out<'real'> = Out<'real'>>() {
 	return new Column<DataType<'real'>, T>({
 		dataType: new DataType('real'),
 		site: captureCallSite(real),
@@ -97,7 +98,9 @@ export function real<T extends number>() {
  * @example latitude: doublePrecision()
  * @example score: doublePrecision().default()
  */
-export function doublePrecision<T extends number>() {
+export function doublePrecision<
+	T extends Out<'double precision'> = Out<'double precision'>,
+>() {
 	return new Column<DataType<'double precision'>, T>({
 		dataType: new DataType('double precision'),
 		site: captureCallSite(doublePrecision),
@@ -118,7 +121,10 @@ export function doublePrecision<T extends number>() {
  * @example price: decimal(10, 2)
  * @example balance: decimal().default()
  */
-export function decimal<T extends string>(precision?: number, scale?: number) {
+export function decimal<T extends Out<'decimal'> = Out<'decimal'>>(
+	precision?: number,
+	scale?: number,
+) {
 	return new Column<DataType<'decimal'>, T>({
 		dataType: new DataType('decimal', {
 			modifiers: modifiers(precision, scale),
@@ -139,7 +145,7 @@ export function decimal<T extends string>(precision?: number, scale?: number) {
  * @example admin: boolean()
  * @example verified: boolean().default()
  */
-export function boolean<T extends boolean>() {
+export function boolean<T extends Out<'boolean'> = Out<'boolean'>>() {
 	return new Column<DataType<'boolean'>, T>({
 		dataType: new DataType('boolean'),
 		site: captureCallSite(boolean),
@@ -159,7 +165,7 @@ export function boolean<T extends boolean>() {
  * @example email: text().nullable()
  * @example role: text<'admin' | 'member'>()
  */
-export function text<T extends string>() {
+export function text<T extends Out<'text'> = Out<'text'>>() {
 	return new Column<DataType<'text'>, T>({
 		dataType: new DataType('text'),
 		site: captureCallSite(text),
@@ -176,7 +182,9 @@ export function text<T extends string>() {
  * @example nickname: varchar(32)
  * @example code: varchar<'US' | 'CA'>()
  */
-export function varchar<T extends string>(length?: number) {
+export function varchar<T extends Out<'varchar'> = Out<'varchar'>>(
+	length?: number,
+) {
 	return new Column<DataType<'varchar'>, T>({
 		dataType: new DataType('varchar', { modifiers: modifiers(length) }),
 		site: captureCallSite(varchar),
@@ -195,7 +203,7 @@ export function varchar<T extends string>(length?: number) {
  * @example token: uuid()
  * @example id: uuid<UserId>().default()
  */
-export function uuid<T extends string>() {
+export function uuid<T extends Out<'uuid'> = Out<'uuid'>>() {
 	return new Column<DataType<'uuid'>, T>({
 		dataType: new DataType('uuid'),
 		site: captureCallSite(uuid),
@@ -203,16 +211,18 @@ export function uuid<T extends string>() {
 }
 
 /**
- * A `bytea` column: binary data, whose value is a `Uint8Array` (a Node
- * `Buffer` is one). `T` narrows it.
+ * A `bytea` column: binary data. A value written may be any `Uint8Array`
+ * (a Node `Buffer` is one); what is read is always a plain `Uint8Array`,
+ * never a `Buffer`, so the type isn't narrowed. It is sent and read in
+ * binary.
  *
  * It admits equality only, which compares the bytes.
  *
  * @example avatar: bytea().nullable()
  * @example hash: bytea()
  */
-export function bytea<T extends Uint8Array>() {
-	return new Column<DataType<'bytea'>, T>({
+export function bytea() {
+	return new Column<DataType<'bytea'>, Out<'bytea'>>({
 		dataType: new DataType('bytea'),
 		site: captureCallSite(bytea),
 	});
@@ -228,7 +238,7 @@ export function bytea<T extends Uint8Array>() {
  * @example birthday: date().nullable()
  * @example dueOn: date().name('due_on')
  */
-export function date<T extends string>() {
+export function date<T extends Out<'date'> = Out<'date'>>() {
 	return new Column<DataType<'date'>, T>({
 		dataType: new DataType('date'),
 		site: captureCallSite(date),
@@ -243,7 +253,7 @@ export function date<T extends string>() {
  *
  * @example opensAt: time().name('opens_at')
  */
-export function time<T extends string>() {
+export function time<T extends Out<'time'> = Out<'time'>>() {
 	return new Column<DataType<'time'>, T>({
 		dataType: new DataType('time'),
 		site: captureCallSite(time),
@@ -261,7 +271,7 @@ export function time<T extends string>() {
  *
  * @example scheduledFor: timestamp().name('scheduled_for')
  */
-export function timestamp<T extends string>() {
+export function timestamp<T extends Out<'timestamp'> = Out<'timestamp'>>() {
 	return new Column<DataType<'timestamp'>, T>({
 		dataType: new DataType('timestamp'),
 		site: captureCallSite(timestamp),
@@ -279,7 +289,9 @@ export function timestamp<T extends string>() {
  * @example createdAt: timestamptz().name('created_at').default()
  * @example deletedAt: timestamptz().name('deleted_at').nullable()
  */
-export function timestamptz<T extends Date>() {
+export function timestamptz<
+	T extends Out<'timestamptz'> = Out<'timestamptz'>,
+>() {
 	return new Column<DataType<'timestamptz'>, T>({
 		dataType: new DataType('timestamptz'),
 		site: captureCallSite(timestamptz),
@@ -295,7 +307,7 @@ export function timestamptz<T extends Date>() {
  * @example duration: interval()
  * @example retention: interval().default()
  */
-export function interval<T extends string>() {
+export function interval<T extends Out<'interval'> = Out<'interval'>>() {
 	return new Column<DataType<'interval'>, T>({
 		dataType: new DataType('interval'),
 		site: captureCallSite(interval),
@@ -303,9 +315,10 @@ export function interval<T extends string>() {
 }
 
 /**
- * A `jsonb` column: a JSON document, whose value is any non-null JSON value
- * unless `T` gives its shape. `T` is trusted, not checked against what the
- * database holds.
+ * A `jsonb` column: a JSON document, whose value is any JSON value
+ * (`JsonValue`, JSON `null` included: a column can hold it) unless `T`
+ * gives its shape. `T` is trusted, not checked against what the database
+ * holds.
  *
  * Values are always sent as JSON text, so a top-level array or string is
  * stored as JSON rather than as a postgres array or bare text. `null` is SQL
@@ -320,9 +333,9 @@ export function interval<T extends string>() {
  * @example settings: jsonb<{ theme: string }>()
  * @example profile: jsonb<{ address: { city: string } }>().nullable()
  */
-export function jsonb<T extends NonNullable<unknown>>() {
-	return new Column<JsonbType, T>({
-		dataType: new JsonbType(),
+export function jsonb<T = Out<'jsonb'>>() {
+	return new Column<DataType<'jsonb'>, T>({
+		dataType: new DataType('jsonb'),
 		site: captureCallSite(jsonb),
 	});
 }
@@ -339,7 +352,7 @@ export function jsonb<T extends NonNullable<unknown>>() {
  * @example ip: inet()
  * @example lastSeenFrom: inet().name('last_seen_from').nullable()
  */
-export function inet<T extends string>() {
+export function inet<T extends Out<'inet'> = Out<'inet'>>() {
 	return new Column<DataType<'inet'>, T>({
 		dataType: new DataType('inet'),
 		site: captureCallSite(inet),
@@ -356,7 +369,7 @@ export function inet<T extends string>() {
  *
  * @example search: tsvector().generated()
  */
-export function tsvector<T extends string>() {
+export function tsvector<T extends Out<'tsvector'> = Out<'tsvector'>>() {
 	return new Column<DataType<'tsvector'>, T>({
 		dataType: new DataType('tsvector'),
 		site: captureCallSite(tsvector),
@@ -378,9 +391,9 @@ export function tsvector<T extends string>() {
  * @example vacation: daterange().nullable()
  * @example season: daterange()
  */
-export function daterange<T extends Range<string>>() {
-	return new Column<DateRangeType, T>({
-		dataType: new DateRangeType(),
+export function daterange<T extends Out<'daterange'> = Out<'daterange'>>() {
+	return new Column<DataType<'daterange'>, T>({
+		dataType: new DataType('daterange'),
 		site: captureCallSite(daterange),
 	});
 }
@@ -389,8 +402,8 @@ export function daterange<T extends Range<string>>() {
  * A `tstzrange` column: a range of instants, whose value is a `Range<Date>`,
  * or `{ empty: true }` for the empty range. `T` narrows it.
  *
- * A range is sent as its literal, with each bound in ISO 8601 form, and an
- * unbounded side is a `null` bound. It keeps the bounds it was written with.
+ * A range is sent as its literal, each bound as a timestamp in UTC (years
+ * past 9999 and BC included), and an unbounded side is a `null` bound. It keeps the bounds it was written with.
  *
  * It admits equality and the range operators; `@>` also takes a single
  * `Date`, or a `date`, `timestamp` or `timestamptz` expression, to test
@@ -399,9 +412,9 @@ export function daterange<T extends Range<string>>() {
  * @example active: tstzrange()
  * @example history: array(tstzrange())
  */
-export function tstzrange<T extends Range<Date>>() {
-	return new Column<TstzRangeType, T>({
-		dataType: new TstzRangeType(),
+export function tstzrange<T extends Out<'tstzrange'> = Out<'tstzrange'>>() {
+	return new Column<DataType<'tstzrange'>, T>({
+		dataType: new DataType('tstzrange'),
 		site: captureCallSite(tstzrange),
 	});
 }
@@ -417,9 +430,9 @@ export function tstzrange<T extends Range<Date>>() {
  * @example embedding: vector()
  * @example embedding: vector().nullable()
  */
-export function vector<T extends number[]>() {
-	return new Column<VectorType, T>({
-		dataType: new VectorType(),
+export function vector<T extends Out<'vector'> = Out<'vector'>>() {
+	return new Column<DataType<'vector'>, T>({
+		dataType: new DataType('vector'),
 		site: captureCallSite(vector),
 	});
 }

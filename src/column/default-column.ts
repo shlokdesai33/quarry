@@ -1,5 +1,6 @@
 import type { DataType } from '../data-type/data-type.js';
-import { BaseColumn } from './base-column.js';
+import type { Codec } from '../driver/codec.js';
+import { BaseColumn, type SwapType } from './base-column.js';
 
 /**
  * A column with a database default. It may still be made nullable; it can't
@@ -37,5 +38,17 @@ export class DefaultColumn<D extends DataType, S, I, U>
 
 	override typed<X extends S, Y extends I, Z extends U>() {
 		return new DefaultColumn<D, X, Y, Z>(this._quarry);
+	}
+
+	override useCodec<In, Out>(codec: Codec<In, Out>) {
+		return new DefaultColumn<
+			D,
+			SwapType<S, Out>,
+			SwapType<I, In>,
+			SwapType<U, In>
+		>({
+			...this._quarry,
+			dataType: this._quarry.dataType.withCodec(codec),
+		});
 	}
 }

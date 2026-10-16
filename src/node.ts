@@ -1,3 +1,5 @@
+import type { Codec } from './driver/codec.js';
+
 /**
  * The tree an expression compiles to. Nodes are plain immutable data with a
  * `kind` discriminant; `compile` renders them to SQL. References are already
@@ -31,8 +33,12 @@ export type ReferenceNode = {
 export type ValueNode = {
 	readonly kind: 'value';
 	readonly value: unknown;
-	/** The type OID declared for the parameter; the server infers it when absent. */
-	readonly typeOid?: number;
+	/**
+	 * The driver codec the value is encoded with, chosen by what it is
+	 * compared with or written to; without one, the driver encodes it by
+	 * its JavaScript type and the server infers its type.
+	 */
+	readonly codec?: Codec | undefined;
 };
 
 /**
@@ -120,6 +126,8 @@ export type TableNode = {
 export type SelectionNode = {
 	readonly expression: OperationNode;
 	readonly alias: string;
+	/** The codec the column is read with, when its SQL type is known. */
+	readonly codec: Codec | undefined;
 };
 
 /** `inner join table on condition`. */
@@ -178,6 +186,8 @@ export type RowsNode = {
 	 * assignment to the column rejects a value too long.
 	 */
 	readonly types: readonly string[];
+	/** The columns' codecs, whose arrays `unnest`'s parameters are encoded with. */
+	readonly codecs: readonly Codec[];
 	readonly rows: readonly (readonly (OperationNode | undefined)[])[];
 	readonly strategy: 'values' | 'unnest';
 };

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { integer, text } from '../src/column-factories.js';
 import { compile } from '../src/compile.js';
+import { plain } from './helpers/compiled.js';
 import { defineTable } from '../src/define-table.js';
 import { expressionBuilder } from '../src/expression-builder.js';
 import {
@@ -30,7 +31,7 @@ const where = (query: {
 	toWhereNode(): Parameters<typeof compile>[0] | undefined;
 }) => {
 	const node = query.toWhereNode();
-	return node === undefined ? undefined : compile(node);
+	return node === undefined ? undefined : plain(compile(node));
 };
 
 // eslint-disable-next-line typescript/no-unsafe-type-assertion -- the undefined a plain JS caller, or an `as` cast, can pass
@@ -220,7 +221,7 @@ describe('pipe', () => {
 			.on('contacts.userId', 'users.id')
 			.pipe(adults)
 			.pipe(contactEmail);
-		expect(compile(query.toNode())).toEqual({
+		expect(plain(compile(query.toNode()))).toEqual({
 			sql: 'select "users"."id" as "id", "contacts"."email" as "email" from "users" inner join "contacts" on "contacts"."user_id" = "users"."id" where "users"."age" >= $1',
 			params: [18],
 		});
@@ -231,7 +232,7 @@ describe('tag', () => {
 	it('is stored on the query and compiled beside its SQL, not into it', () => {
 		const query = selectFrom(users).select(['users.id']).tag('users.ids');
 		expect(query.toNode().tag).toBe('users.ids');
-		expect(compile(query.toNode())).toEqual({
+		expect(plain(compile(query.toNode()))).toEqual({
 			sql: 'select "users"."id" as "id" from "users"',
 			params: [],
 			tag: 'users.ids',
@@ -295,14 +296,16 @@ describe('locking', () => {
 
 	it('renders `of` and the wait policy after the where clause', () => {
 		expect(
-			compile(
-				selectFrom(users)
-					.select(['users.id'])
-					.where('users.role', 'admin')
-					.forUpdate()
-					.of(users)
-					.skipLocked()
-					.toNode(),
+			plain(
+				compile(
+					selectFrom(users)
+						.select(['users.id'])
+						.where('users.role', 'admin')
+						.forUpdate()
+						.of(users)
+						.skipLocked()
+						.toNode(),
+				),
 			),
 		).toEqual({
 			sql: 'select "users"."id" as "id" from "users" where "users"."role" = $1 for update of "users" skip locked',

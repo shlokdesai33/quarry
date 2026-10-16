@@ -1,5 +1,4 @@
-import { binaryArray } from './array-params.js';
-import { DriverError, UndefinedParameterError } from './errors.js';
+import { DriverError } from './errors.js';
 import type { WireValue } from './protocol/frontend.js';
 
 /** Turns one value's text output into a JavaScript value. */
@@ -310,12 +309,24 @@ const hexDigits = (bytes: Uint8Array): string => {
 	return out;
 };
 
+/**
+ * A number as Postgres reads it: integers without an exponent, so `1e21`
+ * is `1000000000000000000000` (which an integer type rejects as out of
+ * range rather than as malformed, and numeric reads exactly).
+ */
+export function numberText(value: number): string {
+	return Number.isInteger(value) && Math.abs(value) >= 1e21
+		? BigInt(value).toString()
+		: String(value);
+}
+
 /** The text of one value, for an array element or a text parameter. */
-function textOf(value: unknown): string {
+export function textOf(value: unknown): string {
 	switch (typeof value) {
 		case 'string':
 			return value;
 		case 'number':
+			return numberText(value);
 		case 'bigint':
 			return String(value);
 		case 'boolean':
@@ -365,7 +376,7 @@ export function encodeParam(value: unknown): WireValue {
 }
 
 /** `encodeParam` for a value already checked for `undefined`. */
-function encodeDefined(value: unknown): WireValue {
+export function encodeDefined(value: unknown): WireValue {
 	if (value === null || value === undefined) return null;
 	if (typeof value === 'string') return value;
 	if (value instanceof Uint8Array) return value;
@@ -376,51 +387,12 @@ function encodeDefined(value: unknown): WireValue {
 	return textOf(value);
 }
 
-/** The protocol counts parameters in 16 bits. */
-const MAX_PARAMETERS = 65535;
-
-const NO_TYPES: readonly number[] = [];
-const NO_VALUES: readonly WireValue[] = [];
-
-/**
- * Encodes a query's parameters with `encodeParam`, refusing `undefined`
- * (or an undefined array element) instead of sending it as NULL. An array
- * whose type `paramTypes` declares is sent in binary where the driver has
- * an encoder for it and every element fits.
- */
-export function encodeParams(
-	sql: string,
-	params: readonly unknown[],
-	paramTypes: readonly number[] = NO_TYPES,
-): readonly WireValue[] {
-	if (params.length === 0) return NO_VALUES;
-	if (params.length > MAX_PARAMETERS) {
-		throw new DriverError(
-			`A query can have at most ${MAX_PARAMETERS} parameters; this one has ${params.length}`,
-		);
-	}
-	// oxlint-disable-next-line unicorn/no-new-array -- sized up front: growing by push allocates room for 16 more
-	const values = new Array<WireValue>(params.length);
-	for (let i = 0; i < params.length; i++) {
-		const value = params[i];
-		const element = undefinedAt(value);
-		if (element !== undefined)
-			throw new UndefinedParameterError(sql, i + 1, element);
-		const type = paramTypes[i];
-		values[i] =
-			(type !== undefined && Array.isArray(value)
-				? binaryArray(value, type)
-				: undefined) ?? encodeDefined(value);
-	}
-	return values;
-}
-
 /**
  * Where `value` is `undefined`: `[]` for the value itself, the 1-based
  * indexes of an element within (nested) arrays, or `undefined` if nowhere.
  * Holes in sparse arrays count as undefined.
  */
-function undefinedAt(value: unknown): number[] | undefined {
+export function undefinedAt(value: unknown): number[] | undefined {
 	if (value === undefined) return [];
 	if (!Array.isArray(value)) return undefined;
 	for (let i = 0; i < value.length; i++) {

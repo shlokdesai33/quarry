@@ -88,11 +88,11 @@ export function columnOf(
 	return { column, name: column._quarry.columnName ?? key };
 }
 
-/** A value written to `column`: an expression as is, a value encoded. */
+/** A value written to `column`: an expression as is, a value encoded by the column's codec. */
 export function valueNode(column: AnyColumn, value: unknown): OperationNode {
 	return Expression.is(value)
 		? value._quarry.node
-		: { kind: 'value', value: column._quarry.dataType.serialize(value) };
+		: { kind: 'value', value, codec: column._quarry.dataType.codec };
 }
 
 /**
@@ -144,6 +144,7 @@ export function rowsNode(
 				modifiers: undefined,
 			}),
 		),
+		codecs: columns.map(({ column }) => column._quarry.dataType.codec),
 		rows: rows.map((row) => {
 			const values = new Map(Object.entries(row));
 			return keys.map((key, i) => {

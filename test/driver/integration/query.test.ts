@@ -14,8 +14,8 @@ import {
 	CheckViolation,
 } from '../../../src/driver/errors.js';
 import type { Notice } from '../../../src/driver/notice.js';
-import { quarryTypes } from '../../../src/decode.js';
-import { oids, rawTypes } from '../../../src/driver/types.js';
+import { codecs } from '../../../src/driver/codecs.js';
+import { defaultTypes, oids, rawTypes } from '../../../src/driver/types.js';
 import { meteredSockets, noPg, open, rejection, table } from './helpers.js';
 
 describe.skipIf(noPg)('queries', () => {
@@ -233,7 +233,7 @@ describe.skipIf(noPg)('queries', () => {
 		expect(rows).toEqual([['1', 't', '{"x": 1}', '{1,2}']]);
 	});
 
-	it('decodes binary results exactly like text, and only where a built-in parser has a binary twin', async () => {
+	it('decodes binary results exactly like text, and only where the codec reads binary', async () => {
 		const sql = `select
 			b, i2, i4, o, f4, f8, bytes, ts
 		from (values
@@ -247,7 +247,7 @@ describe.skipIf(noPg)('queries', () => {
 			(true, 0::int2, 7::int4, 1::oid, '1'::float4, '1'::float8, '\\x'::bytea, '3000-06-15 12:34:56.789999+00'::timestamptz),
 			(true, 0::int2, 7::int4, 1::oid, '1'::float4, '1'::float8, '\\x'::bytea, '4000-01-01 00:00:00.999999+00 BC'::timestamptz)
 		) as t(b, i2, i4, o, f4, f8, bytes, ts)`;
-		await using c = await open({ types: quarryTypes });
+		await using c = await open({ codecs: [codecs.timestamptz] });
 		const text = await c.query(sql, [], { binary: false });
 		await c.query(sql); // describes the statement
 		const binary = await c.query(sql);
@@ -260,7 +260,7 @@ describe.skipIf(noPg)('queries', () => {
 
 		// a custom parser keeps its column in text
 		const custom = {
-			...quarryTypes,
+			...defaultTypes,
 			[oids.timestamptz]: (t: string) => `custom ${t}`,
 		};
 		await c.query('select now() as t, 1 as n', [], { types: custom });

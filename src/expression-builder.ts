@@ -1,6 +1,7 @@
 import type { AnyColumn } from './column/any-column.js';
 import { nameReference } from './comparison.js';
 import type { DataType } from './data-type/data-type.js';
+import type { Codec } from './driver/codec.js';
 import type { Expression, TypedExpression } from './expression.js';
 import { param, predicate, typedExpression } from './expression-methods.js';
 import { type Functions, functions } from './functions.js';
@@ -43,15 +44,21 @@ export interface ExpressionBuilder<in out R extends Refs> {
 	 * type is whatever postgres infers, so its only comparisons are with
 	 * `any` / `all` of an array, whose element type encodes it. A comparison
 	 * takes a plain value instead, except for an array as a whole: `in` and
-	 * `any` / `all` take an array parameter and encode its items. Elsewhere it
-	 * is sent to the driver as is.
+	 * `any` / `all` take an array parameter and encode its items. As a
+	 * `coalesce` fallback it is encoded by the first argument's codec.
+	 * Elsewhere it is encoded by `codec`, which also declares its type, or
+	 * without one, by its JavaScript type.
 	 *
 	 * @example eb.fn.concat('users.firstName', eb.val(' '), 'users.lastName')
 	 * @example eb.ref('users.id').in(eb.val(ids))
+	 * @example eb.fn.concat(eb.val(range, codecs.tstzrange))
 	 */
 	readonly val: {
-		<T extends readonly unknown[]>(value: T): Value<T>;
-		<const T>(value: T): Value<T>;
+		<T extends readonly unknown[]>(
+			value: T,
+			codec?: Codec<NoInfer<T>, unknown>,
+		): Value<T>;
+		<const T>(value: T, codec?: Codec<NoInfer<T>, unknown>): Value<T>;
 	};
 
 	/**
@@ -147,7 +154,7 @@ export function expressionBuilder<const T extends readonly AnyTable[]>(
 			nameReference(resolved.node, column);
 			return typedExpression(resolved.node, resolved.column._quarry.dataType);
 		},
-		val: (value: unknown) => param(value),
+		val: (value: unknown, codec?: Codec) => param(value, codec),
 		fn: functions<R>({ node, dataType }),
 		json: jsonFunctions<R>({ node, dataType }),
 		and: junction('and'),

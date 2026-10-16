@@ -38,6 +38,7 @@ export {
 	copyLine,
 	defaultTypes,
 	encodeParam,
+	numberText,
 	parseBigInt,
 	parseBool,
 	parseFloat,
@@ -66,15 +67,34 @@ export {
 	type TransactionOptions,
 } from './transaction.js';
 export {
-	catalogQuery,
-	catalogTypes,
 	parseRange,
 	parseTimestamptz,
 	parseHalfvec,
 	parseVector,
-	type CatalogType,
 	type RangeValue,
 } from './parsers.js';
+export {
+	arrayOf,
+	defineCodec,
+	typed,
+	TypedValue,
+	type Codec,
+	type CodecFormat,
+	type CodecInput,
+	type CodecOutput,
+	type CodecSpec,
+} from './codec.js';
+export { codecs, defaultCodecs, type JsonValue } from './codecs.js';
+export {
+	catalogQuery,
+	CodecRegistry,
+	createCodecRegistry,
+	defaultRegistry,
+	TypeCatalog,
+	type CatalogType,
+} from './registry.js';
+export type { ParamCodecs } from './params.js';
+export type { ResultCodecs } from './results.js';
 export {
 	detectCapabilities,
 	parseServerVersion,
