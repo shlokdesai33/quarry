@@ -12,12 +12,12 @@ export interface TransactionConnection {
 	cursor<R>(
 		sql: string,
 		params?: readonly unknown[],
-		options?: TxQueryOptions & { batchSize?: number },
+		options?: TxCursorOptions,
 	): AsyncIterable<R[]>;
 	stream<R>(
 		sql: string,
 		params?: readonly unknown[],
-		options?: TxQueryOptions & { batchSize?: number },
+		options?: TxCursorOptions,
 	): AsyncIterable<R>;
 	describe(
 		sql: string,
@@ -76,6 +76,11 @@ export interface TransactionBatch {
 
 /** Query options accepted inside a transaction (the connection's own options). */
 export type TxQueryOptions = Readonly<Record<string, unknown>>;
+/** A cursor's options inside a transaction: no `keepRows`, as on a connection. */
+type TxCursorOptions = TxQueryOptions & {
+	readonly batchSize?: number;
+	readonly keepRows?: never;
+};
 
 export type IsolationLevel =
 	| 'read uncommitted'
@@ -309,7 +314,7 @@ export class Session {
 	cursor<R>(
 		sql: string,
 		params?: readonly unknown[],
-		options?: TxQueryOptions & { batchSize?: number },
+		options?: TxCursorOptions,
 	): AsyncIterable<R[]> {
 		return this.#iterate(() => this.#conn.cursor<R>(sql, params, options));
 	}
@@ -317,7 +322,7 @@ export class Session {
 	stream<R>(
 		sql: string,
 		params?: readonly unknown[],
-		options?: TxQueryOptions & { batchSize?: number },
+		options?: TxCursorOptions,
 	): AsyncIterable<R> {
 		return this.#iterate(() => this.#conn.stream<R>(sql, params, options));
 	}
@@ -478,7 +483,7 @@ export class Transaction {
 	cursor<R = Record<string, unknown>>(
 		sql: string,
 		params?: readonly unknown[],
-		options?: TxQueryOptions & { batchSize?: number },
+		options?: TxCursorOptions,
 	): AsyncIterable<R[]> {
 		this.#check();
 		return this.#conn.cursor<R>(sql, params, options);
@@ -487,7 +492,7 @@ export class Transaction {
 	stream<R = Record<string, unknown>>(
 		sql: string,
 		params?: readonly unknown[],
-		options?: TxQueryOptions & { batchSize?: number },
+		options?: TxCursorOptions,
 	): AsyncIterable<R> {
 		this.#check();
 		return this.#conn.stream<R>(sql, params, options);
