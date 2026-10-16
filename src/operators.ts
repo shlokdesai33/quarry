@@ -107,15 +107,10 @@ type Point<S> = [S] extends [Range<infer P>] ? P : never;
 type Text = Binary<string, DataType<TextKind>>;
 
 /**
- * Any value jsonb can hold.
+ * Any value jsonb can hold: what the jsonb codec reads.
  */
-export type JsonValue =
-	| string
-	| number
-	| boolean
-	| null
-	| readonly JsonValue[]
-	| { [key: string]: JsonValue };
+export type { JsonValue } from './driver/binary.js';
+import type { JsonValue } from './driver/binary.js';
 
 /** The kinds postgres compares a value of kind `K` with. */
 type Comparable<K extends Kind> = K extends TextKind

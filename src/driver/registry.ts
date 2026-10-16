@@ -75,7 +75,7 @@ export class TypeCatalog {
 		if (this.#loaded) return Promise.resolve();
 		this.#loading ??= run().then(
 			(rows) => {
-				this.fill(rows);
+				this.setTypes(rows);
 				this.#loading = undefined;
 				return undefined;
 			},
@@ -93,7 +93,7 @@ export class TypeCatalog {
 	}
 
 	/** Replaces what the catalog holds. */
-	fill(rows: readonly CatalogType[]): void {
+	setTypes(rows: readonly CatalogType[]): void {
 		this.#byOid = new Map();
 		this.#byName = new Map();
 		for (const row of rows) {

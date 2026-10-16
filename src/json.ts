@@ -21,28 +21,33 @@ type Primitive = string | number | boolean | null | undefined;
 
 /**
  * The keys a jsonb value of type `T` has: an object's own, an array's
- * indices, or any key when `T` says nothing (an untyped `jsonb()`).
+ * indices, or any key when `T` says nothing (an untyped `jsonb()`, which
+ * holds any `JsonValue`).
  */
-type KeyOf<T> = T extends Primitive
-	? never
-	: T extends readonly unknown[]
-		? number
-		: [keyof T] extends [never]
-			? Key
-			: keyof T & string;
+type KeyOf<T> = [NonNullable<JsonValue>] extends [T]
+	? Key
+	: T extends Primitive
+		? never
+		: T extends readonly unknown[]
+			? number
+			: [keyof T] extends [never]
+				? Key
+				: keyof T & string;
 
 /** The value at key `K` of a jsonb value of type `T`. */
-type Member<T, K> = T extends Primitive
-	? never
-	: T extends readonly (infer E)[]
-		? K extends number
-			? E
-			: never
-		: [keyof T] extends [never]
-			? JsonValue
-			: K extends keyof T
-				? T[K]
-				: never;
+type Member<T, K> = [NonNullable<JsonValue>] extends [T]
+	? JsonValue
+	: T extends Primitive
+		? never
+		: T extends readonly (infer E)[]
+			? K extends number
+				? E
+				: never
+			: [keyof T] extends [never]
+				? JsonValue
+				: K extends keyof T
+					? T[K]
+					: never;
 
 /** The keys `P` may hold, each checked against the value the ones before reach. */
 type PathIn<T, P> = P extends readonly [infer K, ...infer Rest]

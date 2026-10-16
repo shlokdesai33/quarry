@@ -72,7 +72,7 @@ export type JsonValue =
 	| boolean
 	| null
 	| readonly JsonValue[]
-	| { readonly [key: string]: JsonValue };
+	| { [key: string]: JsonValue };
 
 export const json = (b: Uint8Array, s: number, e: number): JsonValue => {
 	const value: JsonValue = JSON.parse(utf8(b, s, e));

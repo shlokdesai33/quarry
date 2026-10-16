@@ -203,7 +203,7 @@ function compareColumn(
 		site: column.site,
 	};
 
-	if (!sameType(column.type, actual.type)) {
+	if (!sameType(column.type, actual.type) && !sameDomain(column.type, actual)) {
 		const expected = renderType(column.type);
 		const found = describeType(actual);
 		const code = suggestType(actual.type);
@@ -483,6 +483,14 @@ function describeFill(column: CatalogColumn): string {
 	}
 	if (column.expression !== undefined) return `default ${column.expression}`;
 	return 'no default';
+}
+
+/** Whether the code names the domain the column is declared with (a `defineType` of it). */
+function sameDomain(expected: SqlType, actual: CatalogColumn): boolean {
+	if (actual.domain === undefined || expected.array !== actual.type.array)
+		return false;
+	const name = expected.name.split('.').at(-1)?.replaceAll('"', '');
+	return name === actual.domain;
 }
 
 /** The database's type, naming the domain it is declared with. */

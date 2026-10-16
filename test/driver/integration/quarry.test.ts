@@ -28,6 +28,7 @@ import {
 } from '../../../src/database.js';
 import { defineEnum } from '../../../src/define-enum.js';
 import { defineTable } from '../../../src/define-table.js';
+import { defineType } from '../../../src/define-type.js';
 import type { QueryEvent } from '../../../src/driver-executor.js';
 import { defineCodec } from '../../../src/driver/codec.js';
 import { codecs } from '../../../src/driver/codecs.js';
@@ -85,6 +86,16 @@ const jobs = defineTable('jobs', {
 	},
 });
 
+const points = defineType({ sql: 'quarry_points', codec: codecs.int4 });
+
+const scores = defineTable('scores', {
+	columns: {
+		id: integer().identity(),
+		points: points(),
+		big: bigint().useCodec(codecs.int8),
+	},
+});
+
 /** A view that sleeps, so a select can run long enough to cancel. */
 const slow = defineTable('slow', { columns: { done: text() } });
 
@@ -117,6 +128,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 			);
 			create table posts (id int generated always as identity primary key, user_id int not null, title text not null);
 			create table jobs (id int generated always as identity primary key, status text not null);
+			create domain quarry_points as int4 check (value > 0);
+			create table scores (id int generated always as identity primary key, points quarry_points not null, big bigint not null);
 			create view slow as select pg_sleep(2)::text as done;
 		`);
 		});
@@ -303,6 +316,89 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				.takeFirst()
 				.execute();
 			expect(first).toEqual({ email: 'a@x' });
+		});
+
+		it('tests a range against a single date or instant', async () => {
+			const inside = await db
+				.selectFrom(users)
+				.select(['users.email'])
+				.where((eb) =>
+					eb.and([
+						eb.ref('users.active').contains('2024-01-05'),
+						eb.ref('users.window').contains(new Date(Date.UTC(2024, 0, 1, 6))),
+					]),
+				)
+				.execute();
+			expect(inside).toEqual([{ email: 'a@x' }]);
+			const outside = await db
+				.selectFrom(users)
+				.select(['users.email'])
+				.where((eb) => eb.ref('users.active').contains('2025-01-05'))
+				.execute();
+			expect(outside).toEqual([]);
+		});
+
+		it('reads and writes columns through the codec they choose', async () => {
+			const big = 2n ** 62n + 1n;
+			const row = await db
+				.insertInto(scores)
+				.values({ points: 3, big })
+				.returning(['scores.points', 'scores.big'])
+				.expectOne()
+				.execute();
+			expectTypeOf(row).toEqualTypeOf<{ points: number; big: bigint }>();
+			expect(row).toEqual({ points: 3, big });
+			await db
+				.insertInto(scores)
+				.values([
+					{ points: 1, big: 1n },
+					{ points: 2, big: -big },
+				])
+				.execute();
+			const found = await db
+				.selectFrom(scores)
+				.select(['scores.big'])
+				.where((eb) => eb.ref('scores.points').gt(1))
+				.where('scores.big', -big)
+				.execute();
+			expect(found).toEqual([{ big: -big }]);
+			// the domain's check still applies to what the codec sends
+			await expect(
+				db.insertInto(scores).values({ points: 0, big: 0n }).execute(),
+			).rejects.toMatchObject({ code: '23514' });
+			const report = await db.verify([scores]);
+			expect(report.diagnostics.filter((d) => d.severity === 'error')).toEqual(
+				[],
+			);
+		});
+
+		it('asks for binary results on a fresh pool’s first query', async () => {
+			let binary = 0;
+			const counted = defineCodec({
+				name: 'int4',
+				oid: 23,
+				encode: (value: number) => String(value),
+				decodeText: Number,
+				decodeBinary: (bytes, start, end) => {
+					binary++;
+					return codecs.int4.decodeBinary?.(bytes, start, end) ?? 0;
+				},
+			});
+			const countedUsers = defineTable('users', {
+				columns: { id: integer().useCodec(counted) },
+			});
+			await using fresh = database({
+				...options(),
+				max: 1,
+				params: { search_path: `${schema},public` },
+			});
+			const ids = await fresh
+				.selectFrom(countedUsers)
+				.select(['users.id'])
+				.where('users.id', 1)
+				.execute();
+			expect(ids).toEqual([{ id: 1 }]);
+			expect(binary).toBe(1);
 		});
 
 		it('streams rows and describes queries', async () => {

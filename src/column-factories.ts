@@ -333,7 +333,11 @@ export function interval<T extends Out<'interval'> = Out<'interval'>>() {
  * @example settings: jsonb<{ theme: string }>()
  * @example profile: jsonb<{ address: { city: string } }>().nullable()
  */
-export function jsonb<T = Out<'jsonb'>>() {
+export function jsonb(): Column<DataType<'jsonb'>, Out<'jsonb'>>;
+export function jsonb<T>(): Column<DataType<'jsonb'>, T>;
+// an overload without a type parameter, so where a column is expected the
+// value type isn't inferred from there, and an untyped one is a JsonValue
+export function jsonb<T>() {
 	return new Column<DataType<'jsonb'>, T>({
 		dataType: new DataType('jsonb'),
 		site: captureCallSite(jsonb),
