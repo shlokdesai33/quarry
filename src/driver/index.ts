@@ -75,6 +75,7 @@ export {
 } from './parsers.js';
 export {
 	arrayOf,
+	declareParamType,
 	defineCodec,
 	typed,
 	TypedValue,

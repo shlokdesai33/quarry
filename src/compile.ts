@@ -11,7 +11,7 @@ import type {
 	TableNode,
 	UpdateNode,
 } from './node.js';
-import { arrayOf, type Codec } from './driver/codec.js';
+import { arrayOf, declareParamType, type Codec } from './driver/codec.js';
 
 export interface CompiledQuery {
 	readonly sql: string;
@@ -126,9 +126,10 @@ function renderUnnest(rows: RowsNode, params: Params): string {
 				const cell = row[i];
 				return cell?.kind === 'value' ? cell.value : null;
 			}),
+			// the cast pins the array's type, so it can be declared
 			codec === undefined || codec.element !== undefined
 				? undefined
-				: arrayOf(codec),
+				: declareParamType(arrayOf(codec)),
 		);
 		return `${placeholder}::${type}[]`;
 	});

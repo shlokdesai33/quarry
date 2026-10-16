@@ -172,26 +172,23 @@ function hexOf(bytes: Uint8Array): string {
 	return out;
 }
 
+/** Characters that make an array element's text need quotes, by delimiter. */
+const SPECIAL: Readonly<Record<string, RegExp>> = {
+	',': /[{}"\\,\s]/,
+	';': /[{}"\\;\s]/,
+};
+
 /** Whether an array element's text must be quoted: empty, `NULL`, or holding syntax, a quote, a backslash or white space. */
 function needsQuotes(text: string, delimiter: string): boolean {
 	if (text.length === 0) return true;
 	if (text.length === 4 && text.toUpperCase() === 'NULL') return true;
-	for (let i = 0; i < text.length; i++) {
-		const c = text.charCodeAt(i);
-		if (
-			c === 0x7b || // {
-			c === 0x7d || // }
-			c === 0x22 || // "
-			c === 0x5c || // \
-			c <= 0x20 ||
-			text[i] === delimiter
-		)
-			return true;
-	}
-	return false;
+	const special = SPECIAL[delimiter];
+	if (special !== undefined) return special.test(text);
+	return /[{}"\\\s]/.test(text) || text.includes(delimiter);
 }
 
 const BACKSLASH_OR_QUOTE = /[\\"]/g;
+const HAS_BACKSLASH_OR_QUOTE = /[\\"]/;
 
 /** An array literal of `values`, each element through `element.encode`. */
 function arrayText(
@@ -213,9 +210,10 @@ function arrayText(
 		}
 		const encoded = element.encode(value);
 		const text = typeof encoded === 'string' ? encoded : hexOf(encoded);
-		out += needsQuotes(text, delimiter)
-			? `"${text.replace(BACKSLASH_OR_QUOTE, '\\$&')}"`
-			: text;
+		if (!needsQuotes(text, delimiter)) out += text;
+		else if (HAS_BACKSLASH_OR_QUOTE.test(text))
+			out += `"${text.replace(BACKSLASH_OR_QUOTE, '\\$&')}"`;
+		else out += `"${text}"`;
 	}
 	return `${out}}`;
 }
@@ -307,6 +305,43 @@ export function arrayOf<In, Out>(
 	Object.freeze(codec);
 	byDelimiter.set(delimiter, codec);
 	return codec;
+}
+
+const declared = new WeakMap<Codec, Codec>();
+
+/**
+ * `codec`, declaring its type for parameters even where it would leave it
+ * to the server (`inferParamType`): for a parameter whose type the SQL
+ * pins anyway, as `$1::text[]` does. Arrays of text-like types then go in
+ * binary.
+ */
+export function declareParamType<In, Out>(
+	codec: Codec<In, Out>,
+): Codec<In, Out> {
+	if (codec.inferParamType !== true || codec.oid === 0) return codec;
+	const known = declared.get(codec);
+	// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- made below from this codec
+	if (known !== undefined) return known as Codec<In, Out>;
+	const element = codec.element;
+	const binary =
+		element !== undefined &&
+		isTextLike(element) &&
+		element.arrayOid !== undefined;
+	const copy: Codec<In, Out> = Object.freeze({
+		...codec,
+		inferParamType: false,
+		...(binary
+			? {
+					paramFormat: 'binary' as const,
+					encode: (value: In) =>
+						(Array.isArray(value)
+							? binaryArray(value, codec.oid)
+							: undefined) ?? codec.encode(value),
+				}
+			: {}),
+	});
+	declared.set(codec, copy);
+	return copy;
 }
 
 /**

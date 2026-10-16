@@ -570,17 +570,17 @@ describe.skipIf(noPg)('quarry’s binary array parameters', () => {
 
 	it('inserts many rows in binary, as single-row inserts store them', async () => {
 		const query = compile(db.insertInto(items).values(rows).toNode());
-		// each column as an array of its codec: binary where the driver has an
-		// encoder, text-like ones as literals of a type the server infers
+		// each column as an array of its codec, declared as the cast pins it,
+		// and binary where the driver has an encoder
 		expect(query.paramCodecs?.map((codec) => codec?.paramFormat)).toEqual([
 			'binary',
-			'text',
 			'binary',
 			'binary',
 			'binary',
 			'binary',
 			'binary',
-			'text',
+			'binary',
+			'binary',
 			'binary',
 			'binary',
 			'binary',

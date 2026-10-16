@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { integer, jsonb, text, timestamptz } from '../src/column-factories.js';
 import { compile } from '../src/compile.js';
-import { arrayOf } from '../src/driver/codec.js';
+import { arrayOf, declareParamType } from '../src/driver/codec.js';
 import { codecs } from '../src/driver/codecs.js';
 import { codecNames, plain } from './helpers/compiled.js';
 import { databaseWith } from '../src/database.js';
@@ -352,11 +352,16 @@ describe('compiling write queries', () => {
 				['A', null],
 			],
 		});
-		// one array per column, of the column's codec
+		// one array per column, of the column's codec, its type declared: the cast pins it
 		expect(many.paramCodecs).toEqual([
-			arrayOf(codecs.text),
-			arrayOf(codecs.text),
+			declareParamType(arrayOf(codecs.text)),
+			declareParamType(arrayOf(codecs.text)),
 		]);
+		expect(many.paramCodecs?.[0]).toMatchObject({
+			oid: 1009,
+			inferParamType: false,
+			paramFormat: 'binary',
+		});
 		// a row that leaves a column to its default can't go through unnest
 		const ragged = compile(
 			insertInto(users)
