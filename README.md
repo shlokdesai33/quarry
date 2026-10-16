@@ -86,7 +86,7 @@ The package has two entry points:
 | Import          | What it is                                                                           |
 | --------------- | ------------------------------------------------------------------------------------ |
 | `quarry`        | The query builder, `database()`, schema verification, and the driver's error classes |
-| `quarry/driver` | The driver on its own: `connect`, `createPool`, type parsers and everything else     |
+| `quarry/driver` | The driver on its own: `connect`, `createPool`, codecs and everything else           |
 
 The package also installs a `quarry` binary, used for [`quarry verify`](#schema-verification).
 
@@ -366,11 +366,12 @@ Options are resolved like libpq, in this order, the first one that sets a value 
 | `params`             |                            | Startup parameters, e.g. `{ search_path: 'app', timezone: 'UTC' }`.                                                                |
 | `options`            |                            | Command-line options for the server, as `PGOPTIONS` (e.g. `'-c statement_timeout=5s'`).                                            |
 | `passfile`           | `PGPASSFILE` / `~/.pgpass` | A password file in `.pgpass` format.                                                                                               |
-| `types`              | `defaultTypes`             | Result decoders by type OID. See [Decoding results](#decoding-results).                                                            |
+| `codecs`             | `defaultCodecs`            | Codecs to read result columns with, by type, over the defaults. See [Decoding results](#decoding-results).                         |
+| `types`              |                            | Text parsers by type OID instead of the default codecs (`rawTypes` for all text). Kept for parsers written before codecs.          |
 | `prepare`            | `true`                     | Use named prepared statements, cached per connection.                                                                              |
 | `statementCacheSize` | `100`                      | Prepared statements kept per connection (least recently used are deallocated).                                                     |
 | `preparePipelined`   | detected                   | Use named statements for pipelined queries too. See [Poolers and proxies](#poolers-and-proxies).                                   |
-| `binaryResults`      | `true`                     | Receive columns in binary where a binary decoder exists.                                                                           |
+| `binaryResults`      | `true`                     | Receive columns in binary where their codec reads them so.                                                                         |
 | `protocol`           | `'auto'`                   | `'auto'` asks for 3.2 and accepts what the server negotiates; `'3.0'` or `'3.2'` insists on that version.                          |
 | `minProtocolVersion` | `'3.0'`                    | The oldest protocol version to accept.                                                                                             |
 | `maxProtocolVersion` | `'latest'`                 | The newest protocol version to ask for.                                                                                            |
@@ -486,9 +487,11 @@ await pool.query(sql, params, {
 	timeout: 5000, // client-side deadline, in ms
 	statementTimeout: '2s', // server-side statement_timeout for this query only
 	paramTypes: [arrayOids.int4],
+	paramCodecs: [codecs.int4], // encode $1 with this codec, and declare its type
+	resultCodecs: [codecs.int4, codecs.timestamptz], // the codec each column is expected in
+	codecs: [codecs.int8AsString], // codecs by type for this query only
 	prepare: false, // send this one unnamed
 	keepRows: 1, // decode only the first row; rowCount still counts all
-	types: { ...defaultTypes, [oids.numeric]: Number }, // decoders for this query only
 	tag: 'orders.recent', // a label for telemetry spans
 	onTiming: (t) => log(t), // where the query spent its time once it settles
 });
@@ -523,60 +526,88 @@ Parameters are always sent separately from the SQL text, never interpolated.
 | Arrays              | A Postgres array literal, or binary when the type is declared (below).                                                      |
 | Other objects       | JSON.                                                                                                                       |
 
-**Binary arrays.** When a parameter's type is declared in `paramTypes` and its elements fit that type, the array is sent in binary, which the server reads far more cheaply than a literal. This applies to arrays of `bool`, `int2`, `int4`, `int8`, `float8`, `timestamptz` (from `Date`s), `uuid`, `text`, `varchar`, `char`, `jsonb` (from JSON text) and `bytea`. Anything else falls back to a literal.
+**Typed parameters.** `typed(value, codec)` gives a parameter a [codec](#codecs): the value is encoded by it, once, and its type is declared at Parse, so Postgres doesn't have to infer it. That is how a range is tested against a single instant, where an untyped point would be read as a range:
 
 ```ts
-import { arrayOids } from 'quarry/driver';
+import { arrayOf, codecs, typed } from 'quarry/driver';
+
+await pool.query('select $1 @> $2 as inside', [
+	typed(range, codecs.tstzrange),
+	typed(new Date(), codecs.timestamptz),
+]);
 
 await pool.query(
 	'insert into items (id, name) select * from unnest($1::int4[], $2::text[])',
-	[ids, names],
-	{ paramTypes: [arrayOids.int4, arrayOids.text] },
+	[typed(ids, arrayOf(codecs.int4)), typed(names, arrayOf(codecs.text))],
 );
 ```
 
-The query builder declares these types for you, for multi-row inserts, `updateMany` and `column = any($1)`.
+Text-like codecs (`text`, `varchar`, `char`, `name`, and `codecs.raw`) leave the parameter's type to the server, so a string still goes into a `citext`, enum or `char(n)` column as before. Types looked up by name (enums, domains, extensions) declare their OID once the pool's catalog has it. The statement cache keys on the declared types, so the same SQL with differently typed parameters is prepared once per typing.
+
+**Binary arrays.** Arrays of `bool`, `int2`, `int4`, `int8`, `float8`, `timestamptz` (from `Date`s), `uuid`, `jsonb` and `bytea` are sent in binary by their `arrayOf` codec (and, without a codec, when `paramTypes` declares the array's type), which the server reads far more cheaply than a literal. An element that doesn't fit falls back to a literal. Text arrays go as literals of a type the server infers.
+
+The query builder gives every parameter its column's codec: multi-row inserts and `updateMany` send each column as `arrayOf` its codec, and `column = any($1)` the same.
 
 A query takes at most 65,535 parameters, the protocol's limit; more are refused before anything is sent. For more rows than that, use `unnest` with array parameters, or `COPY`.
 
 ## Decoding results
 
-Values are decoded per column type OID. Three choices:
+Values are decoded per column by a codec: the one the query expects for that column (`resultCodecs`, as the query builder always gives), or the registry's codec for the column's type OID. A type without one is the server's text.
 
-| `types`        | Behaviour                                                                                                                                                                                                                                                             |
-| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `defaultTypes` | The default, and lossless: `int2`/`int4`/`float4`/`float8` become numbers, `int8` a `bigint`, `bool` a boolean, `json`/`jsonb` parsed, `bytea` a `Uint8Array`, arrays of those. `numeric`, dates and times stay as text, since no JavaScript type holds them exactly. |
-| `rawTypes`     | Every value is the server's text.                                                                                                                                                                                                                                     |
-| your own       | Any `Record<oid, (text: string) => unknown>`. Spread `defaultTypes` and override what you need.                                                                                                                                                                       |
+| `codecs`        | Behaviour                                                                                                                                                                                                                                                                                    |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `defaultCodecs` | The default, and lossless: `int2`/`int4`/`float4`/`float8` become numbers, `int8` a `bigint`, `bool` a boolean, `json`/`jsonb` parsed, `bytea` a `Uint8Array`, arrays of those and of text-like types. `numeric`, dates and times stay as text, since no JavaScript type holds them exactly. |
+| a list          | Codecs registered over the defaults, by type: each overrides the default for its type, and brings its array type's codec.                                                                                                                                                                    |
 
 ```ts
-import {
-	createPool,
-	defaultTypes,
-	oids,
-	parseTimestamptz,
-} from 'quarry/driver';
+import { codecs, createPool, defineCodec } from 'quarry/driver';
+
+const decimal = defineCodec({
+	name: 'numeric',
+	oid: 1700,
+	arrayOid: 1231,
+	encode: (value: Decimal) => value.toString(),
+	decodeText: (text) => new Decimal(text),
+});
 
 const pool = createPool({
-	types: {
-		...defaultTypes,
-		[oids.timestamptz]: parseTimestamptz, // Date instead of text
-		[oids.numeric]: (text) => new Decimal(text),
-	},
+	codecs: [codecs.int8AsString, codecs.timestamptz, decimal],
 });
 ```
 
-The module exports the building blocks: `oids` and `arrayOids` (type OIDs by name), parsers (`parseInteger`, `parseBigInt`, `parseFloat`, `parseBool`, `parseJson`, `parseBytea`, `parseTimestamptz`, `parseRange`, `parseVector`, `parseHalfvec`) and `arrayParser(element)` to build an array decoder for any element parser. `catalogTypes` looks up the OIDs of extension and enum array types in `pg_type`, which have no fixed OIDs.
+### Codecs
 
-**Binary results.** From a cached statement's second run, columns whose decoder has a binary twin are requested in binary. The values are identical; only the cost differs. That covers `int2`, `int4`, `oid`, `float8`, `bool`, `bytea` and `timestamptz` (as `Date`); arrays of those and of text-like types, `json`/`jsonb` and `int8` (as `bigint`) when the array decoder is the driver's own; and pgvector's `vector`. Custom decoders always receive text. Turn it off with `binaryResults: false`.
+A codec is one type's encoding, both ways:
 
-**pgvector.** `parseVector` returns the float32 values pgvector stores, on every path: `[0.1]` reads as `[0.10000000149011612]`, the value pgvector holds and the value its binary format carries.
+| Field                         | Meaning                                                                                                           |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `name`, `oid`, `arrayOid`     | The type. `oid: 0` means it is looked up by `name` in `pg_type` (enums, domains, extension types), once per pool. |
+| `paramFormat`                 | `'text'` or `'binary'`: what `encode` returns.                                                                    |
+| `resultFormat`                | The format its results are asked for in. `'binary'` needs `decodeBinary`.                                         |
+| `inferParamType`              | Leave a parameter's type to the server instead of declaring `oid`.                                                |
+| `encode(value)`               | A non-null value as a string, or bytes in the binary format.                                                      |
+| `decodeText(text)`            | A non-null value from the server's text.                                                                          |
+| `decodeBinary(b, start, end)` | Optional: a non-null value from its binary format.                                                                |
+
+`codecs` holds the built-in ones, by type: `bool`, `int2`, `int4`, `oid`, `int8` (a `bigint`), `int8AsString`, `float4`, `float8`, `numeric` (a string), `text`, `varchar`, `bpchar`, `name`, `char`, `uuid`, `bytea`, `json`, `jsonb`, `timestamptz` (a `Date`), `timestamptzAsString`, `date`, `time`, `timetz`, `timestamp`, `interval`, `inet`, `cidr`, `macaddr`, `money`, `xml`, `bit`, `varbit`, `point`, `box`, `tsvector`, `tsquery`, `jsonpath`, `daterange` and `tstzrange` (as `RangeValue`), pgvector's `vector` and `halfvec`, and `raw`, which keeps any type as the server's text both ways. `arrayOf(codec)` is the codec of its arrays, of any number of dimensions. `defineCodec({ name, encode, decodeText })` fills in the rest of a codec for a type of your own, looked up by name.
+
+Which types are binary follows what is cheaper in JavaScript: binary where the value is a number, a `Date`, bytes, or an array of those (and pgvector's vectors), text where the value is a string anyway (`int8` as a string, `numeric`, `uuid`, dates, text types, enums) or the binary format carries the same text (`jsonb`).
+
+**Types looked up by name.** A codec whose `oid` is 0 is resolved through `pg_type` once per pool: the first query that needs one loads the catalog behind it (that query still runs, its parameter's type inferred and its column read as text), or `pool.loadTypes()` loads it up front. A domain's columns are reported as its base type, so its codec is the base type's.
+
+**`types`.** A table of text parsers by OID (`defaultTypes`, `rawTypes` for every value as text, or your own `Record<oid, (text) => unknown>`) still works in place of codecs, per pool or per query. The driver's own parsers keep their binary formats; other parsers get text.
+
+The module also exports `oids` and `arrayOids` (type OIDs by name), the parsers (`parseInteger`, `parseBigInt`, `parseFloat`, `parseBool`, `parseJson`, `parseBytea`, `parseTimestamptz`, `parseRange`, `parseVector`, `parseHalfvec`, `parseArray`) and `createCodecRegistry(list)`, to build a registry once and pass it per query.
+
+**Binary results.** Columns are received in binary where their codec reads them so; the values are identical, only the cost differs. A column whose codec the query names (`resultCodecs`) gets it from the statement's first run, prepared or not, and from a cursor's first batch. Other columns get it once a cached statement's columns are known, from its second run. At RowDescription each expected codec is checked against the column's type: a column of another type (schema drift) is read with the registry's codec for it, and one sent in binary that nothing can read fails that run with a `DecodeError`, its statement then asking for text. Turn binary off with `binaryResults: false`.
+
+**pgvector.** `codecs.vector` (and `parseVector`) returns the float32 values pgvector stores, on every path: `[0.1]` reads as `[0.10000000149011612]`, the value pgvector holds and the value its binary format carries.
 
 **Decode errors** fail only the query they belong to, with a `DecodeError` naming the column and type (never the value). The connection stays usable.
 
 ## Prepared statements
 
-Statements are prepared and cached per connection: up to `statementCacheSize` (100), least recently used first out. A repeated query then skips parsing and planning on the server, and its result columns are known in advance, which is what makes binary results possible.
+Statements are prepared and cached per connection: up to `statementCacheSize` (100), least recently used first out. A repeated query then skips parsing and planning on the server, and its result columns are known in advance, so even columns the query names no codec for are received in binary.
 
 - **Schema changes.** A cached statement that a schema change made stale (its result type or an inferred parameter type changed), or that the server no longer has (`DEALLOCATE`, `DISCARD ALL`), is retried once as an unnamed statement, outside a transaction.
 - **Opting out.** `prepare: false` on the connection or pool, or per query.
@@ -911,13 +942,13 @@ Each column is declared under the key you'll use in TypeScript. `.name('created_
 | `text()`            | `text`              | `string`         |                                                                                         |
 | `varchar(n?)`       | `varchar(n)`        | `string`         |                                                                                         |
 | `uuid()`            | `uuid`              | `string`         | Hyphenated form.                                                                        |
-| `bytea()`           | `bytea`             | `Uint8Array`     |                                                                                         |
+| `bytea()`           | `bytea`             | `Uint8Array`     | Read as a plain `Uint8Array`, never a `Buffer`, so it isn't narrowed. Binary both ways. |
 | `date()`            | `date`              | `string`         | `'2026-10-14'`; no time zone to get wrong.                                              |
 | `time()`            | `time`              | `string`         |                                                                                         |
 | `timestamp()`       | `timestamp`         | `string`         | Wall-clock time without a zone, kept as text.                                           |
 | `timestamptz()`     | `timestamptz`       | `Date`           |                                                                                         |
 | `interval()`        | `interval`          | `string`         |                                                                                         |
-| `jsonb<T>()`        | `jsonb`             | `T`              | `T` describes the document.                                                             |
+| `jsonb<T>()`        | `jsonb`             | `T`, `JsonValue` | `T` describes the document. Untyped, any JSON value, JSON `null` included.              |
 | `inet()`            | `inet`              | `string`         |                                                                                         |
 | `tsvector()`        | `tsvector`          | `string`         | Usually `generated()`.                                                                  |
 | `daterange()`       | `daterange`         | `Range<string>`  |                                                                                         |
@@ -925,6 +956,8 @@ Each column is declared under the key you'll use in TypeScript. `.name('created_
 | `vector()`          | `vector` (pgvector) | `number[]`       | The extension must be installed.                                                        |
 | `array(column)`     | `element[]`         | `element[]`      | `array(text().nullable())` is `(string \| null)[]`. One dimension.                      |
 | `defineEnum(...)()` | your enum type      | union of labels  | See [Enums](#enums).                                                                    |
+
+Each factory's TypeScript type is its codec's: what the driver decodes the column to (see [Codecs on columns](#codecs-on-columns)).
 
 A `Range<T>` is either `{ empty: true }` or `{ empty: false, lower, upper, bounds }`, where `lower` and `upper` are `null` when unbounded and `bounds` is `'[)'`, `'(]'`, `'[]'` or `'()'`. Modelling the empty range as its own variant means you can't read a bound before ruling it out.
 
@@ -938,12 +971,13 @@ A `Range<T>` is either `{ empty: true }` or `{ empty: false, lower, upper, bound
 | `.identity()`       | `generated always as identity` (integer types only). | Never written: excluded from inserts and updates.   |
 | `.name(n)`          | The column's name in the database.                   | None.                                               |
 | `.typed<S, I, U>()` | Narrow the select, insert and update types.          | Each may only narrow the current type.              |
+| `.useCodec(codec)`  | Send and read the column with another codec.         | The codec's output on select, its input on writes.  |
 
 Modifiers form a state machine that mirrors what Postgres allows. `nullable` combines with `default` or `generated`; `default` and `generated` exclude each other; `identity` excludes everything. Each modifier returns a column that only has the modifiers still valid, so an invalid chain isn't a type error on some method: the method isn't there.
 
 ### Narrowing types
 
-Every factory takes a type parameter that narrows its value, for branded ids and literal unions:
+Every factory but `bytea()` takes a type parameter that narrows its value, for branded ids and literal unions:
 
 ```ts
 type UserId = number & { readonly __brand: 'UserId' };
@@ -988,6 +1022,49 @@ const refunds = defineTable('refunds', {
 ```
 
 An enum is declared once and backs any number of columns. Its labels are ordered as declared, as in Postgres, so `<` and `>` compare by position. `quarry verify` checks the labels and their order.
+
+### Codecs on columns
+
+Every column type has a [driver codec](#codecs) that sends its values and reads them back, and its TypeScript type is that codec's: `integer()` is `codecs.int4`, `bigint()` `codecs.int8AsString`, `timestamptz()` `codecs.timestamptz`. The query builder only chooses codecs; the driver encodes each parameter once with its column's codec (declaring its type), and asks for each selected column in its codec's format from the first run.
+
+`.useCodec(codec)` swaps a column's codec, and its types with it:
+
+```ts
+import { codecs } from 'quarry';
+
+const events = defineTable('events', {
+	columns: {
+		id: bigint().identity().useCodec(codecs.int8), // a bigint, not a string
+		at: timestamptz().useCodec(codecs.raw), // the server's text, typed as string
+	},
+});
+```
+
+`codecs.raw` keeps any type as the server's text, both ways, for a column you parse yourself.
+
+`defineType({ sql, codec })` declares a type quarry has no factory for (an extension's, a domain, your own), once, and returns its column factory. Its columns admit every operator, with values of the codec's type:
+
+```ts
+import { codecs, defineCodec, defineType } from 'quarry';
+
+const citext = defineType({ sql: 'citext', codec: codecs.text });
+const positive = defineType({ sql: 'positive_int', codec: codecs.int4 }); // a domain
+
+const point = defineType({
+	sql: 'point',
+	codec: defineCodec({
+		name: 'point',
+		oid: 600,
+		encode: ({ x, y }: { x: number; y: number }) => `(${x},${y})`,
+		decodeText: (text) => {
+			const [x, y] = text.slice(1, -1).split(',').map(Number);
+			return { x: x ?? 0, y: y ?? 0 };
+		},
+	}),
+});
+```
+
+`db.verify` checks a `defineType` column against its type's name, or the domain it is declared with.
 
 ### Inferring row types
 
@@ -1039,14 +1116,13 @@ const db = database(
 );
 ```
 
-| Option      | Default           | Description                                                                                                                                                     |
-| ----------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `onQuery`   |                   | Called once per query when it settles, with its SQL, parameters, tag, command, row count, error, and timings (`acquireMs`, `queuedMs`, `execMs`, `durationMs`). |
-| `callsites` | `true`            | Append the stack of the code that ran a query to its error.                                                                                                     |
-| `types`     | quarry's decoders | Text parsers by type OID. The defaults decode to the TypeScript types the columns declare.                                                                      |
-| `raw`       |                   | Leave these types (by name or OID), or all with `true`, as the server's text.                                                                                   |
-| `catalog`   | `true`            | Look up array, enum-array and pgvector type OIDs in `pg_type` once, before the first query, so they decode.                                                     |
-| `prepare`   | the connection's  | Use cached prepared statements.                                                                                                                                 |
+| Option      | Default          | Description                                                                                                                                                     |
+| ----------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `onQuery`   |                  | Called once per query when it settles, with its SQL, parameters, tag, command, row count, error, and timings (`acquireMs`, `queuedMs`, `execMs`, `durationMs`). |
+| `callsites` | `true`           | Append the stack of the code that ran a query to its error.                                                                                                     |
+| `codecs`    | quarry's codecs  | Codecs for result columns no query types (raw SQL, expressions of unknown type). Columns always use their own codec, so their types hold.                       |
+| `catalog`   | `true`           | Look up the types codecs name (enums, pgvector, custom types and their arrays) in `pg_type` once per pool, before the first query.                              |
+| `prepare`   | the connection's | Use cached prepared statements.                                                                                                                                 |
 
 `Database` implements `AsyncDisposable`: `await using db = database(url)` closes it at the end of the scope.
 
@@ -1285,15 +1361,15 @@ db.selectFrom(posts).pipe(published).pipe(withAuthor).select(['posts.title']);
 
 The expression builder `eb`, passed to every callback, builds typed SQL expressions. Its members don't depend on `this`, so it can be destructured: `.where(({ ref, or }) => …)`.
 
-| Member                                            | Description                                                                                                  |
-| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `eb.ref(column)`                                  | A column reference, with the comparison methods of its SQL type.                                             |
-| `eb.val(value)`                                   | A parameter, for positions that take a reference by default (`eb.fn.concat('users.first', eb.val(' '), …)`). |
-| `eb.and([...])`, `eb.or([...])`, `eb.not(p)`      | Combine predicates.                                                                                          |
-| `eb.fn`                                           | SQL functions and aggregates.                                                                                |
-| `eb.json`                                         | jsonb accessors and tests.                                                                                   |
-| `eb.exists(q)`, `eb.notExists(q)`, `eb.scalar(q)` | Subqueries.                                                                                                  |
-| `eb.case()`                                       | `case when … then … else … end`.                                                                             |
+| Member                                            | Description                                                                                                                                                                                                         |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `eb.ref(column)`                                  | A column reference, with the comparison methods of its SQL type.                                                                                                                                                    |
+| `eb.val(value, codec?)`                           | A parameter, for positions that take a reference by default (`eb.fn.concat('users.first', eb.val(' '), …)`). In a comparison or `coalesce` it is encoded by the other side's codec; elsewhere by `codec`, if given. |
+| `eb.and([...])`, `eb.or([...])`, `eb.not(p)`      | Combine predicates.                                                                                                                                                                                                 |
+| `eb.fn`                                           | SQL functions and aggregates.                                                                                                                                                                                       |
+| `eb.json`                                         | jsonb accessors and tests.                                                                                                                                                                                          |
+| `eb.exists(q)`, `eb.notExists(q)`, `eb.scalar(q)` | Subqueries.                                                                                                                                                                                                         |
+| `eb.case()`                                       | `case when … then … else … end`.                                                                                                                                                                                    |
 
 `expressionBuilder(...tables)` creates one outside a query, for building predicates in advance.
 
