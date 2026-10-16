@@ -236,7 +236,7 @@ describe.skipIf(noPg)('binary arrays', () => {
 		const floats = Array.from(new Float32Array(bits.buffer)).filter((f) =>
 			Number.isFinite(f),
 		);
-		const codecs = quarryRegistry;
+		const registry = quarryRegistry;
 		for (let i = 0; i < floats.length; i += 16_000) {
 			const chunk = floats.slice(i, i + 16_000);
 			const sql = `select $1::float4[]::vector as v`;
@@ -244,11 +244,11 @@ describe.skipIf(noPg)('binary arrays', () => {
 			const { rows: textRows } = await c.query<{ v: number[] }>(
 				sql,
 				[literal],
-				{ codecs, binary: false },
+				{ codecs: registry, binary: false },
 			);
-			await c.query(sql, [literal], { codecs });
+			await c.query(sql, [literal], { codecs: registry });
 			const { rows } = await c.query<{ v: number[] }>(sql, [literal], {
-				codecs,
+				codecs: registry,
 			});
 			expect(rows[0]?.v).toEqual(chunk);
 			expect(textRows[0]?.v).toEqual(chunk);
