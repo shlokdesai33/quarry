@@ -11,17 +11,10 @@ import { encodeParams, paramOids } from '../../src/driver/params.js';
 import {
 	createCodecRegistry,
 	defaultRegistry,
-	parsersRegistry,
 	TypeCatalog,
 	type CatalogType,
 } from '../../src/driver/registry.js';
-import {
-	arrayParser,
-	defaultTypes,
-	numberText,
-	parseArray,
-	parseInteger,
-} from '../../src/driver/types.js';
+import { numberText, parseArray } from '../../src/driver/types.js';
 import { prng } from './helpers/backend.js';
 
 const catalogRow = (
@@ -356,22 +349,12 @@ describe('the codec registry', () => {
 		expect(types.resultOidOf(posint)).toBe(23);
 	});
 
-	it('reads a table of text parsers, keeping the driver’s own parsers in binary', () => {
-		const registry = parsersRegistry({
-			...defaultTypes,
-			[23]: (t: string) => `#${t}`,
-			[1005]: arrayParser(parseInteger),
-			[1007]: (t: string) => parseArray(t, parseInteger),
-		});
-		expect(registry.codecFor(16, catalog)).toBe(codecs.bool);
-		expect(registry.codecFor(20, catalog)).toBe(codecs.int8);
-		expect(registry.codecFor(1005, catalog)).toBe(arrayOf(codecs.int2));
-		const custom = registry.codecFor(23, catalog);
-		expect(custom !== undefined && 'decodeBinary' in custom).toBe(false);
-		expect(custom?.decodeText('1')).toBe('#1');
-		const hand = registry.codecFor(1007, catalog);
-		expect(hand !== undefined && 'decodeBinary' in hand).toBe(false);
-		expect(registry.codecFor(1009, catalog)).toBe(arrayOf(codecs.text));
-		expect(parsersRegistry({}).codecFor(23, catalog)).toBeUndefined();
+	it('builds on nothing with a null base, or takes a registry as a pool option', () => {
+		const empty = createCodecRegistry([], null);
+		expect(empty.codecFor(23, catalog)).toBeUndefined();
+		const only = createCodecRegistry([codecs.int4], null);
+		expect(only.codecFor(23, catalog)).toBe(codecs.int4);
+		expect(only.codecFor(1007, catalog)).toBe(arrayOf(codecs.int4));
+		expect(only.codecFor(16, catalog)).toBeUndefined();
 	});
 });

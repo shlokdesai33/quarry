@@ -33,24 +33,14 @@ export { cloudflareSockets } from './cloudflare-socket.js';
 export {
 	arrayLiteral,
 	arrayOids,
-	arrayParser,
 	copyChunks,
 	copyLine,
-	defaultTypes,
 	encodeParam,
 	numberText,
-	parseBigInt,
-	parseBool,
-	parseFloat,
-	parseInteger,
-	parseJson,
 	formatTimestamp,
 	oids,
 	parseArray,
 	parseBytea,
-	rawTypes,
-	type TextParser,
-	type TypeParsers,
 } from './types.js';
 export {
 	createPool,
@@ -66,13 +56,7 @@ export {
 	type SettingValue,
 	type TransactionOptions,
 } from './transaction.js';
-export {
-	parseRange,
-	parseTimestamptz,
-	parseHalfvec,
-	parseVector,
-	type RangeValue,
-} from './parsers.js';
+export { parseRange, parseTimestamptz, type RangeValue } from './parsers.js';
 export {
 	arrayOf,
 	declareParamType,

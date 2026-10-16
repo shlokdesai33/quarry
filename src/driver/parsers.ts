@@ -1,5 +1,4 @@
 import { DriverError } from './errors.js';
-import type { TextParser } from './types.js';
 
 const TIMESTAMPTZ =
 	/^(\d{4,})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)(\.\d+)?([+-])(\d\d)(?::?(\d\d))?(?::?(\d\d))?( BC)?$/;
@@ -192,8 +191,3 @@ export function vectorValues(text: string): number[] {
 		values[i] = Math.fround(values[i] ?? 0);
 	return values;
 }
-
-export const parseVector: TextParser = vectorValues;
-
-/** pgvector's `halfvec` output, `[1,2.5,3]`, as the decimals printed. */
-export const parseHalfvec: TextParser = (text) => JSON.parse(text);

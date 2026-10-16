@@ -20,12 +20,7 @@ import {
 	type SslOptions,
 } from '../../../../../src/driver/index.js';
 import { defaults } from './defaults.js';
-import {
-	parsersFor,
-	pgTypes,
-	TypeOverrides,
-	type TypeSource,
-} from './types.js';
+import { codecsFor, pgTypes, TypeOverrides, type TypeSource } from './types.js';
 
 type Callback = (error: Error | null | undefined, result?: any) => void;
 
@@ -485,9 +480,9 @@ export function execute(
 	}
 	const sql = text;
 	const rowMode = query._rowMode === 'array' ? 'array' : 'object';
-	const types = parsersFor(query.types ?? ctx.types);
+	const codecs = codecsFor(query.types ?? ctx.types);
 	const timeout = query.query_timeout ?? ctx.timeout;
-	const options: Record<string, unknown> = { rowMode, types };
+	const options: Record<string, unknown> = { rowMode, codecs };
 	if (timeout) options['timeout'] = timeout;
 	let values: unknown[];
 	try {

@@ -20,20 +20,18 @@ import { defineTable } from '../../../src/define-table.js';
 import { binaryArray } from '../../../src/driver/array-params.js';
 import type { Connection } from '../../../src/driver/connection.js';
 import { PostgresError } from '../../../src/driver/errors.js';
-import { parseVector } from '../../../src/driver/parsers.js';
+import { arrayOf, defineCodec } from '../../../src/driver/codec.js';
+import { codecs } from '../../../src/driver/codecs.js';
 import { createPool, type Pool } from '../../../src/driver/pool.js';
 import {
+	createCodecRegistry,
 	defaultRegistry,
 	type CodecRegistry,
 } from '../../../src/driver/registry.js';
 import {
 	arrayLiteral,
 	arrayOids,
-	arrayParser,
-	defaultTypes,
 	parseArray,
-	parseInteger,
-	type TypeParsers,
 } from '../../../src/driver/types.js';
 import { quarryRegistry } from '../../../src/kind-codecs.js';
 import { noPg, open, options, pg, table } from './helpers.js';
@@ -61,15 +59,8 @@ afterAll(async () => {
 });
 
 /** The rows of `sql` in text, and in binary (from its second run), on one connection. */
-async function bothWays(
-	c: Connection,
-	sql: string,
-	codecs: CodecRegistry | TypeParsers,
-) {
-	const read =
-		codecs instanceof Object && 'codecFor' in codecs
-			? { codecs }
-			: { types: codecs };
+async function bothWays(c: Connection, sql: string, registry: CodecRegistry) {
+	const read = { codecs: registry };
 	const asText = await c.query(sql, [], { ...read, binary: false });
 	await c.query(sql, [], read); // describes the statement
 	const binary = await c.query(sql, [], read);
@@ -192,14 +183,22 @@ describe.skipIf(noPg)('binary arrays', () => {
 		]);
 	});
 
-	it('keeps arrays in text for custom, hand-written or raw parsers', async () => {
+	it('keeps arrays in text for codecs without a binary decoder, and types without one', async () => {
 		const sql = `select '{1,2}'::int4[] as mine, '{3}'::int4[] as theirs, '{a}'::text[] as raw, '{4}'::int2[] as custom`;
-		const { [arrayOids.text]: _text, ...rest } = defaultTypes;
-		const types: TypeParsers = {
-			...rest,
-			[arrayOids.int4]: (t: string) => parseArray(t, parseInteger),
-			[arrayOids.int2]: arrayParser((t) => `#${t}`),
-		};
+		const ints = defineCodec({
+			name: 'int4[]',
+			oid: arrayOids.int4,
+			encode: String,
+			decodeText: (t) => parseArray(t, Number),
+		});
+		const marked = defineCodec({
+			name: 'int2',
+			oid: 21,
+			arrayOid: arrayOids.int2,
+			encode: String,
+			decodeText: (t) => `#${t}`,
+		});
+		const types = createCodecRegistry([ints, arrayOf(marked)], null);
 		const { binary, formats } = await bothWays(c, sql, types);
 		expect(formats).toEqual({ mine: 0, theirs: 0, raw: 0, custom: 0 });
 		expect(binary).toEqual([
@@ -222,7 +221,7 @@ describe.skipIf(noPg)('binary arrays', () => {
 			);
 			// halfvec stays text, parsed as printed
 			expect(binary[0]?.['h']).toEqual([0.099975586, 2]);
-			expect(parseVector('[0.1]')).toEqual([0.10000000149011612]);
+			expect(codecs.vector.decodeText('[0.1]')).toEqual([0.10000000149011612]);
 		},
 	);
 

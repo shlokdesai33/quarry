@@ -65,11 +65,10 @@ import {
 	CodecRegistry,
 	createCodecRegistry,
 	defaultRegistry,
-	parsersRegistry,
 	type CatalogType,
 } from './registry.js';
 import type { ResultCodecs } from './results.js';
-import { copyChunks, type TypeParsers } from './types.js';
+import { copyChunks } from './types.js';
 
 export interface QueryOptions {
 	/** `object` (default) rows keyed by column name, or positional `array` rows. */
@@ -79,8 +78,6 @@ export interface QueryOptions {
 	 * connection's: a registry (`createCodecRegistry`), or a list.
 	 */
 	readonly codecs?: CodecRegistry | readonly Codec[];
-	/** Text parsers by type OID for this query, instead of the connection's codecs (see `ConnectionOptions.types`). */
-	readonly types?: TypeParsers;
 	/** Use a cached named prepared statement (default: the connection's `prepare` option). */
 	readonly prepare?: boolean;
 	/**
@@ -920,7 +917,6 @@ export class Connection implements AsyncDisposable {
 		if (
 			options === undefined ||
 			(options.codecs === undefined &&
-				options.types === undefined &&
 				options.resultCodecs === undefined &&
 				options.prepare === undefined &&
 				options.binary === undefined &&
@@ -946,7 +942,7 @@ export class Connection implements AsyncDisposable {
 
 	/** The registry a query's options name; undefined for the connection's. */
 	#registryOf(
-		options: Pick<QueryOptions, 'codecs' | 'types'> | undefined,
+		options: Pick<QueryOptions, 'codecs'> | undefined,
 	): CodecRegistry | undefined {
 		const codecs = options?.codecs;
 		if (codecs instanceof CodecRegistry) return codecs;
@@ -958,9 +954,7 @@ export class Connection implements AsyncDisposable {
 			}
 			return registry;
 		}
-		return options?.types === undefined
-			? undefined
-			: parsersRegistry(options.types);
+		return undefined;
 	}
 
 	/** The type OIDs a query's parameters declare: their codecs', or `paramTypes`. */
@@ -1006,12 +1000,22 @@ export class Connection implements AsyncDisposable {
 	 * it on their own the first time they need it; this loads it before.
 	 */
 	loadTypes(): Promise<void> {
-		return this.#config.catalog.load(() =>
-			this.#query<CatalogType>(catalogQuery, [], {
-				prepare: false,
-				codecs: defaultRegistry,
-			}).then(({ rows }) => rows),
-		);
+		return this.#config.catalog.load(() => this.#catalogRows());
+	}
+
+	/**
+	 * Looks up the types again, for types created (or changed) since they
+	 * were loaded; the whole pool then uses the new lookup.
+	 */
+	reloadTypes(): Promise<void> {
+		return this.#config.catalog.load(() => this.#catalogRows(), true);
+	}
+
+	#catalogRows(): Promise<readonly CatalogType[]> {
+		return this.#query<CatalogType>(catalogQuery, [], {
+			prepare: false,
+			codecs: defaultRegistry,
+		}).then(({ rows }) => rows);
 	}
 
 	// --- public API --------------------------------------------------------
@@ -1272,7 +1276,7 @@ export class Connection implements AsyncDisposable {
 		sql: string,
 		options?: Pick<
 			QueryOptions,
-			'rowMode' | 'codecs' | 'types' | 'signal' | 'timeout' | 'tag'
+			'rowMode' | 'codecs' | 'signal' | 'timeout' | 'tag'
 		>,
 	): Promise<QueryResult<R>[]> {
 		if (this.#config.telemetry === undefined && !this.#config.captureStack)
@@ -1288,10 +1292,7 @@ export class Connection implements AsyncDisposable {
 	#simpleQuery<R>(
 		sql: string,
 		options:
-			| Pick<
-					QueryOptions,
-					'rowMode' | 'codecs' | 'types' | 'signal' | 'timeout'
-			  >
+			| Pick<QueryOptions, 'rowMode' | 'codecs' | 'signal' | 'timeout'>
 			| undefined,
 	): Promise<QueryResult<R>[]> {
 		return new Promise((resolve, reject) => {

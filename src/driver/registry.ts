@@ -1,17 +1,5 @@
 import { arrayOf, passThrough, type Codec } from './codec.js';
-import { codecs, defaultCodecs } from './codecs.js';
-import { parseTimestamptz, parseVector } from './parsers.js';
-import {
-	arrayParserInfo,
-	parseBigInt,
-	parseBool,
-	parseBytea,
-	parseFloat,
-	parseInteger,
-	parseJson,
-	type TextParser,
-	type TypeParsers,
-} from './types.js';
+import { defaultCodecs } from './codecs.js';
 
 /** One type from the catalog query. */
 export interface CatalogType {
@@ -70,9 +58,17 @@ export class TypeCatalog {
 		return this.#loaded;
 	}
 
-	/** Loads the catalog once, through `run`; a failure leaves it to be tried again. */
-	load(run: () => Promise<readonly CatalogType[]>): Promise<void> {
-		if (this.#loaded) return Promise.resolve();
+	/**
+	 * Loads the catalog once, through `run` (with `reload`, again, for types
+	 * created since); a failure leaves it to be tried again.
+	 */
+	load(
+		run: () => Promise<readonly CatalogType[]>,
+		reload = false,
+	): Promise<void> {
+		if (this.#loaded && !reload) return Promise.resolve();
+		if (reload && this.#loading !== undefined)
+			return this.#loading.then(() => this.load(run, true));
 		this.#loading ??= run().then(
 			(rows) => {
 				this.setTypes(rows);
@@ -178,20 +174,15 @@ const unknownElement = Object.freeze<Codec<string, string>>({
 export class CodecRegistry {
 	readonly #byOid: Map<number, Codec>;
 	readonly #named: Map<string, Codec>;
-	readonly #legacy: TypeParsers | undefined;
 	readonly #memo = new WeakMap<
 		TypeCatalog,
 		{ generation: number; codecs: Map<number, Codec | null> }
 	>();
 
-	constructor(
-		list: readonly Codec[],
-		base?: CodecRegistry,
-		legacy?: TypeParsers,
-	) {
+	/** A registry of `list` over `base` (none: only `list`). */
+	constructor(list: readonly Codec[], base?: CodecRegistry) {
 		this.#byOid = new Map(base === undefined ? [] : base.#byOid);
 		this.#named = new Map(base === undefined ? [] : base.#named);
-		this.#legacy = legacy ?? (base === undefined ? undefined : base.#legacy);
 		const explicit = new Set<number>();
 		for (const codec of list) if (codec.oid !== 0) explicit.add(codec.oid);
 		for (const codec of list) {
@@ -229,10 +220,6 @@ export class CodecRegistry {
 	#find(oid: number, catalog: TypeCatalog): Codec | undefined {
 		const fixed = this.#byOid.get(oid);
 		if (fixed !== undefined) return fixed;
-		if (this.#legacy !== undefined) {
-			const parser = this.#legacy[oid];
-			return parser === undefined ? undefined : parserCodec(oid, parser);
-		}
 		const type = catalog.type(oid);
 		if (type === undefined) return undefined;
 		if (type.elem !== 0) {
@@ -249,128 +236,17 @@ export class CodecRegistry {
 }
 
 /**
- * A registry of `list` over `base` (the driver's default codecs): later
- * codecs override earlier ones for the same type.
+ * A registry of `list` over `base` (the driver's default codecs; `null`
+ * for none): later codecs override earlier ones for the same type.
  *
  * @example const registry = createCodecRegistry([codecs.int8AsString, codecs.timestamptz]);
  */
 export function createCodecRegistry(
 	list: readonly Codec[],
-	base: CodecRegistry = defaultRegistry,
+	base: CodecRegistry | null = defaultRegistry,
 ): CodecRegistry {
-	return new CodecRegistry(list, base);
+	return new CodecRegistry(list, base ?? undefined);
 }
 
 /** The registry of `defaultCodecs`. */
 export const defaultRegistry = new CodecRegistry(defaultCodecs);
-
-const legacyRegistries = new WeakMap<TypeParsers, CodecRegistry>();
-
-/** A registry reading a table of text parsers by OID (the `types` option). */
-export function parsersRegistry(types: TypeParsers): CodecRegistry {
-	let registry = legacyRegistries.get(types);
-	if (registry === undefined) {
-		registry = new CodecRegistry([], undefined, types);
-		legacyRegistries.set(types, registry);
-	}
-	return registry;
-}
-
-/** The built-in codec a driver parser stands for at `oid`, so it can be read in binary. */
-function builtinFor(oid: number, parser: TextParser): Codec | undefined {
-	switch (parser) {
-		case parseBool:
-			return oid === 16 ? codecs.bool : undefined;
-		case parseInteger:
-			return oid === 21
-				? codecs.int2
-				: oid === 23
-					? codecs.int4
-					: oid === 26
-						? codecs.oid
-						: undefined;
-		case parseFloat:
-			return oid === 701
-				? codecs.float8
-				: oid === 700
-					? codecs.float4
-					: undefined;
-		case parseBigInt:
-			return oid === 20 ? codecs.int8 : undefined;
-		case parseBytea:
-			return oid === 17 ? codecs.bytea : undefined;
-		case parseTimestamptz:
-			return oid === 1184 ? codecs.timestamptz : undefined;
-		case parseJson:
-			return oid === 3802
-				? codecs.jsonb
-				: oid === 114
-					? codecs.json
-					: undefined;
-		case parseVector:
-			return codecs.vector;
-		default:
-			return undefined;
-	}
-}
-
-const parserCodecs = new WeakMap<TextParser, Map<number, Codec>>();
-
-/** The codec reading `oid` with a text parser; the driver's own parsers keep their binary formats. */
-function parserCodec(oid: number, parser: TextParser): Codec {
-	let byOid = parserCodecs.get(parser);
-	if (byOid === undefined) {
-		byOid = new Map();
-		parserCodecs.set(parser, byOid);
-	}
-	let codec = byOid.get(oid);
-	if (codec !== undefined) return codec;
-	codec = builtinFor(oid, parser);
-	const array = arrayParserInfo(parser);
-	if (codec === undefined && array !== undefined) {
-		const elementOid = array.elementOid ?? arrayElements.get(oid);
-		const element =
-			array.element === undefined
-				? textElement(elementOid)
-				: elementOid === undefined
-					? undefined
-					: parserCodec(elementOid, array.element);
-		if (
-			element !== undefined &&
-			element.element === undefined &&
-			element.oid === (elementOid ?? 0)
-		)
-			codec = arrayOf(element, array.delimiter);
-	}
-	codec ??= Object.freeze<Codec>({
-		name: '',
-		oid,
-		paramFormat: 'text',
-		resultFormat: 'text',
-		encode: (value) => String(value),
-		decodeText: parser,
-	});
-	byOid.set(oid, codec);
-	return codec;
-}
-
-/** The element types of the built-in array types. */
-const arrayElements = new Map<number, number>(
-	Object.values(codecs).flatMap((codec) =>
-		codec.arrayOid === undefined ? [] : [[codec.arrayOid, codec.oid]],
-	),
-);
-
-const textElements = new Map<number, Codec>(
-	Object.values(codecs).flatMap((codec) =>
-		codec.oid !== 0 && codec.decodeText === passThrough && codec.name !== ''
-			? [[codec.oid, codec]]
-			: [],
-	),
-);
-
-/** An element kept as text: its built-in codec when it has one, so text-like arrays still read in binary. */
-function textElement(oid: number | undefined): Codec | undefined {
-	if (oid === undefined) return undefined;
-	return textElements.get(oid) ?? { ...unknownElement, oid };
-}

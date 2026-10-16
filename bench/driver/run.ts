@@ -16,7 +16,7 @@ import { pipeline } from 'node:stream/promises';
 import { Pool as PgPool } from 'pg';
 import postgres from 'postgres';
 import { createPool } from '../../src/driver/pool.ts';
-import { quarryTypes } from '../../src/decode.ts';
+import { codecs } from '../../src/driver/codecs.ts';
 import { copyChunks } from '../../src/driver/types.ts';
 import { findBinDir, startCluster } from '../../test/driver/setup/cluster.ts';
 
@@ -50,7 +50,7 @@ function adapters(url: string): Adapter[] {
 		max: POOL,
 		ssl: 'disable',
 		env: {},
-		types: quarryTypes,
+		codecs: [codecs.int8AsString, codecs.timestamptz],
 	});
 	const pgPool = new PgPool({ connectionString: url, max: POOL });
 	const sql = postgres(url, { max: POOL, prepare: true, onnotice: () => {} });

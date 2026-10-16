@@ -15,7 +15,12 @@ import {
 } from '../../../src/driver/errors.js';
 import type { Notice } from '../../../src/driver/notice.js';
 import { codecs } from '../../../src/driver/codecs.js';
-import { defaultTypes, oids, rawTypes } from '../../../src/driver/types.js';
+import { defineCodec } from '../../../src/driver/codec.js';
+import { createCodecRegistry } from '../../../src/driver/registry.js';
+import { oids } from '../../../src/driver/types.js';
+
+/** Every value as the server's text. */
+const rawCodecs = createCodecRegistry([], null);
 import { meteredSockets, noPg, open, rejection, table } from './helpers.js';
 
 describe.skipIf(noPg)('queries', () => {
@@ -29,51 +34,65 @@ describe.skipIf(noPg)('queries', () => {
 
 	it('keeps only the first `keepRows` rows, decoding no others', async () => {
 		let decoded = 0;
-		const types = {
-			...rawTypes,
-			[oids.int4]: (text: string) => {
-				decoded++;
-				if (text === '777') throw new Error('bad int');
-				return Number(text);
-			},
-		};
+		const types = createCodecRegistry(
+			[
+				defineCodec({
+					name: 'int4',
+					oid: oids.int4,
+					encode: String,
+					decodeText: (text) => {
+						decoded++;
+						if (text === '777') throw new Error('bad int');
+						return Number(text);
+					},
+				}),
+			],
+			null,
+		);
 		const sql = 'select n from (values (1), (2), (777), (4)) v (n)';
-		const kept = await conn.query(sql, [], { types, keepRows: 2 });
+		const kept = await conn.query(sql, [], { codecs: types, keepRows: 2 });
 		expect(kept.rows).toEqual([{ n: 1 }, { n: 2 }]);
 		expect(kept.rowCount).toBe(4);
 		expect(decoded).toBe(2);
 		const positional = await conn.query(sql, [], {
-			types,
+			codecs: types,
 			keepRows: 1,
 			rowMode: 'array',
 		});
 		expect(positional.rows).toEqual([[1]]);
 		expect(positional.rowCount).toBe(4);
 		const [grouped] = conn.queryGroup([
-			{ sql, options: { types, keepRows: 1 } },
+			{ sql, options: { codecs: types, keepRows: 1 } },
 		]);
 		expect((await grouped)?.rows).toEqual([{ n: 1 }]);
-		expect((await conn.query(sql, [], { types, keepRows: 0 })).rows).toEqual(
-			[],
-		);
-		await expect(conn.query(sql, [], { types })).rejects.toBeInstanceOf(
+		expect(
+			(await conn.query(sql, [], { codecs: types, keepRows: 0 })).rows,
+		).toEqual([]);
+		await expect(conn.query(sql, [], { codecs: types })).rejects.toBeInstanceOf(
 			DecodeError,
 		);
 	});
 
 	it('fails only the query whose value a parser cannot decode', async () => {
-		const types = {
-			...rawTypes,
-			[oids.int4]: (text: string) => {
-				if (text === '777') throw new Error('bad int');
-				return Number(text);
-			},
-		};
-		const before = conn.query('select 1 as n', [], { types });
+		const types = createCodecRegistry(
+			[
+				defineCodec({
+					name: 'int4',
+					oid: oids.int4,
+					encode: String,
+					decodeText: (text) => {
+						if (text === '777') throw new Error('bad int');
+						return Number(text);
+					},
+				}),
+			],
+			null,
+		);
+		const before = conn.query('select 1 as n', [], { codecs: types });
 		const bad = conn.query('select n from (values (1), (777), (3)) v (n)', [], {
-			types,
+			codecs: types,
 		});
-		const after = conn.query('select 3 as n', [], { types });
+		const after = conn.query('select 3 as n', [], { codecs: types });
 		const error = await rejection(bad, DecodeError);
 		expect(error).toMatchObject({ column: 'n', typeOid: oids.int4 });
 		expect(error.message).not.toContain('777');
@@ -81,19 +100,19 @@ describe.skipIf(noPg)('queries', () => {
 		expect((await before).rows).toEqual([{ n: 1 }]);
 		expect((await after).rows).toEqual([{ n: 3 }]);
 		await expect(
-			conn.simpleQuery('select 777 as n; select 1 as m', { types }),
+			conn.simpleQuery('select 777 as n; select 1 as m', { codecs: types }),
 		).rejects.toBeInstanceOf(DecodeError);
 		await expect(async () => {
 			for await (const _ of conn.cursor(
 				'select generate_series(770, 1000) as n',
 				[],
-				{ types, batchSize: 1 },
+				{ codecs: types, batchSize: 1 },
 			));
 		}).rejects.toBeInstanceOf(DecodeError);
 		expect(conn.closed).toBe(false);
-		expect((await conn.query('select 4 as n', [], { types })).rows).toEqual([
-			{ n: 4 },
-		]);
+		expect(
+			(await conn.query('select 4 as n', [], { codecs: types })).rows,
+		).toEqual([{ n: 4 }]);
 	});
 
 	it('takes up to 65535 parameters, and refuses more before sending', async () => {
@@ -221,12 +240,12 @@ describe.skipIf(noPg)('queries', () => {
 		});
 	});
 
-	it('returns raw text with rawTypes, and arrays with rowMode array', async () => {
+	it('returns raw text with an empty registry, and arrays with rowMode array', async () => {
 		const { rows } = await conn.query(
 			'select 1::int4 as a, true as b, $1::jsonb as c, array[1,2] as d',
 			['{"x":1}'],
 			{
-				types: rawTypes,
+				codecs: rawCodecs,
 				rowMode: 'array',
 			},
 		);
@@ -258,22 +277,26 @@ describe.skipIf(noPg)('queries', () => {
 		expect(binary.rows).toEqual(text.rows);
 		expect(Object.is(binary.rows[0]?.['f8'], -0)).toBe(true);
 
-		// a custom parser keeps its column in text
-		const custom = {
-			...defaultTypes,
-			[oids.timestamptz]: (t: string) => `custom ${t}`,
-		};
-		await c.query('select now() as t, 1 as n', [], { types: custom });
+		// a codec without a binary decoder keeps its column in text
+		const custom = [
+			defineCodec({
+				name: 'timestamptz',
+				oid: oids.timestamptz,
+				encode: String,
+				decodeText: (t) => `custom ${t}`,
+			}),
+		];
+		await c.query('select now() as t, 1 as n', [], { codecs: custom });
 		const mixed = await c.query<{ t: string; n: number }>(
 			'select now() as t, 1 as n',
 			[],
-			{ types: custom },
+			{ codecs: custom },
 		);
 		expect(mixed.fields.map((f) => f.format)).toEqual([0, 1]);
 		expect(mixed.rows[0]?.t).toMatch(/^custom /);
-		const raw = await c.query('select 1 as n', [], { types: rawTypes });
+		const raw = await c.query('select 1 as n', [], { codecs: rawCodecs });
 		expect(
-			(await c.query('select 1 as n', [], { types: rawTypes })).rows,
+			(await c.query('select 1 as n', [], { codecs: rawCodecs })).rows,
 		).toEqual(raw.rows);
 		expect(raw.rows).toEqual([{ n: '1' }]);
 	});

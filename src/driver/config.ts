@@ -5,13 +5,11 @@ import type { SocketFactory } from './socket.js';
 import type { TelemetryOptions } from './telemetry.js';
 import type { Codec } from './codec.js';
 import {
+	CodecRegistry,
 	createCodecRegistry,
 	defaultRegistry,
-	parsersRegistry,
 	TypeCatalog,
-	type CodecRegistry,
 } from './registry.js';
-import type { TypeParsers } from './types.js';
 
 /** How hard to insist on TLS, with libpq's meanings. */
 export type SslMode =
@@ -130,18 +128,12 @@ export interface ConnectionOptions {
 	readonly passfile?: string | undefined;
 	/**
 	 * Codecs to read result columns with, by type, over the driver's
-	 * `defaultCodecs` (or `types`): to add types (an extension's, an enum)
-	 * or override built-in ones, e.g. `[codecs.int8AsString]` for int8 as
-	 * digits. Codecs for types looked up by name make the pool load the
-	 * catalog once.
+	 * `defaultCodecs`: to add types (an extension's, an enum) or override
+	 * built-in ones, e.g. `[codecs.int8AsString]` for int8 as digits. Or a
+	 * registry (`createCodecRegistry`), used as it is. Codecs for types
+	 * looked up by name make the pool load the catalog once.
 	 */
-	readonly codecs?: readonly Codec[] | undefined;
-	/**
-	 * Text parsers by type OID, instead of the default codecs: `rawTypes`
-	 * keeps every value the server's text. Kept for parsers written before
-	 * codecs; the driver's own parsers still read in binary.
-	 */
-	readonly types?: TypeParsers | undefined;
+	readonly codecs?: readonly Codec[] | CodecRegistry | undefined;
 	/** Use named prepared statements, cached per connection (default true). */
 	readonly prepare?: boolean | undefined;
 	/** The most prepared statements kept per connection (default 100). */
@@ -526,18 +518,16 @@ function isLocalHost(host: string): boolean {
 	);
 }
 
-/** Applies the connection string, `PG*` environment variables and defaults to `options`. */
-/** The registry of `codecs` over `types` (or the default codecs). */
+/** The registry of `codecs` over the default codecs. */
 function registryOf(options: ConnectionOptions): CodecRegistry {
-	const base =
-		options.types === undefined
-			? defaultRegistry
-			: parsersRegistry(options.types);
-	return options.codecs === undefined || options.codecs.length === 0
-		? base
-		: createCodecRegistry(options.codecs, base);
+	const codecs = options.codecs;
+	if (codecs instanceof CodecRegistry) return codecs;
+	return codecs === undefined || codecs.length === 0
+		? defaultRegistry
+		: createCodecRegistry(codecs);
 }
 
+/** Applies the connection string, `PG*` environment variables and defaults to `options`. */
 export function resolveConfig(options: ConnectionOptions = {}): ResolvedConfig {
 	const env = options.env ?? processEnv();
 	const fromEnv: Record<string, string> = {};

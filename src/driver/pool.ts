@@ -903,10 +903,7 @@ export class Pool implements AsyncDisposable {
 
 	simpleQuery<R = Record<string, unknown>>(
 		sql: string,
-		options?: Pick<
-			QueryOptions,
-			'rowMode' | 'codecs' | 'types' | 'signal' | 'timeout'
-		>,
+		options?: Pick<QueryOptions, 'rowMode' | 'codecs' | 'signal' | 'timeout'>,
 	): Promise<QueryResult<R>[]> {
 		return this.#withShared(options?.signal, (connection) =>
 			connection.simpleQuery<R>(sql, options),
@@ -920,6 +917,13 @@ export class Pool implements AsyncDisposable {
 	loadTypes(): Promise<void> {
 		if (this.#config.catalog.loaded) return Promise.resolve();
 		return this.#withShared(undefined, (connection) => connection.loadTypes());
+	}
+
+	/** Looks up the types again, for the whole pool; see `Connection.reloadTypes`. */
+	reloadTypes(): Promise<void> {
+		return this.#withShared(undefined, (connection) =>
+			connection.reloadTypes(),
+		);
 	}
 
 	describe(
