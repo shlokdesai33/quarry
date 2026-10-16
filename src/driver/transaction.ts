@@ -118,7 +118,7 @@ export interface TransactionOptions {
 const SETTING_NAME = /^[A-Za-z_][\w$]*(\.[A-Za-z_][\w$]*)*$/;
 
 /** The `select set_config(…)` statement and parameters for some settings. */
-export function settingsQuery(
+function settingsQuery(
 	settings: Readonly<Record<string, SettingValue>>,
 ): { sql: string; params: string[] } | undefined {
 	const entries = Object.entries(settings);

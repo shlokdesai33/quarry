@@ -44,7 +44,7 @@ export interface CatalogRelation {
  * string. Aliases are lowercase single words so that column-name transforms
  * leave them alone.
  */
-export const catalogSql = `with wanted as (
+const catalogSql = `with wanted as (
   select w.ord::int4 as ord, pg_catalog.to_regclass(w.name) as oid
   from pg_catalog.unnest($1::text[]) with ordinality as w(name, ord)
 )

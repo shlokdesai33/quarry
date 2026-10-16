@@ -6,7 +6,7 @@ import { allocate, asBuffer, utf8 } from './text.js';
 const EMPTY = new Uint8Array(0);
 
 /** The largest backend message accepted, by default: 1 GiB, Postgres's own field limit. */
-export const DEFAULT_MAX_MESSAGE_SIZE = 0x40000000;
+const DEFAULT_MAX_MESSAGE_SIZE = 0x40000000;
 
 /**
  * Splits the byte stream from the server into backend messages. Bytes are
@@ -568,7 +568,7 @@ export function decodeNotification(
  * Splits a DataRow body into its values: `null` for SQL NULL, otherwise the
  * `[start, end)` offsets into `payload`. Throws if the body is malformed.
  */
-export function forEachValue(
+function forEachValue(
 	payload: Uint8Array,
 	visit: (index: number, start: number, end: number) => void,
 ): number {

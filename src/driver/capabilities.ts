@@ -1,7 +1,7 @@
 import { ConnectionError } from './errors.js';
 
 /** The oldest PostgreSQL release the driver supports, as `server_version_num`. */
-export const MIN_SERVER_VERSION_NUM = 180000;
+const MIN_SERVER_VERSION_NUM = 180000;
 
 /**
  * What the other end of a connection supports beyond PostgreSQL 18

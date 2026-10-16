@@ -89,7 +89,7 @@ export function columnOf(
 }
 
 /** A value written to `column`: an expression as is, a value encoded by the column's codec. */
-export function valueNode(column: AnyColumn, value: unknown): OperationNode {
+function valueNode(column: AnyColumn, value: unknown): OperationNode {
 	return Expression.is(value)
 		? value._quarry.node
 		: { kind: 'value', value, codec: column._quarry.dataType.codec };
