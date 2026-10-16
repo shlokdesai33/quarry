@@ -11,6 +11,8 @@
  * Exits non-zero if any check fails.
  */
 import { readFileSync } from 'node:fs';
+import { arrayOf, typed } from '../../../src/driver/codec.js';
+import { codecs } from '../../../src/driver/codecs.js';
 import { connect } from '../../../src/driver/connect.js';
 import { QueryCanceled } from '../../../src/driver/errors.js';
 import { createPool } from '../../../src/driver/pool.js';
@@ -79,6 +81,60 @@ await check('SCRAM over TCP, typed rows', async () => {
 	assert(rows[0]?.n === 42 && rows[0].t === 'é😀', JSON.stringify(rows));
 	assert(conn.protocol === '3.2', conn.protocol);
 });
+
+await check(
+	'codecs: typed parameters, binary results from the first run',
+	async () => {
+		await using conn = await connect(base);
+		const range = {
+			empty: false,
+			lower: new Date(Date.UTC(2024, 0, 1)),
+			upper: new Date(Date.UTC(10000, 0, 1)),
+			bounds: '[)',
+		} as const;
+		const { rows, fields } = await conn.query<{
+			ids: number[];
+			at: Date;
+			r: unknown;
+			inside: boolean;
+			tags: string[];
+			bytes: Uint8Array;
+		}>(
+			'select $1::int4[] as ids, $2::timestamptz as at, $3::tstzrange as r, $3 @> $2 as inside, $4::text[] as tags, $5::bytea as bytes',
+			[
+				typed([1, null, 3], arrayOf(codecs.int4)),
+				typed(new Date(Date.UTC(2024, 5, 1)), codecs.timestamptz),
+				typed(range, codecs.tstzrange),
+				typed(['a', 'b c', 'é😀'], arrayOf(codecs.text)),
+				typed(new Uint8Array([0, 255]), codecs.bytea),
+			],
+			{
+				resultCodecs: [
+					arrayOf(codecs.int4),
+					codecs.timestamptz,
+					codecs.tstzrange,
+					codecs.bool,
+					arrayOf(codecs.text),
+					codecs.bytea,
+				],
+			},
+		);
+		const row = rows[0];
+		assert(
+			JSON.stringify(row?.ids) === '[1,null,3]' &&
+				row?.at.getTime() === Date.UTC(2024, 5, 1) &&
+				JSON.stringify(row.r) === JSON.stringify(range) &&
+				row.inside === true &&
+				JSON.stringify(row.tags) === '["a","b c","é😀"]' &&
+				row.bytes[1] === 255,
+			JSON.stringify(row),
+		);
+		assert(
+			fields.map((f) => f.format).join() === '1,1,0,1,1,1',
+			fields.map((f) => f.format).join(),
+		);
+	},
+);
 
 await check(
 	'TLS with SCRAM-SHA-256-PLUS (channel binding required)',

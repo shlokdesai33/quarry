@@ -55,6 +55,8 @@ export interface OpContext {
 	readonly registry: CodecRegistry;
 	/** The types looked up by name, for the pool. */
 	readonly catalog: TypeCatalog;
+	/** How results are read where a query names no codecs, with and without binary. */
+	readonly specs: { readonly binary: ResultSpec; readonly text: ResultSpec };
 	/**
 	 * The cached statement for this SQL, created if new (`unwritten` until
 	 * its Parse is written). A `named` one is created with a name, to be
@@ -221,6 +223,8 @@ export interface QueryOpOptions {
 
 /** How an operation's results are read on this connection. */
 function specOf(options: QueryOpOptions, ctx: OpContext): ResultSpec {
+	if (options.registry === undefined && options.resultCodecs === undefined)
+		return options.binary ? ctx.specs.binary : ctx.specs.text;
 	return {
 		registry: options.registry ?? ctx.registry,
 		catalog: ctx.catalog,

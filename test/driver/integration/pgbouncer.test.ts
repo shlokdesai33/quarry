@@ -1,6 +1,8 @@
 /* oxlint-disable no-await-in-loop -- tests run their steps in order */
 import { describe, expect, it } from 'vitest';
 import { statementNames } from '../../../src/driver/capabilities.js';
+import { typed } from '../../../src/driver/codec.js';
+import { codecs } from '../../../src/driver/codecs.js';
 import { DecodeError } from '../../../src/driver/errors.js';
 import { versionAtLeast } from '../setup/cluster.js';
 import { Transaction } from '../../../src/driver/transaction.js';
@@ -170,6 +172,24 @@ describe.skipIf(!pg?.bouncerPort)('PgBouncer in transaction mode', () => {
 						expect(result.value.fields.map((f) => f.format)).toEqual([
 							1, 1, 1, 0,
 						]);
+				}
+			});
+
+			it('are asked for in their codecs’ formats on the first run', async () => {
+				await using conn = await open(bouncer());
+				const sql = 'select $1::int as i, $2::text as s, now() as t';
+				const params = [typed(7, codecs.int4), 'x'];
+				const resultCodecs = [codecs.int4, codecs.text, codecs.timestamptz];
+				const results = await pipelined(10, () =>
+					conn.query(sql, params, { resultCodecs }),
+				);
+				for (const result of results) {
+					expect(result).toMatchObject({
+						status: 'fulfilled',
+						value: { rows: [{ i: 7, s: 'x', t: expect.any(Date) }] },
+					});
+					if (result.status === 'fulfilled')
+						expect(result.value.fields.map((f) => f.format)).toEqual([1, 0, 1]);
 				}
 			});
 

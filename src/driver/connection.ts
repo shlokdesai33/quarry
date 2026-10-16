@@ -45,7 +45,6 @@ import {
 	type Statement,
 } from './ops.js';
 import * as fe from './protocol/frontend.js';
-import type { WireValue } from './protocol/frontend.js';
 import type { BackendMessage } from './protocol/messages.js';
 import { ChannelNames, decodeNotification, Reader } from './protocol/reader.js';
 import { Writer } from './protocol/writer.js';
@@ -257,6 +256,20 @@ export class Connection implements AsyncDisposable {
 			writer: this.#writer,
 			registry: config.registry,
 			catalog: config.catalog,
+			specs: {
+				binary: {
+					registry: config.registry,
+					catalog: config.catalog,
+					expected: undefined,
+					binary: true,
+				},
+				text: {
+					registry: config.registry,
+					catalog: config.catalog,
+					expected: undefined,
+					binary: false,
+				},
+			},
 			statement: (sql, types, named) => this.#statement(sql, types, named),
 			// alone: nothing else in flight or waiting on the connection, nor
 			// another statement under its Sync that may be named
@@ -950,18 +963,17 @@ export class Connection implements AsyncDisposable {
 			: parsersRegistry(options.types);
 	}
 
-	/** Encodes a query's parameters with their codecs, and the type OIDs they declare. */
-	#encode(
-		sql: string,
+	/** The type OIDs a query's parameters declare: their codecs', or `paramTypes`. */
+	#types(
 		params: readonly unknown[],
 		options: QueryOptions | undefined,
-	): { values: readonly WireValue[]; types: readonly number[] } {
-		const codecs = options?.paramCodecs;
-		const paramTypes = options?.paramTypes;
-		return {
-			values: encodeParams(sql, params, codecs, paramTypes),
-			types: paramOids(params, codecs, paramTypes, this.#config.catalog),
-		};
+	): readonly number[] {
+		return paramOids(
+			params,
+			options?.paramCodecs,
+			options?.paramTypes,
+			this.#config.catalog,
+		);
 	}
 
 	/**
@@ -1104,12 +1116,11 @@ export class Connection implements AsyncDisposable {
 		try {
 			const invalid = invalidSql(sql);
 			if (invalid) throw invalid;
-			const { values, types } = this.#encode(sql, params, options);
 			op = new QueryOp(
 				sql,
 				params,
-				values,
-				types,
+				encodeParams(sql, params, options?.paramCodecs, options?.paramTypes),
+				this.#types(params, options),
 				this.#options(options),
 				resolve,
 				reject,
@@ -1141,19 +1152,24 @@ export class Connection implements AsyncDisposable {
 		const results = statements.map(
 			({ sql, params = [], options }) =>
 				new Promise<QueryResult<unknown>>((resolve, reject) => {
-					let encoded;
+					let values;
 					if (invalid === undefined) {
 						const error = invalidSql(sql);
 						if (error) invalid = { error };
 						else {
 							try {
-								encoded = this.#encode(sql, params, options);
+								values = encodeParams(
+									sql,
+									params,
+									options?.paramCodecs,
+									options?.paramTypes,
+								);
 							} catch (caught) {
 								invalid = { error: caught };
 							}
 						}
 					}
-					if (invalid !== undefined || encoded === undefined) {
+					if (invalid !== undefined || values === undefined) {
 						reject(invalid?.error);
 						return;
 					}
@@ -1161,8 +1177,8 @@ export class Connection implements AsyncDisposable {
 						new QueryOp(
 							sql,
 							params,
-							encoded.values,
-							encoded.types,
+							values,
+							this.#types(params, options),
 							this.#options(options),
 							(result) => resolve(asResult(result)),
 							reject,
@@ -1334,12 +1350,11 @@ export class Connection implements AsyncDisposable {
 		}
 		return {
 			[Symbol.asyncIterator]: () => {
-				const { values, types } = this.#encode(sql, params, options);
 				const op = new CursorOp(
 					sql,
 					params,
-					values,
-					types,
+					encodeParams(sql, params, options?.paramCodecs, options?.paramTypes),
+					this.#types(params, options),
 					this.#options(options),
 					options?.batchSize ?? 1000,
 				);

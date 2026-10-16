@@ -34,7 +34,7 @@ if (process.argv[2]) {
 }
 
 const worker = `
-import { cloudflareSockets, connect, createPool, QueryCanceled } from './driver/index.js';
+import { arrayOf, cloudflareSockets, codecs, connect, createPool, QueryCanceled, typed } from './driver/index.js';
 
 async function check(results, name, fn) {
 	try { await fn(); results.push(['ok', name]); }
@@ -112,6 +112,18 @@ export default {
 		const results = [];
 		await check(results, 'navigator.userAgent picks cloudflare:sockets', async () => {
 			assert(navigator.userAgent === 'Cloudflare-Workers', navigator.userAgent);
+		});
+		await check(results, 'codecs: typed parameters, binary results from the first run, without generated code', async () => {
+			const conn = await connect(base);
+			const { rows, fields } = await conn.query(
+				'select $1::int4[] as ids, $2::timestamptz as at, $3::text[] as tags',
+				[typed([1, null, 3], arrayOf(codecs.int4)), typed(new Date(Date.UTC(2024, 5, 1)), codecs.timestamptz), typed(['a', 'b c'], arrayOf(codecs.text))],
+				{ resultCodecs: [arrayOf(codecs.int4), codecs.timestamptz, arrayOf(codecs.text)] },
+			);
+			const row = rows[0];
+			assert(JSON.stringify(row.ids) === '[1,null,3]' && row.at.getTime() === Date.UTC(2024, 5, 1) && JSON.stringify(row.tags) === '["a","b c"]', JSON.stringify(row));
+			assert(fields.map((f) => f.format).join() === '1,1,1', fields.map((f) => f.format).join());
+			await conn.close();
 		});
 		await check(results, 'SCRAM and typed rows', async () => {
 			const conn = await connect(base);
