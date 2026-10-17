@@ -1608,7 +1608,7 @@ await db
 ```ts
 .set((eb) => ({
   email: eb.fn.lower('users.email'),
-  loginCount: inc(1),
+  loginCount: eb.ref('users.loginCount').plus(1),
   lastSeenAt: eb.fn.now(),
 }))
 ```
