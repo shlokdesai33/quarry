@@ -1,3 +1,4 @@
+import { type CaseStart, caseOf } from './case.js';
 import type { AnyColumn } from './column/any-column.js';
 import { nameReference } from './comparison.js';
 import type { DataType } from './data-type/data-type.js';
@@ -91,6 +92,21 @@ export interface ExpressionBuilder<in out R extends Refs> {
 	readonly not: <E extends AnyPredicate>(
 		expression: E,
 	) => Predicate<NullOf<E['_quarry']['$type']>>;
+
+	/**
+	 * `case when … then … else … end`: the result of the first branch whose
+	 * condition holds. Its type is the union of the results, plus `null`
+	 * without an `else`.
+	 *
+	 * @example
+	 * eb.case()
+	 *   .when(eb.ref('orders.total').gte(1000), 'large')
+	 *   .when(eb.ref('orders.total').gte(100), 'medium')
+	 *   .else('small')
+	 *   .end()
+	 *   .as('size')
+	 */
+	readonly case: () => CaseStart;
 }
 
 /** `kind` of the operands, unwrapping those that are `kind` themselves. */
@@ -161,5 +177,6 @@ export function expressionBuilder<const T extends readonly AnyTable[]>(
 		or: junction('or'),
 		not: (expression: AnyPredicate) =>
 			predicate({ kind: 'not', operand: expression._quarry.node }),
+		case: caseOf,
 	};
 }

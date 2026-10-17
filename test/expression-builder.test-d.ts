@@ -215,9 +215,12 @@ describe('right-hand operands', () => {
 		tb.val({ a: 1 }).contains(tb.fn.any('things.documents'));
 		tb.val('a').eq(tb.fn.any(tb.fn.coalesce('things.tags', tb.val([]))));
 
-		// the operator and the parameter's type are not checked against the
-		// elements yet
-		tb.val(1).like(tb.fn.any('things.tags'));
+		// @ts-expect-error a number is not an element of text[]
+		tb.val(1).eq(tb.fn.any('things.tags'));
+		// @ts-expect-error integer[] has no `like`
+		tb.val('a%').like(tb.fn.any('things.limits'));
+		// @ts-expect-error values have no SQL type to encode the parameter by
+		tb.val('a').eq(tb.fn.any(['a', 'b']));
 
 		// @ts-expect-error a parameter needs `any` or `all` on the right
 		tb.val('a').eq('a');

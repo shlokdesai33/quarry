@@ -8,6 +8,8 @@ import type {
 	Quantified,
 	TypedExpression,
 } from './expression.js';
+import type { CodecInput, CodecOutput } from './driver/codec.js';
+import type { CodecKind, kindCodecs } from './kind-codecs.js';
 import type { Range } from './range.js';
 
 /**
@@ -435,6 +437,175 @@ export interface CustomMethods<
 	matches<V extends Binary<S, D>>(value: V): Predicate<N | NullIn<V>>;
 }
 
+/** The types postgres does exact arithmetic in, which have `%`. */
+type ExactKind = 'smallint' | 'integer' | 'bigint' | 'decimal';
+
+/** The largest of the exact numeric kinds `U`. */
+type LargestExact<U> = 'decimal' extends U
+	? 'decimal'
+	: 'bigint' extends U
+		? 'bigint'
+		: 'integer' extends U
+			? 'integer'
+			: 'smallint';
+
+/**
+ * The kind of `a op b` for numeric kinds `A` and `B`, as postgres resolves
+ * it: the larger of two exact kinds, and `double precision` once a
+ * floating point kind meets another kind.
+ */
+export type WiderKind<A extends NumberKind, B extends NumberKind> = [
+	A,
+] extends [B]
+	? A
+	: [A | B] extends [ExactKind]
+		? LargestExact<A | B>
+		: 'double precision';
+
+/** What a value of kind `K` arrives as, by the kind's codec. */
+export type KindValue<K extends CodecKind> = CodecOutput<(typeof kindCodecs)[K]>;
+
+/** What a value of kind `K` can be sent as, by the kind's codec. */
+type KindInput<K extends CodecKind> = CodecInput<(typeof kindCodecs)[K]>;
+
+/** The numeric kind of an arithmetic operand `V` against a value of kind `K`. */
+type OperandKind<K extends NumberKind, V> =
+	V extends TypedExpression<unknown, DataType<infer O extends NumberKind>>
+		? O
+		: K;
+
+/** `left op right` for a left side of kind `K`, nullable when `N` is `null`. */
+type Arithmetic<K extends NumberKind, N extends null, V> = Expr<
+	KindValue<WiderKind<K, OperandKind<K, V>>> | N | NullIn<V>,
+	DataType<WiderKind<K, OperandKind<K, V>>>
+>;
+
+/**
+ * The arithmetic of the numeric types, for a value of kind `K`. A plain
+ * value is sent as a `K`; with an expression of another numeric kind, the
+ * result has the kind postgres gives it (`integer + bigint` is a `bigint`,
+ * `integer + decimal` a `decimal`, anything with a float a `double
+ * precision`). Division of two integers truncates, as in postgres.
+ */
+export interface NumberMethods<
+	S,
+	K extends NumberKind,
+	N extends null,
+> extends ComparableMethods<S, DataType<NumberKind>, N> {
+	/** `+` */
+	plus<V extends One<KindInput<K>, DataType<NumberKind>>>(
+		value: V,
+	): Arithmetic<K, N, V>;
+	/** `-` */
+	minus<V extends One<KindInput<K>, DataType<NumberKind>>>(
+		value: V,
+	): Arithmetic<K, N, V>;
+	/** `*` */
+	times<V extends One<KindInput<K>, DataType<NumberKind>>>(
+		value: V,
+	): Arithmetic<K, N, V>;
+	/** `/`: truncates when both sides are integers. */
+	dividedBy<V extends One<KindInput<K>, DataType<NumberKind>>>(
+		value: V,
+	): Arithmetic<K, N, V>;
+}
+
+/** The arithmetic of the exact numeric types: `NumberMethods`, and `%`. */
+export interface ExactNumberMethods<
+	S,
+	K extends ExactKind,
+	N extends null,
+> extends NumberMethods<S, K, N> {
+	/** `%`: the remainder, with the sign of the dividend. */
+	mod<V extends One<KindInput<K>, DataType<ExactKind>>>(
+		value: V,
+	): Arithmetic<K, N, V>;
+}
+
+/** An interval operand: a value such as `'7 days'`, or an `interval` expression. */
+type IntervalOperand = One<KindInput<'interval'>, DataType<'interval'>>;
+
+/**
+ * The arithmetic of `timestamp` and `timestamptz` (kind `K`): moving by an
+ * interval, and the interval between two of them.
+ */
+export interface TimestampMethods<
+	S,
+	K extends 'timestamp' | 'timestamptz',
+	N extends null,
+> extends ComparableMethods<S, DataType<TimestampKind>, N> {
+	/** `+ interval`: later by the interval. */
+	plus<V extends IntervalOperand>(
+		interval: V,
+	): Expr<KindValue<K> | N | NullIn<V>, DataType<K>>;
+	/** `- interval`: earlier by the interval. */
+	minus<V extends IntervalOperand>(
+		interval: V,
+	): Expr<KindValue<K> | N | NullIn<V>, DataType<K>>;
+	/** `- timestamp`: the interval between the two. */
+	minus<V extends KindInput<K> | TypedExpression<unknown, DataType<K>>>(
+		other: V,
+	): Expr<KindValue<'interval'> | N | NullIn<V>, DataType<'interval'>>;
+}
+
+/** A whole number of days, as `date` arithmetic takes. */
+type DaysOperand = One<number, DataType<'smallint' | 'integer'>>;
+
+/** The arithmetic of `date`: moving by days, and the days between two dates. */
+export interface DateMethods<S, N extends null> extends ComparableMethods<
+	S,
+	DataType<TimestampKind>,
+	N
+> {
+	/** `+ days`: later by that many days. */
+	plus<V extends DaysOperand>(
+		days: V,
+	): Expr<KindValue<'date'> | N | NullIn<V>, DataType<'date'>>;
+	/** `- days`: earlier by that many days. */
+	minus<V extends DaysOperand>(
+		days: V,
+	): Expr<KindValue<'date'> | N | NullIn<V>, DataType<'date'>>;
+	/** `- date`: the number of days between the two. */
+	minus<V extends TypedExpression<unknown, DataType<'date'>>>(
+		other: V,
+	): Expr<number | N | NullIn<V>, DataType<'integer'>>;
+}
+
+/** The arithmetic of `interval`. */
+export interface IntervalMethods<S, N extends null> extends ComparableMethods<
+	S,
+	DataType<'interval'>,
+	N
+> {
+	/** `+ interval` */
+	plus<V extends IntervalOperand>(
+		interval: V,
+	): Expr<KindValue<'interval'> | N | NullIn<V>, DataType<'interval'>>;
+	/** `- interval` */
+	minus<V extends IntervalOperand>(
+		interval: V,
+	): Expr<KindValue<'interval'> | N | NullIn<V>, DataType<'interval'>>;
+}
+
+/** The methods of pgvector's `vector` type: the distances its indexes serve, each a `double precision`. */
+export interface VectorMethods<S, N extends null> extends NullMethods {
+	/** `<->`: the Euclidean (L2) distance. */
+	l2Distance<V extends One<S, DataType<'vector'>>>(
+		other: V,
+	): Expr<number | N | NullIn<V>, DataType<'double precision'>>;
+	/** `<=>`: the cosine distance, 1 minus the cosine similarity. */
+	cosineDistance<V extends One<S, DataType<'vector'>>>(
+		other: V,
+	): Expr<number | N | NullIn<V>, DataType<'double precision'>>;
+	/**
+	 * `<#>`: the negative inner product, so that ascending order puts the
+	 * largest inner product first, as pgvector's index scans do.
+	 */
+	innerProduct<V extends One<S, DataType<'vector'>>>(
+		other: V,
+	): Expr<number | N | NullIn<V>, DataType<'double precision'>>;
+}
+
 /** The methods of the tsvector type. */
 export interface TsvectorMethods<N extends null> extends NullMethods {
 	/** `@@`: matches the tsquery, e.g. `'fat & rat'`. */
@@ -448,26 +619,26 @@ export interface TsvectorMethods<N extends null> extends NullMethods {
  * type).
  */
 export interface MethodsByKind<S, D extends DataType, N extends null> {
-	smallint: ComparableMethods<S, DataType<NumberKind>, N>;
-	integer: ComparableMethods<S, DataType<NumberKind>, N>;
-	bigint: ComparableMethods<S, DataType<NumberKind>, N>;
-	decimal: ComparableMethods<S, DataType<NumberKind>, N>;
-	real: ComparableMethods<S, DataType<NumberKind>, N>;
-	'double precision': ComparableMethods<S, DataType<NumberKind>, N>;
+	smallint: ExactNumberMethods<S, 'smallint', N>;
+	integer: ExactNumberMethods<S, 'integer', N>;
+	bigint: ExactNumberMethods<S, 'bigint', N>;
+	decimal: ExactNumberMethods<S, 'decimal', N>;
+	real: NumberMethods<S, 'real', N>;
+	'double precision': NumberMethods<S, 'double precision', N>;
 	boolean: BooleanMethods<N>;
 	text: TextMethods<S, DataType<TextKind>, N>;
 	varchar: TextMethods<S, DataType<TextKind>, N>;
 	uuid: EqualityMethods<S, DataType<'uuid'>, N>;
 	bytea: EqualityMethods<S, DataType<'bytea'>, N>;
-	date: ComparableMethods<S, DataType<TimestampKind>, N>;
+	date: DateMethods<S, N>;
 	time: ComparableMethods<S, DataType<'time'>, N>;
-	timestamp: ComparableMethods<S, DataType<TimestampKind>, N>;
-	timestamptz: ComparableMethods<S, DataType<TimestampKind>, N>;
-	interval: ComparableMethods<S, DataType<'interval'>, N>;
+	timestamp: TimestampMethods<S, 'timestamp', N>;
+	timestamptz: TimestampMethods<S, 'timestamptz', N>;
+	interval: IntervalMethods<S, N>;
 	jsonb: JsonbMethods<S, N>;
 	inet: InetMethods<S, N>;
 	tsvector: TsvectorMethods<N>;
-	vector: NullMethods;
+	vector: VectorMethods<S, N>;
 	daterange: RangeMethods<S, DataType<'daterange'>, DataType<'date'>, N>;
 	tstzrange: RangeMethods<S, DataType<'tstzrange'>, DataType<TimestampKind>, N>;
 	enum: EqualityMethods<S, ComparableType<D>, N>;
@@ -490,121 +661,90 @@ export type Expr<T, D extends DataType> = TypedExpression<T, D> &
 		: never);
 
 /**
+ * `any` / `all` of an array whose elements have a SQL type of `D`, as a
+ * parameter compares with: only an array column or expression, whose
+ * element type encodes the parameter. A parameter of type `T` must fit the
+ * elements' type; otherwise the argument fails to type-check.
+ */
+type ParamArray<T, D extends DataType, V> = V &
+	(V extends Quantified<infer S, DataType, null, true>
+		? [NonNullable<T>] extends [S]
+			? unknown
+			: { readonly elementType: S }
+		: never);
+
+/** The range types. */
+type RangeType = DataType<'daterange' | 'tstzrange'>;
+
+/** A comparison of a parameter of type `T` with `any` / `all` of an array of SQL type `D`. */
+type ParamComparison<T, D extends DataType> = <
+	V extends Quantified<unknown, D, null, true>,
+>(
+	array: ParamArray<T, D, V>,
+) => Predicate<Extract<T, null> | NullIn<V>>;
+
+/**
  * The methods of a parameter, as in `eb.val('a').eq(eb.fn.any('users.tags'))`:
- * every comparison that takes `any` / `all` for some SQL type, each taking
- * `any` / `all` of any array. A parameter has no SQL type of its own, so
- * neither the method nor the value is checked against the elements yet; the
- * elements' SQL type encodes it.
+ * every comparison that takes `any` / `all`, each with `any` / `all` of an
+ * array column or expression, whose elements have a SQL type with that
+ * comparison and a TypeScript type the parameter fits. A parameter has no
+ * SQL type of its own, so the elements' SQL type encodes it.
  */
 export interface ParamMethods<T> {
 	/** `=` */
-	eq<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly eq: ParamComparison<T, DataType>;
 	/** `<>` */
-	ne<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly ne: ParamComparison<T, DataType>;
 	/** `>` */
-	gt<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly gt: ParamComparison<T, DataType<OrderedKind>>;
 	/** `>=` */
-	gte<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly gte: ParamComparison<T, DataType<OrderedKind>>;
 	/** `<` */
-	lt<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly lt: ParamComparison<T, DataType<OrderedKind>>;
 	/** `<=` */
-	lte<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly lte: ParamComparison<T, DataType<OrderedKind>>;
 	/** `like` */
-	like<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly like: ParamComparison<T, DataType<TextKind>>;
 	/** `not like` */
-	notLike<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly notLike: ParamComparison<T, DataType<TextKind>>;
 	/** `ilike` */
-	ilike<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly ilike: ParamComparison<T, DataType<TextKind>>;
 	/** `not ilike` */
-	notIlike<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly notIlike: ParamComparison<T, DataType<TextKind>>;
 	/** `~` */
-	regex<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly regex: ParamComparison<T, DataType<TextKind>>;
 	/** `!~` */
-	notRegex<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly notRegex: ParamComparison<T, DataType<TextKind>>;
 	/** `~*` */
-	iregex<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly iregex: ParamComparison<T, DataType<TextKind>>;
 	/** `!~*` */
-	notIregex<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly notIregex: ParamComparison<T, DataType<TextKind>>;
 	/** `^@` */
-	startsWith<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
-	/** `@>` */
-	contains<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
-	/** `<@` */
-	containedBy<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
-	/** `&&` */
-	overlaps<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly startsWith: ParamComparison<T, DataType<TextKind>>;
+	/** `@>`: the range or jsonb value contains an element. */
+	readonly contains: ParamComparison<T, RangeType | DataType<'jsonb'>>;
+	/** `<@`: the range or jsonb value is contained by an element. */
+	readonly containedBy: ParamComparison<T, RangeType | DataType<'jsonb'>>;
+	/** `&&`: the range or network overlaps an element. */
+	readonly overlaps: ParamComparison<T, RangeType | DataType<'inet'>>;
 	/** `<<` (ranges) */
-	strictlyLeftOf<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly strictlyLeftOf: ParamComparison<T, RangeType>;
 	/** `>>` (ranges) */
-	strictlyRightOf<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly strictlyRightOf: ParamComparison<T, RangeType>;
 	/** `&<` */
-	doesNotExtendRightOf<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly doesNotExtendRightOf: ParamComparison<T, RangeType>;
 	/** `&>` */
-	doesNotExtendLeftOf<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly doesNotExtendLeftOf: ParamComparison<T, RangeType>;
 	/** `-|-` */
-	adjacentTo<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
-	/** `<<` (inet) */
-	isSubnetOf<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly adjacentTo: ParamComparison<T, RangeType>;
+	/** `<<`: is a strict subnet of an element. */
+	readonly isSubnetOf: ParamComparison<T, DataType<'inet'>>;
 	/** `<<=` */
-	isSubnetOrEqual<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
-	/** `>>` (inet) */
-	isSupernetOf<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly isSubnetOrEqual: ParamComparison<T, DataType<'inet'>>;
+	/** `>>` */
+	readonly isSupernetOf: ParamComparison<T, DataType<'inet'>>;
 	/** `>>=` */
-	isSupernetOrEqual<V extends Quantified<unknown, DataType, null>>(
-		array: V,
-	): Predicate<Extract<T, null> | NullIn<V>>;
+	readonly isSupernetOrEqual: ParamComparison<T, DataType<'inet'>>;
 }
 
 /** A parameter, with the methods a parameter has. */

@@ -1,5 +1,6 @@
 import type { DataType } from './data-type/data-type.js';
-import type { Codec } from './driver/codec.js';
+import { declareParamType, type Codec } from './driver/codec.js';
+import { codecs } from './driver/codecs.js';
 import type { OperationNode } from './node.js';
 
 /**
@@ -129,11 +130,42 @@ export class Param<T> extends Expression<T> {
 	};
 
 	constructor(value: T, codec?: Codec) {
-		const node = { kind: 'value', value, codec } as const;
+		const node = {
+			kind: 'value',
+			value,
+			codec: codec ?? codecOfValue(value),
+		} as const;
 		super(node);
 		this._quarry = { node, value, codec };
 	}
 }
+
+/**
+ * The codec a parameter used on its own (in a select list, or as an
+ * argument of `concat`) is sent with when `eb.val` wasn't given one,
+ * declaring its type from its JavaScript type: postgres can't infer it
+ * there, and would otherwise take it as `text` or fail to determine it. A
+ * whole number that fits is an `integer`, any other number a `double
+ * precision`; other values are left to the server.
+ */
+function codecOfValue(value: unknown): Codec | undefined {
+	switch (typeof value) {
+		case 'string':
+			return declaredText;
+		case 'number':
+			return Number.isInteger(value) && Math.abs(value) <= 2147483647
+				? codecs.int4
+				: codecs.float8;
+		case 'boolean':
+			return codecs.bool;
+		case 'bigint':
+			return codecs.int8;
+		default:
+			return value instanceof Date ? codecs.timestamptz : undefined;
+	}
+}
+
+const declaredText = declareParamType(codecs.text);
 
 /**
  * `any(array)` or `all(array)`, as `eb.fn.any` and `eb.fn.all` create: on
