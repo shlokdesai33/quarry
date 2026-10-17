@@ -118,7 +118,7 @@ export interface CaseElse<V, D extends DataType> {
 /** A branch as given: its condition's node and its result, not yet encoded. */
 interface Branch {
 	readonly when: OperationNode;
-	readonly then: unknown;
+	readonly result: unknown;
 }
 
 /** The SQL type a plain value is sent as, by its JavaScript type. */
@@ -173,9 +173,7 @@ function caseType(results: readonly unknown[]): DataType {
 /** A result's node: an expression as is, a value sent as `type`. */
 function resultNode(result: unknown, type: DataType): OperationNode {
 	if (result === undefined) {
-		throw new TypeError(
-			'A case result is undefined; for SQL NULL, pass null',
-		);
+		throw new TypeError('A case result is undefined; for SQL NULL, pass null');
 	}
 	const codec = declareParamType(type.codec);
 	if (result instanceof Param) {
@@ -205,7 +203,7 @@ class CaseBuilder {
 
 	when(condition: AnyPredicate, result: unknown): CaseBuilder {
 		return new CaseBuilder(
-			[...this.#branches, { when: condition._quarry.node, then: result }],
+			[...this.#branches, { when: condition._quarry.node, result }],
 			undefined,
 		);
 	}
@@ -215,14 +213,14 @@ class CaseBuilder {
 	}
 
 	end(): unknown {
-		const results = this.#branches.map((branch) => branch.then);
+		const results = this.#branches.map((branch) => branch.result);
 		if (this.#otherwise !== undefined) results.push(this.#otherwise.result);
 		const type = caseType(results);
 		const node: CaseNode = {
 			kind: 'case',
 			branches: this.#branches.map((branch) => ({
 				when: branch.when,
-				then: resultNode(branch.then, type),
+				result: resultNode(branch.result, type),
 			})),
 			otherwise:
 				this.#otherwise === undefined

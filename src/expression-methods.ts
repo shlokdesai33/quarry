@@ -137,14 +137,14 @@ const ARITHMETIC = {
 	innerProduct: '<#>',
 } as const;
 
-const NUMBER_KINDS: readonly string[] = [
+const NUMBER_KINDS: ReadonlySet<string> = new Set([
 	'smallint',
 	'integer',
 	'bigint',
 	'decimal',
 	'real',
 	'double precision',
-];
+]);
 
 const EXACT_KINDS: readonly string[] = [
 	'smallint',
@@ -175,10 +175,11 @@ function arithmeticOf(
 ): { kind: Kind; codec: Codec } {
 	if (operator === '<->' || operator === '<=>' || operator === '<#>')
 		return { kind: 'double precision', codec: kindCodec('vector') };
-	if (NUMBER_KINDS.includes(left))
+	if (NUMBER_KINDS.has(left))
 		return { kind: widerKind(left, right ?? left), codec: kindCodec(left) };
 	if (left === 'date') {
-		const days = right === undefined ? typeof value === 'number' : right !== 'date';
+		const days =
+			right === undefined ? typeof value === 'number' : right !== 'date';
 		return days
 			? { kind: 'date', codec: codecs.int4 }
 			: { kind: 'integer', codec: codecs.date };

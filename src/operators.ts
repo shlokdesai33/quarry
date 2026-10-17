@@ -463,7 +463,9 @@ export type WiderKind<A extends NumberKind, B extends NumberKind> = [
 		: 'double precision';
 
 /** What a value of kind `K` arrives as, by the kind's codec. */
-export type KindValue<K extends CodecKind> = CodecOutput<(typeof kindCodecs)[K]>;
+export type KindValue<K extends CodecKind> = CodecOutput<
+	(typeof kindCodecs)[K]
+>;
 
 /** What a value of kind `K` can be sent as, by the kind's codec. */
 type KindInput<K extends CodecKind> = CodecInput<(typeof kindCodecs)[K]>;
@@ -666,7 +668,7 @@ export type Expr<T, D extends DataType> = TypedExpression<T, D> &
  * element type encodes the parameter. A parameter of type `T` must fit the
  * elements' type; otherwise the argument fails to type-check.
  */
-type ParamArray<T, D extends DataType, V> = V &
+type ParamArray<T, V> = V &
 	(V extends Quantified<infer S, DataType, null, true>
 		? [NonNullable<T>] extends [S]
 			? unknown
@@ -680,7 +682,7 @@ type RangeType = DataType<'daterange' | 'tstzrange'>;
 type ParamComparison<T, D extends DataType> = <
 	V extends Quantified<unknown, D, null, true>,
 >(
-	array: ParamArray<T, D, V>,
+	array: ParamArray<T, V>,
 ) => Predicate<Extract<T, null> | NullIn<V>>;
 
 /**

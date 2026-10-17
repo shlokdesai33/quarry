@@ -40,7 +40,7 @@ export type SqlValue = unknown;
 
 /** The node of one interpolated value; see `sql`. */
 function interpolated(value: SqlValue): OperationNode {
-	if (Expression.is(value)) return value._quarry.node;
+	// a table has `_quarry` too, which `Expression.is` looks for
 	if (value instanceof Table) {
 		const table = tableNode(value);
 		const name = identifier(table.name);
@@ -50,6 +50,7 @@ function interpolated(value: SqlValue): OperationNode {
 				: `${name} as ${identifier(table.alias)}`,
 		);
 	}
+	if (Expression.is(value)) return value._quarry.node;
 	if (value === undefined) {
 		throw new TypeError(
 			'A value interpolated into sql is undefined; for SQL NULL, pass null',
@@ -206,8 +207,7 @@ export class SqlQuery<R> {
 	toQuery(): Query<SqlResult<R>> {
 		return this.#shaped({
 			read: (input) => ({
-				// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- `R` is the promise `db.sql<R>` makes
-				rows: allRows<R>().read(input) as R[],
+				rows: allRows<R>().read(input),
 				rowCount: input.count,
 			}),
 			checked: false,
@@ -225,7 +225,9 @@ export class SqlQuery<R> {
 	}
 
 	/** The value of the first column of the first row, if any; never throws for the number of rows. */
-	takeValue(..._oneColumn: ValueArgs<R, []>): Query<ColumnValue<R> | undefined> {
+	takeValue(
+		..._oneColumn: ValueArgs<R, []>
+	): Query<ColumnValue<R> | undefined> {
 		return this.#shaped(takeValue<ColumnValue<R>>());
 	}
 

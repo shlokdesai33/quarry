@@ -203,12 +203,14 @@ type OnArgs<R extends Refs> =
  * every reference to it ambiguous. A self-join joins the table under an
  * alias.
  */
-type NewName<T extends readonly AnyTable[], J extends AnyTable> =
-	J['name'] extends T[number]['name']
-		? [
-				alreadyJoined: `"${J['name']}" is already in the query: join it under another name, e.g. ${J['name']}.as('other')`,
-			]
-		: [];
+type NewName<
+	T extends readonly AnyTable[],
+	J extends AnyTable,
+> = J['name'] extends T[number]['name']
+	? [
+			alreadyJoined: `"${J['name']}" is already in the query: join it under another name, e.g. ${J['name']}.as('other')`,
+		]
+	: [];
 
 /**
  * The row `O` once the tables it was selected from are on the outer side of
@@ -228,6 +230,12 @@ type OuterTables<T extends readonly AnyTable[]> =
  * expression.
  */
 type Key<R extends Refs, O> = Ref<R> | (keyof O & string) | Expression<unknown>;
+
+/** A key as `#keys` reads it: a string, an expression, or a callback making one. */
+type KeyArg<R extends Refs> =
+	| string
+	| Expression<unknown>
+	| ((eb: ExpressionBuilder<R>) => string | Expression<unknown>);
 
 /** What a `select` over the tables `T` has recorded so far. */
 interface SelectState<T extends readonly AnyTable[]> {
@@ -434,12 +442,11 @@ export class SelectQueryBuilder<
 		const state = this.#joined(table) as unknown as SelectState<
 			[...OuterTables<T>, NullableTable<J>]
 		>;
-		return new JoinBuilder<
-			OuterTables<T>,
-			NullableTable<J>,
-			NullableRow<O>,
-			L
-		>('full', state, table);
+		return new JoinBuilder<OuterTables<T>, NullableTable<J>, NullableRow<O>, L>(
+			'full',
+			state,
+			table,
+		);
 	}
 
 	/**
@@ -975,19 +982,16 @@ export class SelectQueryBuilder<
 	 * (`table.column`), a selected column by its key (no dot), an
 	 * expression, or a callback making one.
 	 */
-	#keys(keys: unknown): (OperationNode | AliasNode)[] {
+	#keys(
+		keys:
+			| readonly KeyArg<RefsOf<T>>[]
+			| ((eb: ExpressionBuilder<RefsOf<T>>) => readonly KeyArg<RefsOf<T>>[]),
+	): (OperationNode | AliasNode)[] {
 		const eb = expressionBuilder(...this.#state.tables);
-		const list: readonly unknown[] =
-			typeof keys === 'function'
-				? (keys as (eb: unknown) => readonly unknown[])(eb)
-				: (keys as readonly unknown[]);
+		const list = typeof keys === 'function' ? keys(eb) : keys;
 		return list.map((key): OperationNode | AliasNode => {
-			const item: unknown =
-				typeof key === 'function' ? (key as (eb: unknown) => unknown)(eb) : key;
-			if (Expression.is(item)) return item._quarry.node;
-			if (typeof item !== 'string') {
-				throw new TypeError('A key is a column, a selected key or an expression');
-			}
+			const item = typeof key === 'function' ? key(eb) : key;
+			if (typeof item !== 'string') return item._quarry.node;
 			if (item.includes('.')) return eb.ref(item)._quarry.node;
 			if (!this.#state.selections.some((s) => s.alias === item)) {
 				throw new Error(

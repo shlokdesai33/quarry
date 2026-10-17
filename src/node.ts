@@ -114,7 +114,7 @@ export type CaseNode = {
 	readonly kind: 'case';
 	readonly branches: readonly {
 		readonly when: OperationNode;
-		readonly then: OperationNode;
+		readonly result: OperationNode;
 	}[];
 	readonly otherwise: OperationNode | undefined;
 };

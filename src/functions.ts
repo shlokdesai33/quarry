@@ -204,7 +204,7 @@ export interface Functions<in out R extends Refs> {
 	 *
 	 * @example eb.fn.cast(eb.fn.count(), 'integer')
 	 */
-	cast<A extends Operand<R>, T extends CastType>(
+	cast<A extends Part<R>, T extends CastType>(
 		value: A,
 		type: T,
 	): Result<(typeof CAST_KINDS)[T], CastValues[T], NullOf<TypeOf<R, A>>>;
@@ -275,7 +275,10 @@ export interface Functions<in out R extends Refs> {
 	 */
 	sum<A extends Operand<R, Summable>>(
 		value: A,
-	): Expr<KindValue<SumKind<KindOf<R, A>>> | null, DataType<SumKind<KindOf<R, A>>>>;
+	): Expr<
+		KindValue<SumKind<KindOf<R, A>>> | null,
+		DataType<SumKind<KindOf<R, A>>>
+	>;
 
 	/**
 	 * `avg(value)`: null over no rows. Of an exact numeric type, a `decimal`
@@ -284,7 +287,10 @@ export interface Functions<in out R extends Refs> {
 	 */
 	avg<A extends Operand<R, Summable>>(
 		value: A,
-	): Expr<KindValue<AvgKind<KindOf<R, A>>> | null, DataType<AvgKind<KindOf<R, A>>>>;
+	): Expr<
+		KindValue<AvgKind<KindOf<R, A>>> | null,
+		DataType<AvgKind<KindOf<R, A>>>
+	>;
 
 	/**
 	 * `array_agg(value)`: the values of the group as an array, nulls
@@ -302,16 +308,20 @@ export interface Functions<in out R extends Refs> {
 	 *
 	 * @example eb.fn.stringAgg('tags.name', ', ')
 	 */
-	stringAgg<A extends Operand<R, Text>, D extends TextArg>(
-		value: A,
-		delimiter: D,
+	stringAgg(
+		value: Operand<R, Text>,
+		delimiter: TextArg,
 	): Result<'text', string, null>;
 
 	/** `bool_and(value)`: whether every non-null value is true; null over no rows. */
-	boolAnd(value: Operand<R, DataType<'boolean'>>): Result<'boolean', boolean, null>;
+	boolAnd(
+		value: Operand<R, DataType<'boolean'>>,
+	): Result<'boolean', boolean, null>;
 
 	/** `bool_or(value)`: whether any value is true; null over no rows. */
-	boolOr(value: Operand<R, DataType<'boolean'>>): Result<'boolean', boolean, null>;
+	boolOr(
+		value: Operand<R, DataType<'boolean'>>,
+	): Result<'boolean', boolean, null>;
 
 	/**
 	 * `jsonb_agg(value)`: the values of the group as a JSON array; null over
@@ -351,9 +361,7 @@ export interface Functions<in out R extends Refs> {
 	 * `decimal` takes. A `decimal` stays one; anything else becomes a
 	 * `double precision`, as in postgres.
 	 */
-	round<A extends Operand<R, DataType<NumberKind>>>(
-		value: A,
-	): Rounded<R, A>;
+	round<A extends Operand<R, DataType<NumberKind>>>(value: A): Rounded<R, A>;
 	round<A extends Operand<R, DataType<'decimal'>>>(
 		value: A,
 		digits: IntegerArg,
@@ -387,7 +395,11 @@ export interface Functions<in out R extends Refs> {
 	 *
 	 * @example eb.fn.substring('users.name', 1, 1)
 	 */
-	substring<A extends Operand<R, Text>, S extends IntegerArg, C extends IntegerArg = never>(
+	substring<
+		A extends Operand<R, Text>,
+		S extends IntegerArg,
+		C extends IntegerArg = never,
+	>(
 		text: A,
 		start: S,
 		count?: C,
@@ -433,7 +445,11 @@ export interface Functions<in out R extends Refs> {
 	 *
 	 * @example eb.fn.splitPart('users.email', '@', 2)
 	 */
-	splitPart<A extends Operand<R, Text>, D extends TextArg, N extends IntegerArg>(
+	splitPart<
+		A extends Operand<R, Text>,
+		D extends TextArg,
+		N extends IntegerArg,
+	>(
 		text: A,
 		delimiter: D,
 		n: N,
@@ -468,7 +484,13 @@ export interface Functions<in out R extends Refs> {
 	 * `to_char(value, format)`: a date, time, timestamp, interval or number
 	 * formatted by the pattern, e.g. `'YYYY-MM-DD'`.
 	 */
-	toChar<A extends Operand<R, DataType<TimestampKind | 'time' | 'interval' | NumberKind>>, F extends TextArg>(
+	toChar<
+		A extends Operand<
+			R,
+			DataType<TimestampKind | 'time' | 'interval' | NumberKind>
+		>,
+		F extends TextArg,
+	>(
 		value: A,
 		format: F,
 	): Result<'text', string, NullOf<TypeOf<R, A>> | ArgNull<F>>;
@@ -536,17 +558,19 @@ type AvgKind<K> = K extends 'real' | 'double precision'
 		: 'decimal';
 
 /** What `round`, `ceil` and `floor` return: a `decimal` stays one, anything else is a `double precision`. */
-type Rounded<R extends Refs, A> = KindOf<R, A> extends 'decimal'
-	? Result<'decimal', string, NullOf<TypeOf<R, A>>>
-	: Result<'double precision', number, NullOf<TypeOf<R, A>>>;
+type Rounded<R extends Refs, A> =
+	KindOf<R, A> extends 'decimal'
+		? Result<'decimal', string, NullOf<TypeOf<R, A>>>
+		: Result<'double precision', number, NullOf<TypeOf<R, A>>>;
 
 /** What `date_trunc` returns: of the argument's type, but a `timestamptz` for a `date`. */
-type Truncated<R extends Refs, A> = KindOf<R, A> extends 'date'
-	? Result<'timestamptz', Date, NullOf<TypeOf<R, A>>>
-	: Expr<
-			KindValue<KindOf<R, A> & CodecKind> | NullOf<TypeOf<R, A>>,
-			DataType<KindOf<R, A>>
-		>;
+type Truncated<R extends Refs, A> =
+	KindOf<R, A> extends 'date'
+		? Result<'timestamptz', Date, NullOf<TypeOf<R, A>>>
+		: Expr<
+				KindValue<KindOf<R, A> & CodecKind> | NullOf<TypeOf<R, A>>,
+				DataType<KindOf<R, A>>
+			>;
 
 /** The types an array can hold: any but an array. */
 type ElementKind = DataType<Exclude<Kind, 'array'>>;
@@ -602,7 +626,7 @@ type DateUnit =
 	| 'century'
 	| 'millennium';
 
-const DATE_UNITS: ReadonlySet<string> = new Set<DateUnit>([
+const DATE_UNIT_LIST: readonly DateUnit[] = [
 	'microseconds',
 	'milliseconds',
 	'second',
@@ -616,7 +640,9 @@ const DATE_UNITS: ReadonlySet<string> = new Set<DateUnit>([
 	'decade',
 	'century',
 	'millennium',
-]);
+];
+
+const DATE_UNITS: ReadonlySet<string> = new Set(DATE_UNIT_LIST);
 
 /** The fields `extract` takes. */
 type DateField =
@@ -632,7 +658,7 @@ type DateField =
 	| 'timezone_minute';
 
 const DATE_FIELDS: ReadonlySet<string> = new Set<DateField>([
-	...(DATE_UNITS as ReadonlySet<DateUnit>),
+	...DATE_UNIT_LIST,
 	'dow',
 	'doy',
 	'epoch',
@@ -735,7 +761,12 @@ export function functions<R extends Refs>({
 		least: (first, ...rest) => extreme('least', first, rest),
 		countDistinct: (value) =>
 			typedExpression(
-				{ kind: 'function', name: 'count', args: [node(value)], distinct: true },
+				{
+					kind: 'function',
+					name: 'count',
+					args: [node(value)],
+					distinct: true,
+				},
 				new DataType('bigint'),
 			),
 		sum: (value) =>
@@ -829,7 +860,8 @@ export function functions<R extends Refs>({
 				new DataType('date'),
 			),
 		dateTrunc: (unit, value) => {
-			if (!DATE_UNITS.has(unit)) throw new Error(`Unknown date_trunc unit "${unit}"`);
+			if (!DATE_UNITS.has(unit))
+				throw new Error(`Unknown date_trunc unit "${unit}"`);
 			const { kind } = dataType(value);
 			return call(
 				'date_trunc',
@@ -838,7 +870,8 @@ export function functions<R extends Refs>({
 			);
 		},
 		extract: (field, value) => {
-			if (!DATE_FIELDS.has(field)) throw new Error(`Unknown extract field "${field}"`);
+			if (!DATE_FIELDS.has(field))
+				throw new Error(`Unknown extract field "${field}"`);
 			return typedExpression(
 				{
 					kind: 'raw',

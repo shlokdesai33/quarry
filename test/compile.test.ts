@@ -412,9 +412,9 @@ describe('value encoding', () => {
 			params: ['a'],
 			types: [oids.text],
 		});
-		expect(wire(eb.fn.concat(eb.val(1), eb.val(1.5)).isNotNull())).toMatchObject(
-			{ params: ['1', '1.5'], types: [oids.int4, oids.float8] },
-		);
+		expect(
+			wire(eb.fn.concat(eb.val(1), eb.val(1.5)).isNotNull()),
+		).toMatchObject({ params: ['1', '1.5'], types: [oids.int4, oids.float8] });
 	});
 
 	it('does not encode expressions', () => {

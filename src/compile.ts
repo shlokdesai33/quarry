@@ -311,7 +311,7 @@ function render(node: OperationNode, params: Params): string {
 		case 'case': {
 			let sql = 'case';
 			for (const branch of node.branches) {
-				sql += ` when ${render(branch.when, params)} then ${render(branch.then, params)}`;
+				sql += ` when ${render(branch.when, params)} then ${render(branch.result, params)}`;
 			}
 			if (node.otherwise !== undefined)
 				sql += ` else ${render(node.otherwise, params)}`;
@@ -371,10 +371,10 @@ function renderSelect(node: SelectNode, params: Params): string {
 	}
 	if (node.orderBy !== undefined && node.orderBy.length > 0) {
 		const keys = node.orderBy.map((key) => {
-			let sql = renderKey(key.expression, params);
-			if (key.direction !== undefined) sql += ` ${key.direction}`;
-			if (key.nulls !== undefined) sql += ` nulls ${key.nulls}`;
-			return sql;
+			let rendered = renderKey(key.expression, params);
+			if (key.direction !== undefined) rendered += ` ${key.direction}`;
+			if (key.nulls !== undefined) rendered += ` nulls ${key.nulls}`;
+			return rendered;
 		});
 		sql += ` order by ${keys.join(', ')}`;
 	}
@@ -432,7 +432,7 @@ function hasAggregate(node: OperationNode): boolean {
 		case 'case':
 			return (
 				node.branches.some(
-					(branch) => hasAggregate(branch.when) || hasAggregate(branch.then),
+					(branch) => hasAggregate(branch.when) || hasAggregate(branch.result),
 				) ||
 				(node.otherwise !== undefined && hasAggregate(node.otherwise))
 			);
