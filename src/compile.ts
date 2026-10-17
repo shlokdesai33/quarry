@@ -1,6 +1,8 @@
 import type {
+	AliasNode,
 	DeleteNode,
 	InsertNode,
+	JoinNode,
 	LockNode,
 	OnConflictNode,
 	OperationNode,
@@ -302,8 +304,19 @@ function render(node: OperationNode, params: Params): string {
 			return renderLogical(node.operands, 'or', 'false', params);
 		case 'not':
 			return `not (${render(node.operand, params)})`;
-		case 'function':
-			return `${node.name}(${node.args.map((arg) => render(arg, params)).join(', ')})`;
+		case 'function': {
+			const args = node.args.map((arg) => render(arg, params)).join(', ');
+			return `${node.name}(${node.distinct === true ? `distinct ${args}` : args})`;
+		}
+		case 'case': {
+			let sql = 'case';
+			for (const branch of node.branches) {
+				sql += ` when ${render(branch.when, params)} then ${render(branch.then, params)}`;
+			}
+			if (node.otherwise !== undefined)
+				sql += ` else ${render(node.otherwise, params)}`;
+			return `${sql} end`;
+		}
 		case 'raw':
 			return node.nodes.reduce(
 				(sql, embedded, i) =>
@@ -315,22 +328,61 @@ function render(node: OperationNode, params: Params): string {
 	}
 }
 
+/** A `group by`, `order by` or `distinct on` key: an expression, or a selected column by its alias. */
+function renderKey(node: OperationNode | AliasNode, params: Params): string {
+	return node.kind === 'alias' ? identifier(node.alias) : render(node, params);
+}
+
+function renderKeys(
+	keys: readonly (OperationNode | AliasNode)[],
+	params: Params,
+): string {
+	return keys.map((key) => renderKey(key, params)).join(', ');
+}
+
+function renderJoin(join: JoinNode, params: Params): string {
+	const table = renderTable(join.table);
+	if (join.kind === 'cross') return ` cross join ${table}`;
+	if (join.on === undefined)
+		throw new Error(`A ${join.kind} join needs an on() condition`);
+	return ` ${join.kind} join ${table} on ${render(join.on, params)}`;
+}
+
 function renderSelect(node: SelectNode, params: Params): string {
+	let sql = 'select';
+	if (node.distinct === true) sql += ' distinct';
+	else if (node.distinct !== undefined)
+		sql += ` distinct on (${renderKeys(node.distinct, params)})`;
 	const selections = node.selections.map(
 		(selection) =>
 			`${render(selection.expression, params)} as ${identifier(selection.alias)}`,
 	);
-	let sql =
-		selections.length === 0 ? 'select' : `select ${selections.join(', ')}`;
+	if (selections.length > 0) sql += ` ${selections.join(', ')}`;
 	sql += ` from ${renderTable(node.from)}`;
-	for (const join of node.joins) {
-		sql += ` inner join ${renderTable(join.table)} on ${render(join.on, params)}`;
-	}
+	for (const join of node.joins) sql += renderJoin(join, params);
 	if (node.where !== undefined) {
 		sql += ` where ${render(node.where, params)}`;
 	}
+	if (node.groupBy !== undefined && node.groupBy.length > 0) {
+		sql += ` group by ${renderKeys(node.groupBy, params)}`;
+	}
+	if (node.having !== undefined) {
+		sql += ` having ${render(node.having, params)}`;
+	}
+	if (node.orderBy !== undefined && node.orderBy.length > 0) {
+		const keys = node.orderBy.map((key) => {
+			let sql = renderKey(key.expression, params);
+			if (key.direction !== undefined) sql += ` ${key.direction}`;
+			if (key.nulls !== undefined) sql += ` nulls ${key.nulls}`;
+			return sql;
+		});
+		sql += ` order by ${keys.join(', ')}`;
+	}
 	if (node.limit !== undefined) {
 		sql += ` limit ${param(params, node.limit)}`;
+	}
+	if (node.offset !== undefined) {
+		sql += ` offset ${param(params, node.offset)}`;
 	}
 	if (node.locks.length > 0) {
 		if (node.selections.some((s) => hasAggregate(s.expression))) {
@@ -351,7 +403,17 @@ function renderLock(lock: LockNode): string {
 }
 
 /** The aggregate functions `eb.fn` builds. */
-const aggregates = new Set(['count', 'min', 'max']);
+const aggregates = new Set([
+	'count',
+	'min',
+	'max',
+	'sum',
+	'avg',
+	'array_agg',
+	'string_agg',
+	'bool_and',
+	'bool_or',
+]);
 
 /** Whether `node` calls an aggregate of its own query, not of a subquery's. */
 function hasAggregate(node: OperationNode): boolean {
@@ -367,6 +429,13 @@ function hasAggregate(node: OperationNode): boolean {
 			return hasAggregate(node.operand);
 		case 'value_list':
 			return node.values.some(hasAggregate);
+		case 'case':
+			return (
+				node.branches.some(
+					(branch) => hasAggregate(branch.when) || hasAggregate(branch.then),
+				) ||
+				(node.otherwise !== undefined && hasAggregate(node.otherwise))
+			);
 		case 'raw':
 			return node.nodes.some(hasAggregate);
 		default:
@@ -380,19 +449,23 @@ function renderTable(table: TableNode): string {
 		: `${identifier(table.name)} as ${identifier(table.alias)}`;
 }
 
-/** Nested comparisons are parenthesised so postgres precedence cannot regroup them. */
+/**
+ * Operands that are operations themselves (comparisons, arithmetic, `not`)
+ * are parenthesised, so postgres precedence cannot regroup them: `not` binds
+ * looser than `is`, so `not (a) is null` would read as `not ((a) is null)`.
+ */
 function renderOperand(node: OperationNode, params: Params): string {
 	const sql = render(node, params);
-	return rendersAsBinary(node) ? `(${sql})` : sql;
+	return rendersAsOperation(node) ? `(${sql})` : sql;
 }
 
 /** A single-operand `and` / `or` renders as its operand, unparenthesised. */
-function rendersAsBinary(node: OperationNode): boolean {
+function rendersAsOperation(node: OperationNode): boolean {
 	if (node.kind === 'and' || node.kind === 'or') {
 		const [only, ...rest] = node.operands;
-		return only !== undefined && rest.length === 0 && rendersAsBinary(only);
+		return only !== undefined && rest.length === 0 && rendersAsOperation(only);
 	}
-	return node.kind === 'binary';
+	return node.kind === 'binary' || node.kind === 'not';
 }
 
 function renderLogical(
@@ -408,7 +481,8 @@ function renderLogical(
 	return `(${rendered.join(` ${operator} `)})`;
 }
 
-function identifier(name: string): string {
+/** `name` as a quoted identifier. */
+export function identifier(name: string): string {
 	return `"${name.replaceAll('"', '""')}"`;
 }
 

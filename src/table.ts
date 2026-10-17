@@ -1,3 +1,4 @@
+import type { AnyColumn } from './column/any-column.js';
 import type { TableNode } from './node.js';
 import type { Schema } from './types.js';
 import type { CallSite } from './call-site.js';
@@ -47,6 +48,40 @@ export class Table<N extends string, S extends Schema> {
 }
 
 export type AnyTable = Table<string, Schema>;
+
+/**
+ * A column as the outer side of a join reads it: null in the rows the join
+ * found no match for. Only its selected type changes; its SQL type, and so
+ * its comparisons and codec, stay the column's.
+ */
+export interface NullableColumn<C extends AnyColumn> {
+	readonly $select: C['$select'] | null;
+	readonly $insert: C['$insert'];
+	readonly $update: C['$update'];
+	readonly _quarry: C['_quarry'];
+}
+
+/**
+ * The table `X` on the outer side of a join (the joined table of a `left
+ * join`, the earlier ones of a `right join`, both of a `full join`): every
+ * column nullable. Only a type: the table itself is the same.
+ */
+export type NullableTable<X extends AnyTable> =
+	X extends Table<infer N, infer S>
+		? Table<
+				N,
+				{
+					columns: {
+						[K in keyof S['columns']]: NullableColumn<S['columns'][K]>;
+					};
+				}
+			>
+		: never;
+
+/** The tables `T`, each a `NullableTable`. */
+export type NullableTables<T extends readonly AnyTable[]> = {
+	[I in keyof T]: NullableTable<T[I]>;
+};
 
 /** A table as `from`, `join` and the write queries render it. */
 export function tableNode(table: AnyTable): TableNode {
