@@ -24,6 +24,11 @@ export {
 	vector,
 } from './column-factories.js';
 export { BatchError, type BatchResults } from './batch.js';
+export {
+	QueryBudgetError,
+	type BudgetUsage,
+	type QueryBudget,
+} from './budget.js';
 export { compile, type CompiledQuery } from './compile.js';
 export {
 	database,
@@ -73,7 +78,11 @@ export {
 	type PoolOptions,
 	type RowStream,
 } from './driver/index.js';
-export type { DatabaseOptions, QueryEvent } from './driver-executor.js';
+export type {
+	DatabaseOptions,
+	QueryEvent,
+	SlowQueryOptions,
+} from './driver-executor.js';
 export { violatedColumns } from './errors.js';
 export { defineEnum } from './define-enum.js';
 export { defineTable } from './define-table.js';
@@ -133,6 +142,7 @@ export type {
 	NullableTable,
 	Table,
 } from './table.js';
+export type { ToSQLOptions } from './to-sql.js';
 export {
 	update,
 	type SetEachOptions,

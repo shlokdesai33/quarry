@@ -2,9 +2,11 @@ import { describe, expectTypeOf, it } from 'vitest';
 import { integer, text } from '../src/column-factories.js';
 import { databaseWith, type DatabaseTransaction } from '../src/database.js';
 import { defineTable } from '../src/define-table.js';
+import type { BudgetUsage } from '../src/budget.js';
 import type { RowStream } from '../src/driver/row-stream.js';
 import type { QueryDescription } from '../src/executor.js';
 import type { NotExecuted, Query } from '../src/query.js';
+import type { CompiledQuery } from '../src/compile.js';
 import { executorFrom, fakeExecutor } from './helpers/executor.js';
 
 const users = defineTable('users', {
@@ -99,5 +101,65 @@ describe('running a query', () => {
 		expectTypeOf(result).toEqualTypeOf<Promise<number>>();
 		// @ts-expect-error a transaction database can't be closed
 		void db.transaction(async (tx) => tx.close());
+	});
+});
+
+describe('toSQL, budgets and sensitive columns', () => {
+	it('renders every builder to SQL without running it', () => {
+		expectTypeOf(query.toSQL()).toEqualTypeOf<CompiledQuery>();
+		expectTypeOf(
+			query.expectOne().toSQL({ inline: true, pretty: true }),
+		).toEqualTypeOf<CompiledQuery>();
+		expectTypeOf(
+			query.takeFirst().toQuery().toSQL(),
+		).toEqualTypeOf<CompiledQuery>();
+		// @ts-expect-error unknown option
+		void query.takeValue().toSQL({ limit: true });
+		expectTypeOf(
+			db.insertInto(users).values({ email: null }).toSQL({ inline: true }),
+		).toEqualTypeOf<CompiledQuery>();
+		expectTypeOf(
+			db.update(users).set({ email: 'a' }).allRows().toSQL({ pretty: true }),
+		).toEqualTypeOf<CompiledQuery>();
+		expectTypeOf(
+			db.deleteFrom(users).where('users.id', 1).toSQL(),
+		).toEqualTypeOf<CompiledQuery>();
+		// @ts-expect-error unknown option
+		void query.toSQL({ inlined: true });
+	});
+
+	it('returns what the budgeted callback returns, with live usage', () => {
+		expectTypeOf(
+			db.budget({ maxQueries: 5 }, async (usage) => {
+				expectTypeOf(usage).toEqualTypeOf<BudgetUsage>();
+				return 1;
+			}),
+		).toEqualTypeOf<Promise<number>>();
+		void db.transaction(async (tx) => {
+			expectTypeOf(
+				tx.budget({ maxDurationMs: 10 }, async () => 'x'),
+			).toEqualTypeOf<Promise<string>>();
+		});
+	});
+
+	it('keeps a sensitive column’s types', () => {
+		const accounts = defineTable('accounts', {
+			columns: {
+				id: integer().identity().sensitive(),
+				email: text().nullable().sensitive(),
+				hash: text().sensitive().default(),
+			},
+		});
+		const row = databaseWith(fakeExecutor().executor)
+			.selectFrom(accounts)
+			.select(['accounts.id', 'accounts.email', 'accounts.hash'])
+			.expectOne()
+			.execute();
+		expectTypeOf(row).toEqualTypeOf<
+			Promise<{ id: number; email: string | null; hash: string }>
+		>();
+		void databaseWith(fakeExecutor().executor)
+			.insertInto(accounts)
+			.values({ email: null });
 	});
 });

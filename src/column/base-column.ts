@@ -30,6 +30,8 @@ export type ColumnArgs<D extends DataType> = {
 	readonly fill?: ColumnFill;
 	/** Where the column's factory was called. */
 	readonly site?: CallSite | undefined;
+	/** Whether the column was made `sensitive()`. */
+	readonly sensitive?: boolean | undefined;
 };
 
 /**
@@ -55,7 +57,8 @@ export type ColumnArgs<D extends DataType> = {
  * - `IdentityColumn`: none
  *
  * The `array()` factory takes a `Column` of a non-array type as its element.
- * `name()` and `typed()` are valid everywhere and keep the state.
+ * `name()`, `typed()` and `sensitive()` are valid everywhere and keep the
+ * state.
  */
 export abstract class BaseColumn<D extends DataType, S, I, U> {
 	/**
@@ -79,7 +82,7 @@ export abstract class BaseColumn<D extends DataType, S, I, U> {
 	 * its name in the database, when it differs from the key it is declared
 	 * under. The rest mirror the modifiers for `db.verify`: `nullable`, `fill`
 	 * (`default()`, `generated()` or `identity()`), and `site`, where the
-	 * column's factory was called.
+	 * column's factory was called. `sensitive` is set by `sensitive()`.
 	 */
 	readonly _quarry: {
 		readonly dataType: D;
@@ -87,6 +90,7 @@ export abstract class BaseColumn<D extends DataType, S, I, U> {
 		readonly nullable: boolean;
 		readonly fill: ColumnFill;
 		readonly site: CallSite | undefined;
+		readonly sensitive: boolean;
 	};
 
 	/**
@@ -100,8 +104,9 @@ export abstract class BaseColumn<D extends DataType, S, I, U> {
 		nullable = false,
 		fill,
 		site,
+		sensitive = false,
 	}: ColumnArgs<D>) {
-		this._quarry = { dataType, columnName, nullable, fill, site };
+		this._quarry = { dataType, columnName, nullable, fill, site, sensitive };
 	}
 
 	/**
@@ -111,6 +116,19 @@ export abstract class BaseColumn<D extends DataType, S, I, U> {
 	 * @example firstName: text().name('first_name')
 	 */
 	abstract name(columnName: string): BaseColumn<D, S, I, U>;
+
+	/**
+	 * Marks the column as holding secrets or personal data. Every value
+	 * bound against it (compared in a `where`, inserted, set by an update or
+	 * upsert, or a row of `setEach`) is shown as `'[redacted]'` in
+	 * `onQuery` events, in errors' `query`, in `toSQL({ inline })`, and in
+	 * decode errors; a constraint error's `detail` naming it is redacted too.
+	 * What is sent to the database and the rows returned are unchanged.
+	 * Valid in every state, which it keeps.
+	 *
+	 * @example passwordHash: text().name('password_hash').sensitive()
+	 */
+	abstract sensitive(): BaseColumn<D, S, I, U>;
 
 	/**
 	 * Narrows the TypeScript view of the column (branded ids, literal unions,

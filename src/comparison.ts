@@ -1,6 +1,6 @@
 import { arrayOf, type Codec } from './driver/codec.js';
 import { Expression, Param, Quantified } from './expression.js';
-import type { OperationNode } from './node.js';
+import type { OperationNode, ValueNode } from './node.js';
 
 /** The reference each `eb.ref` node was made from, as written (`users.firstName`), for errors. */
 const references = new WeakMap<OperationNode, string>();
@@ -37,6 +37,44 @@ const QUANTIFIED = {
 	'not in': ['<>', 'all'],
 } as const;
 
+/** Whether `node` reads a `sensitive()` column anywhere within it. */
+export function readsSensitive(node: OperationNode): boolean {
+	switch (node.kind) {
+		case 'reference':
+			return node.sensitive === true;
+		case 'value':
+		case 'literal':
+			return false;
+		case 'value_list':
+			return node.values.some(readsSensitive);
+		case 'binary':
+			return readsSensitive(node.left) || readsSensitive(node.right);
+		case 'and':
+		case 'or':
+			return node.operands.some(readsSensitive);
+		case 'not':
+			return readsSensitive(node.operand);
+		case 'function':
+			return node.args.some(readsSensitive);
+		case 'case':
+			return (
+				node.branches.some(
+					(branch) =>
+						readsSensitive(branch.when) || readsSensitive(branch.result),
+				) ||
+				(node.otherwise !== undefined && readsSensitive(node.otherwise))
+			);
+		case 'raw':
+			return (
+				(node.table?.sensitive?.length ?? 0) > 0 ||
+				node.nodes.some(readsSensitive)
+			);
+		default:
+			// a subquery's own columns, and nodes that read no column
+			return false;
+	}
+}
+
 /** How the values of a comparison are encoded: the codec for one value. */
 export type CodecFor = (value: unknown) => Codec | undefined;
 
@@ -60,14 +98,20 @@ function arrayCodec(
  * `eb.val` was given one); other expressions are used as-is. An array of
  * operands, as `in` against an array and `any` / `all` take, is one
  * parameter, encoded by `arrayOf` that codec. `undefined`, as the value or
- * one of the items, throws.
+ * one of the items, throws. The parameters are marked `sensitive` when
+ * `left` reads a `sensitive()` column, or when `sensitive` says so.
  */
 export function comparison(
 	left: OperationNode,
 	operator: string,
 	value: unknown,
 	codecFor: CodecFor,
+	sensitive = readsSensitive(left),
 ): OperationNode {
+	const parameter = (inner: unknown, codec: Codec | undefined): ValueNode =>
+		sensitive
+			? { kind: 'value', value: inner, codec, sensitive: true }
+			: { kind: 'value', value: inner, codec };
 	const check = (item: unknown): unknown => {
 		if (item === undefined) throw undefinedComparison(left);
 		return item;
@@ -75,28 +119,22 @@ export function comparison(
 	const operand = (item: unknown): OperationNode => {
 		if (item instanceof Param) {
 			const inner = check(item._quarry.value);
-			return {
-				kind: 'value',
-				value: inner,
-				codec: item._quarry.codec ?? codecFor(inner),
-			};
+			return parameter(inner, item._quarry.codec ?? codecFor(inner));
 		}
 		return Expression.is(item)
 			? item._quarry.node
-			: { kind: 'value', value: check(item), codec: codecFor(item) };
+			: parameter(check(item), codecFor(item));
 	};
 
 	const array = (items: unknown): OperationNode => {
 		const values = items instanceof Param ? items._quarry.value : items;
 		if (!Array.isArray(values)) return operand(items);
 		for (const item of values) check(item);
-		return {
-			kind: 'value',
-			value: values,
-			codec:
-				(items instanceof Param ? items._quarry.codec : undefined) ??
+		return parameter(
+			values,
+			(items instanceof Param ? items._quarry.codec : undefined) ??
 				arrayCodec(values, codecFor),
-		};
+		);
 	};
 
 	if (value instanceof Quantified) {

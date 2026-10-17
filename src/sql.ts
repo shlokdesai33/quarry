@@ -27,6 +27,7 @@ import {
 	type ValueArgs,
 } from './shape.js';
 import { Table, tableNode } from './table.js';
+import { toSQL as renderSQL, type ToSQLOptions } from './to-sql.js';
 
 /**
  * A fragment of SQL written by hand, as `sql` makes: an expression of type
@@ -44,11 +45,11 @@ function interpolated(value: SqlValue): OperationNode {
 	if (value instanceof Table) {
 		const table = tableNode(value);
 		const name = identifier(table.name);
-		return verbatim(
+		const text =
 			table.alias === undefined
 				? name
-				: `${name} as ${identifier(table.alias)}`,
-		);
+				: `${name} as ${identifier(table.alias)}`;
+		return { kind: 'raw', fragments: [text], nodes: [], table };
 	}
 	if (Expression.is(value)) return value._quarry.node;
 	if (value === undefined) {
@@ -133,6 +134,17 @@ export interface SqlTag {
 	 * @example sql`${eb.ref('users.id')} in (${sql.join(ids)})`
 	 */
 	join(items: readonly SqlValue[], separator?: Sql<unknown>): Sql<unknown>;
+
+	/**
+	 * A parameter to show as `'[redacted]'`, as a value bound against a
+	 * `sensitive()` column is, where nothing else says it is secret: in
+	 * `onQuery` events, errors and `toSQL({ inline })`. What is sent is
+	 * unchanged. A fragment that reads a sensitive column or interpolates a
+	 * table with one redacts its values without it.
+	 *
+	 * @example db.sql`update accounts set password_hash = ${sql.sensitive(hash)} where id = ${id}`
+	 */
+	sensitive(value: unknown): Sql<unknown>;
 }
 
 export const sql: SqlTag = Object.assign(
@@ -165,6 +177,14 @@ export const sql: SqlTag = Object.assign(
 				nodes,
 			});
 		},
+		sensitive: (value: unknown): Sql<unknown> => {
+			if (value === undefined) {
+				throw new TypeError(
+					'A value interpolated into sql is undefined; for SQL NULL, pass null',
+				);
+			}
+			return new Sql({ kind: 'value', value, sensitive: true });
+		},
 	},
 );
 
@@ -191,10 +211,12 @@ export class SqlQuery<R> {
 	declare readonly $output: R;
 
 	readonly #executor: Executor | undefined;
+	readonly #node: RawNode;
 	readonly #query: CompiledQuery;
 
 	constructor(executor: Executor | undefined, node: RawNode) {
 		this.#executor = executor;
+		this.#node = node;
 		this.#query = compile(node);
 	}
 
@@ -214,9 +236,14 @@ export class SqlQuery<R> {
 		});
 	}
 
-	/** The SQL and parameters `execute()` sends. */
-	toSQL(): CompiledQuery {
-		return this.#query;
+	/**
+	 * The SQL and parameters `execute()` sends; with `inline` or `pretty`,
+	 * rendered as the builders' `toSQL` renders theirs.
+	 */
+	toSQL(options?: ToSQLOptions): CompiledQuery {
+		return options?.inline || options?.pretty
+			? renderSQL(this.#node, options)
+			: this.#query;
 	}
 
 	/** The first row, if any; never throws for the number of rows. */

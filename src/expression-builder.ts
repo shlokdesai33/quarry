@@ -144,12 +144,11 @@ export function expressionBuilder<const T extends readonly AnyTable[]>(
 		if (column === undefined) {
 			throw new Error(`Unknown column reference "${reference}"`);
 		}
+		const name = column._quarry.columnName ?? key;
 		return {
-			node: {
-				kind: 'reference',
-				table: tableName,
-				column: column._quarry.columnName ?? key,
-			},
+			node: column._quarry.sensitive
+				? { kind: 'reference', table: tableName, column: name, sensitive: true }
+				: { kind: 'reference', table: tableName, column: name },
 			column,
 		};
 	};

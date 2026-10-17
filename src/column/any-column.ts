@@ -23,5 +23,6 @@ export interface AnyColumn {
 		readonly nullable: boolean;
 		readonly fill: ColumnFill;
 		readonly site: CallSite | undefined;
+		readonly sensitive: boolean;
 	};
 }
