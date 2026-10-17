@@ -95,7 +95,7 @@ export const DRIVERS: Record<
 	quarry: {
 		runtimes: ['node', 'bun', 'deno'],
 		describe:
-			'quarry/driver (built dist). Like-for-like decoding (int8/numeric as string, timestamptz as Date, as pg does: `codecs: [codecs.int8AsString, codecs.timestamptz]`). Defaults: prepared statements (LRU 100), binary results for hot types, pipelining onto shared connections when the pool is busy (50 per connection).',
+			'quarry/driver (built dist). Like-for-like decoding (int8/numeric as string, timestamptz as Date, as pg does: `codecs: [codecs.int8AsString, codecs.timestamptz]`). Defaults: prepared statements (LRU 100), binary results once a statement is described, pipelining onto shared connections when the pool is busy (adaptive depth 100–1000).',
 		make: (o) => quarry(o, { decode: 'compat' }),
 	},
 	'quarry-candidate': {

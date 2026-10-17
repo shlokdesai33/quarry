@@ -346,7 +346,29 @@ if len(sys.argv) > 4:
                 continue
             rows.setdefault((c["phase"], c["max"], c.get("concurrency"), c.get("pipeline"), c.get("rtt")), []).append(r["result"]["throughput"])
         return {k: sorted(v)[len(v) // 2] for k, v in rows.items()}
-    base, cand = load(sys.argv[3]), load(sys.argv[4])
+    def load_md(path):
+        # the same points from a tables.md (a results snapshot), when the raw results are gone
+        import re
+        rows, title = {}, None
+        for line in open(path, encoding="utf8"):
+            m = re.match(r"^\*\*(.+)\*\*$", line.strip())
+            if m:
+                title = m.group(1)
+                continue
+            if not title or not line.startswith("|"):
+                continue
+            cells = [c.strip().replace("*", "").split("±")[0].strip().replace(",", "") for c in line.strip().strip("|").split("|")]
+            pool = re.match(r"Node 24: pool size (\d+), point lookups/s by concurrency", title)
+            try:
+                if pool:
+                    rows[("conc", int(pool.group(1)), int(cells[0]), None, None)] = float(cells[1])
+                elif title.startswith("quarry, one connection, 100 concurrent point lookups"):
+                    rows[("pipeline", 1, 100, int(cells[0]), 0)] = float(cells[1])
+                    rows[("pipeline", 1, 100, int(cells[0]), 5)] = float(cells[2])
+            except (ValueError, IndexError):
+                pass
+        return rows
+    base, cand = [(load_md if path.endswith(".md") else load)(path) for path in sys.argv[3:5]]
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.2))
     for pool, color in zip([1, 5, 10], ["#1f77b4", "#2ca02c", "#d62728"]):
         xs = [1, 10, 50, 100, 500, 1000]
