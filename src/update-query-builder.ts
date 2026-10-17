@@ -4,12 +4,16 @@ import {
 	expressionBuilder,
 } from './expression-builder.js';
 import type { SelectionNode, SetNode, UpdateNode } from './node.js';
-import type { RefsOf } from './refs.js';
+import type { Ref, RefsOf } from './refs.js';
 import {
 	type AddRow,
+	allColumns,
+	returningNodes,
 	type RowOf,
 	type Selection,
 	selectionNodes,
+	type UniqueColumns,
+	type UniqueKeys,
 } from './row.js';
 import { type AnyTable, tableNode } from './table.js';
 import {
@@ -205,12 +209,35 @@ export class UpdateQueryBuilder<
 	 */
 	returning<const S extends readonly Selection<RefsOf<[T]>>[]>(
 		selections: S | ((eb: ExpressionBuilder<RefsOf<[T]>>) => S),
+		..._unique: UniqueKeys<O, S>
 	): UpdateQueryBuilder<T, AddRow<O, RowOf<RefsOf<[T]>, S[number]>>, M> {
 		const eb = expressionBuilder(this.#state.table);
 		const list = typeof selections === 'function' ? selections(eb) : selections;
 		return new UpdateQueryBuilder({
 			...this.#state,
-			returning: [...this.#state.returning, ...selectionNodes(eb, list)],
+			returning: returningNodes(
+				this.#state.returning,
+				selectionNodes(eb, list),
+			),
+		});
+	}
+
+	/**
+	 * Adds every column of the table to the `returning` list, each keyed by
+	 * its name and listed, never `*`.
+	 *
+	 * @example .returningAll()
+	 */
+	returningAll(
+		..._unique: UniqueColumns<O, Ref<RefsOf<[T]>>>
+	): UpdateQueryBuilder<T, AddRow<O, RowOf<RefsOf<[T]>, Ref<RefsOf<[T]>>>>, M> {
+		const eb = expressionBuilder(this.#state.table);
+		return new UpdateQueryBuilder({
+			...this.#state,
+			returning: returningNodes(
+				this.#state.returning,
+				selectionNodes(eb, allColumns(this.#state.table)),
+			),
 		});
 	}
 
