@@ -1408,7 +1408,8 @@ export class CursorOp extends Op {
 	}
 
 	fail(error: Error): void {
-		this.#error ??= error;
+		// closed before it was sent: it ends without an error
+		if (!this.#closing) this.#error ??= error;
 		this.#finished = true;
 		this.#phase = 'ended';
 		this.settle();

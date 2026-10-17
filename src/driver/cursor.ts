@@ -56,7 +56,11 @@ export class CursorIterator implements AsyncIterator<unknown[], undefined> {
 	readonly #host: CursorHost;
 	readonly #request: CursorRequest;
 	#started = false;
+	/** Why the cursor couldn't be opened. */
+	#failure: { error: unknown } | undefined;
 	#done = false;
+	/** Ended by `return()`: a `next` waiting for a batch gets the end. */
+	#returned = false;
 	/** The operation opening the portal: outside a transaction, it reads every batch. */
 	#op: CursorOp | undefined;
 	#held = false;
@@ -80,6 +84,14 @@ export class CursorIterator implements AsyncIterator<unknown[], undefined> {
 	}
 
 	next(): Promise<IteratorResult<unknown[], undefined>> {
+		// opened by the call itself, so queries issued after it run after it
+		if (!this.#started && !this.#done) {
+			try {
+				this.#start();
+			} catch (error) {
+				this.#failure = { error };
+			}
+		}
 		return this.#serial(() => this.#next());
 	}
 
@@ -97,11 +109,13 @@ export class CursorIterator implements AsyncIterator<unknown[], undefined> {
 	async #next(): Promise<IteratorResult<unknown[], undefined>> {
 		if (this.#done) return DONE;
 		try {
-			if (!this.#started) this.#start();
+			if (this.#failure !== undefined) throw this.#failure.error;
 			const rows = await this.#read();
 			if (rows !== undefined) return { done: false, value: rows };
 		} catch (error) {
-			throw await this.#end(error);
+			const failure = await this.#end(error);
+			if (this.#returned) return DONE;
+			throw failure;
 		}
 		const error = await this.#end(undefined);
 		if (error !== undefined) throw error;
@@ -114,7 +128,13 @@ export class CursorIterator implements AsyncIterator<unknown[], undefined> {
 			this.#done = true;
 			return DONE;
 		}
-		const close = this.#held ? undefined : this.#op?.close();
+		this.#returned = true;
+		const op = this.#op;
+		const close = this.#held ? undefined : op?.close();
+		// not sent yet: dropped from the queue rather than waiting its turn
+		const unsent = this.#held ? this.#reading : op;
+		if (unsent !== undefined && !unsent.written)
+			this.#host.abort(unsent, 'abort');
 		await Promise.all([close, this.#end(undefined)]);
 		return DONE;
 	}
@@ -138,6 +158,8 @@ export class CursorIterator implements AsyncIterator<unknown[], undefined> {
 			this.#openHeld(signal, timeout);
 			return;
 		}
+		const op = this.#request.open('', false);
+		this.#op = op;
 		if (statementTimeout !== undefined) {
 			// a transaction of its own, so the setting can't outlive the cursor
 			const setup = Promise.all([
@@ -149,8 +171,6 @@ export class CursorIterator implements AsyncIterator<unknown[], undefined> {
 			setup.catch(noop);
 			this.#setup = setup;
 		}
-		const op = this.#request.open('', false);
-		this.#op = op;
 		host.enqueue(op, signal, timeout);
 		if (statementTimeout !== undefined) {
 			const commit = host.query('commit', []);
@@ -170,6 +190,8 @@ export class CursorIterator implements AsyncIterator<unknown[], undefined> {
 			});
 		}
 		this.#portal = this.#host.portal();
+		const op = this.#request.open(this.#portal, true);
+		this.#op = op;
 		const cleanups: (() => void)[] = [];
 		if (signal !== undefined) {
 			const onAbort = () => this.#interrupt('abort', signal.reason);
@@ -186,8 +208,6 @@ export class CursorIterator implements AsyncIterator<unknown[], undefined> {
 		this.#cleanup = () => {
 			for (const cleanup of cleanups) cleanup();
 		};
-		const op = this.#request.open(this.#portal, true);
-		this.#op = op;
 		this.#reading = op;
 		this.#host.enqueue(op);
 	}

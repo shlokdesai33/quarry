@@ -464,6 +464,37 @@ describe.skipIf(noPg)('cursors', () => {
 		]);
 	});
 
+	it('opens with its first next(), ahead of the queries issued after it', async () => {
+		for (const inTransaction of [false, true]) {
+			await using c = await open();
+			if (inTransaction) await c.query('begin');
+			const settled: string[] = [];
+			const cursor = iterate(
+				c.cursor('select 1 / (n - 3) as v from generate_series(1, 5) n'),
+			);
+			const first = cursor.next().then(
+				() => settled.push('cursor'),
+				() => settled.push('cursor failed'),
+			);
+			const after = c
+				.query(inTransaction ? 'rollback' : 'select 2')
+				.then(() => settled.push('query'));
+			await Promise.all([first, after]);
+			expect(settled).toEqual(['cursor failed', 'query']);
+			expect(c.transactionStatus).toBe('idle');
+		}
+		const bad = iterate(conn.cursor('select $1::int', [undefined]));
+		const next = bad.next();
+		const later = conn.query('select 3 as x');
+		await expect(next).rejects.toThrow(/undefined/);
+		expect((await later).rows).toEqual([{ x: 3 }]);
+		const timed = iterate(
+			conn.cursor('select $1::int', [undefined], { statementTimeout: '1s' }),
+		);
+		await expect(timed.next()).rejects.toThrow(/undefined/);
+		expect(conn.transactionStatus).toBe('idle');
+	});
+
 	it('takes next() calls in order, and a return() before it is sent', async () => {
 		const iterator = iterate(
 			conn.cursor<{ n: number }>('select generate_series(1, 5) as n', [], {
