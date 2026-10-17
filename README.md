@@ -68,6 +68,7 @@ const user = await db
   - [Running queries](#running-queries)
   - [Batches](#batches)
   - [Transactions with the query builder](#transactions-with-the-query-builder)
+  - [Slow queries and query budgets](#slow-queries-and-query-budgets)
   - [Handling errors](#handling-errors)
   - [Schema verification](#schema-verification)
 - [Development](#development)
@@ -969,15 +970,16 @@ A `Range<T>` is either `{ empty: true }` or `{ empty: false, lower, upper, bound
 
 ### Modifiers
 
-| Modifier            | Meaning                                              | Effect on types                                     |
-| ------------------- | ---------------------------------------------------- | --------------------------------------------------- |
-| `.nullable()`       | The column allows `NULL`.                            | Adds `null` to the select, insert and update types. |
-| `.default()`        | The database has a default.                          | Optional on insert.                                 |
-| `.generated()`      | `generated always as (…) stored`.                    | Never written: excluded from inserts and updates.   |
-| `.identity()`       | `generated always as identity` (integer types only). | Never written: excluded from inserts and updates.   |
-| `.name(n)`          | The column's name in the database.                   | None.                                               |
-| `.typed<S, I, U>()` | Narrow the select, insert and update types.          | Each may only narrow the current type.              |
-| `.useCodec(codec)`  | Send and read the column with another codec.         | The codec's output on select, its input on writes.  |
+| Modifier            | Meaning                                                             | Effect on types                                     |
+| ------------------- | ------------------------------------------------------------------- | --------------------------------------------------- |
+| `.nullable()`       | The column allows `NULL`.                                           | Adds `null` to the select, insert and update types. |
+| `.default()`        | The database has a default.                                         | Optional on insert.                                 |
+| `.generated()`      | `generated always as (…) stored`.                                   | Never written: excluded from inserts and updates.   |
+| `.identity()`       | `generated always as identity` (integer types only).                | Never written: excluded from inserts and updates.   |
+| `.name(n)`          | The column's name in the database.                                  | None.                                               |
+| `.typed<S, I, U>()` | Narrow the select, insert and update types.                         | Each may only narrow the current type.              |
+| `.useCodec(codec)`  | Send and read the column with another codec.                        | The codec's output on select, its input on writes.  |
+| `.sensitive()`      | Redact its values in logs and errors ([below](#sensitive-columns)). | None.                                               |
 
 Modifiers form a state machine that mirrors what Postgres allows. `nullable` combines with `default` or `generated`; `default` and `generated` exclude each other; `identity` excludes everything. Each modifier returns a column that only has the modifiers still valid, so an invalid chain isn't a type error on some method: the method isn't there.
 
@@ -1072,6 +1074,31 @@ const point = defineType({
 
 `db.verify` checks a `defineType` column against its type's name, or the domain it is declared with.
 
+### Sensitive columns
+
+```ts
+const accounts = defineTable('accounts', {
+	columns: {
+		id: integer().identity(),
+		email: text().sensitive(),
+		passwordHash: text().name('password_hash').sensitive(),
+	},
+});
+```
+
+A parameter bound against a `sensitive()` column is shown as `'[redacted]'`:
+
+- in `onQuery` and `slowQuery` events;
+- in the `query` of errors: `PostgresError` and its subclasses, `NoRowError`, `TooManyRowsError`, `RowCountError` and `QueryBudgetError`, also when they come from a [batch](#batches) (each of a `BatchError`'s errors, or an atomic batch's error);
+- in `toSQL({ inline: true })`;
+- in a `DecodeError` on a result column that reads a sensitive column, which loses its `cause` (the codec's error, which may quote the value).
+
+"Bound against" covers comparisons with the column or with an expression that reads it (`where`, `eb.ref(…).in(…)`, `eb.fn.lower('accounts.email').eq(…)`, `eb.json.hasKey(…)`), inserted values (including the `unnest` arrays of multi-row inserts), `update().set()`, upserts and `updateMany` rows.
+
+Server errors are redacted too, where they repeat a value. A constraint error's `detail` that names a sensitive column, such as `Key (email)=(ada@example.com) already exists.`, becomes `Key (email)=([redacted]) already exists.`, and `violatedColumns` still works on it. A `Failing row contains (…)` detail loses its values when the table has a sensitive column. Any sensitive parameter's text of three characters or more, as its codec sent it, is also removed from the message and detail.
+
+What is sent and the rows returned are unchanged. `toSQL()` without `inline` returns the real values, since its output is for running elsewhere. A value passed through `eb.val()` into a position not compared with a sensitive column (e.g. a function argument) isn't tracked.
+
 ### Inferring row types
 
 ```ts
@@ -1125,6 +1152,7 @@ const db = database(
 | Option      | Default          | Description                                                                                                                                                     |
 | ----------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `onQuery`   |                  | Called once per query when it settles, with its SQL, parameters, tag, command, row count, error, and timings (`acquireMs`, `queuedMs`, `execMs`, `durationMs`). |
+| `slowQuery` |                  | `{ thresholdMs, onSlow }`: `onSlow` gets the event of every query that took at least `thresholdMs` ([below](#slow-queries-and-query-budgets)).                  |
 | `callsites` | `true`           | Append the stack of the code awaiting a failed query to its error (captured when it fails).                                                                     |
 | `codecs`    | quarry's codecs  | Codecs for result columns no query types (raw SQL, expressions of unknown type). Columns always use their own codec, so their types hold.                       |
 | `catalog`   | `true`           | Look up the types codecs name (enums, pgvector, custom types and their arrays) in `pg_type` once per pool, before the first query.                              |
@@ -1756,12 +1784,27 @@ await db.transaction(async (tx) => {
 - **Node and web streams**: a stream is an async iterable, so `Readable.from(query.stream())` and `ReadableStream.from(query.stream())` pull from it with backpressure, and close it when destroyed or canceled.
 - **Only every row streams.** The `take…` and `expect…` shapes read a whole result, so they have no `stream()`.
 
-**Inspecting.** Every builder can show its SQL without running it, and the database can describe it:
+**Inspecting.** Every builder and every shaped query can show its SQL without running it, and the database can describe it:
 
 ```ts
 const { sql, params } = query.toSQL();
 const { params: paramTypes, columns } = await query.describe(); // types as the server sees them
+
+console.log(query.expectOne().toSQL({ inline: true, pretty: true }).sql);
+// select
+//   "users"."id" as "id"
+// from "users"
+// where (
+//   "users"."tags" @> '{a,"b,c"}'
+//   and "users"."created_at" > '2026-01-02 03:04:05.678+00'::timestamptz
+// )
 ```
+
+- Without options, `toSQL()` is exactly what `execute()` sends, codecs and tag included. A result shape never changes it, since no shape adds a `limit`; each item of a [batch](#batches) renders the same way (`item.toQuery().toSQL()`).
+- **`inline`** writes each parameter into the SQL as a literal: the text its codec sends, quoted as `quote_literal` does and cast to the codec's type (`'12.50'::numeric`, `'9007199254740993'::int8`, `'{1,NULL}'::int4[]`, `'{"a":1}'::jsonb`, `'happy'::mood`, `E'\\x01ff'::bytea`; `true` and integers bare). Text-like values (`text`, `varchar`, `citext`, …) stay uncast, as their parameters stay inferred, and `unnest`'s arrays keep the cast the SQL already writes. `params` is then empty. The statement pastes into psql and behaves like the query.
+- **`pretty`** puts each clause, list item and top-level `where` condition on its own line, changing only whitespace outside quotes.
+
+Inlined SQL is for reading and logs. Never execute inlined SQL built from untrusted input: run the query, which sends values as parameters. Values of [sensitive columns](#sensitive-columns) show as `'[redacted]'`, so inlined SQL that contains one won't run.
 
 **Tagging.** `.tag('posts.feed')` labels a query for `onQuery` events and OpenTelemetry spans (`db.query.summary`). The tag never appears in the SQL, so it doesn't fragment the statement cache.
 
@@ -1835,6 +1878,45 @@ const orderId = await db.transaction(
 | `tx.setLocal(name, value)` | Sets a run-time parameter until the transaction ends, with a bound value (e.g. `app.tenant_id` for row-level security). |
 
 The options are the driver's [transaction options](#transactions): `isolation`, `readOnly`, `deferrable`, `retries`, `settings`, `timeout` and `durable`. With `retries`, the callback may run more than once, so keep side effects in `afterCommit`.
+
+## Slow queries and query budgets
+
+Both build on the event `onQuery` receives (SQL, redacted params, tag, timings, row count, error).
+
+```ts
+const db = database(process.env.DATABASE_URL, {
+	slowQuery: {
+		thresholdMs: 200,
+		onSlow: (e) => log.warn({ tag: e.tag, sql: e.sql, ms: e.durationMs }),
+	},
+});
+```
+
+`slowQuery.onSlow` gets the `QueryEvent` of every query that took at least `thresholdMs`, failed ones included; a throwing listener never affects the query. In a batch, each query gets its own event, timed from when the batch started.
+
+`db.budget(limits, fn)` limits the queries one unit of work (a request, a job) runs on this database:
+
+```ts
+// strict: throws QueryBudgetError, e.g. in tests or dev, to catch N+1 loops
+await db.budget({ maxQueries: 10 }, () => loadDashboard(db, userId));
+
+// report: tells you once and lets the work finish, e.g. in production
+const page = await db.budget(
+	{
+		maxQueries: 50,
+		maxDurationMs: 1000,
+		onExceeded: (usage) => log.warn(req.url, usage),
+	},
+	(usage) => renderPage(req, usage), // usage.queries and usage.durationMs are live
+);
+```
+
+- Queries count wherever they are issued inside `fn` (anything it awaits, transactions and streams included), through `AsyncLocalStorage`. Concurrent budgets don't see each other's queries, another database's queries don't count, and budgets nest.
+- **`maxQueries`**: the query that would go over is refused before it is sent. Each query of a `db.batch` counts, and a batch that would go over is refused whole, before any of it is sent.
+- **`maxDurationMs`** (the queries' total time): the query that takes the total over has run, so it throws instead of returning, like `expectRows`; inside a transaction, that rolls it back. A batch is one round trip, so its time counts once; a batch that takes the total over has run (with `{ transaction: true }`, committed) and rejects.
+- After a strict budget is exceeded, every later query in it is refused. With **`onExceeded`**, nothing throws: it is called once, with the usage, by the query that went over.
+
+A budget is tied to a database, so a library's own database doesn't eat an app's budget, and scoped to a callback rather than a middleware, so it works in any framework, job runner or test. `AsyncLocalStorage` is loaded through `process.getBuiltinModule('node:async_hooks')` only when a budget is first used: Node, Deno, Bun, and Cloudflare Workers with `nodejs_compat`. Elsewhere `db.budget` rejects, and nothing else changes.
 
 ## Handling errors
 
