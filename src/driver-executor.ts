@@ -316,9 +316,12 @@ export class DriverExecutor implements TransactionExecutor {
 	}
 
 	/**
-	 * Reads the result in batches through a cursor, on one connection held
-	 * for the whole iteration. A `timeout` outside a transaction opens one
-	 * on that connection, so the setting can't leak.
+	 * Reads the result in batches through a cursor. On a pool, the cursor
+	 * has a connection of its own, taken by the first batch and released
+	 * when the iteration ends however it ends; inside a transaction, other
+	 * queries of the transaction run between its batches. A `timeout`
+	 * outside a transaction runs the cursor in a transaction of its own,
+	 * so the setting can't leak.
 	 */
 	async *stream(
 		query: CompiledQuery,
@@ -326,38 +329,30 @@ export class DriverExecutor implements TransactionExecutor {
 	): AsyncGenerator<unknown[], void, undefined> {
 		const callsite = this.#callsite();
 		const start = performance.now();
+		let acquired = start;
 		let rows = 0;
+		let failure: unknown;
 		const source = this.#source;
 		let client: PoolClient | undefined;
-		let runner: Runner;
-		if (source instanceof Pool) {
-			client = await source.acquire(
-				options.signal === undefined ? {} : { signal: options.signal },
-			);
-			runner = client.connection;
-		} else {
-			runner = source instanceof PoolClient ? source.connection : source;
-		}
-		const acquired = performance.now();
-		let failure: unknown;
-		let opened = false;
 		try {
-			await this.#prepare(runner);
-			if (options.timeout !== undefined) {
-				if (runner.transactionStatus === 'idle') {
-					await runner.query('begin');
-					opened = true;
-				}
-				await runner.query("select set_config('statement_timeout', $1, true)", [
-					interval(options.timeout),
-				]);
+			if (options.timeout !== undefined && source instanceof Transaction) {
+				throw new DriverError(
+					'A stream inside a transaction takes no timeout: set statement_timeout with setLocal',
+				);
 			}
+			let runner: Runner;
+			if (source instanceof Pool) {
+				client = await source.acquire(
+					options.signal === undefined ? {} : { signal: options.signal },
+				);
+				runner = client.connection;
+			} else {
+				runner = source instanceof PoolClient ? source.connection : source;
+			}
+			acquired = performance.now();
+			await this.#prepare(runner);
 			const cursorOptions = {
-				...this.#queryOptions(
-					{ ...options, timeout: undefined },
-					undefined,
-					query,
-				),
+				...this.#queryOptions(options, undefined, query),
 				...(options.batchSize === undefined
 					? {}
 					: { batchSize: options.batchSize }),
@@ -370,14 +365,11 @@ export class DriverExecutor implements TransactionExecutor {
 				rows += batch.length;
 				yield batch;
 			}
-			if (opened) await runner.query('commit');
 		} catch (error) {
 			failure = error;
 			decorate(error, query, callsite);
 			throw error;
 		} finally {
-			if (opened && runner.transactionStatus !== 'idle')
-				await runner.query('rollback').catch(() => {});
 			client?.release();
 			if (this.#options.onQuery !== undefined) {
 				this.#report(

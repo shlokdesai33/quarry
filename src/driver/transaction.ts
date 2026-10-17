@@ -1,5 +1,6 @@
 import { DriverError, PostgresError } from './errors.js';
 import type { Description, QueryResult } from './ops.js';
+import { RowStream } from './row-stream.js';
 
 /** What a transaction needs from the connection it runs on. */
 export interface TransactionConnection {
@@ -323,8 +324,8 @@ export class Session {
 		sql: string,
 		params?: readonly unknown[],
 		options?: TxCursorOptions,
-	): AsyncIterable<R> {
-		return this.#iterate(() => this.#conn.stream<R>(sql, params, options));
+	): RowStream<R> {
+		return new RowStream(this.cursor<R>(sql, params, options));
 	}
 
 	describe(
@@ -489,11 +490,15 @@ export class Transaction {
 		return this.#conn.cursor<R>(sql, params, options);
 	}
 
+	/**
+	 * Like `cursor`, one row at a time. Other queries of the transaction
+	 * run between its batches, so the loop can run them.
+	 */
 	stream<R = Record<string, unknown>>(
 		sql: string,
 		params?: readonly unknown[],
 		options?: TxCursorOptions,
-	): AsyncIterable<R> {
+	): RowStream<R> {
 		this.#check();
 		return this.#conn.stream<R>(sql, params, options);
 	}

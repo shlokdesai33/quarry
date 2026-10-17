@@ -1,4 +1,5 @@
 import {
+	AbortError,
 	ConnectionError,
 	DecodeError,
 	DriverError,
@@ -109,8 +110,11 @@ export interface OpTiming {
 export abstract class Op {
 	written = false;
 	done = false;
-	/** Whether later operations must wait until this one completes (it keeps talking after being written). */
-	readonly exclusive: boolean = false;
+	/**
+	 * Whether later operations must wait until this one completes (it keeps
+	 * talking after being written); read once it is written.
+	 */
+	exclusive = false;
 	/** Set when this client asked the server to cancel this operation. */
 	canceledBy: 'abort' | 'timeout' | undefined;
 	/** Receives the operation's timing when it settles, if set. */
@@ -151,6 +155,15 @@ export abstract class Op {
 	 * object; false when this operation doesn't accept rows that way.
 	 */
 	dataRow(_bytes: Uint8Array, _start: number, _end: number): boolean {
+		return false;
+	}
+
+	/**
+	 * Stops a written operation the server isn't running, without a cancel
+	 * request: true when it did. Otherwise the connection asks the server to
+	 * cancel it.
+	 */
+	interrupt(_reason: 'abort' | 'timeout', _cause: unknown): boolean {
 		return false;
 	}
 
@@ -926,36 +939,78 @@ interface Waiter<T> {
 	reject(error: Error): void;
 }
 
+/** A batch of a cursor's rows, and whether its portal may have more. */
+export interface CursorBatch {
+	readonly rows: unknown[];
+	readonly more: boolean;
+}
+
+/** Why an aborted cursor stopped: its `AbortSignal`, or its client-side timeout. */
+export function cursorAborted(
+	reason: 'abort' | 'timeout',
+	cause: unknown,
+): AbortError {
+	return new AbortError(
+		reason === 'timeout' ? 'The cursor timed out' : 'The cursor was aborted',
+		cause === undefined ? undefined : { cause },
+	);
+}
+
 /**
- * A portal read in batches: Bind, then Execute(batchSize) + Flush per
- * batch, and Sync at the end. Exclusive: nothing else can be written while
- * the portal is open, since another Bind would replace it.
+ * Opens a portal and reads its rows in batches of `batchSize`, each one
+ * fetched only when `next` asks for it.
+ *
+ * The columns are known before Bind, so each comes in the format its codec
+ * reads (binary where it can): from the cached statement, or else from a
+ * Describe of the statement first, one more round trip per statement and
+ * connection.
+ *
+ * - Not `held` (outside a transaction): the portal lives in the implicit
+ *   transaction of one Sync, so the operation is exclusive until it ends:
+ *   Execute + Flush per batch, then Close + Sync.
+ * - `held` (inside a transaction, where a named portal outlives Sync): the
+ *   first batch's Execute ends with Sync, and the operation is done once
+ *   that batch is read; `FetchOp` reads the next ones, so other queries
+ *   run between batches. Exclusive only while it describes the statement.
  */
 export class CursorOp extends Op {
-	override readonly exclusive = true;
 	readonly #sql: string;
 	readonly #params: readonly unknown[];
 	readonly #values: readonly WireValue[];
-	readonly #options: QueryOpOptions;
-	readonly #batchSize: number;
 	readonly #paramTypes: readonly number[];
+	#options: QueryOpOptions;
+	readonly #batchSize: number;
+	readonly #portal: string;
+	readonly #held: boolean;
 	#ctx: OpContext | undefined;
 	#spec: ResultSpec | undefined;
-	#requested: readonly number[] | 0 | undefined;
 	#statement: Statement | undefined;
+	/** The name the statement was parsed (or found) under: '' for the unnamed one. */
+	#name = '';
 	#created = false;
+	/** Bound unnamed with its cached statement's columns, which the portal's description must match. */
+	#expected: readonly Field[] | undefined;
 	#decoder: RowDecoder | undefined;
-	#fields: readonly Field[] | undefined;
+	#phase: 'describing' | 'fetching' | 'suspended' | 'ended' = 'fetching';
 	#batch: unknown[] = [];
-	/** Batches received but not yet taken: rows, and whether the portal is exhausted. */
-	readonly #ready: { rows: unknown[]; last: boolean }[] = [];
-	#waiter: Waiter<unknown[] | undefined> | undefined;
-	#fetching = false;
-	#exhausted = false;
+	/** Batches read and not yet taken. */
+	readonly #unread: unknown[][] = [];
+	readonly #waiters: Waiter<unknown[] | undefined>[] = [];
+	/** Batches read so far: a stale statement is retried only before the first. */
+	#batches = 0;
+	#more = true;
 	#synced = false;
+	/** Rows still to come are dropped: the portal is being closed, or failed. */
+	#discarding = false;
+	#closing = false;
+	/** Aborted while the server ran a batch: the cursor fails with it if the batch completes anyway. */
+	#interrupted: Error | undefined;
 	#error: Error | undefined;
+	/** Whether a consumer was handed the error: `next` then reports the end. */
+	#reported = false;
+	#retried = false;
 	#finished = false;
-	#finishWaiters: (() => void)[] = [];
+	readonly #finishWaiters: (() => void)[] = [];
 
 	constructor(
 		sql: string,
@@ -964,6 +1019,8 @@ export class CursorOp extends Op {
 		paramTypes: readonly number[],
 		options: QueryOpOptions,
 		batchSize: number,
+		portal: string,
+		held: boolean,
 	) {
 		super();
 		this.#sql = sql;
@@ -972,223 +1029,508 @@ export class CursorOp extends Op {
 		this.#paramTypes = paramTypes;
 		this.#options = options;
 		this.#batchSize = batchSize;
+		this.#portal = portal;
+		this.#held = held;
+		this.exclusive = true;
+	}
+
+	override get prepares(): number {
+		return this.#options.prepare ? 1 : 0;
+	}
+
+	/** Whether the portal may have more rows than the batches read. */
+	get more(): boolean {
+		return this.#more;
+	}
+
+	/** How the portal's rows are decoded, once its columns are known: for the `FetchOp`s of a held cursor. */
+	get decoder(): RowDecoder | undefined {
+		return this.#decoder;
 	}
 
 	write(ctx: OpContext): void {
 		this.#ctx = ctx;
-		const w = ctx.writer;
-		const spec = specOf(this.#options, ctx);
-		this.#spec = spec;
-		const types = this.#paramTypes;
-		if (this.#options.prepare && ctx.named()) {
-			const statement = ctx.statement(this.#sql, types, true);
-			const created = statement.unwritten;
-			statement.unwritten = false;
-			this.#statement = statement;
-			this.#created = created;
-			if (created) {
-				fe.parse(w, statement.name, this.#sql, types);
-				fe.describe(w, 'S', statement.name);
-			}
-			const known = created ? undefined : statement.fields;
-			const formats =
-				known === undefined
-					? 0
-					: cachedPlan(statement.plans, known, spec).formats;
-			this.#requested = formats;
-			fe.bind(w, '', statement.name, this.#values, formats);
-		} else {
-			this.#requested = 0;
-			fe.parse(w, '', this.#sql, types);
-			fe.bind(w, '', '', this.#values);
-			fe.describe(w, 'P', '');
+		if (this.#discarding) {
+			// closed before it was written: nothing to open
+			fe.sync(ctx.writer);
+			this.#synced = true;
+			this.#phase = 'ended';
+			return;
 		}
-		fe.execute(w, '', this.#batchSize);
-		fe.flush(w);
-		this.#fetching = true;
+		this.#open(ctx);
+		this.exclusive = !this.#held || this.#phase === 'describing';
 	}
 
-	/** The columns: from the portal's description (with their formats), or the statement's. */
-	#setFields(fields: readonly Field[], portal: boolean): void {
-		// oxlint-disable-next-line typescript/no-non-null-assertion -- set by write
+	#open(ctx: OpContext): void {
+		const w = ctx.writer;
+		this.#spec = specOf(this.#options, ctx);
+		const types = this.#paramTypes;
+		if (!this.#options.prepare || !ctx.preparable(this.#sql, types)) {
+			fe.parse(w, '', this.#sql, types);
+			this.#describe(w);
+			return;
+		}
+		const named = ctx.named();
+		const statement = ctx.statement(this.#sql, types, named);
+		this.#statement = statement;
+		if (!named) {
+			// behind a pooler that rewrites named statements: parsed unnamed, with the cached columns
+			fe.parse(w, '', this.#sql, types);
+			if (statement.fields === undefined) this.#describe(w);
+			else this.#bind(w, statement.fields, true);
+			return;
+		}
+		this.#name = statement.name;
+		const created = statement.unwritten;
+		statement.unwritten = false;
+		this.#created = created;
+		if (created) fe.parse(w, statement.name, this.#sql, types);
+		if (created || statement.fields === undefined) this.#describe(w);
+		else this.#bind(w, statement.fields);
+	}
+
+	#describe(w: Writer): void {
+		fe.describe(w, 'S', this.#name);
+		fe.flush(w);
+		this.#phase = 'describing';
+	}
+
+	/** Binds the portal with each column in the format its codec reads, and fetches the first batch. */
+	#bind(w: Writer, fields: readonly Field[], verify = false): void {
+		// oxlint-disable-next-line typescript/no-non-null-assertion -- set by #open
 		const spec = this.#spec!;
-		const plan = portal
-			? resultPlan(fields, spec, 'fields')
-			: planOf(this.#statement, fields, spec, this.#requested);
-		this.#fields = plan.fields;
+		const plan =
+			this.#statement === undefined
+				? resultPlan(fields, spec)
+				: cachedPlan(this.#statement.plans, fields, spec);
+		fe.bind(w, this.#portal, this.#name, this.#values, plan.formats);
+		if (verify) {
+			fe.describe(w, 'P', this.#portal);
+			this.#expected = plan.fields;
+		}
+		this.#execute(w);
+		this.#use(plan);
+	}
+
+	#execute(w: Writer): void {
+		fe.execute(w, this.#portal, this.#batchSize);
+		if (this.#held) {
+			fe.sync(w);
+			this.#synced = true;
+		} else {
+			fe.flush(w);
+		}
+		this.#phase = 'fetching';
+	}
+
+	#use(plan: ResultPlan): void {
 		if (plan.unreadable !== undefined) {
-			this.#error ??= new DecodeError(
-				plan.unreadable.name,
-				plan.unreadable.typeOid,
-				new DriverError(
-					'The column is not of the type the query expected, and came in binary',
+			this.#fail(
+				new DecodeError(
+					plan.unreadable.name,
+					plan.unreadable.typeOid,
+					new DriverError(
+						'The column is not of the type the query expected, and came in binary',
+					),
 				),
 			);
-			this.#sync(true);
+			return;
 		}
 		this.#decoder = planDecoder(plan, this.#options.rowMode);
 	}
 
-	#deliver(last: boolean): void {
+	/**
+	 * The statement's columns, before Bind; or, for an unnamed statement
+	 * bound with its cached columns, the portal's, which must be those.
+	 */
+	#described(fields: readonly Field[], ctx: OpContext): void {
+		const statement = this.#statement;
+		if (this.#phase !== 'describing') {
+			const expected = this.#expected;
+			if (expected === undefined || sameColumns(fields, expected)) return;
+			// the schema changed since the columns were cached: read what came
+			if (statement !== undefined) ctx.forget(statement);
+			// oxlint-disable-next-line typescript/no-non-null-assertion -- set by #open
+			this.#use(resultPlan(fields, this.#spec!, 'fields'));
+			return;
+		}
+		if (statement !== undefined) {
+			if (this.#created) statement.fields = fields;
+			else statement.fields ??= fields;
+		}
+		if (this.#discarding) {
+			// closed or aborted while describing: nothing was bound
+			this.#sync(false);
+			return;
+		}
+		const w = ctx.writer;
+		this.#bind(w, statement?.fields ?? fields);
+		ctx.send(w.take());
+	}
+
+	/** Fails with a value it can't read: the rows still to come are dropped, and the portal closed. */
+	#fail(error: Error): void {
+		this.#error ??= error;
+		this.#batch = [];
+		this.#discarding = true;
+		this.#sync(true);
+	}
+
+	#endBatch(more: boolean): void {
 		const rows = this.#batch;
 		this.#batch = [];
-		this.#fetching = false;
-		if (last) this.#exhausted = true;
+		if (this.#discarding) return;
+		if (this.#interrupted !== undefined) {
+			this.#fail(this.#interrupted);
+			return;
+		}
+		this.#more = more;
+		this.#batches++;
+		if (this.#held) {
+			// handed over with ReadyForQuery, once the connection is free of it
+			this.#unread.push(rows);
+			this.#phase = 'ended';
+			return;
+		}
+		if (more) {
+			this.#phase = 'suspended';
+		} else {
+			this.#phase = 'ended';
+			this.#sync(false);
+		}
 		// a portal whose size is a multiple of the batch size ends with an empty batch
-		if (!last || rows.length > 0) this.#ready.push({ rows, last });
+		if (more || rows.length > 0) this.#unread.push(rows);
 		this.#pump();
 	}
 
-	/** Hands a ready batch to a waiting consumer, prefetching the next one. */
-	#pump(): void {
-		const waiter = this.#waiter;
-		if (waiter === undefined) return;
-		const batch = this.#ready.shift();
-		if (batch !== undefined) {
-			this.#waiter = undefined;
-			if (!batch.last) this.#fetch();
-			waiter.resolve(batch.rows);
-			return;
-		}
-		if (this.#error !== undefined && this.#finished) {
-			this.#waiter = undefined;
-			waiter.reject(this.#error);
-			return;
-		}
-		if (this.#exhausted && this.#finished) {
-			this.#waiter = undefined;
-			waiter.resolve(undefined);
-		}
-	}
-
 	#fetch(): void {
-		if (
-			this.#fetching ||
-			this.#exhausted ||
-			this.#synced ||
-			this.#ctx === undefined
-		)
-			return;
-		this.#fetching = true;
-		const w = this.#ctx.writer;
-		fe.execute(w, '', this.#batchSize);
-		fe.flush(w);
-		this.#ctx.send(w.take());
+		const ctx = this.#ctx;
+		if (ctx === undefined) return;
+		const w = ctx.writer;
+		this.#execute(w);
+		ctx.send(w.take());
 	}
 
 	#sync(closePortal: boolean): void {
 		if (this.#synced || this.#ctx === undefined) return;
 		this.#synced = true;
 		const w = this.#ctx.writer;
-		if (closePortal) fe.close(w, 'P', '');
+		if (closePortal) fe.close(w, 'P', this.#portal);
 		fe.sync(w);
 		this.#ctx.send(w.take());
 	}
 
-	/** The next batch of rows, or undefined once the portal is exhausted. */
+	/** Hands batches to waiting consumers, fetching one when they wait for it. */
+	#pump(): void {
+		while (this.#waiters.length > 0) {
+			const batch = this.#unread.shift();
+			// oxlint-disable-next-line typescript/no-non-null-assertion -- the loop checks there is one
+			if (batch !== undefined) this.#waiters.shift()!.resolve(batch);
+			else if (!this.#finished) {
+				if (this.#phase === 'suspended' && !this.#discarding) this.#fetch();
+				return;
+			} else {
+				// oxlint-disable-next-line typescript/no-non-null-assertion -- the loop checks there is one
+				const waiter = this.#waiters.shift()!;
+				if (this.#error !== undefined && !this.#reported) {
+					this.#reported = true;
+					waiter.reject(this.#error);
+				} else {
+					waiter.resolve(undefined);
+				}
+			}
+		}
+	}
+
+	/** The next batch of rows, or undefined once there are none. */
 	next(): Promise<unknown[] | undefined> {
 		return new Promise((resolve, reject) => {
-			this.#waiter = { resolve, reject };
+			this.#waiters.push({ resolve, reject });
 			this.#pump();
 		});
 	}
 
-	/** Stops early: closes the portal and waits for the connection to be free again. */
+	/** Stops early: closes the portal and waits until the connection is free of it. */
 	async close(): Promise<void> {
-		if (!this.#finished) {
-			if (this.#ctx === undefined) {
-				// not written yet: it will close as soon as it is
-				this.#exhausted = true;
-			} else {
-				this.#sync(true);
-			}
-			await new Promise<void>((resolve) => this.#finishWaiters.push(resolve));
+		if (this.#finished) return;
+		this.#closing = true;
+		this.#unread.length = 0;
+		this.#batch = [];
+		this.#discarding = true;
+		this.#sync(this.#phase !== 'describing');
+		await new Promise<void>((resolve) => this.#finishWaiters.push(resolve));
+	}
+
+	override interrupt(reason: 'abort' | 'timeout', cause: unknown): boolean {
+		if (this.#finished) return true;
+		const error = cursorAborted(reason, cause);
+		this.#unread.length = 0;
+		if (this.#phase === 'fetching' && !this.#discarding) {
+			// the server is running a batch: cancel it
+			this.#interrupted = error;
+			return false;
 		}
+		this.#error ??= error;
+		this.#batch = [];
+		this.#discarding = true;
+		this.#sync(this.#phase === 'suspended');
+		this.#pump();
+		return true;
 	}
 
 	override dataRow(bytes: Uint8Array, start: number, end: number): boolean {
-		if (this.#synced) return true;
-		if (this.#decoder === undefined)
+		if (this.#discarding) return true;
+		const decoder = this.#decoder;
+		if (decoder === undefined)
 			throw new ProtocolError('DataRow before RowDescription');
 		try {
-			this.#batch.push(this.#decoder(bytes, start, end));
+			this.#batch.push(decoder(bytes, start, end));
 		} catch (error) {
 			if (!(error instanceof DecodeError)) throw error;
-			// the iteration fails with it; the portal is closed so no more rows come
-			this.#error ??= error;
-			this.#batch = [];
-			this.#sync(true);
+			this.#fail(error);
 		}
 		return true;
 	}
 
 	handle(msg: BackendMessage, ctx: OpContext): boolean {
 		switch (msg.type) {
+			case 'DataRow':
+				return !this.dataRow(msg.payload, 0, msg.payload.length);
 			case 'ParseComplete':
 				if (this.#statement && this.#created) this.#statement.parsed = true;
 				return false;
 			case 'ParameterDescription':
+			case 'BindComplete':
+			case 'CloseComplete':
 				return false;
 			case 'RowDescription':
-				if (this.#statement && this.#created)
-					this.#statement.fields = msg.fields;
-				this.#setFields(msg.fields, this.#statement === undefined);
+				this.#described(msg.fields, ctx);
 				return false;
 			case 'NoData':
-				if (this.#statement && this.#created) this.#statement.fields = [];
-				this.#setFields([], false);
+				this.#described([], ctx);
 				return false;
-			case 'BindComplete':
-				if (this.#fields === undefined && this.#statement?.fields !== undefined)
-					this.#setFields(this.#statement.fields, false);
-				if (this.#exhausted && !this.#synced) this.#sync(true);
-				return false;
-			case 'DataRow':
-				return !this.dataRow(msg.payload, 0, msg.payload.length);
 			case 'PortalSuspended':
-				if (!this.#synced) this.#deliver(false);
+				this.#endBatch(true);
 				return false;
 			case 'CommandComplete':
 			case 'EmptyQueryResponse':
-				if (!this.#synced) {
-					this.#deliver(true);
-					this.#sync(false);
-				}
+				this.#endBatch(false);
 				return false;
-			case 'CloseComplete':
+			case 'ErrorResponse':
+				this.#onError(
+					postgresError(msg.fields, { sql: this.#sql, params: this.#params }),
+					ctx,
+				);
 				return false;
-			case 'ErrorResponse': {
-				const error = postgresError(msg.fields, {
-					sql: this.#sql,
-					params: this.#params,
-				});
-				if (this.#statement && this.#created && !this.#statement.parsed) {
-					this.#statement.error = error;
-					ctx.forget(this.#statement);
-				}
-				this.#error ??= this.classify(error);
-				this.#sync(false);
-				return false;
-			}
 			case 'ReadyForQuery':
-				this.#finish();
+				return this.#onReady(msg.status, ctx);
+			default:
+				return this.unexpected(msg);
+		}
+	}
+
+	#onError(error: PostgresError, ctx: OpContext): void {
+		const statement = this.#statement;
+		if (statement && this.#created && !statement.parsed) {
+			statement.error = error;
+			ctx.forget(statement);
+		} else if (
+			statement &&
+			!this.#created &&
+			statement.error !== undefined &&
+			error.code === '26000'
+		) {
+			// an earlier pipelined Parse of the same SQL failed; report its error
+			error = postgresError(statement.error.fields, {
+				sql: this.#sql,
+				params: this.#params,
+			});
+		}
+		this.#error ??= this.classify(error);
+		this.#batch = [];
+		this.#discarding = true;
+		this.#sync(false);
+	}
+
+	#onReady(status: 'I' | 'T' | 'E', ctx: OpContext): boolean {
+		const error = this.#error;
+		const statement = this.#statement;
+		if (
+			error instanceof PostgresError &&
+			statement !== undefined &&
+			this.#name !== '' &&
+			!this.#held &&
+			!this.#retried &&
+			!this.#closing &&
+			this.#interrupted === undefined &&
+			this.#batches === 0 &&
+			status === 'I' &&
+			staleStatement(error, statement, this.#created)
+		) {
+			this.#retry(statement, ctx);
+			return false;
+		}
+		if (this.#held && error === undefined && this.#more && status !== 'T') {
+			// the portal ended with the implicit transaction: there was no other
+			this.#error = new DriverError(
+				'The cursor was opened outside a transaction, and closed with its first batch',
+			);
+		}
+		this.#finished = true;
+		this.#phase = 'ended';
+		this.settle();
+		this.#pump();
+		for (const resolve of this.#finishWaiters.splice(0)) resolve();
+		return true;
+	}
+
+	/**
+	 * Opens the portal again, unnamed, after its cached statement went
+	 * stale: it is still the connection's operation, so nothing else ran.
+	 */
+	#retry(statement: Statement, ctx: OpContext): void {
+		ctx.forget(statement);
+		if (this.#created) ctx.unprepare(statement);
+		this.#retried = true;
+		this.#options = { ...this.#options, prepare: false };
+		this.#statement = undefined;
+		this.#name = '';
+		this.#created = false;
+		this.#expected = undefined;
+		this.#decoder = undefined;
+		this.#batch = [];
+		this.#more = true;
+		this.#synced = false;
+		this.#discarding = false;
+		this.#error = undefined;
+		this.#open(ctx);
+		ctx.send(ctx.writer.take());
+	}
+
+	fail(error: Error): void {
+		// closed before it was sent: it ends without an error
+		if (!this.#closing) this.#error ??= error;
+		this.#finished = true;
+		this.#phase = 'ended';
+		this.settle();
+		this.#pump();
+		for (const resolve of this.#finishWaiters.splice(0)) resolve();
+	}
+}
+
+/** Reads the next batch of a held cursor's portal: Execute + Sync, inside its transaction. */
+export class FetchOp extends Op {
+	readonly #sql: string;
+	readonly #params: readonly unknown[];
+	readonly #portal: string;
+	readonly #batchSize: number;
+	readonly #decoder: RowDecoder | undefined;
+	readonly #resolve: (batch: CursorBatch) => void;
+	readonly #reject: (error: Error) => void;
+	#rows: unknown[] = [];
+	#more = false;
+	#error: Error | undefined;
+
+	constructor(
+		sql: string,
+		params: readonly unknown[],
+		portal: string,
+		batchSize: number,
+		decoder: RowDecoder | undefined,
+		resolve: (batch: CursorBatch) => void,
+		reject: (error: Error) => void,
+	) {
+		super();
+		this.#sql = sql;
+		this.#params = params;
+		this.#portal = portal;
+		this.#batchSize = batchSize;
+		this.#decoder = decoder;
+		this.#resolve = resolve;
+		this.#reject = reject;
+	}
+
+	write(ctx: OpContext): void {
+		fe.execute(ctx.writer, this.#portal, this.#batchSize);
+		fe.sync(ctx.writer);
+	}
+
+	override dataRow(bytes: Uint8Array, start: number, end: number): boolean {
+		if (this.#error !== undefined) return true;
+		const decoder = this.#decoder;
+		if (decoder === undefined)
+			throw new ProtocolError('DataRow before RowDescription');
+		try {
+			this.#rows.push(decoder(bytes, start, end));
+		} catch (error) {
+			if (!(error instanceof DecodeError)) throw error;
+			this.#error = error;
+			this.#rows = [];
+		}
+		return true;
+	}
+
+	handle(msg: BackendMessage): boolean {
+		switch (msg.type) {
+			case 'DataRow':
+				return !this.dataRow(msg.payload, 0, msg.payload.length);
+			case 'PortalSuspended':
+				this.#more = true;
+				return false;
+			case 'CommandComplete':
+			case 'EmptyQueryResponse':
+				return false;
+			case 'ErrorResponse':
+				this.#error ??= this.classify(
+					postgresError(msg.fields, { sql: this.#sql, params: this.#params }),
+				);
+				this.#rows = [];
+				return false;
+			case 'ReadyForQuery':
+				this.settle();
+				if (this.#error !== undefined) this.#reject(this.#error);
+				else if (this.#more && msg.status !== 'T')
+					this.#reject(
+						new DriverError('The cursor’s transaction ended while it was open'),
+					);
+				else this.#resolve({ rows: this.#rows, more: this.#more });
 				return true;
 			default:
 				return this.unexpected(msg);
 		}
 	}
 
-	#finish(): void {
-		this.#finished = true;
-		this.#exhausted = true;
+	fail(error: Error): void {
 		this.settle();
-		this.#pump();
-		for (const resolve of this.#finishWaiters.splice(0)) resolve();
+		this.#reject(error);
+	}
+}
+
+/**
+ * Closes a held cursor's portal: Close + Sync. Its outcome is ignored: the
+ * transaction may have ended already, and the portal with it.
+ */
+export class ClosePortalOp extends Op {
+	readonly #portal: string;
+
+	constructor(portal: string) {
+		super();
+		this.#portal = portal;
 	}
 
-	fail(error: Error): void {
-		this.#error ??= error;
-		this.#finish();
+	write(ctx: OpContext): void {
+		fe.close(ctx.writer, 'P', this.#portal);
+		fe.sync(ctx.writer);
+	}
+
+	handle(msg: BackendMessage): boolean {
+		if (msg.type !== 'ReadyForQuery') return false;
+		this.settle();
+		return true;
+	}
+
+	fail(): void {
+		this.settle();
 	}
 }
 

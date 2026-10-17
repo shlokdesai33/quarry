@@ -8,6 +8,7 @@ import type {
 	StreamOptions,
 	TooManyRowsError,
 } from './executor.js';
+import { RowStream } from './driver/row-stream.js';
 import { Expression, type TypedExpression } from './expression.js';
 import {
 	type ExpressionBuilder,
@@ -924,23 +925,47 @@ export class SelectQueryBuilder<
 	readonly then = rejectAwait;
 
 	/**
-	 * Runs the query and yields its rows as they arrive, fetching
-	 * `batchSize` (default 1000) at a time through a cursor, so a large
-	 * result never sits in memory at once. Breaking out of the loop stops
-	 * the query.
+	 * Runs the query through a cursor and yields its rows, decoded as
+	 * `execute()` decodes them. Rows are fetched `batchSize` (default 1000)
+	 * at a time, each batch once the rows before it are taken, so a large
+	 * result never sits in memory at once and a slow loop holds one batch.
+	 * Nothing runs until the first row is asked for.
+	 *
+	 * On a pool, the stream has a connection of its own until it ends:
+	 * read to the end, left early (`break`, `return`, a throw) or aborted
+	 * with `signal`. Inside `db.transaction`, other queries of the
+	 * transaction can run in the loop, between batches. A `timeout` bounds
+	 * the whole stream, the loop's time included.
+	 *
+	 * Only every row streams: the `take…` and `expect…` shapes read a whole
+	 * result, so they have no `stream`.
 	 *
 	 * @example
 	 * for await (const user of db.selectFrom(users).select(['users.id']).stream()) { … }
+	 *
+	 * @example
+	 * Readable.from(db.selectFrom(users).select(['users.email']).stream({ batchSize: 500, signal }))
 	 */
-	async *stream(options?: StreamOptions): AsyncGenerator<O, void, undefined> {
+	stream(options?: StreamOptions): RowStream<O> {
 		const executor = this.#executor();
-		for await (const batch of executor.stream(
-			compile(this.toNode()),
-			options,
-		)) {
-			// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the select list supplies the row type
-			yield* batch as readonly O[];
+		const batchSize = options?.batchSize;
+		if (
+			batchSize !== undefined &&
+			(!Number.isInteger(batchSize) || batchSize < 1)
+		) {
+			throw new RangeError(
+				`batchSize takes a whole number of rows from 1, not ${batchSize}`,
+			);
 		}
+		const query = compile(this.toNode());
+		const iterate = () => {
+			// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the select list supplies the row type
+			const batches = executor.stream(query, options) as AsyncIterable<
+				readonly O[]
+			>;
+			return batches[Symbol.asyncIterator]();
+		};
+		return new RowStream<O>({ [Symbol.asyncIterator]: iterate });
 	}
 
 	/** The query's parameter and result types, as the server reports them without running it. */

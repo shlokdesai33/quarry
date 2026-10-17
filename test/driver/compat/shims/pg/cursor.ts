@@ -1,6 +1,6 @@
 // pg-cursor over quarry's `connection.cursor()`. pg-cursor sends
-// Execute(n) per `read(n)`; quarry's cursor reads fixed-size batches and
-// prefetches one, so reads are served from a buffer. Rows, errors, closing
+// Execute(n) per `read(n)`; quarry's cursor reads fixed-size batches, each
+// when asked for, so reads are served from a buffer. Rows, errors, closing
 // and when the connection is free again are quarry's.
 import { EventEmitter } from 'node:events';
 import type { Connection } from '../../../../../src/driver/index.js';
