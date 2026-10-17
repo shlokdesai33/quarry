@@ -206,7 +206,6 @@ describe.skipIf(noPg)('startup', () => {
 		expect(conn.protocol).toBe('3.2');
 		expect(conn.capabilities).toMatchObject({
 			protocol: '3.2',
-			longCancelKeys: true,
 		});
 		expect(conn.capabilities.serverVersion).toMatch(/^1[89]/);
 		expect(conn.parameters.get('client_encoding')).toBe('UTF8');

@@ -211,16 +211,14 @@ describe.skipIf(noPg)('binary arrays', () => {
 		async () => {
 			const types = quarryRegistry;
 			const sql = `select '[0.1,1e-45,3.4028235e38,-0,1,-2.5]'::vector as v,
-				array['[1,0.2]'::vector, null] as va, '[0.1,2]'::halfvec as h
-				union all select '[3]', '{}', null`;
+				array['[1,0.2]'::vector, null] as va
+				union all select '[3]', '{}'`;
 			const { text: asText, binary, formats } = await bothWays(c, sql, types);
-			expect(formats).toEqual({ v: 1, va: 1, h: 0 });
+			expect(formats).toEqual({ v: 1, va: 1 });
 			expect(binary).toEqual(asText);
 			expect(binary[0]?.['v']).toEqual(
 				[0.1, 1e-45, 3.4028235e38, -0, 1, -2.5].map(Math.fround),
 			);
-			// halfvec stays text, parsed as printed
-			expect(binary[0]?.['h']).toEqual([0.099975586, 2]);
 			expect(codecs.vector.decodeText('[0.1]')).toEqual([0.10000000149011612]);
 		},
 	);

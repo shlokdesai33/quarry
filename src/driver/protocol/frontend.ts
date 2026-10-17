@@ -13,8 +13,6 @@ export const protocolVersion = (minor: number): number => (3 << 16) | minor;
 
 /** Protocol version 3.0, as sent in the startup message. */
 export const PROTOCOL_3_0 = protocolVersion(0);
-/** Protocol version 3.2 (PostgreSQL 18+): variable-length cancel keys. */
-export const PROTOCOL_3_2 = protocolVersion(2);
 
 const SSL_REQUEST_CODE = 80877103;
 const CANCEL_REQUEST_CODE = 80877102;

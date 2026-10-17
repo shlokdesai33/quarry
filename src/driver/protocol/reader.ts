@@ -6,7 +6,7 @@ import { allocate, asBuffer, utf8 } from './text.js';
 const EMPTY = new Uint8Array(0);
 
 /** The largest backend message accepted, by default: 1 GiB, Postgres's own field limit. */
-export const DEFAULT_MAX_MESSAGE_SIZE = 0x40000000;
+const DEFAULT_MAX_MESSAGE_SIZE = 0x40000000;
 
 /**
  * Splits the byte stream from the server into backend messages. Bytes are
@@ -385,21 +385,15 @@ function parseMessage(
 		case 0x52: // R
 			return authentication(new Cursor(bytes, start, end));
 		case 0x47: // G
-		case 0x48: // H
-		case 0x57: {
-			// W
+		case 0x48: {
+			// H
 			const cursor = new Cursor(bytes, start, end);
 			const binary = cursor.int8() === 1;
 			const n = cursor.count();
 			const columnFormats: number[] = [];
 			for (let i = 0; i < n; i++) columnFormats.push(cursor.int16());
 			return {
-				type:
-					type === 0x47
-						? 'CopyInResponse'
-						: type === 0x48
-							? 'CopyOutResponse'
-							: 'CopyBothResponse',
+				type: type === 0x47 ? 'CopyInResponse' : 'CopyOutResponse',
 				binary,
 				columnFormats,
 			};
@@ -416,8 +410,6 @@ function parseMessage(
 			for (let i = 0; i < n; i++) unrecognized.push(cursor.cstring());
 			return { type: 'NegotiateProtocolVersion', minor, unrecognized };
 		}
-		case 0x56: // V
-			return { type: 'FunctionCallResponse' };
 		default:
 			throw new ProtocolError(
 				`Unknown message type 0x${type.toString(16).padStart(2, '0')}`,
@@ -568,7 +560,7 @@ export function decodeNotification(
  * Splits a DataRow body into its values: `null` for SQL NULL, otherwise the
  * `[start, end)` offsets into `payload`. Throws if the body is malformed.
  */
-export function forEachValue(
+function forEachValue(
 	payload: Uint8Array,
 	visit: (index: number, start: number, end: number) => void,
 ): number {

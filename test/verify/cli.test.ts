@@ -8,15 +8,12 @@ import { text } from '../../src/column-factories.js';
 import { defineTable } from '../../src/define-table.js';
 import { type Io, runCli, usage } from '../../src/cli/run.js';
 import { databaseWith } from '../../src/database.js';
+import { createPool, type Pool } from '../../src/driver/pool.js';
+import { DriverExecutor } from '../../src/driver-executor.js';
 import { fakeExecutor } from '../helpers/executor.js';
+import { noPg, options } from '../driver/integration/helpers.js';
 import * as fixtures from './fixtures/schema.js';
 import { schema as driftSchema, users } from './fixtures/schema.js';
-import {
-	postgresAvailable,
-	schema,
-	startDatabase,
-	type TestDatabase,
-} from './helpers/postgres.js';
 
 const configPath = fileURLToPath(
 	new URL('./fixtures/quarry.config.ts', import.meta.url),
@@ -151,28 +148,30 @@ describe('config', () => {
 	});
 });
 
-describe.skipIf(!postgresAvailable)('quarry verify against PostgreSQL', () => {
-	let db: TestDatabase;
-	const env = { QUARRY_VERIFY_CONFIG_POOL: '' };
+describe.skipIf(noPg)('quarry verify against PostgreSQL', () => {
+	/** The schema the drift fixture is created in, first on the search path. */
+	const schema = 'quarry_verify_cli';
+	let pool: Pool;
 
 	beforeAll(async () => {
-		db = await startDatabase();
-		await db.sql(
+		const poolOptions = {
+			...options(),
+			max: 2,
+			params: { search_path: schema },
+		};
+		pool = createPool(poolOptions);
+		await pool.simpleQuery(
+			`drop schema if exists ${schema} cascade; create schema ${schema};`,
+		);
+		await pool.simpleQuery(
 			readFileSync(new URL('./fixtures/drift.sql', import.meta.url), 'utf8'),
 		);
-		const { host, user, database: name } = db.pool.options;
-		env.QUARRY_VERIFY_CONFIG_POOL = JSON.stringify({
-			host,
-			user,
-			database: name,
-			connectionString: process.env['QUARRY_TEST_DATABASE_URL'],
-			options: `-c search_path=${schema}`,
-		});
-		process.env['QUARRY_VERIFY_CONFIG_POOL'] = env.QUARRY_VERIFY_CONFIG_POOL;
+		process.env['QUARRY_VERIFY_CONFIG_POOL'] = JSON.stringify(poolOptions);
 	});
 	afterAll(async () => {
 		delete process.env['QUARRY_VERIFY_CONFIG_POOL'];
-		await db?.stop();
+		await pool?.simpleQuery(`drop schema if exists ${schema} cascade`);
+		await pool?.end();
 	});
 
 	test('loads quarry.config.ts and exits 1 on errors', async () => {
@@ -225,14 +224,14 @@ describe.skipIf(!postgresAvailable)('quarry verify against PostgreSQL', () => {
 	});
 
 	test('exits 0 with only notes, and closes the config', async () => {
-		await db.sql('create table only_notes (a text, extra text)');
+		await pool.simpleQuery('create table only_notes (a text, extra text)');
 		const table = defineTable('only_notes', {
 			columns: { a: text().nullable() },
 		});
 		let closed = false;
 		const { io: streams, out } = io({
 			load: async () => ({
-				db: databaseWith(db.executor),
+				db: databaseWith(new DriverExecutor(pool)),
 				schema: { table },
 				close: () => {
 					closed = true;

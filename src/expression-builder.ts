@@ -156,7 +156,7 @@ export function expressionBuilder<const T extends readonly AnyTable[]>(
 		},
 		val: (value: unknown, codec?: Codec) => param(value, codec),
 		fn: functions<R>({ node, dataType }),
-		json: jsonFunctions<R>({ node, dataType }),
+		json: jsonFunctions<R>({ node }),
 		and: junction('and'),
 		or: junction('or'),
 		not: (expression: AnyPredicate) =>

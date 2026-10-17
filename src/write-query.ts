@@ -1,6 +1,12 @@
 import type { AnyColumn } from './column/any-column.js';
-import { compile } from './compile.js';
-import { type Executor, NoRowError, RowCountError } from './executor.js';
+import { compile, type CompiledQuery } from './compile.js';
+import {
+	type Executor,
+	NoRowError,
+	RowCountError,
+	type RunOptions,
+	type TooManyRowsError,
+} from './executor.js';
 import { Expression } from './expression.js';
 import { typedExpression } from './expression-methods.js';
 import type {
@@ -12,14 +18,23 @@ import type {
 	UpdateNode,
 } from './node.js';
 import type { Expr } from './operators.js';
-import type { Query } from './query.js';
+import { type Missing, type Query, rejectAwait } from './query.js';
 import {
+	type ColumnValue,
 	type ErrorFor,
+	errorArg,
+	expectAtMostOne,
+	expectFirst,
 	expectNonEmpty,
+	expectOne,
+	expectValue,
 	failure,
 	type Shape,
 	type ShapeInput,
 	shapedQuery,
+	takeFirst,
+	takeValue,
+	type ValueArgs,
 } from './shape.js';
 import type { AnyTable } from './table.js';
 import type { Prettify } from './types.js';
@@ -89,7 +104,7 @@ export function columnOf(
 }
 
 /** A value written to `column`: an expression as is, a value encoded by the column's codec. */
-export function valueNode(column: AnyColumn, value: unknown): OperationNode {
+function valueNode(column: AnyColumn, value: unknown): OperationNode {
 	return Expression.is(value)
 		? value._quarry.node
 		: { kind: 'value', value, codec: column._quarry.dataType.codec };
@@ -174,7 +189,7 @@ export function excluded<T extends AnyTable>(table: T): Excluded<T> {
 }
 
 /** Checks the argument of `expectRows`. */
-export function rowCount(count: number): number {
+function rowCount(count: number): number {
 	if (!Number.isInteger(count) || count < 0) {
 		throw new RangeError(
 			`expectRows takes a whole number of rows, not ${count}`,
@@ -184,7 +199,7 @@ export function rowCount(count: number): number {
 }
 
 /** A write query, read by `shape`. */
-export function writeQuery<R>(
+function writeQuery<R>(
 	executor: Executor | undefined,
 	node: InsertNode | UpdateNode | DeleteNode,
 	shape: Shape<R>,
@@ -219,7 +234,7 @@ function output<O>(
 }
 
 /** A write query in its default shape; see `WriteOutput`. */
-export function writeOutput<O>(
+function writeOutput<O>(
 	executor: Executor | undefined,
 	node: InsertNode | UpdateNode | DeleteNode,
 ): Query<WriteOutput<O>> {
@@ -233,7 +248,7 @@ export function writeOutput<O>(
  * A write query that must affect one or more rows; see `NonEmptyOutput`.
  * Throws `NoRowError`, or what `err` makes of it, otherwise.
  */
-export function writeNonEmpty<O>(
+function writeNonEmpty<O>(
 	executor: Executor | undefined,
 	node: InsertNode | UpdateNode | DeleteNode,
 	err: ErrorFor<NoRowError> | undefined,
@@ -263,7 +278,7 @@ export function writeNonEmpty<O>(
  * A write query that must affect exactly `count` rows, in its default
  * shape. Throws `RowCountError`, or what `err` makes of it, otherwise.
  */
-export function writeExpectRows<O>(
+function writeExpectRows<O>(
 	executor: Executor | undefined,
 	node: InsertNode | UpdateNode | DeleteNode,
 	count: number,
@@ -282,4 +297,170 @@ export function writeExpectRows<O>(
 		},
 		checked: true,
 	});
+}
+
+/**
+ * What the insert, update and delete builders share: the `take…` and
+ * `expect…` shapes over their `returning` rows (and `expectNonEmpty` and
+ * `expectRows` over their row count), `execute()`, `toSQL()` and
+ * `toQuery()`. `O` is the `returning` row (`undefined` without
+ * `returning`); `M` is what the query still needs before it can run.
+ */
+export abstract class WriteQueryBuilder<O, M extends string> {
+	/** The type of a `returning` row. Never set. */
+	declare readonly $output: O;
+
+	/** What the query still needs before it can run. Never set. */
+	declare readonly $missing: M;
+
+	/** What the query runs on; `undefined` when it was built on its own. */
+	readonly #executor: Executor | undefined;
+
+	constructor(executor: Executor | undefined) {
+		this.#executor = executor;
+	}
+
+	/** The whole query as one node. */
+	abstract toNode(): InsertNode | UpdateNode | DeleteNode;
+
+	/**
+	 * The first `returning` row, if any; runs with `execute()`. Never
+	 * throws for the number of rows, and doesn't change the SQL: the
+	 * statement writes every row it matches, and only the first is decoded.
+	 */
+	takeFirst(this: WriteQueryBuilder<O & object, never>): Query<O | undefined> {
+		return writeQuery(this.#executor, this.toNode(), takeFirst<O>());
+	}
+
+	/**
+	 * The value of the one `returning` column of the first row, if any;
+	 * runs with `execute()`. Never throws for the number of rows, and
+	 * doesn't change the SQL: the statement writes every row it matches.
+	 *
+	 * @example .returning(['users.id']).takeValue()
+	 */
+	takeValue(
+		this: WriteQueryBuilder<O & object, never>,
+		..._oneColumn: ValueArgs<O, []>
+	): Query<ColumnValue<O> | undefined> {
+		return writeQuery(
+			this.#executor,
+			this.toNode(),
+			takeValue<ColumnValue<O>>(),
+		);
+	}
+
+	/**
+	 * Requires the statement to write one or more rows; runs with
+	 * `execute()`, which resolves to the `returning` rows, as a non-empty
+	 * array, or without `returning`, to the row count. Throws `NoRowError`
+	 * (or what `err` makes of it) after the statement ran, when it wrote
+	 * none; inside a transaction, that rolls it back.
+	 */
+	expectNonEmpty(
+		this: WriteQueryBuilder<O, never>,
+		err?: ErrorFor<NoRowError>,
+	): Query<NonEmptyOutput<O>> {
+		return writeNonEmpty<O>(this.#executor, this.toNode(), err);
+	}
+
+	/**
+	 * The first `returning` row; runs with `execute()`, which throws
+	 * `NoRowError` (or what `err` makes of it) when there is none, after
+	 * the statement ran. Other rows are ignored.
+	 */
+	expectFirst(
+		this: WriteQueryBuilder<O & object, never>,
+		err?: ErrorFor<NoRowError>,
+	): Query<O> {
+		return writeQuery(this.#executor, this.toNode(), expectFirst<O>(err));
+	}
+
+	/**
+	 * The one `returning` row; runs with `execute()`, which throws
+	 * `NoRowError` when there is none and `TooManyRowsError` (with the
+	 * `count`) when there are several, after the statement ran; `err`
+	 * makes the error to throw instead.
+	 */
+	expectOne(
+		this: WriteQueryBuilder<O & object, never>,
+		err?: ErrorFor<NoRowError | TooManyRowsError>,
+	): Query<O> {
+		return writeQuery(this.#executor, this.toNode(), expectOne<O>(err));
+	}
+
+	/**
+	 * The `returning` row, if any; runs with `execute()`, which throws
+	 * `TooManyRowsError` (or what `err` makes of it) when there are
+	 * several, after the statement ran.
+	 */
+	expectAtMostOne(
+		this: WriteQueryBuilder<O & object, never>,
+		err?: ErrorFor<TooManyRowsError>,
+	): Query<O | undefined> {
+		return writeQuery(this.#executor, this.toNode(), expectAtMostOne<O>(err));
+	}
+
+	/**
+	 * The value of the one `returning` column of the first row; runs with
+	 * `execute()`, which throws `NoRowError` (or what `err` makes of it)
+	 * when there is no row, after the statement ran.
+	 */
+	expectValue(
+		this: WriteQueryBuilder<O & object, never>,
+		...args: ValueArgs<O, [err?: ErrorFor<NoRowError>]>
+	): Query<ColumnValue<O>> {
+		return writeQuery(
+			this.#executor,
+			this.toNode(),
+			expectValue<ColumnValue<O>>(errorArg(args)),
+		);
+	}
+
+	/**
+	 * Requires the statement to write exactly `count` rows; runs with
+	 * `execute()`, which resolves as it does without a shape, and throws
+	 * `RowCountError` (or what `err` makes of it) after the statement ran,
+	 * when it wrote a different number; inside a transaction, that rolls
+	 * it back.
+	 *
+	 * @example .onConflict('email').doNothing().expectRows(1)
+	 * @example .where('docs.id', id).where('docs.version', version).expectRows(1)
+	 */
+	expectRows(
+		this: WriteQueryBuilder<O, never>,
+		count: number,
+		err?: ErrorFor<RowCountError>,
+	): Query<WriteOutput<O>> {
+		return writeExpectRows<O>(this.#executor, this.toNode(), count, err);
+	}
+
+	/**
+	 * Runs the query, resolving to every `returning` row, or without
+	 * `returning`, to the number of rows written. Never throws for the
+	 * number of rows: the `expect` shapes do.
+	 */
+	execute(
+		this: WriteQueryBuilder<O, never>,
+		options?: RunOptions,
+	): Promise<WriteOutput<O>> {
+		return writeOutput<O>(this.#executor, this.toNode()).execute(options);
+	}
+
+	/** The SQL and parameters `execute()` sends. */
+	toSQL(): CompiledQuery {
+		return compile(this.toNode());
+	}
+
+	/** The query `execute()` runs, for `db.batch`; one that still needs clauses has none. */
+	toQuery(): [M] extends [never] ? Query<WriteOutput<O>> : Missing<M> {
+		// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the type keeps a query that can't run yet out of a batch
+		return writeOutput<O>(this.#executor, this.toNode()) as [M] extends [never]
+			? Query<WriteOutput<O>>
+			: Missing<M>;
+	}
+
+	/** @deprecated A query runs with `execute()`; awaiting one rejects. */
+	// oxlint-disable-next-line unicorn/no-thenable -- so that a forgotten execute() fails loudly
+	readonly then = rejectAwait;
 }

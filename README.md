@@ -588,7 +588,7 @@ A codec is one type's encoding, both ways:
 | `decodeText(text)`            | A non-null value from the server's text.                                                                          |
 | `decodeBinary(b, start, end)` | Optional: a non-null value from its binary format.                                                                |
 
-`codecs` holds the built-in ones, by type: `bool`, `int2`, `int4`, `oid`, `int8` (a `bigint`), `int8AsString`, `float4`, `float8`, `numeric` (a string), `text`, `varchar`, `bpchar`, `name`, `char`, `uuid`, `bytea`, `json`, `jsonb`, `timestamptz` (a `Date`), `timestamptzAsString`, `date`, `time`, `timetz`, `timestamp`, `interval`, `inet`, `cidr`, `macaddr`, `money`, `xml`, `bit`, `varbit`, `point`, `box`, `tsvector`, `tsquery`, `jsonpath`, `daterange` and `tstzrange` (as `RangeValue`), pgvector's `vector` and `halfvec`, and `raw`, which keeps any type as the server's text both ways. `arrayOf(codec)` is the codec of its arrays, of any number of dimensions. `defineCodec({ name, encode, decodeText })` fills in the rest of a codec for a type of your own, looked up by name.
+`codecs` holds the built-in ones, by type: `bool`, `int2`, `int4`, `oid`, `int8` (a `bigint`), `int8AsString`, `float4`, `float8`, `numeric` (a string), `text`, `varchar`, `bpchar`, `name`, `char`, `uuid`, `bytea`, `json`, `jsonb`, `timestamptz` (a `Date`), `timestamptzAsString`, `date`, `time`, `timetz`, `timestamp`, `interval`, `inet`, `cidr`, `macaddr`, `money`, `xml`, `bit`, `varbit`, `point`, `box`, `tsvector`, `tsquery`, `jsonpath`, `daterange` and `tstzrange` (as `RangeValue`), pgvector's `vector`, and `raw`, which keeps any type as the server's text both ways. `arrayOf(codec)` is the codec of its arrays, of any number of dimensions. `defineCodec({ name, encode, decodeText })` fills in the rest of a codec for a type of your own, looked up by name.
 
 Which types are binary follows what is cheaper in JavaScript: binary where the value is a number, a `Date`, bytes, or an array of those (and pgvector's vectors), text where the value is a string anyway (`int8` as a string, `numeric`, `uuid`, dates, text types, enums) or the binary format carries the same text (`jsonb`).
 
@@ -796,7 +796,7 @@ await pool.end({ timeout: 5000 }); // fail whatever is still running after 5 s
 
 **RDS Proxy, Supavisor, Neon and other transaction poolers** follow the same rules. Avoid session-level `SET`, which can pin a session to a server connection. If a proxy pins or rejects named prepared statements, use `prepare: false`.
 
-`connection.capabilities` reports what poolers and proxies may change: the negotiated `protocol`, `serverVersion` (when reported), `pgbouncer` (its version and settings, when detected), `longCancelKeys` (protocol 3.2's longer cancel keys) and the `saslMechanisms` the server offered.
+`connection.capabilities` reports what poolers and proxies may change: the negotiated `protocol`, `serverVersion` (when reported), `pgbouncer` (its version and settings, when detected) and the `saslMechanisms` the server offered.
 
 ## Errors
 

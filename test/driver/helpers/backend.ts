@@ -50,16 +50,7 @@ export function encodeBackend(message: BackendMessage): Uint8Array {
 			break;
 		case 'CopyInResponse':
 		case 'CopyOutResponse':
-		case 'CopyBothResponse':
-			w.begin(
-				code(
-					message.type === 'CopyInResponse'
-						? 'G'
-						: message.type === 'CopyOutResponse'
-							? 'H'
-							: 'W',
-				),
-			)
+			w.begin(code(message.type === 'CopyInResponse' ? 'G' : 'H'))
 				.int8(message.binary ? 1 : 0)
 				.int16(message.columnFormats.length);
 			for (const f of message.columnFormats) w.int16(f);
@@ -120,9 +111,6 @@ export function encodeBackend(message: BackendMessage): Uint8Array {
 					.int32(f.typeModifier)
 					.int16(f.format);
 			}
-			break;
-		case 'FunctionCallResponse':
-			w.begin(code('V')).int32(-1);
 			break;
 	}
 	return w.end().take();

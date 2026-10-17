@@ -206,8 +206,6 @@ describe.skipIf(noPg)('capabilities', () => {
 		await using conn = await open();
 		expect(conn.capabilities).toMatchObject({
 			protocol: '3.2',
-			longCancelKeys: true,
-			reportsHotStandby: true,
 		});
 		expect(conn.capabilities.saslMechanisms).toContain('SCRAM-SHA-256');
 		expect(conn.capabilities.serverVersion).toBe(

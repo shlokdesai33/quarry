@@ -328,18 +328,16 @@ export class DriverExecutor implements TransactionExecutor {
 		const start = performance.now();
 		let rows = 0;
 		const source = this.#source;
-		const client =
-			source instanceof Pool
-				? await source.acquire(
-						options.signal === undefined ? {} : { signal: options.signal },
-					)
-				: undefined;
+		let client: PoolClient | undefined;
 		let runner: Runner;
-		if (client !== undefined) runner = client.connection;
-		else if (source instanceof PoolClient) runner = source.connection;
-		else if (source instanceof Pool)
-			throw new DriverError('A pool must lend a connection');
-		else runner = source;
+		if (source instanceof Pool) {
+			client = await source.acquire(
+				options.signal === undefined ? {} : { signal: options.signal },
+			);
+			runner = client.connection;
+		} else {
+			runner = source instanceof PoolClient ? source.connection : source;
+		}
 		const acquired = performance.now();
 		let failure: unknown;
 		let opened = false;

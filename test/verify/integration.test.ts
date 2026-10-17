@@ -1,5 +1,4 @@
 import { readFileSync } from 'node:fs';
-import { Pool } from 'pg';
 import {
 	afterAll,
 	beforeAll,
@@ -37,31 +36,45 @@ import { databaseWith } from '../../src/database.js';
 import { executorFrom } from '../helpers/executor.js';
 import { defineEnum } from '../../src/define-enum.js';
 import { defineTable } from '../../src/define-table.js';
+import { createPool, type Pool } from '../../src/driver/pool.js';
+import { createCodecRegistry } from '../../src/driver/registry.js';
+import { DriverExecutor } from '../../src/driver-executor.js';
 import type { Executor } from '../../src/executor.js';
 import type { AnyTable } from '../../src/table.js';
 import { formatVerifyReport } from '../../src/verify/render/format.js';
 import type { VerifyOptions } from '../../src/verify/report.js';
-import { schema as driftSchema } from './fixtures/schema.js';
 import {
-	postgresAvailable,
-	schema,
-	startDatabase,
-	type TestDatabase,
-} from './helpers/postgres.js';
+	cluster,
+	noPg,
+	options as connectionOptions,
+} from '../driver/integration/helpers.js';
+import { schema as driftSchema } from './fixtures/schema.js';
 
-let db: TestDatabase;
+/** The schema the tests create their tables in, first on the search path. */
+const schema = 'quarry_verify';
+
+/** A pool whose sessions find tables in `schema` first. */
+const poolOf = (params: Record<string, string> = {}) =>
+	createPool({
+		...connectionOptions(),
+		max: 2,
+		params: { search_path: schema, ...params },
+	});
+
+let pool: Pool;
+let executor: Executor;
 
 /** Verifies on a counting executor, checking it ran a single query. */
 async function verify(
 	tables: readonly AnyTable[],
 	options?: VerifyOptions,
-	executor: Executor = db.executor,
+	on: Executor = executor,
 ) {
 	const queries: CompiledQuery[] = [];
 	const report = await databaseWith(
 		executorFrom((query) => {
 			queries.push(query);
-			return executor.execute(query);
+			return on.execute(query);
 		}),
 	).verify(tables, options);
 	expect(queries).toHaveLength(tables.length === 0 ? 0 : 1);
@@ -82,26 +95,29 @@ function withoutDuration(report: Report): Report {
 	return { ...report, summary: { ...report.summary, durationMs: 0 } };
 }
 
-describe.skipIf(!postgresAvailable)('db.verify against PostgreSQL', () => {
+describe.skipIf(noPg)('db.verify against PostgreSQL', () => {
 	let version: number;
 
-	beforeAll(async () => {
-		db = await startDatabase();
-		const { rows } = await db.pool.query<{ v: string }>(
-			"select current_setting('server_version_num') as v",
-		);
-		version = Number(rows[0]?.v);
+	beforeAll(() => {
+		pool = poolOf();
+		executor = new DriverExecutor(pool);
+		version = cluster().serverVersionNum;
 	});
-	afterAll(() => db?.stop());
+	afterAll(async () => {
+		await pool?.simpleQuery(
+			`drop schema if exists ${schema} cascade; drop schema if exists quarry_verify_other cascade`,
+		);
+		await pool?.end();
+	});
 	beforeEach(async () => {
-		await db.sql(
+		await pool.simpleQuery(
 			`drop schema if exists ${schema} cascade; create schema ${schema};
 			drop schema if exists quarry_verify_other cascade;`,
 		);
 	});
 
 	test('the drift fixture', async () => {
-		await db.sql(
+		await pool.simpleQuery(
 			readFileSync(new URL('./fixtures/drift.sql', import.meta.url), 'utf8'),
 		);
 		const report = await verify(driftSchema);
@@ -139,14 +155,14 @@ describe.skipIf(!postgresAvailable)('db.verify against PostgreSQL', () => {
 	});
 
 	test('the drift fixture, fixed with the suggested SQL, matches', async () => {
-		await db.sql(
+		await pool.simpleQuery(
 			readFileSync(new URL('./fixtures/drift.sql', import.meta.url), 'utf8'),
 		);
 		const report = await verify(driftSchema);
 		const fixes = report.diagnostics
 			.map((d) => d.fix?.replaceAll('<expression>', 'now()'))
 			.filter((fix) => fix !== undefined);
-		await db.sql(
+		await pool.simpleQuery(
 			[
 				...fixes,
 				// the parts the suggestions leave to people
@@ -198,7 +214,7 @@ describe.skipIf(!postgresAvailable)('db.verify against PostgreSQL', () => {
 				ac: decimal(5),
 			},
 		});
-		await db.sql(`
+		await pool.simpleQuery(`
 			create type mood as enum ('happy', 'sad');
 			create table all_types (
 				a smallint not null, b integer not null, c bigint not null,
@@ -249,7 +265,7 @@ describe.skipIf(!postgresAvailable)('db.verify against PostgreSQL', () => {
 	});
 
 	test('types quarry has no factory for are named as postgres does', async () => {
-		await db.sql(
+		await pool.simpleQuery(
 			'create table other (a json not null, b char(3) not null, c macaddr not null, d timetz not null)',
 		);
 		const table = defineTable('other', {
@@ -265,7 +281,7 @@ describe.skipIf(!postgresAvailable)('db.verify against PostgreSQL', () => {
 	});
 
 	test('names resolve through search_path, or in the schema option', async () => {
-		await db.sql(`
+		await pool.simpleQuery(`
 			create table accounts (id integer not null);
 			create schema quarry_verify_other;
 			create table quarry_verify_other.accounts (id bigint not null);
@@ -285,7 +301,7 @@ describe.skipIf(!postgresAvailable)('db.verify against PostgreSQL', () => {
 	});
 
 	test('quoted identifiers', async () => {
-		await db.sql(`
+		await pool.simpleQuery(`
 			create type "Status Kind" as enum ('On', 'off''s');
 			create table "UserAccounts" (
 				"First Name" text not null,
@@ -314,7 +330,7 @@ describe.skipIf(!postgresAvailable)('db.verify against PostgreSQL', () => {
 	});
 
 	test('partitioned tables, partitions, views and materialized views', async () => {
-		await db.sql(`
+		await pool.simpleQuery(`
 			create table events (id bigint not null, at date not null, note text)
 				partition by range (at);
 			create table events_2026 partition of events
@@ -355,7 +371,7 @@ describe.skipIf(!postgresAvailable)('db.verify against PostgreSQL', () => {
 
 	test('identities, serials, defaults and generated columns', async () => {
 		const virtual = version >= 180000;
-		await db.sql(`
+		await pool.simpleQuery(`
 			create table filled (
 				a integer generated always as identity,
 				b integer generated by default as identity,
@@ -414,7 +430,7 @@ describe.skipIf(!postgresAvailable)('db.verify against PostgreSQL', () => {
 	});
 
 	test('domains resolve to their base type', async () => {
-		await db.sql(`
+		await pool.simpleQuery(`
 			create domain email as text check (value like '%@%');
 			create domain short_code as varchar(4) not null;
 			create table contacts (a email not null, b short_code, c email[])`);
@@ -434,41 +450,26 @@ describe.skipIf(!postgresAvailable)('db.verify against PostgreSQL', () => {
 	});
 
 	test('a driver that returns every value as text gives the same report', async () => {
-		await db.sql(
+		await pool.simpleQuery(
 			readFileSync(new URL('./fixtures/drift.sql', import.meta.url), 'utf8'),
 		);
-		const textPool = new Pool({
-			...db.pool.options,
-			types: { getTypeParser: () => (value: string) => value },
-		});
-		try {
-			const textual = await verify(driftSchema, undefined, {
-				...executorFrom(async ({ sql, params }) => ({
-					rows: (await textPool.query(sql, [...params])).rows,
-				})),
-			});
-			const parsed = await verify(driftSchema);
-			expect(withoutDuration(textual)).toEqual(withoutDuration(parsed));
-		} finally {
-			await textPool.end();
-		}
+		const textual = await verify(
+			driftSchema,
+			undefined,
+			new DriverExecutor(pool, {}, false, createCodecRegistry([], null)),
+		);
+		const parsed = await verify(driftSchema);
+		expect(withoutDuration(textual)).toEqual(withoutDuration(parsed));
 	});
 
 	test('the catalog query runs in a read-only session', async () => {
-		await db.sql('create table readonly_t (a text not null)');
-		const readOnly = new Pool({
-			...db.pool.options,
-			options: `-c search_path=${schema} -c default_transaction_read_only=on`,
-		});
+		await pool.simpleQuery('create table readonly_t (a text not null)');
+		const readOnly = poolOf({ default_transaction_read_only: 'on' });
 		try {
 			const report = await verify(
 				[defineTable('readonly_t', { columns: { a: text() } })],
 				undefined,
-				{
-					...executorFrom(async ({ sql, params }) => ({
-						rows: (await readOnly.query(sql, [...params])).rows,
-					})),
-				},
+				new DriverExecutor(readOnly),
 			);
 			expect(report.ok).toBe(true);
 		} finally {
@@ -477,7 +478,7 @@ describe.skipIf(!postgresAvailable)('db.verify against PostgreSQL', () => {
 	});
 
 	test('strict makes extra columns errors', async () => {
-		await db.sql('create table wide (a text not null, extra text)');
+		await pool.simpleQuery('create table wide (a text not null, extra text)');
 		const table = defineTable('wide', { columns: { a: text() } });
 		expect((await verify([table])).ok).toBe(true);
 		const strict = await verify([table], { strict: true });

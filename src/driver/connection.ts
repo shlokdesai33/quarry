@@ -140,7 +140,8 @@ export interface GroupStatement {
 		| undefined;
 }
 
-export interface CursorOptions extends QueryOptions {
+/** A cursor's options: a query's, without `keepRows` (a cursor reads every row it fetches). */
+export interface CursorOptions extends Omit<QueryOptions, 'keepRows'> {
 	/** Rows fetched per round trip (default 1000). */
 	readonly batchSize?: number;
 }
@@ -811,7 +812,6 @@ export class Connection implements AsyncDisposable {
 			unwritten: true,
 			parsed: false,
 			fields: undefined,
-			paramTypes: undefined,
 			error: undefined,
 			plans: [],
 		};

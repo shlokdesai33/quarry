@@ -135,7 +135,7 @@ export function sameFormats(
 }
 
 /** Whether two queries expect the same codecs, column by column. */
-export function sameCodecs(
+function sameCodecs(
 	a: ResultCodecs | undefined,
 	b: ResultCodecs | undefined,
 ): boolean {

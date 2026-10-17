@@ -131,7 +131,7 @@ export const decodesAsText = (codec: Codec): boolean =>
  */
 const binaryInArrays = new WeakSet<Codec>();
 
-/** Element codecs the driver has an in-place binary array encoder for, keyed by the array OID. */
+/** Element codecs the driver has an in-place binary array encoder for. */
 const binaryArrayEncoders = new WeakSet<Codec>();
 
 /** @internal Marks a built-in codec's arrays as read in binary. */
@@ -161,7 +161,7 @@ export function markTextLike(codec: Codec): void {
 }
 
 /** Whether a codec's binary format is its UTF-8 text. */
-export const isTextLike = (codec: Codec): boolean => textLike.has(codec);
+const isTextLike = (codec: Codec): boolean => textLike.has(codec);
 
 const HEX_DIGITS = '0123456789abcdef';
 

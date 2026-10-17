@@ -203,7 +203,7 @@ const pathCodec = codecs.jsonpath;
 
 export function jsonFunctions<R extends Refs>({
 	node,
-}: Scope<R>): JsonFunctions<R> {
+}: Pick<Scope<R>, 'node'>): JsonFunctions<R> {
 	const walk =
 		(last: '->' | '->>', type: DataType) =>
 		(json: Operand<R, Jsonb>, ...path: readonly Key[]) =>

@@ -44,7 +44,7 @@ export type BackendMessage =
 	| { readonly type: 'CopyData'; readonly data: Uint8Array }
 	| { readonly type: 'CopyDone' }
 	| {
-			readonly type: 'CopyInResponse' | 'CopyOutResponse' | 'CopyBothResponse';
+			readonly type: 'CopyInResponse' | 'CopyOutResponse';
 			readonly binary: boolean;
 			readonly columnFormats: readonly number[];
 	  }
@@ -84,7 +84,4 @@ export type BackendMessage =
 			/** `I` idle, `T` in a transaction, `E` in a failed transaction. */
 			readonly status: 'I' | 'T' | 'E';
 	  }
-	| { readonly type: 'RowDescription'; readonly fields: readonly Field[] }
-	| { readonly type: 'FunctionCallResponse' };
-
-export type BackendMessageType = BackendMessage['type'];
+	| { readonly type: 'RowDescription'; readonly fields: readonly Field[] };

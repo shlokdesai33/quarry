@@ -1,11 +1,4 @@
-import { compile, type CompiledQuery } from './compile.js';
-import type {
-	Executor,
-	NoRowError,
-	RowCountError,
-	RunOptions,
-	TooManyRowsError,
-} from './executor.js';
+import type { Executor } from './executor.js';
 import {
 	type ExpressionBuilder,
 	expressionBuilder,
@@ -17,7 +10,6 @@ import type {
 	SelectionNode,
 } from './node.js';
 import type { AnyPredicate } from './operators.js';
-import { type Missing, type Query, rejectAwait } from './query.js';
 import type { RefsOf } from './refs.js';
 import {
 	type AddRow,
@@ -25,18 +17,6 @@ import {
 	type Selection,
 	selectionNodes,
 } from './row.js';
-import {
-	type ColumnValue,
-	type ErrorFor,
-	errorArg,
-	expectAtMostOne,
-	expectFirst,
-	expectOne,
-	expectValue,
-	takeFirst,
-	takeValue,
-	type ValueArgs,
-} from './shape.js';
 import { type AnyTable, tableNode } from './table.js';
 import type { InferInsertType } from './types.js';
 import {
@@ -49,16 +29,11 @@ import {
 	columnOf,
 	excluded,
 	type Excluded,
-	type NonEmptyOutput,
 	rowsNode,
 	setNodes,
 	type SetValues,
 	type UpdateKey,
-	writeExpectRows,
-	writeNonEmpty,
-	writeOutput,
-	type WriteOutput,
-	writeQuery,
+	WriteQueryBuilder,
 } from './write-query.js';
 
 /** What an `insert` into `T` has recorded so far. */
@@ -133,16 +108,15 @@ export function insertIntoWith<T extends AnyTable>(
  *
  * Immutable: every method returns a new builder.
  */
-export class InsertQueryBuilder<T extends AnyTable, O, M extends 'values'> {
-	/** The type of a `returning` row. Never set. */
-	declare readonly $output: O;
-
-	/** What the query still needs before it can run. Never set. */
-	declare readonly $missing: M;
-
+export class InsertQueryBuilder<
+	T extends AnyTable,
+	O,
+	M extends 'values',
+> extends WriteQueryBuilder<O, M> {
 	readonly #state: InsertState<T>;
 
 	constructor(state: InsertState<T>) {
+		super(state.executor);
 		this.#state = state;
 	}
 
@@ -222,156 +196,7 @@ export class InsertQueryBuilder<T extends AnyTable, O, M extends 'values'> {
 		return condition ? build(this) : this;
 	}
 
-	/**
-	 * The first `returning` row, if any; runs with `execute()`. Never
-	 * throws for the number of rows, and doesn't change the SQL: the
-	 * statement writes every row it matches, and only the first is decoded.
-	 */
-	takeFirst(
-		this: InsertQueryBuilder<T, O & object, never>,
-	): Query<O | undefined> {
-		return writeQuery(this.#state.executor, this.toNode(), takeFirst<O>());
-	}
-
-	/**
-	 * The value of the one `returning` column of the first row, if any;
-	 * runs with `execute()`. Never throws for the number of rows, and
-	 * doesn't change the SQL: the statement writes every row it matches.
-	 *
-	 * @example .returning(['users.id']).takeValue()
-	 */
-	takeValue(
-		this: InsertQueryBuilder<T, O & object, never>,
-		..._oneColumn: ValueArgs<O, []>
-	): Query<ColumnValue<O> | undefined> {
-		return writeQuery(
-			this.#state.executor,
-			this.toNode(),
-			takeValue<ColumnValue<O>>(),
-		);
-	}
-
-	/**
-	 * Requires the statement to insert one or more rows; runs with
-	 * `execute()`, which resolves to the `returning` rows, as a non-empty
-	 * array, or without `returning`, to the row count. Throws `NoRowError`
-	 * (or what `err` makes of it) after the statement ran, when it inserted
-	 * none; inside a transaction, that rolls it back.
-	 */
-	expectNonEmpty(
-		this: InsertQueryBuilder<T, O, never>,
-		err?: ErrorFor<NoRowError>,
-	): Query<NonEmptyOutput<O>> {
-		return writeNonEmpty<O>(this.#state.executor, this.toNode(), err);
-	}
-
-	/**
-	 * The first `returning` row; runs with `execute()`, which throws
-	 * `NoRowError` (or what `err` makes of it) when there is none, after
-	 * the statement ran. Other rows are ignored.
-	 */
-	expectFirst(
-		this: InsertQueryBuilder<T, O & object, never>,
-		err?: ErrorFor<NoRowError>,
-	): Query<O> {
-		return writeQuery(this.#state.executor, this.toNode(), expectFirst<O>(err));
-	}
-
-	/**
-	 * The one `returning` row; runs with `execute()`, which throws
-	 * `NoRowError` when there is none and `TooManyRowsError` (with the
-	 * `count`) when there are several, after the statement ran; `err`
-	 * makes the error to throw instead.
-	 */
-	expectOne(
-		this: InsertQueryBuilder<T, O & object, never>,
-		err?: ErrorFor<NoRowError | TooManyRowsError>,
-	): Query<O> {
-		return writeQuery(this.#state.executor, this.toNode(), expectOne<O>(err));
-	}
-
-	/**
-	 * The `returning` row, if any; runs with `execute()`, which throws
-	 * `TooManyRowsError` (or what `err` makes of it) when there are
-	 * several, after the statement ran.
-	 */
-	expectAtMostOne(
-		this: InsertQueryBuilder<T, O & object, never>,
-		err?: ErrorFor<TooManyRowsError>,
-	): Query<O | undefined> {
-		return writeQuery(
-			this.#state.executor,
-			this.toNode(),
-			expectAtMostOne<O>(err),
-		);
-	}
-
-	/**
-	 * The value of the one `returning` column of the first row; runs with
-	 * `execute()`, which throws `NoRowError` (or what `err` makes of it)
-	 * when there is no row, after the statement ran.
-	 */
-	expectValue(
-		this: InsertQueryBuilder<T, O & object, never>,
-		...args: ValueArgs<O, [err?: ErrorFor<NoRowError>]>
-	): Query<ColumnValue<O>> {
-		return writeQuery(
-			this.#state.executor,
-			this.toNode(),
-			expectValue<ColumnValue<O>>(errorArg(args)),
-		);
-	}
-
-	/**
-	 * Requires the statement to insert exactly `count` rows; runs with
-	 * `execute()`, which resolves as it does without a shape, and throws
-	 * `RowCountError` (or what `err` makes of it) after the statement ran,
-	 * when it inserted a different number; inside a transaction, that rolls
-	 * it back.
-	 *
-	 * @example .onConflict('email').doNothing().expectRows(1)
-	 */
-	expectRows(
-		this: InsertQueryBuilder<T, O, never>,
-		count: number,
-		err?: ErrorFor<RowCountError>,
-	): Query<WriteOutput<O>> {
-		return writeExpectRows<O>(this.#state.executor, this.toNode(), count, err);
-	}
-
-	/**
-	 * Runs the query, resolving to every `returning` row, or without
-	 * `returning`, to the number of rows inserted. Never throws for the
-	 * number of rows: the `expect` shapes do.
-	 */
-	execute(
-		this: InsertQueryBuilder<T, O, never>,
-		options?: RunOptions,
-	): Promise<WriteOutput<O>> {
-		return writeOutput<O>(this.#state.executor, this.toNode()).execute(options);
-	}
-
-	/** The SQL and parameters `execute()` sends. */
-	toSQL(): CompiledQuery {
-		return compile(this.toNode());
-	}
-
-	/** The query `execute()` runs, for `db.batch`; one that still needs clauses has none. */
-	toQuery(): [M] extends [never] ? Query<WriteOutput<O>> : Missing<M> {
-		// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the type keeps a query that can't run yet out of a batch
-		return writeOutput<O>(this.#state.executor, this.toNode()) as [M] extends [
-			never,
-		]
-			? Query<WriteOutput<O>>
-			: Missing<M>;
-	}
-
-	/** @deprecated A query runs with `execute()`; awaiting one rejects. */
-	// oxlint-disable-next-line unicorn/no-thenable -- so that a forgotten execute() fails loudly
-	readonly then = rejectAwait;
-
-	/** The whole query as one node. */
-	toNode(): InsertNode {
+	override toNode(): InsertNode {
 		const { table, values, onConflict, returning, tag } = this.#state;
 		return {
 			kind: 'insert',

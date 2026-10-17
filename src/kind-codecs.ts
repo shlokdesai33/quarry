@@ -39,10 +39,10 @@ export const kindCodecs = {
 /** The kinds with a codec of their own; enums, arrays and custom types are given theirs. */
 export type CodecKind = keyof typeof kindCodecs;
 
-/** The codec a kind's values are sent and read with. */
 /** The kinds' codecs, as a table of every kind (no kind is an `Object` member). */
 const byKind: Partial<Record<Kind, Codec>> = kindCodecs;
 
+/** The codec a kind's values are sent and read with. */
 export function kindCodec(kind: Kind): Codec {
 	return byKind[kind] ?? codecs.raw;
 }
@@ -50,7 +50,7 @@ export function kindCodec(kind: Kind): Codec {
 /**
  * How quarry reads a column no query chose a codec for (raw SQL, an
  * expression of unknown type): the driver's default codecs, with the
- * choices the column factories make, and pgvector's types.
+ * choices the column factories make, and pgvector's `vector`.
  */
 export const quarryRegistry = createCodecRegistry([
 	codecs.int8AsString,
@@ -58,5 +58,4 @@ export const quarryRegistry = createCodecRegistry([
 	codecs.daterange,
 	codecs.tstzrange,
 	codecs.vector,
-	codecs.halfvec,
 ]);

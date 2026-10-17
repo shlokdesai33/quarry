@@ -36,7 +36,6 @@ export interface Statement {
 	/** Set once ParseComplete arrives. */
 	parsed: boolean;
 	fields: readonly Field[] | undefined;
-	paramTypes: readonly number[] | undefined;
 	/** The Parse error, when parsing failed; later binds of it report this. */
 	error: PostgresError | undefined;
 	/**
@@ -240,16 +239,15 @@ function planOf(
 	statement: Statement | undefined,
 	fields: readonly Field[],
 	spec: ResultSpec,
-	requested: readonly number[] | 0 | 'fields' | undefined,
+	requested: readonly number[] | 0 | undefined,
 ): ResultPlan {
 	if (statement === undefined)
 		return resultPlan(fields, spec, requested ?? 'fields');
 	const plan = cachedPlan(statement.plans, fields, spec);
 	if (requested === undefined) return plan;
-	const asked = requested === 'fields' ? formatsOf(fields) : requested;
-	return sameFormats(plan.formats, asked)
+	return sameFormats(plan.formats, requested)
 		? plan
-		: resultPlan(fields, spec, asked);
+		: resultPlan(fields, spec, requested);
 }
 
 function formatsOf(fields: readonly Field[]): readonly number[] | 0 {
@@ -506,10 +504,7 @@ export class QueryOp extends Op {
 			case 'CopyOutResponse':
 			case 'CopyData':
 			case 'CopyDone':
-				return false;
 			case 'ParameterDescription':
-				if (this.#statement && this.#createdStatement)
-					this.#statement.paramTypes = msg.typeOids;
 				return false;
 			case 'RowDescription':
 				if (this.#unnamed) {
@@ -979,10 +974,6 @@ export class CursorOp extends Op {
 		this.#batchSize = batchSize;
 	}
 
-	get fields(): readonly Field[] | undefined {
-		return this.#fields;
-	}
-
 	write(ctx: OpContext): void {
 		this.#ctx = ctx;
 		const w = ctx.writer;
@@ -1137,8 +1128,6 @@ export class CursorOp extends Op {
 				if (this.#statement && this.#created) this.#statement.parsed = true;
 				return false;
 			case 'ParameterDescription':
-				if (this.#statement && this.#created)
-					this.#statement.paramTypes = msg.typeOids;
 				return false;
 			case 'RowDescription':
 				if (this.#statement && this.#created)
@@ -1305,16 +1294,11 @@ export class CopyToOp extends Op {
 	#waiter: Waiter<Uint8Array | undefined> | undefined;
 	#error: Error | undefined;
 	#finished = false;
-	#rowCount = 0;
 
 	constructor(sql: string, highWaterMark: number) {
 		super();
 		this.#sql = sql;
 		this.#highWaterMark = highWaterMark;
-	}
-
-	get rowCount(): number {
-		return this.#rowCount;
 	}
 
 	write(ctx: OpContext): void {
@@ -1365,7 +1349,6 @@ export class CopyToOp extends Op {
 				return false;
 			}
 			case 'CommandComplete':
-				this.#rowCount = parseTag(msg.tag).rowCount ?? 0;
 				return false;
 			case 'CopyInResponse': {
 				const w = ctx.writer;
