@@ -1,20 +1,5 @@
 import { DriverError } from './errors.js';
-import type { Field } from './protocol/messages.js';
 import { NodeBuffer, utf8 } from './protocol/text.js';
-import { parseTimestamptz, parseVector } from './parsers.js';
-import {
-	arrayOids,
-	arrayParserInfo,
-	oids,
-	parseBigInt,
-	parseBool,
-	parseBytea,
-	parseFloat,
-	parseInteger,
-	parseJson,
-	type TextParser,
-	type TypeParsers,
-} from './types.js';
 
 /** Decodes one binary-format value, `bytes[start, end)`. */
 export type BinaryParser = (
@@ -31,22 +16,29 @@ const int32 = (b: Uint8Array, s: number): number =>
 	((b[s + 2] ?? 0) << 8) |
 	(b[s + 3] ?? 0);
 
-const bool: BinaryParser = (b, s) => b[s] !== 0;
-const int2: BinaryParser = (b, s) =>
+const int16 = (b: Uint8Array, s: number): number =>
 	(((b[s] ?? 0) << 24) >> 16) | (b[s + 1] ?? 0);
-const int4: BinaryParser = (b, s) => int32(b, s);
-const uint4: BinaryParser = (b, s) => int32(b, s) >>> 0;
-const float8: BinaryParser = (b, s) => {
+
+export const bool = (b: Uint8Array, s: number): boolean => b[s] !== 0;
+export const int2 = (b: Uint8Array, s: number): number => int16(b, s);
+export const int4 = (b: Uint8Array, s: number): number => int32(b, s);
+export const uint4 = (b: Uint8Array, s: number): number => int32(b, s) >>> 0;
+export const float4 = (b: Uint8Array, s: number): number => {
+	for (let i = 0; i < 4; i++) scratch.setUint8(i, b[s + i] ?? 0);
+	return scratch.getFloat32(0);
+};
+export const float8 = (b: Uint8Array, s: number): number => {
 	for (let i = 0; i < 8; i++) scratch.setUint8(i, b[s + i] ?? 0);
 	return scratch.getFloat64(0);
 };
 /** A copy, so rows never hold on to (or alias) the read buffer. */
-const bytea: BinaryParser = (b, s, e) => new Uint8Array(b.subarray(s, e));
+export const bytea = (b: Uint8Array, s: number, e: number): Uint8Array =>
+	new Uint8Array(b.subarray(s, e));
 
-/** Microseconds between the Unix epoch and PostgreSQL's (2000-01-01). */
+/** Milliseconds between the Unix epoch and PostgreSQL's (2000-01-01). */
 const PG_EPOCH_MS = 946_684_800_000;
 const MAX_DATE = 8.64e15;
-const timestamptz: BinaryParser = (b, s) => {
+export const timestamptz = (b: Uint8Array, s: number): Date => {
 	const hi = int32(b, s);
 	const lo = int32(b, s + 4) >>> 0;
 	if (hi === 0x7fffffff && lo === 0xffffffff) return new Date(MAX_DATE);
@@ -58,22 +50,86 @@ const timestamptz: BinaryParser = (b, s) => {
 };
 
 const TWO_32 = 4294967296;
-const int8BigInt: BinaryParser = (b, s) => {
+export const int8BigInt = (b: Uint8Array, s: number): bigint => {
 	const hi = int32(b, s);
 	const lo = int32(b, s + 4) >>> 0;
 	// exact as a double below 2^53
 	if (hi >= -0x200000 && hi < 0x200000) return BigInt(hi * TWO_32 + lo);
 	return BigInt.asIntN(64, (BigInt(hi) << 32n) | BigInt(lo));
 };
-const json: BinaryParser = (b, s, e) => JSON.parse(utf8(b, s, e));
+export const int8String = (b: Uint8Array, s: number): string => {
+	const hi = int32(b, s);
+	const lo = int32(b, s + 4) >>> 0;
+	if (hi >= -0x200000 && hi < 0x200000) return String(hi * TWO_32 + lo);
+	return String(BigInt.asIntN(64, (BigInt(hi) << 32n) | BigInt(lo)));
+};
+export const text = (b: Uint8Array, s: number, e: number): string =>
+	utf8(b, s, e);
+/** Any JSON value; `null` here is JSON `null`, which a column holds apart from SQL NULL. */
+export type JsonValue =
+	| string
+	| number
+	| boolean
+	| null
+	| readonly JsonValue[]
+	| { [key: string]: JsonValue };
+
+export const json = (b: Uint8Array, s: number, e: number): JsonValue => {
+	const value: JsonValue = JSON.parse(utf8(b, s, e));
+	return value;
+};
 /** jsonb's binary format: a version byte (1), then the text. */
-const jsonb: BinaryParser = (b, s, e) => {
+export const jsonb = (b: Uint8Array, s: number, e: number): JsonValue => {
 	if (b[s] !== 1) throw new DriverError('Unsupported jsonb binary version');
-	return JSON.parse(utf8(b, s + 1, e));
+	const value: JsonValue = JSON.parse(utf8(b, s + 1, e));
+	return value;
+};
+
+const HEX = '0123456789abcdef';
+/** uuid's binary format: 16 bytes, as the hyphenated lowercase text `uuid_out` prints. */
+export const uuid = (b: Uint8Array, s: number): string => {
+	let out = '';
+	for (let i = 0; i < 16; i++) {
+		if (i === 4 || i === 6 || i === 8 || i === 10) out += '-';
+		const byte = b[s + i] ?? 0;
+		out += (HEX[byte >> 4] ?? '0') + (HEX[byte & 15] ?? '0');
+	}
+	return out;
+};
+
+/**
+ * numeric's binary format, as the text `numeric_out` prints: base-10000
+ * digits with a weight, a sign (or NaN, ±Infinity) and a display scale.
+ */
+export const numeric = (b: Uint8Array, s: number): string => {
+	const ndigits = int16(b, s);
+	const weight = int16(b, s + 2);
+	const sign = ((b[s + 4] ?? 0) << 8) | (b[s + 5] ?? 0);
+	const dscale = ((b[s + 6] ?? 0) << 8) | (b[s + 7] ?? 0);
+	if (sign === 0xc000) return 'NaN';
+	if (sign === 0xd000) return 'Infinity';
+	if (sign === 0xf000) return '-Infinity';
+	const digit = (i: number): number =>
+		i >= 0 && i < ndigits ? int16(b, s + 8 + i * 2) & 0xffff : 0;
+	let out = sign === 0x4000 ? '-' : '';
+	if (weight < 0) out += '0';
+	else {
+		for (let i = 0; i <= weight; i++) {
+			const d = String(digit(i));
+			out += i === 0 ? d : d.padStart(4, '0');
+		}
+	}
+	if (dscale > 0) {
+		let fraction = '';
+		for (let i = weight + 1; fraction.length < dscale; i++)
+			fraction += String(digit(i)).padStart(4, '0');
+		out += `.${fraction.slice(0, dscale)}`;
+	}
+	return out;
 };
 
 /** pgvector's binary format: Int16 dimensions, Int16 unused, then float4s. */
-const vector: BinaryParser = (b, s, e) => {
+export const vector = (b: Uint8Array, s: number, e: number): number[] => {
 	const dim = ((b[s] ?? 0) << 8) | (b[s + 1] ?? 0);
 	if (e - s !== 4 + dim * 4)
 		throw new DriverError('Invalid vector binary value');
@@ -96,21 +152,24 @@ const hasLatin1Slice = (b: Uint8Array): b is Latin1Buffer =>
 	NodeBuffer !== undefined && b instanceof NodeBuffer;
 
 /** Elements whose binary format is their UTF-8 text. */
-const TEXT = 'text';
+export const TEXT = 'text';
 
 /**
  * Decodes a binary array into nested arrays, as `parseArray` does its text:
  * lower bounds are dropped and NULL elements are `null`. Text elements are
  * sliced from one latin1 string of the whole value where they are ASCII: a
- * substring costs far less than a native UTF-8 decode per element.
+ * substring costs far less than a native UTF-8 decode per element. An
+ * `elementOid` of 0 (a type looked up by name) isn't checked.
  */
-function arrayDecoder(
+export function arrayDecoder(
 	elementOid: number,
 	element: BinaryParser | typeof TEXT,
 ): BinaryParser {
 	return (b, s, e) => {
 		const ndim = int32(b, s);
-		if (e - s < 12 || int32(b, s + 8) !== elementOid) throw invalidArray();
+		if (e - s < 12) throw invalidArray();
+		if (elementOid !== 0 && int32(b, s + 8) >>> 0 !== elementOid)
+			throw invalidArray();
 		if (ndim === 0) return [];
 		let pos = s + 12 + ndim * 8;
 		if (ndim < 0 || ndim > MAX_DIMENSIONS || pos > e) throw invalidArray();
@@ -150,101 +209,5 @@ function arrayDecoder(
 		const out = level(0);
 		if (pos !== e) throw invalidArray();
 		return out;
-	};
-}
-
-const oidsByName: Readonly<Record<string, number>> = oids;
-/** The element type of each built-in array type. */
-const arrayElements: Readonly<Record<number, number>> = Object.fromEntries(
-	Object.entries(arrayOids).flatMap(([name, oid]) => {
-		const element = oidsByName[name];
-		return element === undefined ? [] : [[oid, element]];
-	}),
-);
-
-/** Element types whose binary format is their text. */
-const textLike = new Set<number>([
-	oids.text,
-	oids.varchar,
-	oids.bpchar,
-	oids.name,
-]);
-
-/**
- * The binary decoder of an array element giving the same value as
- * `parser`: the scalar decoders, plus text-like types, int8 as a bigint and
- * json, which stay text as scalars (binary only pays off inside an array).
- */
-function elementParser(
-	oid: number,
-	parser: TextParser | undefined,
-): BinaryParser | typeof TEXT | undefined {
-	// without a parser int8 stays text: building its digits costs more than slicing them
-	if (parser === undefined) return textLike.has(oid) ? TEXT : undefined;
-	if (oid === oids.int8) return parser === parseBigInt ? int8BigInt : undefined;
-	if (oid === oids.json) return parser === parseJson ? json : undefined;
-	if (oid === oids.jsonb) return parser === parseJson ? jsonb : undefined;
-	return binaryParser(oid, parser);
-}
-
-/**
- * The binary decoder that gives the same value as `parser` for type `oid`,
- * or undefined. Binary format is only used where this exists, so custom
- * parsers and raw types always get the server's text. Arrays qualify when
- * their parser is the driver's own (`arrayParser`) and their element has
- * a decoder.
- */
-export function binaryParser(
-	oid: number,
-	parser: TextParser | undefined,
-): BinaryParser | undefined {
-	if (parser === undefined) return undefined;
-	if (parser === parseVector) return vector;
-	const array = arrayParserInfo(parser);
-	if (array !== undefined) {
-		const elementOid = array.elementOid ?? arrayElements[oid];
-		if (elementOid === undefined || array.delimiter !== ',') return undefined;
-		const element = elementParser(elementOid, array.element);
-		return element && arrayDecoder(elementOid, element);
-	}
-	switch (oid) {
-		case oids.bool:
-			return parser === parseBool ? bool : undefined;
-		case oids.int2:
-			return parser === parseInteger ? int2 : undefined;
-		case oids.int4:
-			return parser === parseInteger ? int4 : undefined;
-		case oids.oid:
-			return parser === parseInteger ? uint4 : undefined;
-		// float4 stays text: its text form is the shortest float32 round-trip
-		// (3.4e38), which as a double differs from the binary float32 value
-		case oids.float8:
-			return parser === parseFloat ? float8 : undefined;
-		case oids.bytea:
-			return parser === parseBytea ? bytea : undefined;
-		case oids.timestamptz:
-			return parser === parseTimestamptz ? timestamptz : undefined;
-		default:
-			return undefined;
-	}
-}
-
-/** Per-column result formats for `fields` (1 where a binary decoder applies), and the fields with those formats. */
-export interface FormatPlan {
-	readonly formats: readonly number[] | 0;
-	readonly fields: readonly Field[];
-}
-
-export function formatPlan(
-	fields: readonly Field[],
-	types: TypeParsers,
-): FormatPlan {
-	const formats = fields.map((field) =>
-		binaryParser(field.typeOid, types[field.typeOid]) ? 1 : 0,
-	);
-	if (!formats.includes(1)) return { formats: 0, fields };
-	return {
-		formats,
-		fields: fields.map((field, i) => ({ ...field, format: formats[i] ?? 0 })),
 	};
 }

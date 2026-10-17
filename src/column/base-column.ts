@@ -1,5 +1,14 @@
 import type { CallSite } from '../call-site.js';
 import type { DataType } from '../data-type/data-type.js';
+import type { Codec } from '../driver/codec.js';
+
+/**
+ * `Old` with its type swapped for `New`, keeping whether it can be `null`
+ * or `undefined`; a column never written (`never`) stays so.
+ */
+export type SwapType<Old, New> = [Old] extends [never]
+	? never
+	: New | Extract<Old, null | undefined>;
 
 /** Where the value of a column omitted on insert comes from, if anywhere. */
 export type ColumnFill = 'default' | 'generated' | 'identity' | undefined;
@@ -112,4 +121,17 @@ export abstract class BaseColumn<D extends DataType, S, I, U> {
 	 * @example text().typed<string, never, never>()
 	 */
 	abstract typed(): BaseColumn<D, unknown, unknown, unknown>;
+
+	/**
+	 * Sends and reads the column's values with `codec` instead of its
+	 * type's, and types them by it: what is selected is the codec's output,
+	 * what is written its input (nullability kept). `codecs.raw` keeps the
+	 * server's text, as a `string`. Valid in every state, which it keeps.
+	 *
+	 * @example createdAt: timestamptz().useCodec(codecs.raw)
+	 * @example views: bigint().useCodec(codecs.int8)
+	 */
+	abstract useCodec<In, Out>(
+		codec: Codec<In, Out>,
+	): BaseColumn<D, unknown, unknown, unknown>;
 }

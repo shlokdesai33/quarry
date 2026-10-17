@@ -13,8 +13,6 @@ export const protocolVersion = (minor: number): number => (3 << 16) | minor;
 
 /** Protocol version 3.0, as sent in the startup message. */
 export const PROTOCOL_3_0 = protocolVersion(0);
-/** Protocol version 3.2 (PostgreSQL 18+): variable-length cancel keys. */
-export const PROTOCOL_3_2 = protocolVersion(2);
 
 const SSL_REQUEST_CODE = 80877103;
 const CANCEL_REQUEST_CODE = 80877102;
@@ -104,14 +102,19 @@ export function bind(
 	resultFormat: 0 | 1 | readonly number[] = 0,
 ): Writer {
 	w.begin(0x42).cstring(portal).cstring(statement);
-	if (values.some((value) => value instanceof Uint8Array)) {
+	// index loops: this runs per query, and a callback would be allocated each time
+	let binary = false;
+	for (let i = 0; i < values.length && !binary; i++)
+		binary = values[i] instanceof Uint8Array;
+	if (binary) {
 		w.int16(values.length);
-		for (const value of values) w.int16(value instanceof Uint8Array ? 1 : 0);
+		for (let i = 0; i < values.length; i++)
+			w.int16(values[i] instanceof Uint8Array ? 1 : 0);
 	} else {
 		w.int16(0);
 	}
 	w.int16(values.length);
-	for (const value of values) w.value(value);
+	for (let i = 0; i < values.length; i++) w.value(values[i] ?? null);
 	if (resultFormat === 0) w.int16(0);
 	else if (resultFormat === 1) w.int16(1).int16(1);
 	else {

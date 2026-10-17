@@ -1,3 +1,5 @@
+import { allocate } from './text.js';
+
 const encoder = new TextEncoder();
 
 /** A buffer grown past this is handed to `take`'s caller rather than copied and kept. */
@@ -173,7 +175,14 @@ export class Writer {
 			this.#buf = new Uint8Array(this.#size);
 			this.#view = new DataView(this.#buf.buffer);
 		} else {
-			out = this.#buf.slice(0, this.#pos);
+			// a Buffer where Buffer exists: small ones come from its shared
+			// pool, and Node's socket takes them without wrapping them first
+			const length = this.#pos;
+			const buf = this.#buf;
+			out = allocate(length);
+			// a loop for a few bytes, rather than a view to copy from
+			if (length <= 256) for (let i = 0; i < length; i++) out[i] = buf[i] ?? 0;
+			else out.set(buf.subarray(0, length));
 		}
 		this.#pos = 0;
 		return out;

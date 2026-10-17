@@ -15,19 +15,20 @@ import {
 	DecodeError,
 	DriverError,
 	UndefinedParameterError,
+	CodecRegistry,
+	createCodecRegistry,
 	parseArray,
 	PostgresError as QuarryPostgresError,
-	rawTypes,
 	type Connection,
 	type Field,
 	type Pool,
 	type QueryResult,
-	type TextParser,
+	type Codec,
+	type TypeCatalog,
 	type DriverSocket,
 	type Notice,
 	type SocketFactory,
 	type Transaction,
-	type TypeParsers,
 } from '../../../../../src/driver/index.js';
 
 // postgres.js's own modules, from the checkout under test
@@ -86,6 +87,42 @@ const fieldsToObject = (fields: Readonly<Record<string, string>>) => {
 	return out;
 };
 
+type TextParser = (text: string) => unknown;
+
+/** Every value as the server's text, for postgres.js's raw queries. */
+const rawCodecs = createCodecRegistry([], null);
+
+/** A registry reading each type with the parser `parsers` has for it as a value is read: they change once postgres.js fetches types. */
+class ParserRegistry extends CodecRegistry {
+	readonly #parsers: Record<number, TextParser>;
+	readonly #codecs = new Map<number, Codec>();
+
+	constructor(parsers: Record<number, TextParser>) {
+		super([]);
+		this.#parsers = parsers;
+	}
+
+	override codecFor(oid: number, _catalog: TypeCatalog): Codec {
+		let codec = this.#codecs.get(oid);
+		if (codec === undefined) {
+			const parsers = this.#parsers;
+			codec = {
+				name: '',
+				oid,
+				paramFormat: 'text',
+				resultFormat: 'text',
+				encode: String,
+				decodeText: (text) => {
+					const parse = parsers[oid];
+					return parse === undefined ? text : parse(text);
+				},
+			};
+			this.#codecs.set(oid, codec);
+		}
+		return codec;
+	}
+}
+
 /** postgres.js's JSON types: quarry can't tell a string meant as JSON from text. */
 const JSON_TYPES = new Set([114, 3802]);
 
@@ -107,11 +144,8 @@ export default function Postgres(a?: any, b?: any): any {
 	const id = connectionIds++;
 	const parsers: Record<number, TextParser> = {};
 
-	/** quarry's parser table from postgres.js's parsers, arrays decoded by quarry's parseArray. */
-	const table: TypeParsers = new Proxy(parsers, {
-		get: (target, key) =>
-			typeof key === 'string' ? target[Number(key)] : undefined,
-	});
+	/** quarry's codecs from postgres.js's parsers, arrays decoded by quarry's parseArray. */
+	const table = new ParserRegistry(parsers);
 
 	function rebuildParsers(
 		arrays: { oid: number; typarray: number; typdelim: string }[],
@@ -155,7 +189,7 @@ export default function Postgres(a?: any, b?: any): any {
 				: undefined,
 			targetSessionAttrs: options.target_session_attrs ?? undefined,
 			params: { ...options.connection },
-			types: table,
+			codecs: table,
 			captureStack: true,
 			env: process.env,
 			...(options.socket ? { socket: customSockets(options) } : {}),
@@ -190,7 +224,7 @@ export default function Postgres(a?: any, b?: any): any {
 				group by b.oid, b.typarray, b.typdelim
 				order by b.oid`,
 				[],
-				{ types: rawTypes },
+				{ codecs: rawCodecs },
 			)
 			.then(({ rows }) => {
 				catalogLoaded = true;
@@ -552,7 +586,7 @@ export default function Postgres(a?: any, b?: any): any {
 			const prepare =
 				options.prepare && ('prepare' in q.options ? q.options.prepare : true);
 			const base = {
-				types: q.isRaw === true ? rawTypes : table,
+				codecs: q.isRaw === true ? rawCodecs : table,
 				rowMode: q.isRaw ? 'array' : 'object',
 				signal,
 			};

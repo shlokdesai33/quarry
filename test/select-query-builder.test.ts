@@ -1,9 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { integer, text } from '../src/column-factories.js';
 import { compile } from '../src/compile.js';
+import { plain } from './helpers/compiled.js';
 import { defineTable } from '../src/define-table.js';
 import { expressionBuilder } from '../src/expression-builder.js';
-import { fragment, selectFrom } from '../src/select-query-builder.js';
+import {
+	fragment,
+	type SelectQueryBuilder,
+	selectFrom,
+} from '../src/select-query-builder.js';
 
 const users = defineTable('users', {
 	columns: {
@@ -26,7 +31,7 @@ const where = (query: {
 	toWhereNode(): Parameters<typeof compile>[0] | undefined;
 }) => {
 	const node = query.toWhereNode();
-	return node === undefined ? undefined : compile(node);
+	return node === undefined ? undefined : plain(compile(node));
 };
 
 // eslint-disable-next-line typescript/no-unsafe-type-assertion -- the undefined a plain JS caller, or an `as` cast, can pass
@@ -216,7 +221,7 @@ describe('pipe', () => {
 			.on('contacts.userId', 'users.id')
 			.pipe(adults)
 			.pipe(contactEmail);
-		expect(compile(query.toNode())).toEqual({
+		expect(plain(compile(query.toNode()))).toEqual({
 			sql: 'select "users"."id" as "id", "contacts"."email" as "email" from "users" inner join "contacts" on "contacts"."user_id" = "users"."id" where "users"."age" >= $1',
 			params: [18],
 		});
@@ -227,7 +232,7 @@ describe('tag', () => {
 	it('is stored on the query and compiled beside its SQL, not into it', () => {
 		const query = selectFrom(users).select(['users.id']).tag('users.ids');
 		expect(query.toNode().tag).toBe('users.ids');
-		expect(compile(query.toNode())).toEqual({
+		expect(plain(compile(query.toNode()))).toEqual({
 			sql: 'select "users"."id" as "id" from "users"',
 			params: [],
 			tag: 'users.ids',
@@ -272,6 +277,171 @@ describe('tag', () => {
 		const query = selectFrom(users);
 		query.tag('ignored');
 		expect(query.toNode().tag).toBeUndefined();
+	});
+});
+
+const sql = (query: { toNode(): Parameters<typeof compile>[0] }) =>
+	compile(query.toNode()).sql;
+
+describe('locking', () => {
+	it('renders each strength', () => {
+		const query = selectFrom(users).select(['users.id']);
+		expect(sql(query.forUpdate())).toBe(
+			'select "users"."id" as "id" from "users" for update',
+		);
+		expect(sql(query.forNoKeyUpdate())).toMatch(/ for no key update$/);
+		expect(sql(query.forShare())).toMatch(/ for share$/);
+		expect(sql(query.forKeyShare())).toMatch(/ for key share$/);
+	});
+
+	it('renders `of` and the wait policy after the where clause', () => {
+		expect(
+			plain(
+				compile(
+					selectFrom(users)
+						.select(['users.id'])
+						.where('users.role', 'admin')
+						.forUpdate()
+						.of(users)
+						.skipLocked()
+						.toNode(),
+				),
+			),
+		).toEqual({
+			sql: 'select "users"."id" as "id" from "users" where "users"."role" = $1 for update of "users" skip locked',
+			params: ['admin'],
+		});
+		expect(sql(selectFrom(users).forShare().noWait())).toBe(
+			'select from "users" for share nowait',
+		);
+	});
+
+	it('renders after the limit', () => {
+		expect(
+			compile(selectFrom(users).forUpdate().skipLocked().limit(1).toNode()),
+		).toEqual({
+			sql: 'select from "users" limit $1 for update skip locked',
+			params: [1],
+		});
+		expect(sql(selectFrom(users).limit(1).forUpdate().skipLocked())).toBe(
+			'select from "users" limit $1 for update skip locked',
+		);
+	});
+
+	it('names tables in `of` as the query references them', () => {
+		const managers = users.as('managers');
+		const query = selectFrom(contacts)
+			.innerJoin(managers)
+			.on('managers.id', 'contacts.userId');
+		expect(sql(query.forUpdate().of(managers, 'contacts'))).toBe(
+			'select from "contacts" inner join "users" as "managers" on "managers"."id" = "contacts"."user_id" for update of "managers", "contacts"',
+		);
+	});
+
+	it('takes several clauses, in order', () => {
+		expect(
+			sql(
+				selectFrom(users)
+					.innerJoin(contacts)
+					.on('contacts.userId', 'users.id')
+					.forUpdate()
+					.of(contacts)
+					.noWait()
+					.forKeyShare()
+					.of(users),
+			),
+		).toMatch(/ for update of "contacts" nowait for key share of "users"$/);
+	});
+
+	it('keeps the clause through later methods, joins, `when` and `pipe`', () => {
+		const query = selectFrom(users)
+			.forUpdate()
+			.where('users.role', 'admin')
+			.innerJoin(contacts)
+			.on('contacts.userId', 'users.id')
+			.of(contacts)
+			.select(['users.id'])
+			.tag('locked')
+			.skipLocked()
+			.when(true, (qb) => qb.where('users.age', 1))
+			.pipe(adults);
+		expect(query.toNode().locks).toEqual([
+			{ strength: 'update', of: ['contacts'], wait: 'skip locked' },
+		]);
+	});
+
+	it('can be added inside `when` and fragments', () => {
+		expect(
+			selectFrom(users)
+				.when(true, (qb) => qb.forShare().skipLocked())
+				.toNode().locks,
+		).toEqual([{ strength: 'share', of: [], wait: 'skip locked' }]);
+		expect(
+			selectFrom(users)
+				.when(false, (qb) => qb.forShare())
+				.toNode().locks,
+		).toEqual([]);
+		const locked = fragment(users, (qb) => qb.forUpdate().of(users));
+		expect(selectFrom(users).pipe(locked).toNode().locks).toEqual([
+			{ strength: 'update', of: ['users'], wait: undefined },
+		]);
+	});
+
+	it('throws for modifiers in the wrong place, as a cast or plain JS call can make them', () => {
+		type Open = SelectQueryBuilder<[typeof users], unknown, 'strength'>;
+		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the methods' `this` types rule these calls out
+		const unlocked = selectFrom(users) as unknown as Open;
+		expect(() => unlocked.skipLocked()).toThrow(
+			'skipLocked() needs a locking clause first: forUpdate(), forNoKeyUpdate(), forShare() or forKeyShare()',
+		);
+		expect(() => unlocked.of(users)).toThrow(
+			'of() needs a locking clause first',
+		);
+		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- as above
+		const waited = selectFrom(users).forUpdate().noWait() as unknown as Open;
+		expect(() => waited.skipLocked()).toThrow(
+			'A locking clause takes one of skipLocked() and noWait()',
+		);
+		expect(() => waited.of(users)).toThrow(
+			'of() comes right after forUpdate(), forNoKeyUpdate(), forShare() or forKeyShare()',
+		);
+	});
+
+	it('refuses aggregates in the select list when compiling', () => {
+		const query = selectFrom(users)
+			.select((eb) => [eb.fn.count().as('n')])
+			.forUpdate();
+		expect(() => compile(query.toNode())).toThrow(
+			'A locking clause (forUpdate() and the like) cannot be used with aggregate functions',
+		);
+		expect(() =>
+			compile(
+				selectFrom(users)
+					.select((eb) => [
+						eb.fn.coalesce(eb.fn.max('users.age'), eb.val(0)).as('n'),
+					])
+					.forShare()
+					.toNode(),
+			),
+		).toThrow('aggregate functions');
+		expect(
+			sql(
+				selectFrom(users)
+					.select((eb) => [eb.fn.lower('users.role').as('role')])
+					.forUpdate(),
+			),
+		).toMatch(/ for update$/);
+	});
+
+	it('leaves the builder it was called on unchanged', () => {
+		const query = selectFrom(users);
+		query.forUpdate();
+		const locked = query.forUpdate();
+		locked.skipLocked();
+		expect(query.toNode().locks).toEqual([]);
+		expect(locked.toNode().locks).toEqual([
+			{ strength: 'update', of: [], wait: undefined },
+		]);
 	});
 });
 

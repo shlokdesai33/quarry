@@ -1,5 +1,18 @@
 import type { CallSite } from '../call-site.js';
+import { passThrough, type Codec } from '../driver/codec.js';
 import { DataType } from './data-type.js';
+
+/** The codec of an enum: text both ways, its OID looked up by name, so parameters declare it. */
+function enumCodec(name: string): Codec<string> {
+	return Object.freeze<Codec<string>>({
+		name,
+		oid: 0,
+		paramFormat: 'text',
+		resultFormat: 'text',
+		encode: (value) => value,
+		decodeText: passThrough,
+	});
+}
 
 /**
  * A postgres enum type, declared once with `defineEnum` and shared by every
@@ -26,7 +39,7 @@ export class EnumType<N extends string = string> extends DataType<'enum'> {
 	readonly site: CallSite | undefined;
 
 	constructor(enumName: N, values: readonly string[], site?: CallSite) {
-		super('enum');
+		super('enum', { codec: enumCodec(enumName) });
 		this.enumName = enumName;
 		this.values = values;
 		this.site = site;

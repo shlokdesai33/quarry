@@ -1,5 +1,6 @@
 import type { DataType } from '../data-type/data-type.js';
-import { BaseColumn } from './base-column.js';
+import type { Codec } from '../driver/codec.js';
+import { BaseColumn, type SwapType } from './base-column.js';
 import { DefaultColumn } from './default-column.js';
 import { GeneratedColumn } from './generated-column.js';
 
@@ -57,5 +58,12 @@ export class Column<D extends DataType, S, I = S, U = I>
 
 	override typed<X extends S, Y extends I, Z extends U>() {
 		return new Column<D, X, Y, Z>(this._quarry);
+	}
+
+	override useCodec<In, Out>(codec: Codec<In, Out>) {
+		return new Column<D, SwapType<S, Out>, SwapType<I, In>, SwapType<U, In>>({
+			...this._quarry,
+			dataType: this._quarry.dataType.withCodec(codec),
+		});
 	}
 }

@@ -1,4 +1,4 @@
-import type { Executor, RunOptions } from './executor.js';
+import type { Executor } from './executor.js';
 import {
 	type ExpressionBuilder,
 	expressionBuilder,
@@ -27,18 +27,13 @@ import {
 import {
 	type ColumnKey,
 	columnOf,
-	type Excluded,
 	excluded,
-	exactlyOne,
-	atMostOne,
-	executeWrite,
-	writeRows,
-	rowCount,
+	type Excluded,
 	rowsNode,
-	type SetValues,
 	setNodes,
+	type SetValues,
 	type UpdateKey,
-	type WriteResult,
+	WriteQueryBuilder,
 } from './write-query.js';
 
 /** What an `insert` into `T` has recorded so far. */
@@ -47,7 +42,6 @@ interface InsertState<T extends AnyTable> {
 	readonly values: InsertNode['values'];
 	readonly onConflict: OnConflictNode | undefined;
 	readonly returning: readonly SelectionNode[];
-	readonly expectRows: number | undefined;
 	readonly tag: string | undefined;
 	/** What the query runs on; `undefined` when it was built on its own. */
 	readonly executor: Executor | undefined;
@@ -89,10 +83,15 @@ export function insertIntoWith<T extends AnyTable>(
 ): InsertQueryBuilder<T, undefined, 'values'> {
 	return new InsertQueryBuilder({
 		table,
-		values: { columns: [], types: [], rows: [], strategy: 'values' },
+		values: {
+			columns: [],
+			types: [],
+			codecs: [],
+			rows: [],
+			strategy: 'values',
+		},
 		onConflict: undefined,
 		returning: [],
-		expectRows: undefined,
 		tag: undefined,
 		executor,
 	});
@@ -103,18 +102,21 @@ export function insertIntoWith<T extends AnyTable>(
  * `returning`). `M` is what it still needs before it can run: `'values'`
  * until `values` is called.
  *
+ * It runs with `execute()` (or in `db.batch`), never when awaited;
+ * the `take…` and `expect…` shapes read its `returning` rows (and
+ * `expectNonEmpty` and `expectRows` its row count).
+ *
  * Immutable: every method returns a new builder.
  */
-export class InsertQueryBuilder<T extends AnyTable, O, M extends 'values'> {
-	/** The type of a `returning` row. Never set. */
-	declare readonly $output: O;
-
-	/** What the query still needs before it can run. Never set. */
-	declare readonly $missing: M;
-
+export class InsertQueryBuilder<
+	T extends AnyTable,
+	O,
+	M extends 'values',
+> extends WriteQueryBuilder<O, M> {
 	readonly #state: InsertState<T>;
 
 	constructor(state: InsertState<T>) {
+		super(state.executor);
 		this.#state = state;
 	}
 
@@ -176,17 +178,6 @@ export class InsertQueryBuilder<T extends AnyTable, O, M extends 'values'> {
 		});
 	}
 
-	/**
-	 * Requires the query to insert exactly `count` rows, e.g. `1` with
-	 * `onConflict(...).doNothing()` to know the row is new.
-	 */
-	expectRows(count: number): InsertQueryBuilder<T, O, M> {
-		return new InsertQueryBuilder({
-			...this.#state,
-			expectRows: rowCount(count),
-		});
-	}
-
 	/** Labels the query; see `SelectQueryBuilder.tag`. */
 	tag(name: string): InsertQueryBuilder<T, O, M> {
 		return new InsertQueryBuilder({ ...this.#state, tag: name });
@@ -205,74 +196,14 @@ export class InsertQueryBuilder<T extends AnyTable, O, M extends 'values'> {
 		return condition ? build(this) : this;
 	}
 
-	/**
-	 * Runs the query, resolving to the number of rows inserted. Throws
-	 * `RowCountError` if `expectRows` was set and a different number was.
-	 */
-	execute(
-		this: InsertQueryBuilder<T, unknown, never>,
-		options?: RunOptions,
-	): Promise<WriteResult> {
-		return executeWrite(this.#state.executor, this.toNode(), options);
-	}
-
-	/** Runs the query and returns every `returning` row. */
-	async all(
-		this: InsertQueryBuilder<T, O & object, never>,
-		options?: RunOptions,
-	): Promise<O[]> {
-		return (await writeRows<O>(this.#state.executor, this.toNode(), options))
-			.rows;
-	}
-
-	/** Runs the query and returns its first `returning` row, if any. */
-	async first(
-		this: InsertQueryBuilder<T, O & object, never>,
-		options?: RunOptions,
-	): Promise<O | undefined> {
-		const { rows } = await writeRows<O>(
-			this.#state.executor,
-			this.toNode(),
-			options,
-		);
-		return rows[0];
-	}
-
-	/**
-	 * Runs the query and returns its one `returning` row: throws
-	 * `NoRowError` when there is none and `TooManyRowsError` when there are
-	 * several (after the statement has run).
-	 */
-	async one(
-		this: InsertQueryBuilder<T, O & object, never>,
-		options?: RunOptions,
-	): Promise<O> {
-		return exactlyOne(
-			await writeRows<O>(this.#state.executor, this.toNode(), options),
-		);
-	}
-
-	/** Runs the query and returns its `returning` row, if any: throws `TooManyRowsError` when there are several. */
-	async maybeOne(
-		this: InsertQueryBuilder<T, O & object, never>,
-		options?: RunOptions,
-	): Promise<O | undefined> {
-		return atMostOne(
-			await writeRows<O>(this.#state.executor, this.toNode(), options),
-		);
-	}
-
-	/** The whole query as one node. */
-	toNode(): InsertNode {
-		const { table, values, onConflict, returning, expectRows, tag } =
-			this.#state;
+	override toNode(): InsertNode {
+		const { table, values, onConflict, returning, tag } = this.#state;
 		return {
 			kind: 'insert',
 			table: tableNode(table),
 			values,
 			onConflict,
 			returning,
-			expectRows,
 			tag,
 		};
 	}

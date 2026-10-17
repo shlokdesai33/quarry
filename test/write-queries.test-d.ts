@@ -9,6 +9,7 @@ import {
 import type { DataType } from '../src/data-type/data-type.js';
 import { databaseWith } from '../src/database.js';
 import { fakeExecutor } from './helpers/executor.js';
+import type { Query } from '../src/query.js';
 import { defineTable } from '../src/define-table.js';
 import {
 	type DeleteQueryBuilder,
@@ -94,26 +95,27 @@ describe('insertInto', () => {
 	it('returns rows only with `returning`, typed like a select list', () => {
 		const query = insertInto(users).values(ada);
 		// @ts-expect-error no `returning`, so no rows
-		void query.one();
+		void query.expectOne();
 
 		const returning = query.returning(['users.id', 'users.role']);
-		expectTypeOf(returning.one()).toEqualTypeOf<
-			Promise<{ id: number; role: 'admin' | 'member' }>
+		expectTypeOf(returning.expectOne()).toEqualTypeOf<
+			Query<{ id: number; role: 'admin' | 'member' }>
 		>();
-		expectTypeOf(returning.all()).toEqualTypeOf<
-			Promise<{ id: number; role: 'admin' | 'member' }[]>
+		expectTypeOf(returning.toQuery()).toEqualTypeOf<
+			Query<{ id: number; role: 'admin' | 'member' }[]>
 		>();
 		expectTypeOf(
-			query.returning((eb) => [eb.fn.lower('users.email').as('lower')]).first(),
-		).toEqualTypeOf<Promise<{ lower: string } | undefined>>();
+			query
+				.returning((eb) => [eb.fn.lower('users.email').as('lower')])
+				.takeFirst(),
+		).toEqualTypeOf<Query<{ lower: string } | undefined>>();
 
 		// @ts-expect-error not a column of the table
 		query.returning(['docs.id']);
 	});
 
-	it('keeps its type through `expectRows`, `tag` and `when`', () => {
+	it('keeps its type through `tag` and `when`', () => {
 		const query = insertInto(users).values(ada);
-		expectTypeOf(query.expectRows(1)).toEqualTypeOf<typeof query>();
 		expectTypeOf(query.tag('users.create')).toEqualTypeOf<typeof query>();
 		expectTypeOf(
 			query.when(true, (qb) => qb.onConflict('email').doNothing()),
@@ -271,22 +273,24 @@ describe('update', () => {
 				.update(docs)
 				.set({ body, version: version + 1 })
 				.where('docs.id', id)
-				.where('docs.version', version)
-				.expectRows(1);
-		expectTypeOf(save(1, 3, 'x').execute()).toEqualTypeOf<
+				.where('docs.version', version);
+		expectTypeOf(save(1, 3, 'x').expectRows(1).execute()).toEqualTypeOf<
 			Promise<WriteResult>
 		>();
 		expectTypeOf(
-			save(1, 3, 'x').returning(['docs.version']).one(),
-		).toEqualTypeOf<Promise<{ version: number }>>();
+			save(1, 3, 'x').returning(['docs.version']).expectRows(1).execute(),
+		).toEqualTypeOf<Promise<{ version: number }[]>>();
+		expectTypeOf(
+			save(1, 3, 'x').returning(['docs.version']).expectOne(),
+		).toEqualTypeOf<Query<{ version: number }>>();
 	});
 
 	it('returns rows only with `returning`', () => {
 		const query = update(users).set({ name: 'Ada' }).where('users.id', 1);
 		// @ts-expect-error no `returning`, so no rows
-		void query.all();
-		expectTypeOf(query.returning(['users.name']).all()).toEqualTypeOf<
-			Promise<{ name: string | null }[]>
+		void query.takeFirst();
+		expectTypeOf(query.returning(['users.name']).toQuery()).toEqualTypeOf<
+			Query<{ name: string | null }[]>
 		>();
 	});
 });
@@ -349,11 +353,11 @@ describe('deleteFrom', () => {
 	it('returns rows only with `returning`', () => {
 		const query = deleteFrom(users).where('users.id', 1);
 		// @ts-expect-error no `returning`, so no rows
-		void query.maybeOne();
-		expectTypeOf(query.returning(['users.email']).maybeOne()).toEqualTypeOf<
-			Promise<{ email: string } | undefined>
-		>();
-		expectTypeOf(query.expectRows(1)).toEqualTypeOf<typeof query>();
+		void query.expectAtMostOne();
+		expectTypeOf(
+			query.returning(['users.email']).expectAtMostOne(),
+		).toEqualTypeOf<Query<{ email: string } | undefined>>();
+		expectTypeOf(query.expectRows(1)).toEqualTypeOf<Query<WriteResult>>();
 	});
 });
 

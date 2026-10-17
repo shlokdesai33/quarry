@@ -1,9 +1,13 @@
-// pg-types bridged into quarry's parser tables. The instance comes from the
+// pg-types bridged into quarry's codec registry. The instance comes from the
 // node-postgres checkout when the compatibility runner sets
 // QUARRY_COMPAT_PG_TYPES, so tests that change parsers globally
 // (`types.setTypeParser`) reach the shim too; otherwise from quarry's own pg.
 import { createRequire } from 'node:module';
-import type { TypeParsers } from '../../../../../src/driver/index.js';
+import {
+	CodecRegistry,
+	type Codec,
+	type TypeCatalog,
+} from '../../../../../src/driver/index.js';
 
 type Parser = (value: string) => unknown;
 
@@ -52,29 +56,46 @@ export class TypeOverrides implements TypeSource {
 	}
 }
 
-const tables = new WeakMap<TypeSource, TypeParsers>();
-
 /**
- * A quarry parser table that asks `source` for every OID, so parsers set
- * after the table was made still apply (as in pg). A parser that throws
- * fails the query, as in pg.
+ * A registry asking `source` for each type's parser as a value is read, so
+ * parsers set after a query was made still apply (as in pg). A parser that
+ * throws fails the query, as in pg. Every column is read as text.
  */
-export function parsersFor(source: TypeSource): TypeParsers {
-	let table = tables.get(source);
-	if (table === undefined) {
-		table = new Proxy(
-			{},
-			{
-				get: (_target, key) => {
-					if (typeof key !== 'string') return undefined;
-					const oid = Number(key);
-					if (!Number.isInteger(oid)) return undefined;
-					return (text: string) => source.getTypeParser(oid, 'text')(text);
-				},
-				has: () => true,
-			},
-		) as TypeParsers;
-		tables.set(source, table);
+class PgTypesRegistry extends CodecRegistry {
+	readonly #source: TypeSource;
+	readonly #codecs = new Map<number, Codec>();
+
+	constructor(source: TypeSource) {
+		super([]);
+		this.#source = source;
 	}
-	return table;
+
+	override codecFor(oid: number, _catalog: TypeCatalog): Codec {
+		let codec = this.#codecs.get(oid);
+		if (codec === undefined) {
+			const source = this.#source;
+			codec = {
+				name: '',
+				oid,
+				paramFormat: 'text',
+				resultFormat: 'text',
+				encode: String,
+				decodeText: (text) => source.getTypeParser(oid, 'text')(text),
+			};
+			this.#codecs.set(oid, codec);
+		}
+		return codec;
+	}
+}
+
+const registries = new WeakMap<TypeSource, CodecRegistry>();
+
+/** The registry reading values with `source`'s parsers. */
+export function codecsFor(source: TypeSource): CodecRegistry {
+	let registry = registries.get(source);
+	if (registry === undefined) {
+		registry = new PgTypesRegistry(source);
+		registries.set(source, registry);
+	}
+	return registry;
 }

@@ -17,7 +17,8 @@ type Execute = (
 /**
  * A complete executor from an `execute` function, for tests without a
  * database: streams the rows in one batch, runs transactions inline
- * (callbacks after `fn` settles), and can't describe.
+ * (callbacks after `fn` settles), and can't describe. It returns the rows
+ * as `rowMode` and `keepRows` ask, from the object rows `execute` gives.
  */
 export function executorFrom(execute: Execute): Executor {
 	const run = async (
@@ -25,8 +26,16 @@ export function executorFrom(execute: Execute): Executor {
 		options?: ExecuteOptions,
 	): Promise<ExecuteResult> => {
 		const { rows, rowCount } = await execute(query, options);
+		const kept = rows.slice(0, options?.keepRows);
 		return {
-			rows,
+			rows:
+				options?.rowMode === 'array'
+					? kept.map((row) =>
+							typeof row === 'object' && row !== null
+								? Object.values(row)
+								: [row],
+						)
+					: kept,
 			rowCount: rowCount ?? rows.length,
 			command: query.sql.split(' ')[0]?.toUpperCase() ?? '',
 		};
@@ -37,6 +46,20 @@ export function executorFrom(execute: Execute): Executor {
 			yield (await run(query, options)).rows;
 		},
 		describe: () => Promise.reject(new Error('describe needs a database')),
+		async batch(queries, options = {}) {
+			const settled = await Promise.allSettled(
+				queries.map(({ query, ...read }) =>
+					run(query, { ...options, ...read }),
+				),
+			);
+			if (options.transaction === undefined) return settled;
+			const values = settled.map((outcome) => {
+				if (outcome.status === 'rejected') throw outcome.reason;
+				return outcome.value;
+			});
+			options.verify?.(values);
+			return settled;
+		},
 		async transaction(fn) {
 			const committed: (() => unknown)[] = [];
 			const rolledBack: (() => unknown)[] = [];

@@ -1,11 +1,13 @@
 import { inspect } from 'node:util';
 import { describe, expect, it } from 'vitest';
+import { BatchError } from '../src/batch.js';
 import { integer, text } from '../src/column-factories.js';
 import { databaseWith } from '../src/database.js';
 import { defineTable } from '../src/define-table.js';
 import { NoRowError, TooManyRowsError } from '../src/executor.js';
+import type { AnyQuery } from '../src/query.js';
 import { selectFrom } from '../src/select-query-builder.js';
-import { fakeExecutor } from './helpers/executor.js';
+import { executorFrom, fakeExecutor } from './helpers/executor.js';
 
 const users = defineTable('users', {
 	columns: {
@@ -37,7 +39,7 @@ describe('the query', () => {
 			.selectFrom(users)
 			.select(['users.id', 'users.firstName'])
 			.where('users.email', 'ada@example.com')
-			.all();
+			.execute();
 		expect(ran).toEqual([
 			{
 				sql: 'select "users"."id" as "id", "users"."first_name" as "firstName" from "users" where "users"."email" = $1',
@@ -51,7 +53,7 @@ describe('the query', () => {
 		await db
 			.selectFrom(users)
 			.select((eb) => [eb.fn.lower('users.email').as('lowerEmail')])
-			.all();
+			.execute();
 		expect(ran[0]?.sql).toBe(
 			'select lower("users"."email") as "lowerEmail" from "users"',
 		);
@@ -66,7 +68,7 @@ describe('the query', () => {
 			.innerJoin(users.as('managers'))
 			.on((eb) => eb.ref('managers.id').eq(eb.ref('users.managerId')))
 			.select(['users.id', 'contacts.phone', 'managers.email'])
-			.all();
+			.execute();
 		expect(ran[0]?.sql).toBe(
 			'select "users"."id" as "id", "contacts"."phone" as "phone", "managers"."email" as "email" from "users" inner join "contacts" on "contacts"."user_id" = "users"."id" inner join "users" as "managers" on "managers"."id" = "users"."manager_id"',
 		);
@@ -74,17 +76,22 @@ describe('the query', () => {
 
 	it('selects no columns until told to', async () => {
 		const { db, ran } = fake([]);
-		await db.selectFrom(users).all();
+		await db.selectFrom(users).execute();
 		expect(ran[0]?.sql).toBe('select from "users"');
 	});
 
 	it('passes the tag to the executor beside the SQL', async () => {
 		const { db, ran } = fake([]);
-		await db.selectFrom(users).select(['users.id']).tag('users.ids').first();
+		await db
+			.selectFrom(users)
+			.select(['users.id'])
+			.tag('users.ids')
+			.takeFirst()
+			.execute();
 		expect(ran).toEqual([
 			{
-				sql: 'select "users"."id" as "id" from "users" limit $1',
-				params: [1],
+				sql: 'select "users"."id" as "id" from "users"',
+				params: [],
 				tag: 'users.ids',
 			},
 		]);
@@ -92,60 +99,172 @@ describe('the query', () => {
 
 	it('passes no tag when none was set', async () => {
 		const { db, ran } = fake([]);
-		await db.selectFrom(users).all();
+		await db.selectFrom(users).execute();
 		expect(ran[0]).not.toHaveProperty('tag');
 	});
 
 	it('runs only when started from a database', async () => {
-		await expect(selectFrom(users).all()).rejects.toThrow(
+		await expect(selectFrom(users).execute()).rejects.toThrow(
 			'The query has no database to run on',
 		);
 	});
-});
 
-describe('all', () => {
-	it('returns every row', async () => {
-		const rows = [{ id: 1 }, { id: 2 }];
-		expect(
-			await fake(rows).db.selectFrom(users).select(['users.id']).all(),
-		).toEqual(rows);
-	});
-});
-
-describe('first', () => {
-	it('fetches with `limit 1` and returns the row', async () => {
-		const { db, ran } = fake([{ id: 1 }]);
-		expect(await db.selectFrom(users).select(['users.id']).first()).toEqual({
-			id: 1,
-		});
+	it('limits the rows only with `limit`', async () => {
+		const { db, ran } = fake([]);
+		await db.selectFrom(users).select(['users.id']).limit(1).execute();
 		expect(ran[0]).toEqual({
 			sql: 'select "users"."id" as "id" from "users" limit $1',
 			params: [1],
 		});
-	});
-
-	it('returns undefined when there is none', async () => {
-		expect(await fake([]).db.selectFrom(users).first()).toBeUndefined();
+		expect(() => db.selectFrom(users).limit(-1)).toThrow(RangeError);
+		expect(() => db.selectFrom(users).limit(1.5)).toThrow(RangeError);
 	});
 });
 
-describe('one', () => {
-	it('fetches with `limit 2` and returns the one row', async () => {
-		const { db, ran } = fake([{ id: 1 }]);
-		expect(await db.selectFrom(users).select(['users.id']).one()).toEqual({
-			id: 1,
-		});
-		expect(ran[0]?.params).toEqual([2]);
+/** What `shape` reads from `rows`: its result, or the name of the error it throws. */
+const read = (rows: unknown[], shape: AnyQuery) =>
+	databaseWith(fakeExecutor(rows).executor)
+		.batch([shape])
+		.then(([value]) => value)
+		.catch((error: unknown) =>
+			error instanceof BatchError ? error.errors[0] : error,
+		)
+		.then((outcome) => (outcome instanceof Error ? outcome.name : outcome));
+
+const notFound = (error: Error) => new Error(`not found: ${error.name}`);
+
+describe('result shapes', () => {
+	const query = selectFrom(users).select(['users.id']);
+	const shapes = {
+		execute: query.toQuery(),
+		takeFirst: query.takeFirst(),
+		takeValue: query.takeValue(),
+		expectNonEmpty: query.expectNonEmpty(),
+		expectFirst: query.expectFirst(),
+		expectOne: query.expectOne(),
+		expectAtMostOne: query.expectAtMostOne(),
+		expectValue: query.expectValue(),
+	};
+
+	it('never change the SQL', () => {
+		for (const shape of Object.values(shapes)) {
+			expect(shape.toSQL()).toEqual(query.toSQL());
+		}
+		expect(query.limit(5).expectOne().toSQL()).toEqual(query.limit(5).toSQL());
 	});
 
+	it('ask the executor to decode only the rows they read', async () => {
+		const asked: Record<string, unknown> = {};
+		await Promise.all(
+			Object.entries(shapes).map(([name, shape]) =>
+				databaseWith(
+					executorFrom(async (_query, options) => {
+						asked[name] = {
+							rowMode: options?.rowMode,
+							keepRows: options?.keepRows,
+						};
+						return { rows: [{ id: 1 }] };
+					}),
+				).batch([shape]),
+			),
+		);
+		const value = { rowMode: 'array', keepRows: 1 };
+		expect(asked).toEqual({
+			execute: {},
+			takeFirst: { keepRows: 1 },
+			takeValue: value,
+			expectNonEmpty: {},
+			expectFirst: { keepRows: 1 },
+			expectOne: { keepRows: 2 },
+			expectAtMostOne: { keepRows: 2 },
+			expectValue: value,
+		});
+	});
+
+	it('read what the shape says from no row, one or several', async () => {
+		const results = Object.fromEntries(
+			await Promise.all(
+				Object.entries(shapes).map(async ([name, shape]) => [
+					name,
+					await Promise.all(
+						[[], [{ id: 1 }], [{ id: 1 }, { id: 2 }, { id: 3 }]].map((rows) =>
+							read(rows, shape),
+						),
+					),
+				]),
+			),
+		);
+		const three = [{ id: 1 }, { id: 2 }, { id: 3 }];
+		expect(results).toEqual({
+			execute: [[], [{ id: 1 }], three],
+			takeFirst: [undefined, { id: 1 }, { id: 1 }],
+			takeValue: [undefined, 1, 1],
+			expectNonEmpty: ['NoRowError', [{ id: 1 }], three],
+			expectFirst: ['NoRowError', { id: 1 }, { id: 1 }],
+			expectOne: ['NoRowError', { id: 1 }, 'TooManyRowsError'],
+			expectAtMostOne: [undefined, { id: 1 }, 'TooManyRowsError'],
+			expectValue: ['NoRowError', 1, 1],
+		});
+	});
+
+	it('read a null value as null, and no row as undefined', async () => {
+		const names = (rows: unknown[]) =>
+			databaseWith(fakeExecutor(rows).executor)
+				.selectFrom(users)
+				.select(['users.firstName']);
+		expect(
+			await names([{ firstName: null }])
+				.takeValue()
+				.execute(),
+		).toBeNull();
+		expect(
+			await names([{ firstName: null }])
+				.expectValue()
+				.execute(),
+		).toBeNull();
+		expect(await names([]).takeValue().execute()).toBeUndefined();
+		expect(
+			await databaseWith(fakeExecutor([{ count: '3' }]).executor)
+				.selectFrom(users)
+				.select((eb) => [eb.fn.count().as('count')])
+				.takeValue()
+				.execute(),
+		).toBe('3');
+	});
+
+	it('throw what `err` makes of the error instead', async () => {
+		const { db } = fake([]);
+		const several = fake([{ id: 1 }, { id: 2 }]).db;
+		await expect(
+			db.selectFrom(users).expectOne(notFound).execute(),
+		).rejects.toThrow('not found: NoRowError');
+		await expect(
+			several.selectFrom(users).expectOne(notFound).execute(),
+		).rejects.toThrow('not found: TooManyRowsError');
+		await expect(
+			several.selectFrom(users).expectAtMostOne(notFound).execute(),
+		).rejects.toThrow('not found: TooManyRowsError');
+		await expect(
+			db.selectFrom(users).expectFirst(notFound).execute(),
+		).rejects.toThrow('not found: NoRowError');
+		await expect(
+			db.selectFrom(users).expectNonEmpty(notFound).execute(),
+		).rejects.toThrow('not found: NoRowError');
+		await expect(
+			db.selectFrom(users).select(['users.id']).expectValue(notFound).execute(),
+		).rejects.toThrow('not found: NoRowError');
+	});
+});
+
+describe('expectOne', () => {
 	it('throws when there is none', async () => {
-		const failure = fake([]).db.selectFrom(users).one();
+		const failure = fake([]).db.selectFrom(users).expectOne().execute();
 		await expect(failure).rejects.toBeInstanceOf(NoRowError);
 		await expect(failure).rejects.toMatchObject({
 			table: 'users',
 			message:
 				'The query on "users" returned no row, where exactly one was expected',
-			query: { sql: 'select from "users" limit $1', params: [2] },
+			query: { sql: 'select from "users"', params: [] },
 		});
 	});
 
@@ -153,7 +272,8 @@ describe('one', () => {
 		const error = await fake([])
 			.db.selectFrom(users)
 			.where('users.email', 'secret-param')
-			.one()
+			.expectOne()
+			.execute()
 			.catch((e: unknown) => e);
 		if (!(error instanceof NoRowError)) throw new Error('expected NoRowError');
 		expect(error.query.params).toContain('secret-param');
@@ -167,36 +287,52 @@ describe('one', () => {
 
 	it('keeps the tag on the query it throws with', async () => {
 		await expect(
-			fake([]).db.selectFrom(users).tag('users.one').one(),
+			fake([]).db.selectFrom(users).tag('users.one').expectOne().execute(),
 		).rejects.toMatchObject({ query: { tag: 'users.one' } });
 	});
 
-	it('throws when there are several', async () => {
-		const failure = fake([{ id: 1 }, { id: 2 }])
+	it('throws when there are several, with how many', async () => {
+		const failure = fake([{ id: 1 }, { id: 2 }, { id: 3 }])
 			.db.selectFrom(users)
-			.one();
+			.expectOne()
+			.execute();
 		await expect(failure).rejects.toBeInstanceOf(TooManyRowsError);
-		await expect(failure).rejects.toMatchObject({ table: 'users' });
+		await expect(failure).rejects.toMatchObject({
+			table: 'users',
+			count: 3,
+			message:
+				'The query on "users" returned 3 rows, where exactly one was expected',
+		});
+	});
+
+	it('counts the rows from the row count, beyond those decoded', async () => {
+		const db = databaseWith(
+			executorFrom(async () => ({
+				rows: [{ id: 1 }, { id: 2 }],
+				rowCount: 40,
+			})),
+		);
+		await expect(
+			db.selectFrom(users).expectAtMostOne().execute(),
+		).rejects.toMatchObject({
+			count: 40,
+			message:
+				'The query on "users" returned 40 rows, where at most one was expected',
+		});
 	});
 });
 
-describe('maybeOne', () => {
-	it('returns the row, or undefined when there is none', async () => {
-		expect(
-			await fake([{ id: 1 }])
-				.db.selectFrom(users)
-				.maybeOne(),
-		).toEqual({
-			id: 1,
-		});
-		expect(await fake([]).db.selectFrom(users).maybeOne()).toBeUndefined();
-	});
-
-	it('throws when there are several', async () => {
+describe('expectFirst and expectNonEmpty', () => {
+	it('say at least one row was expected', async () => {
 		await expect(
-			fake([{ id: 1 }, { id: 2 }])
-				.db.selectFrom(users)
-				.maybeOne(),
-		).rejects.toBeInstanceOf(TooManyRowsError);
+			fake([]).db.selectFrom(users).expectFirst().execute(),
+		).rejects.toThrow(
+			'The query on "users" returned no row, where at least one was expected',
+		);
+		await expect(
+			fake([]).db.selectFrom(users).expectNonEmpty().execute(),
+		).rejects.toThrow(
+			'The query on "users" returned no row, where at least one was expected',
+		);
 	});
 });

@@ -68,21 +68,18 @@ const { paramTypes, fields } = await conn.describe(sql); // without running it
 
 Parameters:
 
-- Strings pass through unchanged; quarry encodes values itself.
-- Numbers, bigints, booleans and `Date`s become their Postgres text. A `Date` is sent as a UTC timestamp, so a `timestamp without time zone` column receives the UTC wall-clock time whatever the process's time zone.
-- Arrays become array literals and other objects JSON.
-- `Uint8Array` is sent in binary.
-- An array whose type is declared in `paramTypes` is sent in binary when its elements fit the type, which is much cheaper for the server to read than a literal. This applies to bool, int2/int4/int8, float8, timestamptz (`Date`s), uuid, text/varchar/char, jsonb (JSON text) and bytea arrays. Anything else is sent as a literal, as before. Quarry declares the types of its `unnest` arrays (multi-row insert, `updateMany`) and of `column = any($1)` for integer and boolean columns.
+- A parameter with a codec (`typed(value, codec)`, or the query's `paramCodecs`, as quarry's builder gives every value compared with or written to a column) is encoded by it once, and its type OID declared at Parse, except for text-like codecs, whose type the server infers. Types looked up by name declare their OID once the pool's catalog has it.
 
   ```ts
-  await conn.query(
-  	'select * from unnest($1::int4[], $2::text[])',
-  	[ids, names],
-  	{
-  		paramTypes: [arrayOids.int4, arrayOids.text],
-  	},
-  );
+  await conn.query('select * from unnest($1::int4[], $2::text[])', [
+  	typed(ids, arrayOf(codecs.int4)),
+  	typed(names, arrayOf(codecs.text)),
+  ]);
   ```
+
+- Without one, a value is encoded by its JavaScript type: strings pass through unchanged; numbers (integers without an exponent), bigints, booleans and `Date`s become their Postgres text. A `Date` is sent as a UTC timestamp, so a `timestamp without time zone` column receives the UTC wall-clock time whatever the process's time zone. Arrays become array literals and other objects JSON. `Uint8Array` is sent in binary.
+- Arrays of bool, int2/int4/int8, float8, timestamptz (`Date`s), uuid, jsonb and bytea are sent in binary by their `arrayOf` codec, or untyped when `paramTypes` declares their type, which is much cheaper for the server to read than a literal. An element that doesn't fit falls back to a literal.
+- The statement cache keys on the declared types.
 
 Queries issued concurrently on one connection are pipelined into shared socket writes. Each still gets its own Sync, so one failing query doesn't fail its neighbours (outside a transaction). Writes respect backpressure: a long queue goes out in 64 KiB chunks, and once the socket's buffer is full, the remaining queries wait unencoded until it drains, so a deep pipeline or large parameters can't pile up in memory.
 
@@ -90,23 +87,24 @@ A query takes at most 65535 parameters, the protocol's limit; more are refused b
 
 Statements are prepared and cached per connection (100 by default; `statementCacheSize`, `prepare: false`). This is safe behind PgBouncer 1.21+ with `max_prepared_statements`. A cached statement that a schema change made stale (its result type or an inferred parameter type changed), or that the server no longer has (`DEALLOCATE`, `DISCARD ALL`), is retried once as an unnamed statement, outside a transaction. Behind PgBouncer, which maps a new Parse of the same text back to the statement it already prepared, SQL that still comes back stale is no longer prepared on that connection.
 
-From a cached statement's second run, columns whose parser has a binary twin are received in binary, which is cheaper to decode and gives identical values. These are:
+Behind PgBouncer in transaction mode, a query pipelined with others on its connection is sent unnamed instead (Parse, Bind, and Describe of the portal), still with its cached columns and binary formats. A query alone on its connection stays named.
 
-- int2/int4/oid, float8, bool, bytea, and timestamptz decoded to `Date`;
-- arrays of those, and of text-like types, json/jsonb and int8 as `bigint`, when the array parser is the driver's own (`defaultTypes`, quarry's, the catalog's, or one built with `arrayParser`);
-- pgvector's `vector`.
+- **Why:** PgBouncer rewrites the name in every named Bind. It flushes what it holds, then writes the new name apart from the rest, so each named query reaches the server in two writes instead of sharing one. Under load the single-threaded pooler is the bottleneck, and this costs it more than parsing again costs the server.
+- **Detection:** PgBouncer 1.26+ reports itself at login (`connection.capabilities.pgbouncer`). For 1.21–1.25, set `preparePipelined: false`; `true` keeps pipelined queries named. With `max_prepared_statements = 0`, no statement is named.
+- **Schema changes:** a pipelined query whose columns changed since they were cached is decoded by what the server sent, and the cache entry is dropped. If a column asked for in binary changed to a type without a binary decoder, that query fails with a `DecodeError` after running.
 
-Custom parsers and raw types always get text. Turn it off with `binaryResults: false`.
+Columns are received in binary where their codec reads them so, which is cheaper to decode and gives identical values: int2/int4/oid, int8 as a `bigint`, float8, bool, bytea, timestamptz as a `Date`, pgvector's `vector`, and arrays of those, of text-like types and of json/jsonb. A format is only asked for once the server has described the statement's columns, from a cached statement's second run; each column is then read with the codec the query expects for it (`resultCodecs`) when its type matches, and with the registry's codec for its type otherwise. Turn it off with `binaryResults: false`.
 
-`parseVector` returns the float32 values stored, on every path: `[0.1]` reads as `[0.10000000149011612]`, the value pgvector holds and the value its binary format carries.
+`codecs.vector` returns the float32 values stored, on every path: `[0.1]` reads as `[0.10000000149011612]`, the value pgvector holds and the value its binary format carries.
 
-### Decoding
+### Codecs and decoding
 
-Results arrive in text format and are decoded per type OID:
+The driver owns the codecs: one object per type with `name`, `oid` (0 to look it up by name), `paramFormat`, `resultFormat`, `encode`, `decodeText` and an optional `decodeBinary`. `codecs` has the built-in ones, `arrayOf(codec)` the codec of a type's arrays, `defineCodec({ name, encode, decodeText })` one of your own. Each result column is read with the codec the query expects for it (checked against the column's type OID at RowDescription), or the registry's codec for its type:
 
-- **`defaultTypes`** (the default, lossless): int2/int4/float become numbers, int8 a `bigint`, bool, json/jsonb parsed, bytea a `Uint8Array`, and arrays of those. numeric, dates and times stay as text.
-- **`rawTypes`**: every value is the server's text.
-- **Your own**: any `Record<oid, (text) => value>`.
+- **`defaultCodecs`** (the default, lossless): int2/int4/float become numbers, int8 a `bigint`, bool, json/jsonb parsed, bytea a `Uint8Array`, and arrays of those and of the text types. numeric, dates and times stay as text.
+- **`codecs: [...]`** on the pool, or per query: registered over the defaults, each for its type (and its arrays), e.g. `[codecs.int8AsString, codecs.timestamptz]`; or a registry built once with `createCodecRegistry(list, base?)` (`null` base: every other value as text).
+
+Enums, domains and extension types have no fixed OIDs. A codec for one (`oid: 0`) is resolved through `pg_type` once per pool: behind the first query that needs it, or up front with `loadTypes()`; `reloadTypes()` looks them up again for types created since.
 
 ### Cancelling and timeouts
 
@@ -143,6 +141,7 @@ await pool.transaction(async (tx) => {
 - A COMMIT that the server turned into a ROLLBACK (because an error was swallowed inside) throws `TransactionRolledBack`.
 - BEGIN (with the settings) is sent with the callback's first statement, under one Sync, so a transaction takes 2 round trips. If BEGIN fails, the server skips that statement, and the transaction rejects with BEGIN's error. The callback has already started by then.
 - A savepoint's `release` isn't waited for; if it fails, the next statement in the transaction, or the COMMIT, reports its error.
+- quarry's `db.batch(queries, { transaction: true })` runs a fixed list of statements in one round trip: BEGIN, the settings and the statements under one Sync, then COMMIT with its own, all in one write. A failed statement skips the rest, so COMMIT reports ROLLBACK; a failed BEGIN runs nothing, and the COMMIT after it does nothing.
 
 ## Pool
 
@@ -164,7 +163,7 @@ await pool.transaction(async (tx) => {
 ## Poolers and proxies
 
 - **Protocol version:** the driver asks for protocol 3.2 and accepts 3.0 from poolers that negotiate down. A pooler that rejects 3.2 outright gets one retry with 3.0; `minProtocolVersion` / `maxProtocolVersion` override this.
-- **PgBouncer in transaction mode** (tested with 1.26): named prepared statements work from 1.21 with `max_prepared_statements` set; with older versions, or other poolers without prepared-statement support, use `prepare: false`.
+- **PgBouncer in transaction mode** (tested with 1.26): named prepared statements work from 1.21 with `max_prepared_statements` set, and pipelined queries are sent unnamed (see [Queries](#queries); `preparePipelined: false` for 1.21–1.25). With older versions, or other poolers without prepared-statement support, use `prepare: false`; PgBouncer 1.26+ without `max_prepared_statements` is detected, and no statement is named.
 - **Session state** (`SET`, `LISTEN`, temporary tables, session advisory locks) doesn't survive between transactions in transaction mode. The driver's own settings never use it: `statementTimeout`, transaction `settings` and `timeout` all go through `set_config(…, true)` inside a transaction. `LISTEN` needs a direct or session-mode connection.
 - **RDS Proxy, Supavisor, Neon and other transaction poolers:** the same rules apply. Avoid session-level `SET`, which can pin a session to a server connection. If a proxy pins or rejects named prepared statements, use `prepare: false`.
 - **Version check:** a pooler that hides `server_version` skips the PostgreSQL 18 check.
@@ -187,7 +186,9 @@ const db = database(process.env.DATABASE_URL, { onQuery: (e) => log(e) });
 const user = await db
 	.selectFrom(users)
 	.where('users.id', id)
-	.one({ signal: request.signal, timeout: '2s' });
+	.select(['users.email'])
+	.expectOne()
+	.execute({ signal: request.signal, timeout: '2s' });
 await db.transaction(async (tx) => {
 	await tx.insertInto(orders).values(order).execute();
 	tx.afterCommit(() => queue.publish('order.created'));

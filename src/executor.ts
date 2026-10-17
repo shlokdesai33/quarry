@@ -1,9 +1,6 @@
 import type { CompiledQuery } from './compile.js';
 
-/**
- * Per-query options of the result methods (`all`, `first`, `one`,
- * `maybeOne`, `execute`, `stream`).
- */
+/** Per-query options of `execute` and `stream`. */
 export interface RunOptions {
 	/** Cancels the query on the server when aborted. */
 	readonly signal?: AbortSignal | undefined;
@@ -14,10 +11,23 @@ export interface RunOptions {
 	readonly timeout?: number | string | undefined;
 }
 
-/** What an executor is asked to do besides the query itself. */
-export interface ExecuteOptions extends RunOptions {
+/** How an executor returns a query's rows. */
+export interface ReadOptions {
 	/** `array` asks for positional rows, for decoding by position. */
 	readonly rowMode?: 'object' | 'array' | undefined;
+	/**
+	 * Returns only the first `keepRows` rows, and may skip decoding the
+	 * rest; `rowCount` still counts every row.
+	 */
+	readonly keepRows?: number | undefined;
+}
+
+/** What an executor is asked to do besides the query itself. */
+export interface ExecuteOptions extends RunOptions, ReadOptions {}
+
+/** A query of a batch, and how its rows are returned. */
+export interface BatchQuery extends ReadOptions {
+	readonly query: CompiledQuery;
 }
 
 export interface StreamOptions extends RunOptions {
@@ -77,6 +87,29 @@ export interface TransactionOptions {
 	readonly durable?: boolean | undefined;
 }
 
+/** The transaction a batch runs in: it runs once, so it isn't retried. */
+export type BatchTransactionOptions = Omit<TransactionOptions, 'retries'>;
+
+/** Options of `db.batch`. */
+export interface BatchOptions extends RunOptions {
+	/**
+	 * Runs the queries in one transaction, all or nothing: `true`, or the
+	 * transaction's options. Inside a transaction, in a savepoint.
+	 */
+	readonly transaction?: boolean | BatchTransactionOptions | undefined;
+}
+
+/** What an executor is asked to do with a batch. */
+export interface ExecuteBatchOptions extends RunOptions {
+	/** Runs the queries in a transaction of their own (a savepoint, inside one). */
+	readonly transaction?: BatchTransactionOptions | undefined;
+	/**
+	 * Checks the results of a batch that runs all or nothing, before it is
+	 * done (before its transaction commits): throwing fails it.
+	 */
+	readonly verify?: ((results: readonly ExecuteResult[]) => void) | undefined;
+}
+
 /**
  * Runs compiled queries. The driver implements it; so can a mock, a SQL
  * snapshot recorder, or another backend (HTTP, PGlite). Not part of the
@@ -95,6 +128,17 @@ export interface Executor {
 	): AsyncIterable<readonly unknown[]>;
 	/** The query's parameter and result types, without running it. */
 	describe(query: CompiledQuery): Promise<QueryDescription>;
+	/**
+	 * Runs `queries` in one round trip, on one connection. Outside a
+	 * transaction, each runs on its own, and this resolves to each one's
+	 * outcome. In a transaction (with `transaction`, or the one the
+	 * executor is in) they run all or nothing: this rejects with the error
+	 * that failed them, after calling `verify` on the results.
+	 */
+	batch(
+		queries: readonly BatchQuery[],
+		options?: ExecuteBatchOptions,
+	): Promise<readonly PromiseSettledResult<ExecuteResult>[]>;
 	/**
 	 * Runs `fn` in a transaction, passing an executor whose queries run
 	 * inside it. Inside a transaction, this nests a savepoint.
@@ -126,16 +170,25 @@ function hideQuery(error: Error, query: CompiledQuery): void {
 	Object.defineProperty(error, 'query', { value: query });
 }
 
-/** The query returned no row where `one` expects exactly one. */
+/**
+ * The query returned no row where an `expect` shape needs one
+ * (`expectOne`, `expectFirst`, `expectValue`, `expectNonEmpty`), or a write
+ * that `expectNonEmpty` checks affected none.
+ */
 export class NoRowError extends Error {
 	/** The query that returned no row. Not enumerable. */
 	declare readonly query: CompiledQuery;
 	/** The table the query reads (its `from`) or writes, by its name in the database. */
 	readonly table: string | undefined;
 
-	constructor(query: CompiledQuery, table?: string) {
+	constructor(
+		query: CompiledQuery,
+		table?: string,
+		expected: 'exactly one' | 'at least one' = 'exactly one',
+		verb: 'returned' | 'affected' = 'returned',
+	) {
 		super(
-			`The query ${onTable(table)}returned no row, where exactly one was expected`,
+			`The query ${onTable(table)}${verb} no row, where ${expected} was expected`,
 		);
 		this.name = 'NoRowError';
 		this.table = table;
@@ -144,21 +197,30 @@ export class NoRowError extends Error {
 }
 
 /**
- * The query returned several rows where `one` or `maybeOne` expects at most
- * one.
+ * The query returned several rows where `expectOne` or `expectAtMostOne`
+ * allows at most one. The shapes add no `limit`, so `count` is every row
+ * the query returned.
  */
 export class TooManyRowsError extends Error {
 	/** The query that returned several rows. Not enumerable. */
 	declare readonly query: CompiledQuery;
 	/** The table the query reads (its `from`) or writes, by its name in the database. */
 	readonly table: string | undefined;
+	/** The number of rows the query returned. */
+	readonly count: number;
 
-	constructor(query: CompiledQuery, table?: string) {
+	constructor(
+		query: CompiledQuery,
+		table: string | undefined,
+		count: number,
+		expected: 'exactly one' | 'at most one' = 'at most one',
+	) {
 		super(
-			`The query ${onTable(table)}returned several rows, where at most one was expected`,
+			`The query ${onTable(table)}returned ${count} rows, where ${expected} was expected`,
 		);
 		this.name = 'TooManyRowsError';
 		this.table = table;
+		this.count = count;
 		hideQuery(this, query);
 	}
 }

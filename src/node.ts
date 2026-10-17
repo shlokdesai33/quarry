@@ -1,3 +1,5 @@
+import type { Codec } from './driver/codec.js';
+
 /**
  * The tree an expression compiles to. Nodes are plain immutable data with a
  * `kind` discriminant; `compile` renders them to SQL. References are already
@@ -31,8 +33,12 @@ export type ReferenceNode = {
 export type ValueNode = {
 	readonly kind: 'value';
 	readonly value: unknown;
-	/** The type OID declared for the parameter; the server infers it when absent. */
-	readonly typeOid?: number;
+	/**
+	 * The driver codec the value is encoded with, chosen by what it is
+	 * compared with or written to; without one, the driver encodes it by
+	 * its JavaScript type and the server infers its type.
+	 */
+	readonly codec?: Codec | undefined;
 };
 
 /**
@@ -120,12 +126,25 @@ export type TableNode = {
 export type SelectionNode = {
 	readonly expression: OperationNode;
 	readonly alias: string;
+	/** The codec the column is read with, when its SQL type is known. */
+	readonly codec: Codec | undefined;
 };
 
 /** `inner join table on condition`. */
 export type JoinNode = {
 	readonly table: TableNode;
 	readonly on: OperationNode;
+};
+
+/**
+ * `for strength [of tables] [skip locked | nowait]`. `of` names tables as the
+ * query references them (an alias, for an aliased table); empty for every
+ * table of the query.
+ */
+export type LockNode = {
+	readonly strength: 'update' | 'no key update' | 'share' | 'key share';
+	readonly of: readonly string[];
+	readonly wait: 'skip locked' | 'nowait' | undefined;
 };
 
 /**
@@ -139,6 +158,8 @@ export type SelectNode = {
 	readonly joins: readonly JoinNode[];
 	readonly where: OperationNode | undefined;
 	readonly limit: number | undefined;
+	/** The locking clauses, in order. */
+	readonly locks: readonly LockNode[];
 	/** A label passed on with the compiled query, never rendered into its SQL. */
 	readonly tag: string | undefined;
 };
@@ -165,6 +186,8 @@ export type RowsNode = {
 	 * assignment to the column rejects a value too long.
 	 */
 	readonly types: readonly string[];
+	/** The columns' codecs, whose arrays `unnest`'s parameters are encoded with. */
+	readonly codecs: readonly Codec[];
 	readonly rows: readonly (readonly (OperationNode | undefined)[])[];
 	readonly strategy: 'values' | 'unnest';
 };
@@ -196,8 +219,6 @@ export type OnConflictNode = {
 type WriteNode = {
 	readonly table: TableNode;
 	readonly returning: readonly SelectionNode[];
-	/** The number of rows the query must affect, as `expectRows` sets it. */
-	readonly expectRows: number | undefined;
 	readonly tag: string | undefined;
 };
 

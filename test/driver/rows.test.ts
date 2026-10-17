@@ -2,8 +2,27 @@ import { describe, expect, it } from 'vitest';
 import { DecodeError, ProtocolError } from '../../src/driver/errors.js';
 import type { Field } from '../../src/driver/protocol/messages.js';
 import { Writer } from '../../src/driver/protocol/writer.js';
-import { rowDecoder } from '../../src/driver/rows.js';
-import { defaultTypes, oids } from '../../src/driver/types.js';
+import { defineCodec } from '../../src/driver/codec.js';
+import {
+	createCodecRegistry,
+	defaultRegistry,
+	TypeCatalog,
+	type CodecRegistry,
+} from '../../src/driver/registry.js';
+import { rowDecoder as decoderOf } from '../../src/driver/rows.js';
+import { oids } from '../../src/driver/types.js';
+
+/** A decoder reading each column with the registry's codec for its type. */
+const rowDecoder = (
+	fields: readonly Field[],
+	registry: CodecRegistry,
+	mode: 'object' | 'array',
+) =>
+	decoderOf(
+		fields,
+		fields.map((f) => registry.codecFor(f.typeOid, new TypeCatalog())),
+		mode,
+	);
 
 const field = (name: string, typeOid: number, format = 0): Field => ({
 	name,
@@ -19,7 +38,8 @@ const field = (name: string, typeOid: number, format = 0): Field => ({
 function payload(values: readonly (string | Uint8Array | null)[]): Uint8Array {
 	const w = new Writer(64).int16(values.length);
 	for (const v of values) w.value(v);
-	return w.take();
+	// a plain copy: `take` may return a Buffer, or a view into a shared one
+	return new Uint8Array(w.take());
 }
 
 const int4 = (n: number) => {
@@ -32,7 +52,7 @@ function decode(
 	fields: readonly Field[],
 	values: readonly (string | Uint8Array | null)[],
 	mode: 'object' | 'array' = 'object',
-	types = defaultTypes,
+	types = defaultRegistry,
 ): unknown {
 	const body = payload(values);
 	// at an offset inside a larger buffer, as rows are read from the socket buffer
@@ -116,7 +136,7 @@ describe('rowDecoder', () => {
 		const body = payload([new Uint8Array([1, 2, 3])]);
 		const value = rowDecoder(
 			[field('b', oids.bytea, 1)],
-			defaultTypes,
+			defaultRegistry,
 			'array',
 		)(body, 0, body.length);
 		body.fill(0);
@@ -128,13 +148,17 @@ describe('rowDecoder', () => {
 			field(`c${i}`, oids.int4),
 		);
 		const values = fields.map((_, i) => String(i));
-		const types = {
-			...defaultTypes,
-			[oids.int4]: (t: string) => {
-				if (t === '13') throw new RangeError('bad value');
-				return Number(t);
-			},
-		};
+		const types = createCodecRegistry([
+			defineCodec({
+				name: 'int4',
+				oid: oids.int4,
+				encode: String,
+				decodeText: (t: string) => {
+					if (t === '13') throw new RangeError('bad value');
+					return Number(t);
+				},
+			}),
+		]);
 		let error: unknown;
 		try {
 			decode(fields, values, 'object', types);
@@ -151,7 +175,7 @@ describe('rowDecoder', () => {
 		const fields = Array.from({ length: 10 }, (_, i) =>
 			field(`c${i}`, oids.int4),
 		);
-		const decoder = rowDecoder(fields, defaultTypes, 'object');
+		const decoder = rowDecoder(fields, defaultRegistry, 'object');
 		const good = payload(fields.map(() => '1'));
 		expect(() => decoder(payload(['1']), 0, payload(['1']).length)).toThrow(
 			/column count/,

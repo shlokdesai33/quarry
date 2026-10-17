@@ -628,22 +628,3 @@ export function classify(
 		? { ...SESSION_STATE, flaky: true, wildcard: true }
 		: undefined;
 }
-
-/** Every expectation, for the report. */
-export function allExpectations(): readonly {
-	suite: string;
-	file: string;
-	name: string;
-	expectation: Expectation;
-}[] {
-	return Object.entries(expectations).flatMap(([suite, files]) =>
-		Object.entries(files).flatMap(([file, tests]) =>
-			Object.entries(tests).map(([name, expectation]) => ({
-				suite,
-				file,
-				name,
-				expectation,
-			})),
-		),
-	);
-}

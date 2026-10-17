@@ -12,7 +12,7 @@ import {
 	toPgField,
 	type Client,
 } from './client.js';
-import { parsersFor } from './types.js';
+import { codecsFor } from './types.js';
 
 type ReadCallback = (
 	error: Error | null,
@@ -64,7 +64,7 @@ export class Cursor extends EventEmitter {
 		const source = this._conf.types ?? client._types;
 		const options: Record<string, unknown> = {
 			rowMode: this._conf.rowMode === 'array' ? 'array' : 'object',
-			types: parsersFor(source),
+			codecs: codecsFor(source),
 			batchSize: this._conf.batchSize ?? BATCH,
 		};
 		const timeout = client._queryTimeout;

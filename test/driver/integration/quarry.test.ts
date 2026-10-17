@@ -1,6 +1,13 @@
 /* oxlint-disable no-await-in-loop -- tests run their steps in order */
 import { inspect } from 'node:util';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import {
+	afterAll,
+	beforeAll,
+	describe,
+	expect,
+	expectTypeOf,
+	it,
+} from 'vitest';
 import {
 	array,
 	bigint,
@@ -14,19 +21,31 @@ import {
 	tstzrange,
 	vector,
 } from '../../../src/column-factories.js';
-import { database, type Database } from '../../../src/database.js';
+import {
+	database,
+	type Database,
+	type DatabaseTransaction,
+} from '../../../src/database.js';
 import { defineEnum } from '../../../src/define-enum.js';
 import { defineTable } from '../../../src/define-table.js';
+import { defineType } from '../../../src/define-type.js';
 import type { QueryEvent } from '../../../src/driver-executor.js';
+import { defineCodec } from '../../../src/driver/codec.js';
+import { codecs } from '../../../src/driver/codecs.js';
 import { createPool, type Pool } from '../../../src/driver/pool.js';
 import {
 	DriverError,
+	LockNotAvailable,
 	NotNullViolation,
 	QueryCanceled,
 	UniqueViolation,
 } from '../../../src/driver/errors.js';
 import { violatedColumns } from '../../../src/errors.js';
-import { NoRowError, RowCountError } from '../../../src/executor.js';
+import {
+	NoRowError,
+	RowCountError,
+	TooManyRowsError,
+} from '../../../src/executor.js';
 import { noPg, options, pg, rejection, table } from './helpers.js';
 
 const mood = defineEnum('quarry_mood', ['happy', 'sad']);
@@ -57,6 +76,23 @@ const posts = defineTable('posts', {
 		id: integer().identity(),
 		userId: integer().name('user_id'),
 		title: text(),
+	},
+});
+
+const jobs = defineTable('jobs', {
+	columns: {
+		id: integer().identity(),
+		status: text<'queued' | 'running'>(),
+	},
+});
+
+const points = defineType({ sql: 'quarry_points', codec: codecs.int4 });
+
+const scores = defineTable('scores', {
+	columns: {
+		id: integer().identity(),
+		points: points(),
+		big: bigint().useCodec(codecs.int8),
 	},
 });
 
@@ -91,6 +127,9 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				"window" tstzrange not null default '(,)', embedding vector(3)
 			);
 			create table posts (id int generated always as identity primary key, user_id int not null, title text not null);
+			create table jobs (id int generated always as identity primary key, status text not null);
+			create domain quarry_points as int4 check (value > 0);
+			create table scores (id int generated always as identity primary key, points quarry_points not null, big bigint not null);
 			create view slow as select pg_sleep(2)::text as done;
 		`);
 		});
@@ -141,7 +180,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					'users.window',
 					'users.embedding',
 				])
-				.one();
+				.expectOne()
+				.execute();
 			expect(ada).toEqual({
 				id: 1,
 				balance: '12345678901234567890.5',
@@ -172,7 +212,7 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					{ firstName: 'Cy', email: 'c@x', embedding: null },
 				])
 				.returning(['users.email', 'users.active', 'users.window'])
-				.all();
+				.execute();
 			expect(many).toEqual([
 				{
 					email: 'b@x',
@@ -201,7 +241,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				.onConflict('email')
 				.merge(['firstName'])
 				.returning(['users.id', 'users.firstName'])
-				.one();
+				.expectOne()
+				.execute();
 			expect(merged).toEqual({ id: 1, firstName: 'Ada Lovelace' });
 			expect(
 				await db
@@ -218,7 +259,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				.set({ visits: '42' })
 				.where('users.email', 'b@x')
 				.returning(['users.visits'])
-				.one();
+				.expectOne()
+				.execute();
 			expect(updated).toEqual({ visits: '42' });
 			expect(
 				await db
@@ -231,7 +273,7 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 						{ by: 'id' },
 					)
 					.returning(['users.firstName'])
-					.all(),
+					.execute(),
 			).toEqual(
 				expect.arrayContaining([{ firstName: 'Bea' }, { firstName: 'Cyd' }]),
 			);
@@ -239,7 +281,7 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				.deleteFrom(posts)
 				.where('posts.title', 'second')
 				.returning(['posts.title'])
-				.all();
+				.execute();
 			expect(removed).toEqual([{ title: 'second' }]);
 			await expect(
 				db
@@ -257,21 +299,109 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				.on('posts.userId', 'users.id')
 				.select(['users.email', 'posts.title'])
 				.where('users.admin', true)
-				.all();
+				.execute();
 			expect(titles).toEqual([{ email: 'a@x', title: 'first' }]);
 			await expect(
 				db
 					.selectFrom(users)
 					.select(['users.id'])
 					.where('users.email', 'nobody')
-					.one(),
+					.expectOne()
+					.execute(),
 			).rejects.toBeInstanceOf(NoRowError);
 			const first = await db
 				.selectFrom(users)
 				.select(['users.email'])
 				.where((eb) => eb.ref('users.roles').contains(['admin']))
-				.first();
+				.takeFirst()
+				.execute();
 			expect(first).toEqual({ email: 'a@x' });
+		});
+
+		it('tests a range against a single date or instant', async () => {
+			const inside = await db
+				.selectFrom(users)
+				.select(['users.email'])
+				.where((eb) =>
+					eb.and([
+						eb.ref('users.active').contains('2024-01-05'),
+						eb.ref('users.window').contains(new Date(Date.UTC(2024, 0, 1, 6))),
+					]),
+				)
+				.execute();
+			expect(inside).toEqual([{ email: 'a@x' }]);
+			const outside = await db
+				.selectFrom(users)
+				.select(['users.email'])
+				.where((eb) => eb.ref('users.active').contains('2025-01-05'))
+				.execute();
+			expect(outside).toEqual([]);
+		});
+
+		it('reads and writes columns through the codec they choose', async () => {
+			const big = 2n ** 62n + 1n;
+			const row = await db
+				.insertInto(scores)
+				.values({ points: 3, big })
+				.returning(['scores.points', 'scores.big'])
+				.expectOne()
+				.execute();
+			expectTypeOf(row).toEqualTypeOf<{ points: number; big: bigint }>();
+			expect(row).toEqual({ points: 3, big });
+			await db
+				.insertInto(scores)
+				.values([
+					{ points: 1, big: 1n },
+					{ points: 2, big: -big },
+				])
+				.execute();
+			const found = await db
+				.selectFrom(scores)
+				.select(['scores.big'])
+				.where((eb) => eb.ref('scores.points').gt(1))
+				.where('scores.big', -big)
+				.execute();
+			expect(found).toEqual([{ big: -big }]);
+			// the domain's check still applies to what the codec sends
+			await expect(
+				db.insertInto(scores).values({ points: 0, big: 0n }).execute(),
+			).rejects.toMatchObject({ code: '23514' });
+			const report = await db.verify([scores]);
+			expect(report.diagnostics.filter((d) => d.severity === 'error')).toEqual(
+				[],
+			);
+		});
+
+		it('asks for binary results only once the statement is described', async () => {
+			let binary = 0;
+			const counted = defineCodec({
+				name: 'int4',
+				oid: 23,
+				encode: (value: number) => String(value),
+				decodeText: Number,
+				decodeBinary: (bytes, start, end) => {
+					binary++;
+					return codecs.int4.decodeBinary?.(bytes, start, end) ?? 0;
+				},
+			});
+			const countedUsers = defineTable('users', {
+				columns: { id: integer().useCodec(counted) },
+			});
+			await using fresh = database({
+				...options(),
+				max: 1,
+				params: { search_path: `${schema},public` },
+			});
+			const read = () =>
+				fresh
+					.selectFrom(countedUsers)
+					.select(['users.id'])
+					.where('users.id', 1)
+					.execute();
+			expect(await read()).toEqual([{ id: 1 }]);
+			expect(binary).toBe(0);
+			expect(await read()).toEqual([{ id: 1 }]);
+			expect(binary).toBe(1);
 		});
 
 		it('streams rows and describes queries', async () => {
@@ -305,13 +435,13 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 				db
 					.selectFrom(slow)
 					.select(['slow.done'])
-					.all({ signal: controller.signal }),
+					.execute({ signal: controller.signal }),
 				QueryCanceled,
 			);
 			setTimeout(() => controller.abort(), 100);
 			expect((await running).reason).toBe('abort');
 			const timedOut = await rejection(
-				db.selectFrom(slow).select(['slow.done']).all({ timeout: '100ms' }),
+				db.selectFrom(slow).select(['slow.done']).execute({ timeout: '100ms' }),
 				QueryCanceled,
 			);
 			expect(timedOut.reason).toBe('statement_timeout');
@@ -319,7 +449,11 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 
 		it('reports tags and timings to onQuery, and enriches errors', async () => {
 			events.length = 0;
-			await db.selectFrom(users).select(['users.id']).tag('users.ids').all();
+			await db
+				.selectFrom(users)
+				.select(['users.id'])
+				.tag('users.ids')
+				.execute();
 			expect(events.find((e) => e.tag === 'users.ids')).toMatchObject({
 				kind: 'execute',
 				command: 'SELECT',
@@ -347,7 +481,7 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					.selectFrom(slow)
 					.select(['slow.done'])
 					.where('slow.done', 'secret-param')
-					.all({ timeout: '50ms' }),
+					.execute({ timeout: '50ms' }),
 				QueryCanceled,
 			);
 			expect(error.query?.params).toEqual(['secret-param']);
@@ -398,9 +532,9 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 						}),
 					).rejects.toBeInstanceOf(RowCountError);
 					await tx.setLocal('app.user', 7);
-					return (await tx.selectFrom(posts).select(['posts.title']).all()).map(
-						(r) => r.title,
-					);
+					return (
+						await tx.selectFrom(posts).select(['posts.title']).execute()
+					).map((r) => r.title);
 				},
 				{
 					isolation: 'repeatable read',
@@ -424,8 +558,190 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					.selectFrom(posts)
 					.select(['posts.id'])
 					.where('posts.title', 'never')
-					.maybeOne(),
+					.expectAtMostOne()
+					.execute(),
 			).toBeUndefined();
+		});
+
+		it('reads each result shape without changing the SQL', async () => {
+			const items = defineTable('items', {
+				columns: { id: integer().identity(), n: integer() },
+			});
+			await pool.simpleQuery(
+				'create table items (id int generated always as identity primary key, n int not null)',
+			);
+			let decoded = 0;
+			const counted = defineCodec({
+				name: 'int4',
+				oid: 23,
+				encode: (value: number) => String(value),
+				decodeText: (digits) => {
+					decoded++;
+					return Number(digits);
+				},
+			});
+			const countedItems = defineTable('items', {
+				columns: { id: integer().identity(), n: integer().useCodec(counted) },
+			});
+			const counting = db;
+			const none = counting.selectFrom(countedItems).select(['items.n']);
+			expect(await none.takeFirst().execute()).toBeUndefined();
+			expect(await none.takeValue().execute()).toBeUndefined();
+			await expect(none.expectFirst().execute()).rejects.toBeInstanceOf(
+				NoRowError,
+			);
+			await expect(none.expectNonEmpty().execute()).rejects.toBeInstanceOf(
+				NoRowError,
+			);
+			expect(await none.expectAtMostOne().execute()).toBeUndefined();
+			const inserted = await counting
+				.insertInto(countedItems)
+				.values([1, 2, 3, 4, 5].map((n) => ({ n })))
+				.returning(['items.n'])
+				.expectNonEmpty()
+				.execute();
+			expect(inserted).toHaveLength(5);
+
+			const ns = counting.selectFrom(countedItems).select(['items.n']);
+			decoded = 0;
+			expect(await ns.takeFirst().execute()).toEqual({
+				n: expect.any(Number),
+			});
+			expect(await ns.takeValue().execute()).toEqual(expect.any(Number));
+			expect(await ns.expectFirst().execute()).toEqual({
+				n: expect.any(Number),
+			});
+			expect(decoded).toBe(3);
+			const several = await ns
+				.expectOne()
+				.execute()
+				.catch((e: unknown) => e);
+			expect(several).toBeInstanceOf(TooManyRowsError);
+			expect(several).toMatchObject({ count: 5, table: 'items' });
+			await expect(ns.expectAtMostOne().execute()).rejects.toMatchObject({
+				count: 5,
+			});
+			expect(decoded).toBe(7);
+			expect(await ns.expectNonEmpty().execute()).toHaveLength(5);
+			expect(await ns.where('items.n', 3).expectOne().execute()).toEqual({
+				n: 3,
+			});
+			expect(await ns.limit(2).execute()).toHaveLength(2);
+			expect(
+				await counting
+					.selectFrom(items)
+					.select((eb) => [eb.fn.count().as('count')])
+					.expectValue()
+					.execute(),
+			).toBe('5');
+
+			const seen: QueryEvent[] = [];
+			const observed = database(pool, { onQuery: (e) => seen.push(e) });
+			await observed
+				.selectFrom(items)
+				.select(['items.n'])
+				.takeFirst()
+				.execute();
+			expect(seen[0]).toMatchObject({
+				sql: 'select "items"."n" as "n" from "items"',
+				rowCount: 5,
+			});
+
+			const [first, value, count] = await counting.batch([
+				ns.takeFirst(),
+				ns.where('items.n', 4).takeValue(),
+				counting.update(items).set({ n: 0 }).where('items.n', 9).expectRows(0),
+			]);
+			expect(first).toEqual({ n: expect.any(Number) });
+			expect(value).toBe(4);
+			expect(count).toEqual({ rowCount: 0 });
+			await expect(
+				counting.batch(
+					[
+						counting
+							.update(items)
+							.set({ n: 0 })
+							.where('items.n', 9)
+							.expectNonEmpty(() => new Error('no item 9')),
+					],
+					{ transaction: true },
+				),
+			).rejects.toThrow('no item 9');
+		});
+
+		it('claims a different job per worker with for update skip locked', async () => {
+			await db
+				.insertInto(jobs)
+				.values([{ status: 'queued' }, { status: 'queued' }])
+				.execute();
+			// `limit(1)`: no shape adds a limit, and every row returned is locked
+			const claim = async (tx: DatabaseTransaction) =>
+				(
+					await tx
+						.selectFrom(jobs)
+						.select(['jobs.id'])
+						.where('jobs.status', 'queued')
+						.forUpdate()
+						.skipLocked()
+						.limit(1)
+						.takeFirst()
+						.execute()
+				)?.id;
+			let claimed!: (id: number | undefined) => void;
+			const firstId = new Promise<number | undefined>((resolve) => {
+				claimed = resolve;
+			});
+			let release!: () => void;
+			const released = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const first = db.transaction(async (tx) => {
+				const id = await claim(tx);
+				claimed(id);
+				await released;
+				if (id !== undefined) {
+					await tx
+						.update(jobs)
+						.set({ status: 'running' })
+						.where('jobs.id', id)
+						.execute();
+				}
+				return id;
+			});
+			const held = await firstId;
+			try {
+				expect(held).toEqual(expect.any(Number));
+				const second = await db.transaction(async (tx) => {
+					const id = await claim(tx);
+					// both jobs are locked now, so a third worker finds none
+					expect(await db.transaction(claim)).toBeUndefined();
+					return id;
+				});
+				expect(second).toEqual(expect.any(Number));
+				expect(second).not.toBe(held);
+				await rejection(
+					db
+						.selectFrom(jobs)
+						.select(['jobs.id'])
+						.where('jobs.id', held!)
+						.forNoKeyUpdate()
+						.noWait()
+						.takeFirst()
+						.execute(),
+					LockNotAvailable,
+				);
+			} finally {
+				release();
+			}
+			expect(await first).toBe(held);
+			expect(
+				await db
+					.selectFrom(jobs)
+					.select(['jobs.status'])
+					.where('jobs.id', held!)
+					.expectOne()
+					.execute(),
+			).toEqual({ status: 'running' });
 		});
 
 		it('refuses to nest a durable transaction', async () => {
@@ -452,26 +768,46 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 							.selectFrom(posts)
 							.select(['posts.id'])
 							.where('posts.title', 'first')
-							.one(),
+							.expectOne()
+							.execute(),
 					{ durable: true },
 				),
 			).toMatchObject({ id: expect.any(Number) });
 		});
 
-		it('leaves opted-in types as text', async () => {
-			const raw = database(pool, {
-				raw: ['timestamptz', 'daterange', 'vector'],
+		it('leaves columns given the raw codec as the server’s text, typed as strings', async () => {
+			const rawUsers = defineTable('users', {
+				columns: {
+					id: integer().identity(),
+					createdAt: timestamptz().name('created_at').useCodec(codecs.raw),
+					active: daterange().useCodec(codecs.raw),
+					embedding: vector().nullable().useCodec(codecs.raw),
+				},
 			});
-			const row = await raw
-				.selectFrom(users)
+			const row = await db
+				.selectFrom(rawUsers)
 				.select(['users.createdAt', 'users.active', 'users.embedding'])
 				.where('users.id', 1)
-				.one();
+				.expectOne()
+				.execute();
+			expectTypeOf(row).toEqualTypeOf<{
+				createdAt: string;
+				active: string;
+				embedding: string | null;
+			}>();
 			expect(row).toEqual({
 				createdAt: '2024-01-02 03:04:05.678+00',
 				active: '[2024-01-01,2024-02-01)',
 				embedding: '[1,2.5,3]',
 			});
+			// and written as they are: the server reads the text as the column's type
+			const found = await db
+				.selectFrom(rawUsers)
+				.select(['users.id'])
+				.where('users.createdAt', '2024-01-02 03:04:05.678+00')
+				.takeFirst()
+				.execute();
+			expect(found).toEqual({ id: 1 });
 		});
 
 		it('verifies the schema through the driver', async () => {
@@ -492,7 +828,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					.selectFrom(posts)
 					.select(['posts.title'])
 					.where('posts.title', 'first')
-					.one(),
+					.expectOne()
+					.execute(),
 			).toEqual({ title: 'first' });
 			const c = pg;
 			if (c === null) return;
@@ -503,7 +840,8 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 					.selectFrom(users)
 					.select(['users.email'])
 					.where('users.id', 1)
-					.one(),
+					.expectOne()
+					.execute(),
 			).toEqual({ email: 'a@x' });
 			await fromUrl.close();
 		});

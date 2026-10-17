@@ -1,7 +1,8 @@
 import type { ArrayType } from './data-type/array.js';
 import { DataType } from './data-type/data-type.js';
-import { JsonbType } from './data-type/jsonb.js';
-import { Expression, type Param, type TypedExpression } from './expression.js';
+import { arrayOf, type Codec } from './driver/codec.js';
+import { codecs } from './driver/codecs.js';
+import { Expression, Param, type TypedExpression } from './expression.js';
 import { typedExpression } from './expression-methods.js';
 import type { Scope } from './functions.js';
 import type { OperationNode } from './node.js';
@@ -20,28 +21,33 @@ type Primitive = string | number | boolean | null | undefined;
 
 /**
  * The keys a jsonb value of type `T` has: an object's own, an array's
- * indices, or any key when `T` says nothing (an untyped `jsonb()`).
+ * indices, or any key when `T` says nothing (an untyped `jsonb()`, which
+ * holds any `JsonValue`).
  */
-type KeyOf<T> = T extends Primitive
-	? never
-	: T extends readonly unknown[]
-		? number
-		: [keyof T] extends [never]
-			? Key
-			: keyof T & string;
+type KeyOf<T> = [NonNullable<JsonValue>] extends [T]
+	? Key
+	: T extends Primitive
+		? never
+		: T extends readonly unknown[]
+			? number
+			: [keyof T] extends [never]
+				? Key
+				: keyof T & string;
 
 /** The value at key `K` of a jsonb value of type `T`. */
-type Member<T, K> = T extends Primitive
-	? never
-	: T extends readonly (infer E)[]
-		? K extends number
-			? E
-			: never
-		: [keyof T] extends [never]
-			? JsonValue
-			: K extends keyof T
-				? T[K]
-				: never;
+type Member<T, K> = [NonNullable<JsonValue>] extends [T]
+	? JsonValue
+	: T extends Primitive
+		? never
+		: T extends readonly (infer E)[]
+			? K extends number
+				? E
+				: never
+			: [keyof T] extends [never]
+				? JsonValue
+				: K extends keyof T
+					? T[K]
+					: never;
 
 /** The keys `P` may hold, each checked against the value the ones before reach. */
 type PathIn<T, P> = P extends readonly [infer K, ...infer Rest]
@@ -85,7 +91,7 @@ export interface JsonFunctions<in out R extends Refs> {
 	get<A extends Operand<R, Jsonb>, const P extends readonly [Key, ...Key[]]>(
 		json: A,
 		...path: P & PathIn<JsonOf<R, A>, P>
-	): Expr<Exclude<At<JsonOf<R, A>, P>, undefined> | null, JsonbType>;
+	): Expr<Exclude<At<JsonOf<R, A>, P>, undefined> | null, Jsonb>;
 
 	/**
 	 * `json -> ... ->> key`: the value at the path as text, null where it is
@@ -178,14 +184,26 @@ function key(value: Key): OperationNode {
 	return { kind: 'literal', value };
 }
 
-/** A key or path operand: values and parameters are sent as is, as text. */
-function operand(value: unknown): OperationNode {
-	return Expression.is(value) ? value._quarry.node : { kind: 'value', value };
+/** A key or path operand: values and parameters encoded by `codec` (a parameter's own, if it has one). */
+function operand(value: unknown, codec: Codec): OperationNode {
+	if (value instanceof Param)
+		return {
+			kind: 'value',
+			value: value._quarry.value,
+			codec: value._quarry.codec ?? codec,
+		};
+	return Expression.is(value)
+		? value._quarry.node
+		: { kind: 'value', value, codec };
 }
+
+const keyCodec = codecs.text;
+const keysCodec = arrayOf(codecs.text);
+const pathCodec = codecs.jsonpath;
 
 export function jsonFunctions<R extends Refs>({
 	node,
-}: Scope<R>): JsonFunctions<R> {
+}: Pick<Scope<R>, 'node'>): JsonFunctions<R> {
 	const walk =
 		(last: '->' | '->>', type: DataType) =>
 		(json: Operand<R, Jsonb>, ...path: readonly Key[]) =>
@@ -203,9 +221,15 @@ export function jsonFunctions<R extends Refs>({
 			);
 
 	const test =
-		(operator: string) => (json: Operand<R, Jsonb>, right: unknown) =>
+		(operator: string, codec: Codec) =>
+		(json: Operand<R, Jsonb>, right: unknown) =>
 			typedExpression(
-				{ kind: 'binary', left: node(json), operator, right: operand(right) },
+				{
+					kind: 'binary',
+					left: node(json),
+					operator,
+					right: operand(right, codec),
+				},
 				new DataType('boolean'),
 			);
 
@@ -213,13 +237,13 @@ export function jsonFunctions<R extends Refs>({
 		typedExpression({ kind: 'function', name, args: [node(json)] }, type);
 
 	return {
-		get: walk('->', new JsonbType()),
+		get: walk('->', new DataType('jsonb')),
 		text: walk('->>', new DataType('text')),
-		hasKey: test('?'),
-		hasAnyKey: test('?|'),
-		hasAllKeys: test('?&'),
-		pathExists: test('@?'),
-		pathMatches: test('@@'),
+		hasKey: test('?', keyCodec),
+		hasAnyKey: test('?|', keysCodec),
+		hasAllKeys: test('?&', keysCodec),
+		pathExists: test('@?', pathCodec),
+		pathMatches: test('@@', pathCodec),
 		typeOf: call('jsonb_typeof', new DataType('text')),
 		length: call('jsonb_array_length', new DataType('integer')),
 	};

@@ -1,5 +1,6 @@
 import { createServer, type Server, type Socket } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
+import { statementNames } from '../../src/driver/capabilities.js';
 import { connect } from '../../src/driver/connect.js';
 import {
 	ConnectionError,
@@ -228,7 +229,7 @@ describe('tolerating the unknown and refusing the unsafe', () => {
 		expect(conn.parameters.get('some_future_setting')).toBe('x');
 		expect(conn.capabilities).toMatchObject({
 			serverVersion: '18.1',
-			longCancelKeys: true,
+			protocol: '3.2',
 		});
 		const pending = conn.query('select 1');
 		await new Promise((r) => setTimeout(r, 20));
@@ -424,5 +425,120 @@ describe('transactions', () => {
 		expect(second).toBe(error);
 		// one Sync for both, and neither the second insert, COMMIT nor ROLLBACK sent
 		expect(segments).toEqual([['begin', 'insert into t values (1)']]);
+	});
+});
+
+/** What PgBouncer 1.26+ reports at login. */
+const pgbouncer = (poolMode: string, maxPreparedStatements: number) => ({
+	'pgbouncer.version': '1.26.0',
+	'pgbouncer.pool_mode': poolMode,
+	'pgbouncer.max_prepared_statements': String(maxPreparedStatements),
+});
+
+describe('statement names behind a pooler', () => {
+	/** A server that reports `parameters` and answers every statement as an insert, recording the statement each Parse and Bind names. */
+	async function pooler(parameters: Record<string, string>) {
+		const parsed: string[] = [];
+		const bound: string[] = [];
+		const port = await fakeServer((socket, _version, send) => {
+			send(
+				{ type: 'AuthenticationOk' },
+				...Object.entries(parameters).map(([name, value]) => ({
+					type: 'ParameterStatus' as const,
+					name,
+					value,
+				})),
+				{ type: 'ReadyForQuery', status: 'I' },
+			);
+			socket.on('data', (data: Buffer) => {
+				const cstring = (start: number) =>
+					data.toString('latin1', start, data.indexOf(0, start));
+				for (
+					let i = 0;
+					i + 5 <= data.length;
+					i += 1 + data.readInt32BE(i + 1)
+				) {
+					switch (String.fromCharCode(data[i] ?? 0)) {
+						case 'P':
+							parsed.push(cstring(i + 5));
+							send({ type: 'ParseComplete' });
+							break;
+						case 'B':
+							bound.push(cstring(data.indexOf(0, i + 5) + 1));
+							send({ type: 'BindComplete' });
+							break;
+						case 'D':
+							if (data[i + 5] === 0x53)
+								send({ type: 'ParameterDescription', typeOids: [23] });
+							send({ type: 'NoData' });
+							break;
+						case 'E':
+							send({ type: 'CommandComplete', tag: 'INSERT 0 1' });
+							break;
+						case 'S':
+							send({ type: 'ReadyForQuery', status: 'I' });
+							break;
+						default:
+					}
+				}
+			});
+		});
+		return { port, parsed, bound };
+	}
+
+	/** One query alone, three pipelined, then one alone again. */
+	async function run(port: number, preparePipelined?: boolean) {
+		await using conn = await connect({
+			...options(port),
+			...(preparePipelined === undefined ? {} : { preparePipelined }),
+		});
+		const insert = () => conn.query('insert into t values ($1)', [1]);
+		await insert();
+		await Promise.all([insert(), insert(), insert()]);
+		await insert();
+		return conn.capabilities;
+	}
+
+	it('sends pipelined queries unnamed through PgBouncer in transaction mode', async () => {
+		const { port, parsed, bound } = await pooler(pgbouncer('transaction', 200));
+		const capabilities = await run(port);
+		expect(capabilities.pgbouncer).toEqual({
+			version: '1.26.0',
+			poolMode: 'transaction',
+			maxPreparedStatements: 200,
+		});
+		expect(statementNames(capabilities.pgbouncer)).toBe('rewritten');
+		expect(parsed).toEqual(['q1', '', '', '']);
+		expect(bound).toEqual(['q1', '', '', '', 'q1']);
+	});
+
+	it('names no statement when PgBouncer in transaction mode keeps none', async () => {
+		const { port, parsed, bound } = await pooler(pgbouncer('transaction', 0));
+		expect(statementNames((await run(port)).pgbouncer)).toBe('unsupported');
+		expect(parsed).toEqual(['', '', '', '', '']);
+		expect(bound).toEqual(['', '', '', '', '']);
+	});
+
+	it('names every statement directly, in session mode, or when asked to', async () => {
+		for (const [parameters, preparePipelined] of [
+			[{}, undefined],
+			[pgbouncer('session', 0), undefined],
+			[pgbouncer('transaction', 200), true],
+		] as const) {
+			// oxlint-disable-next-line no-await-in-loop
+			const { port, parsed, bound } = await pooler(parameters);
+			// oxlint-disable-next-line no-await-in-loop
+			await run(port, preparePipelined);
+			expect(parsed).toEqual(['q1']);
+			expect(bound).toEqual(['q1', 'q1', 'q1', 'q1', 'q1']);
+		}
+	});
+
+	it('sends pipelined queries unnamed when asked to (PgBouncer before 1.26)', async () => {
+		const { port, parsed, bound } = await pooler({});
+		const capabilities = await run(port, false);
+		expect(capabilities.pgbouncer).toBeUndefined();
+		expect(parsed).toEqual(['q1', '', '', '']);
+		expect(bound).toEqual(['q1', '', '', '', 'q1']);
 	});
 });

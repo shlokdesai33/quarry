@@ -131,12 +131,15 @@ export function meteredSockets(): {
 /**
  * A socket factory that counts round trips: writes that follow data from
  * the server. Writes with no answer in between are pipelined into one.
+ * It counts the socket writes too.
  */
 export function roundTripSockets(): {
 	factory: SocketFactory;
 	roundTrips(): number;
+	writes(): number;
 } {
 	let count = 0;
+	let writes = 0;
 	const factory: SocketFactory = {
 		async connect(o) {
 			const socket = await nodeSockets.connect(o);
@@ -147,6 +150,7 @@ export function roundTripSockets(): {
 				},
 				write: (data) => {
 					if (answered) count++;
+					writes++;
 					answered = false;
 					return socket.write(data);
 				},
@@ -168,7 +172,7 @@ export function roundTripSockets(): {
 			return wrapped;
 		},
 	};
-	return { factory, roundTrips: () => count };
+	return { factory, roundTrips: () => count, writes: () => writes };
 }
 
 /** Calls `visit` with the type of each complete message in `data` from `offset`; returns where the incomplete tail starts. */

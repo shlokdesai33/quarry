@@ -1,9 +1,9 @@
-import { binaryParser, type BinaryParser } from './binary.js';
+import type { BinaryParser } from './binary.js';
+import { decodesAsText, type Codec } from './codec.js';
 import { DecodeError, ProtocolError } from './errors.js';
 import type { QueryResult } from './ops.js';
 import type { Field } from './protocol/messages.js';
 import { utf8 } from './protocol/text.js';
-import type { TextParser, TypeParsers } from './types.js';
 
 /** `object` rows are keyed by column name (the last wins on duplicates); `array` rows are positional. */
 export type RowMode = 'object' | 'array';
@@ -51,8 +51,8 @@ const COLUMNS_PER_FUNCTION = 8;
 
 type MakeDecoder = (
 	count: number,
-	binary: readonly (BinaryParser | undefined)[],
-	parsers: readonly (TextParser | undefined)[],
+	codecs: readonly (Codec | undefined)[],
+	copy: BinaryParser,
 	text: typeof utf8,
 	mismatch: () => Error,
 	short: () => Error,
@@ -84,8 +84,7 @@ const invalid = () => new ProtocolError('Invalid value length in DataRow');
  */
 function factorySource(
 	names: readonly string[],
-	binary: readonly (BinaryParser | undefined)[],
-	parsers: readonly (TextParser | undefined)[],
+	how: readonly Decode[],
 	mode: RowMode,
 ): string {
 	const out: string[] = [];
@@ -98,12 +97,19 @@ function factorySource(
 		const body: string[] = [];
 		for (let i = from; i < to; i++) {
 			let value = 'utf8(b, pos, pos + length)';
-			if (binary[i] !== undefined) {
-				out.push(`const d${i} = d[${i}];`);
-				value = `d${i}(b, pos, pos + length)`;
-			} else if (parsers[i] !== undefined) {
-				out.push(`const p${i} = p[${i}];`);
-				value = `p${i}(${value})`;
+			switch (how[i]) {
+				case 'binary':
+					out.push(`const c${i} = c[${i}];`);
+					value = `c${i}.decodeBinary(b, pos, pos + length)`;
+					break;
+				case 'copy':
+					value = 'copy(b, pos, pos + length)';
+					break;
+				case 'parse':
+					out.push(`const c${i} = c[${i}];`);
+					value = `c${i}.decodeText(${value})`;
+					break;
+				default:
 			}
 			const key = mode === 'object' ? JSON.stringify(names[i]) : String(i);
 			body.push(
@@ -154,8 +160,8 @@ function factory(source: string): MakeDecoder | undefined {
 		// oxlint-disable-next-line typescript/no-implied-eval, typescript/no-unsafe-type-assertion
 		make = new Function(
 			'count',
-			'd',
-			'p',
+			'c',
+			'copy',
 			'utf8',
 			'mismatch',
 			'short',
@@ -184,17 +190,17 @@ function factory(source: string): MakeDecoder | undefined {
  */
 function compiledDecoder(
 	fields: readonly Field[],
-	binary: readonly (BinaryParser | undefined)[],
-	parsers: readonly (TextParser | undefined)[],
+	codecs: readonly (Codec | undefined)[],
+	how: readonly Decode[],
 	mode: RowMode,
 ): RowDecoder | undefined {
 	const names = fields.map((field) => field.name);
 	if (mode === 'object' && names.includes('__proto__')) return undefined;
-	const make = factory(factorySource(names, binary, parsers, mode));
+	const make = factory(factorySource(names, how, mode));
 	return make?.(
 		fields.length,
-		binary,
-		parsers,
+		codecs,
+		copy,
 		utf8,
 		mismatch,
 		short,
@@ -206,23 +212,30 @@ function compiledDecoder(
 	);
 }
 
-/** Builds a decoder for rows of `fields`, parsing text values by type OID. */
+/** How one column's values are read: its codec's binary or text decoder, the bytes, or the text as it is. */
+type Decode = 'binary' | 'copy' | 'parse' | 'text';
+
+function decodeOf(field: Field, codec: Codec | undefined): Decode {
+	if (field.format === 1)
+		return codec?.decodeBinary === undefined ? 'copy' : 'binary';
+	return codec === undefined || decodesAsText(codec) ? 'text' : 'parse';
+}
+
+/**
+ * Builds a decoder for rows of `fields`, each column through its codec:
+ * its binary decoder for a column sent in binary (the bytes, copied, where
+ * it has none), its text decoder otherwise. A column without a codec is
+ * the server's text.
+ */
 export function rowDecoder(
 	fields: readonly Field[],
-	types: TypeParsers,
+	codecs: readonly (Codec | undefined)[],
 	mode: RowMode,
 ): RowDecoder {
 	const count = fields.length;
-	const binary: (BinaryParser | undefined)[] = fields.map((field) =>
-		field.format === 1
-			? (binaryParser(field.typeOid, types[field.typeOid]) ?? copy)
-			: undefined,
-	);
-	const parsers: (TextParser | undefined)[] = fields.map((field) =>
-		field.format === 1 ? undefined : types[field.typeOid],
-	);
+	const how = fields.map((field, i) => decodeOf(field, codecs[i]));
 
-	const compiled = compiledDecoder(fields, binary, parsers, mode);
+	const compiled = compiledDecoder(fields, codecs, how, mode);
 	if (compiled !== undefined) return compiled;
 
 	// without generated code: `new Function` is forbidden, or a column is named `__proto__`
@@ -252,14 +265,22 @@ export function rowDecoder(
 			const valueEnd = pos + length;
 			if (length < 0 || valueEnd > end)
 				throw new ProtocolError('Invalid value length in DataRow');
-			const decode = binary[i];
+			const codec = codecs[i];
 			try {
-				if (decode !== undefined) {
-					row.push(decode(bytes, pos, valueEnd));
-				} else {
-					const parse = parsers[i];
-					const text = utf8(bytes, pos, valueEnd);
-					row.push(parse === undefined ? text : parse(text));
+				switch (how[i]) {
+					case 'binary':
+						// oxlint-disable-next-line typescript/no-non-null-assertion -- `decodeOf` checked it
+						row.push(codec!.decodeBinary!(bytes, pos, valueEnd));
+						break;
+					case 'copy':
+						row.push(copy(bytes, pos, valueEnd));
+						break;
+					case 'parse':
+						// oxlint-disable-next-line typescript/no-non-null-assertion -- `decodeOf` checked it
+						row.push(codec!.decodeText(utf8(bytes, pos, valueEnd)));
+						break;
+					default:
+						row.push(utf8(bytes, pos, valueEnd));
 				}
 			} catch (error) {
 				const field = fields[i];
@@ -287,4 +308,12 @@ export function asRows<R>(rows: unknown[]): R[] {
 export function asResult<R>(result: QueryResult<unknown>): QueryResult<R> {
 	// oxlint-disable-next-line typescript/no-unsafe-type-assertion
 	return result as QueryResult<R>;
+}
+
+/** `asResult` for a pending result, without a callback per query to cast it. */
+export function asResultPromise<R>(
+	result: Promise<QueryResult<unknown>>,
+): Promise<QueryResult<R>> {
+	// oxlint-disable-next-line typescript/no-unsafe-type-assertion
+	return result as Promise<QueryResult<R>>;
 }

@@ -23,6 +23,7 @@ export {
 	varchar,
 	vector,
 } from './column-factories.js';
+export { BatchError, type BatchResults } from './batch.js';
 export { compile, type CompiledQuery } from './compile.js';
 export {
 	database,
@@ -30,7 +31,19 @@ export {
 	type DatabaseSource,
 	type DatabaseTransaction,
 } from './database.js';
-export type { RawTypes } from './decode.js';
+export {
+	arrayOf,
+	codecs,
+	defineCodec,
+	typed,
+	type Codec,
+	type CodecFormat,
+	type CodecInput,
+	type CodecOutput,
+	type CodecSpec,
+	type JsonValue,
+} from './driver/index.js';
+export { defineType, type TypeDefinition } from './define-type.js';
 export {
 	AbortError,
 	CheckViolation,
@@ -67,6 +80,8 @@ export {
 	NoRowError,
 	RowCountError,
 	TooManyRowsError,
+	type BatchOptions,
+	type BatchTransactionOptions,
 	type QueryDescription,
 	type RunOptions,
 	type StreamOptions,
@@ -82,11 +97,13 @@ export {
 	type InsertQueryBuilder,
 	type OnConflictBuilder,
 } from './insert-query-builder.js';
+export type { AnyQuery, Query } from './query.js';
 export type { Range } from './range.js';
 export {
 	fragment,
 	selectFrom,
 	type Fragment,
+	type LockState,
 	type SelectQueryBuilder,
 } from './select-query-builder.js';
 export type { AnyTable, Table } from './table.js';

@@ -12,12 +12,12 @@ export interface TransactionConnection {
 	cursor<R>(
 		sql: string,
 		params?: readonly unknown[],
-		options?: TxQueryOptions & { batchSize?: number },
+		options?: TxCursorOptions,
 	): AsyncIterable<R[]>;
 	stream<R>(
 		sql: string,
 		params?: readonly unknown[],
-		options?: TxQueryOptions & { batchSize?: number },
+		options?: TxCursorOptions,
 	): AsyncIterable<R>;
 	describe(
 		sql: string,
@@ -35,11 +35,52 @@ export interface TransactionConnection {
 			params?: readonly unknown[] | undefined;
 			options?: TxQueryOptions | undefined;
 		}[],
+		options?: GroupOptions,
 	): Promise<QueryResult<unknown>>[];
+}
+
+/** Options of a group of statements under one Sync. */
+export interface GroupOptions {
+	/** Cancels the whole group. */
+	readonly signal?: AbortSignal | undefined;
+}
+
+/** What `Transaction.batch` needs from the connection. */
+export type BatchConnection = Pick<
+	TransactionConnection,
+	'transactionStatus' | 'query' | 'queryGroup'
+>;
+
+/** Options of `Transaction.batch`: a transaction's, but it runs once. */
+export interface TransactionBatchOptions
+	extends
+		Omit<TransactionOptions, 'retries' | 'retryDelay' | 'durable'>,
+		GroupOptions {
+	/**
+	 * Checks the results before COMMIT is sent; throwing rolls the
+	 * transaction back. COMMIT then waits for the results: a second round
+	 * trip.
+	 */
+	readonly verify?:
+		| ((results: readonly QueryResult<unknown>[]) => void)
+		| undefined;
+}
+
+/** A batch running in its own transaction. */
+export interface TransactionBatch {
+	/** Each statement's result; once one fails, the rest reject with its error. */
+	readonly results: readonly Promise<QueryResult<unknown>>[];
+	/** The results once committed; rejects with why the transaction rolled back. */
+	readonly done: Promise<QueryResult<unknown>[]>;
 }
 
 /** Query options accepted inside a transaction (the connection's own options). */
 export type TxQueryOptions = Readonly<Record<string, unknown>>;
+/** A cursor's options inside a transaction: no `keepRows`, as on a connection. */
+type TxCursorOptions = TxQueryOptions & {
+	readonly batchSize?: number;
+	readonly keepRows?: never;
+};
 
 export type IsolationLevel =
 	| 'read uncommitted'
@@ -82,7 +123,7 @@ export interface TransactionOptions {
 const SETTING_NAME = /^[A-Za-z_][\w$]*(\.[A-Za-z_][\w$]*)*$/;
 
 /** The `select set_config(…)` statement and parameters for some settings. */
-export function settingsQuery(
+function settingsQuery(
 	settings: Readonly<Record<string, SettingValue>>,
 ): { sql: string; params: string[] } | undefined {
 	const entries = Object.entries(settings);
@@ -146,8 +187,49 @@ interface Waiter {
 	readonly fail: (error: unknown) => void;
 }
 
-/** Connections running `Transaction.run`, which may not have sent BEGIN yet. */
-const running = new WeakSet<TransactionConnection>();
+/** Connections running `Transaction.run` or `batch`, which may not have sent BEGIN yet. */
+const running = new WeakSet<BatchConnection>();
+
+/**
+ * BEGIN and the settings that open a transaction on `conn`, unprepared:
+ * they run once per transaction, and can't go stale. Throws when the
+ * options are invalid or `conn` is already in a transaction.
+ */
+function openingStatements(
+	conn: BatchConnection,
+	options: TransactionOptions,
+): GroupStatement[] {
+	if (
+		options.isolation !== undefined &&
+		!ISOLATION_LEVELS.has(options.isolation)
+	) {
+		throw new DriverError(
+			`Invalid isolation level ${JSON.stringify(options.isolation)}`,
+		);
+	}
+	if (conn.transactionStatus !== 'idle' || running.has(conn)) {
+		throw new DriverError(
+			options.durable
+				? 'A durable transaction cannot run inside another transaction'
+				: 'The connection is already in a transaction; use tx.transaction() to nest',
+		);
+	}
+	const timeout =
+		options.timeout === undefined
+			? undefined
+			: typeof options.timeout === 'number'
+				? `${options.timeout}ms`
+				: options.timeout;
+	const settings = settingsQuery({
+		...options.settings,
+		...(timeout === undefined ? {} : { transaction_timeout: timeout }),
+	});
+	const opening: GroupStatement[] = [
+		{ sql: beginStatement(options), options: { prepare: false } },
+	];
+	if (settings) opening.push({ ...settings, options: { prepare: false } });
+	return opening;
+}
 
 /**
  * The connection as one transaction and its savepoints use it, saving
@@ -200,9 +282,26 @@ export class Session {
 				OWN_SYNC.every((key) => options[key] === undefined))
 		) {
 			// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- rows are typed by the caller, as in `asResult`
-			return this.#begin({ sql, params, options }) as Promise<QueryResult<R>>;
+			return this.#begin([{ sql, params, options }])[0] as Promise<
+				QueryResult<R>
+			>;
 		}
 		return this.#send(() => this.#conn.query<R>(sql, params, options));
+	}
+
+	/** Runs statements under one Sync, which BEGIN shares if not yet sent: once one fails, the rest reject with its error. */
+	queryGroup(
+		statements: readonly GroupStatement[],
+		options?: GroupOptions,
+	): Promise<QueryResult<unknown>>[] {
+		if (this.#opening !== undefined) return this.#begin(statements, options);
+		const group = this.#send(() => {
+			const results = this.#conn.queryGroup(statements, options);
+			// read below once the group was sent; it may never be, if a deferred statement failed
+			for (const result of results) result.catch(noop);
+			return Promise.resolve(results);
+		});
+		return statements.map((_, i) => group.then((results) => results[i]!));
 	}
 
 	/** Sends `sql` without waiting for its answer: the next statement reports its error. */
@@ -215,7 +314,7 @@ export class Session {
 	cursor<R>(
 		sql: string,
 		params?: readonly unknown[],
-		options?: TxQueryOptions & { batchSize?: number },
+		options?: TxCursorOptions,
 	): AsyncIterable<R[]> {
 		return this.#iterate(() => this.#conn.cursor<R>(sql, params, options));
 	}
@@ -223,7 +322,7 @@ export class Session {
 	stream<R>(
 		sql: string,
 		params?: readonly unknown[],
-		options?: TxQueryOptions & { batchSize?: number },
+		options?: TxCursorOptions,
 	): AsyncIterable<R> {
 		return this.#iterate(() => this.#conn.stream<R>(sql, params, options));
 	}
@@ -253,13 +352,14 @@ export class Session {
 		return this.#failure;
 	}
 
-	/** Sends BEGIN and the settings, with `first` under the same Sync; `first`'s result. */
-	#begin(first?: GroupStatement): Promise<QueryResult<unknown>> | undefined {
+	/** Sends BEGIN and the settings, with `statements` under the same Sync; their results. */
+	#begin(
+		statements: readonly GroupStatement[] = [],
+		options?: GroupOptions,
+	): Promise<QueryResult<unknown>>[] {
 		const opening = this.#opening ?? [];
 		this.#opening = undefined;
-		const results = this.#conn.queryGroup(
-			first === undefined ? opening : [...opening, first],
-		);
+		const results = this.#conn.queryGroup([...opening, ...statements], options);
 		// a failed statement skips the rest, so the last opening one reports for all
 		for (let i = 0; i < opening.length - 1; i++) results[i]?.catch(noop);
 		this.#beginning = true;
@@ -267,7 +367,7 @@ export class Session {
 			() => this.#began(undefined),
 			(error: unknown) => this.#began({ error }),
 		);
-		return results[opening.length];
+		return results.slice(opening.length);
 	}
 
 	/** Sends what waited for BEGIN, in order, or fails it with BEGIN's error. */
@@ -364,10 +464,26 @@ export class Transaction {
 		return this.#conn.query<R>(sql, params, options);
 	}
 
+	/**
+	 * @internal Runs statements under one Sync, in one round trip (with
+	 * BEGIN, if it wasn't sent yet): once one fails, the server skips the
+	 * rest, and they reject with its error.
+	 */
+	queryGroup(
+		statements: readonly GroupStatement[],
+		options?: GroupOptions,
+	): Promise<QueryResult<unknown>>[] {
+		if (this.#finished) {
+			const error = finishedError();
+			return statements.map(() => Promise.reject(error));
+		}
+		return this.#conn.queryGroup(statements, options);
+	}
+
 	cursor<R = Record<string, unknown>>(
 		sql: string,
 		params?: readonly unknown[],
-		options?: TxQueryOptions & { batchSize?: number },
+		options?: TxCursorOptions,
 	): AsyncIterable<R[]> {
 		this.#check();
 		return this.#conn.cursor<R>(sql, params, options);
@@ -376,7 +492,7 @@ export class Transaction {
 	stream<R = Record<string, unknown>>(
 		sql: string,
 		params?: readonly unknown[],
-		options?: TxQueryOptions & { batchSize?: number },
+		options?: TxCursorOptions,
 	): AsyncIterable<R> {
 		this.#check();
 		return this.#conn.stream<R>(sql, params, options);
@@ -481,36 +597,7 @@ export class Transaction {
 		fn: (tx: Transaction) => Promise<T>,
 		options: TransactionOptions = {},
 	): Promise<T> {
-		if (
-			options.isolation !== undefined &&
-			!ISOLATION_LEVELS.has(options.isolation)
-		) {
-			throw new DriverError(
-				`Invalid isolation level ${JSON.stringify(options.isolation)}`,
-			);
-		}
-		if (conn.transactionStatus !== 'idle' || running.has(conn)) {
-			throw new DriverError(
-				options.durable
-					? 'A durable transaction cannot run inside another transaction'
-					: 'The connection is already in a transaction; use tx.transaction() to nest',
-			);
-		}
-		const timeout =
-			options.timeout === undefined
-				? undefined
-				: typeof options.timeout === 'number'
-					? `${options.timeout}ms`
-					: options.timeout;
-		const settings = settingsQuery({
-			...options.settings,
-			...(timeout === undefined ? {} : { transaction_timeout: timeout }),
-		});
-		// unprepared: they run once per transaction, and can't go stale
-		const opening: GroupStatement[] = [
-			{ sql: beginStatement(options), options: { prepare: false } },
-		];
-		if (settings) opening.push({ ...settings, options: { prepare: false } });
+		const opening = openingStatements(conn, options);
 		const retries = options.retries ?? 0;
 		running.add(conn);
 		try {
@@ -554,6 +641,62 @@ export class Transaction {
 		}
 	}
 	/* oxlint-enable no-await-in-loop */
+
+	/**
+	 * @internal Runs `statements` as one transaction, in one round trip:
+	 * BEGIN and the settings share the statements' Sync, and COMMIT follows
+	 * with its own without waiting. A failed statement makes the server skip
+	 * the rest, so COMMIT reports ROLLBACK; if BEGIN itself failed, nothing
+	 * ran, and COMMIT, outside a transaction, does nothing.
+	 *
+	 * Without `verify`, COMMIT is sent before any result is read: a result
+	 * the client can't decode fails the batch, but its transaction has
+	 * committed. Throws when the options are invalid or `conn` is already in
+	 * a transaction.
+	 */
+	static batch(
+		conn: BatchConnection,
+		statements: readonly GroupStatement[],
+		options: TransactionBatchOptions = {},
+	): TransactionBatch {
+		const opening = openingStatements(conn, options);
+		const { verify, signal } = options;
+		running.add(conn);
+		const all = conn.queryGroup([...opening, ...statements], { signal });
+		// a failed statement skips the rest, so the statements report for BEGIN too
+		for (const result of all) result.catch(noop);
+		const results = all.slice(opening.length);
+		// nothing is sent once aborted, so nothing needs committing
+		const pipelined =
+			verify === undefined && !signal?.aborted
+				? conn.query('commit')
+				: undefined;
+		pipelined?.catch(noop);
+		const done = (async () => {
+			try {
+				let failure: { error: unknown } | undefined;
+				let rows: QueryResult<unknown>[] = [];
+				try {
+					rows = (await Promise.all(all)).slice(opening.length);
+					verify?.(rows);
+				} catch (error) {
+					failure = { error };
+				}
+				if (failure !== undefined) {
+					await pipelined?.catch(noop);
+					throw failure.error;
+				}
+				const commit = await (pipelined ?? conn.query('commit'));
+				if (commit.command === 'ROLLBACK') throw new TransactionRolledBack();
+				return rows;
+			} finally {
+				if (conn.transactionStatus !== 'idle')
+					await conn.query('rollback').catch(noop);
+				running.delete(conn);
+			}
+		})();
+		return { results, done };
+	}
 }
 
 /** Runs callbacks, reporting (not throwing) their errors: the transaction outcome is already decided. */

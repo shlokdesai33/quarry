@@ -1,11 +1,11 @@
-import { compile } from './compile.js';
+import { compile, type CompiledQuery } from './compile.js';
 import type { DataType } from './data-type/data-type.js';
-import {
-	type Executor,
+import type {
+	Executor,
 	NoRowError,
-	type QueryDescription,
-	type RunOptions,
-	type StreamOptions,
+	QueryDescription,
+	RunOptions,
+	StreamOptions,
 	TooManyRowsError,
 } from './executor.js';
 import { Expression, type TypedExpression } from './expression.js';
@@ -15,12 +15,14 @@ import {
 } from './expression-builder.js';
 import type {
 	JoinNode,
+	LockNode,
 	OperationNode,
 	SelectNode,
 	SelectionNode,
 	TableNode,
 } from './node.js';
 import type { AnyPredicate, EqualsValue } from './operators.js';
+import { type Query, rejectAwait } from './query.js';
 import type { Ref, Refs, RefsOf } from './refs.js';
 import {
 	type AddRow,
@@ -28,6 +30,22 @@ import {
 	type Selection,
 	selectionNodes,
 } from './row.js';
+import {
+	allRows,
+	type ColumnValue,
+	type ErrorFor,
+	errorArg,
+	expectAtMostOne,
+	expectFirst,
+	expectNonEmpty,
+	expectOne,
+	expectValue,
+	type Shape,
+	shapedQuery,
+	takeFirst,
+	takeValue,
+	type ValueArgs,
+} from './shape.js';
 import { type AnyTable, tableNode } from './table.js';
 import type { Prettify } from './types.js';
 import {
@@ -105,6 +123,27 @@ interface JoinCondition<
 type WhenRow<O, P> = [keyof P] extends [never] ? O : Prettify<O & Partial<P>>;
 
 /**
+ * What the latest locking clause of a query still takes, so that its
+ * modifiers can only follow it:
+ *
+ * - `'none'`: the query has no locking clause
+ * - `'strength'`: one was just added; it takes `of` and a wait policy
+ * - `'of'`: it has its tables; it takes a wait policy
+ * - `'done'`: it takes nothing more: it has a wait policy, or `when` or
+ *   `pipe` may have added it
+ */
+export type LockState = 'none' | 'strength' | 'of' | 'done';
+
+/**
+ * The lock state `L` after applying a piece whose own query ended in `B`:
+ * unchanged when the piece added no locking clause.
+ */
+type LockAfter<L extends LockState, B> = B extends 'none' ? L : 'done';
+
+/** A table `of` takes: one in scope, or the name it's referenced by there. */
+type LockTarget<T extends readonly AnyTable[]> = T[number] | T[number]['name'];
+
+/**
  * What a fragment builds on: a query over the tables `T` it needs, with
  * nothing selected yet.
  */
@@ -119,12 +158,13 @@ export type Fragment<T extends readonly AnyTable[]> = SelectQueryBuilder<
  */
 interface AnyQuery {
 	readonly $output: unknown;
+	readonly $lock: LockState;
 	toNode(): SelectNode;
 }
 
 /** The tables the fragment's query `Q` joined onto its tables `P`. */
 type JoinedBy<Q, P extends readonly AnyTable[]> =
-	Q extends SelectQueryBuilder<infer T, unknown>
+	Q extends SelectQueryBuilder<infer T, unknown, LockState>
 		? T extends readonly [...P, ...infer J extends AnyTable[]]
 			? J
 			: never
@@ -154,6 +194,7 @@ interface SelectState<T extends readonly AnyTable[]> {
 	readonly where: WhereBuilder<RefsOf<T>>;
 	readonly selections: readonly SelectionNode[];
 	readonly limit: number | undefined;
+	readonly locks: readonly LockNode[];
 	/** The label set by `tag()`. */
 	readonly tag: string | undefined;
 	/** What the query runs on; `undefined` when it was built on its own. */
@@ -162,7 +203,8 @@ interface SelectState<T extends readonly AnyTable[]> {
 
 /**
  * Starts a `select` from `table`, built without a database: it can be
- * inspected and composed, but runs only when started from `database(...)`.
+ * inspected and composed, and run by a database's `batch`, but `execute()`
+ * runs only a query started from `database(...)`.
  *
  * @example
  * selectFrom(users)
@@ -220,6 +262,7 @@ export function selectFromWith<T extends AnyTable>(
 		where: new WhereBuilder(expressionBuilder(...tables)),
 		selections: [],
 		limit: undefined,
+		locks: [],
 		tag: undefined,
 		executor,
 	});
@@ -230,11 +273,26 @@ export function selectFromWith<T extends AnyTable>(
  * whose result rows are `O`. Every reference is resolved against `T`, so a
  * column can only be used once its table has been joined.
  *
- * Immutable: every method returns a new builder.
+ * Nothing runs until `execute()` (or `stream`, or `db.batch`): the
+ * `take…` and `expect…` shapes only set how the result is read, and never
+ * change the SQL.
+ *
+ * Immutable: every method returns a new builder. `L` is what its latest
+ * locking clause still takes, if it has one.
+ *
+ * @example
+ * const user = await db.selectFrom(users).where('users.id', id).select(['users.email']).expectOne().execute();
  */
-export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
+export class SelectQueryBuilder<
+	T extends readonly AnyTable[],
+	O,
+	L extends LockState = 'none',
+> {
 	/** The type of a result row. Never set. */
 	declare readonly $output: O;
+
+	/** What the latest locking clause still takes. Never set. */
+	declare readonly $lock: L;
 
 	readonly #state: SelectState<T>;
 
@@ -250,18 +308,18 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 	 * @example .where((eb) => eb.ref('users.age').gte(18))
 	 * @example .where((eb) => eb.or([eb.ref('users.age').lt(13), eb.ref('users.age').gt(65)]))
 	 */
-	readonly where: Condition<RefsOf<T>, SelectQueryBuilder<T, O>> = (
+	readonly where: Condition<RefsOf<T>, SelectQueryBuilder<T, O, L>> = (
 		...args: ConditionArgs<RefsOf<T>>
 	) =>
-		new SelectQueryBuilder<T, O>({
+		new SelectQueryBuilder<T, O, L>({
 			...this.#state,
 			where: this.#state.where.add(args),
 		});
 
 	/** Joins `table`, whose columns are in scope from `on` onwards. */
-	innerJoin<J extends AnyTable>(table: J): JoinBuilder<T, J, O> {
+	innerJoin<J extends AnyTable>(table: J): JoinBuilder<T, J, O, L> {
 		const tables: [...T, J] = [...this.#state.tables, table];
-		return new JoinBuilder<T, J, O>(
+		return new JoinBuilder<T, J, O, L>(
 			{
 				...this.#state,
 				tables,
@@ -280,14 +338,16 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 	 */
 	select<const S extends readonly Selection<RefsOf<T>>[]>(
 		selections: S | ((eb: ExpressionBuilder<RefsOf<T>>) => S),
-	): SelectQueryBuilder<T, AddRow<O, RowOf<RefsOf<T>, S[number]>>> {
+	): SelectQueryBuilder<T, AddRow<O, RowOf<RefsOf<T>, S[number]>>, L> {
 		const eb = expressionBuilder(...this.#state.tables);
 		const list = typeof selections === 'function' ? selections(eb) : selections;
 		const added = selectionNodes(eb, list);
-		return new SelectQueryBuilder({
-			...this.#state,
-			selections: [...this.#state.selections, ...added],
-		});
+		return new SelectQueryBuilder<T, AddRow<O, RowOf<RefsOf<T>, S[number]>>, L>(
+			{
+				...this.#state,
+				selections: [...this.#state.selections, ...added],
+			},
+		);
 	}
 
 	/**
@@ -299,13 +359,15 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 	 * @example .when(onlyActive, (qb) => qb.where('users.status', 'active'))
 	 * @example .when(withEmail, (qb) => qb.select(['users.email']))
 	 */
-	when<P>(
+	when<P, B extends LockState>(
 		condition: boolean,
-		build: (qb: Fragment<T>) => SelectQueryBuilder<T, P>,
-	): SelectQueryBuilder<T, WhenRow<O, P>> {
+		build: (qb: Fragment<T>) => SelectQueryBuilder<T, P, B>,
+	): SelectQueryBuilder<T, WhenRow<O, P>, LockAfter<L, B>> {
 		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the row type doesn't affect what `build` can do; `WhenRow` adds the earlier columns back
 		const query = condition ? build(this as unknown as Fragment<T>) : this;
-		return new SelectQueryBuilder<T, WhenRow<O, P>>(query.#state);
+		return new SelectQueryBuilder<T, WhenRow<O, P>, LockAfter<L, B>>(
+			query.#state,
+		);
 	}
 
 	/**
@@ -320,7 +382,11 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 	pipe<P extends readonly AnyTable[], Q extends AnyQuery>(
 		piece: (qb: Fragment<P>) => Q,
 		..._inScope: InScope<T, P>
-	): SelectQueryBuilder<[...T, ...JoinedBy<Q, P>], AddRow<O, Q['$output']>> {
+	): SelectQueryBuilder<
+		[...T, ...JoinedBy<Q, P>],
+		AddRow<O, Q['$output']>,
+		LockAfter<L, Q['$lock']>
+	> {
 		type Tables = [...T, ...JoinedBy<Q, P>];
 		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- `InScope` checks every reference the fragment can make is in scope here
 		const query = piece(this as unknown as Fragment<P>);
@@ -328,7 +394,109 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 		const built = query as unknown as this;
 		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- that state has these tables, then the fragment's joins
 		const state = built.#state as unknown as SelectState<Tables>;
-		return new SelectQueryBuilder<Tables, AddRow<O, Q['$output']>>(state);
+		return new SelectQueryBuilder<
+			Tables,
+			AddRow<O, Q['$output']>,
+			LockAfter<L, Q['$lock']>
+		>(state);
+	}
+
+	/**
+	 * Adds `for update`: locks the rows the query returns against updates,
+	 * deletes and other locks until the transaction ends, so run it in
+	 * `db.transaction`; on its own, the statement's transaction releases the
+	 * locks as it returns. The other strengths are `forNoKeyUpdate`,
+	 * `forShare` and `forKeyShare`.
+	 *
+	 * Right after it, `of(...)` limits the lock to some of the query's tables,
+	 * and `skipLocked()` or `noWait()` says what to do with rows already
+	 * locked (by default, wait for them). A query can have several locking
+	 * clauses, usually each `of` different tables; postgres takes the
+	 * strongest lock where they overlap. A query with a locking clause can't
+	 * select aggregates: compiling it throws.
+	 *
+	 * The result shapes add no `limit`, so every row the query returns is
+	 * locked: `.limit(1)` locks one.
+	 *
+	 * @example .forUpdate()
+	 * @example .forUpdate().of(jobs).skipLocked()
+	 * @example .forUpdate().of(jobs).forShare().of(users)
+	 */
+	forUpdate(): SelectQueryBuilder<T, O, 'strength'> {
+		return this.#lock('update');
+	}
+
+	/**
+	 * Adds `for no key update`: like `forUpdate`, but doesn't block inserts
+	 * that reference the rows by foreign key (`forKeyShare`). The lock an
+	 * `update` that leaves the key alone takes.
+	 */
+	forNoKeyUpdate(): SelectQueryBuilder<T, O, 'strength'> {
+		return this.#lock('no key update');
+	}
+
+	/**
+	 * Adds `for share`: other transactions can share-lock the rows too, but
+	 * not update, delete or `forUpdate` them.
+	 */
+	forShare(): SelectQueryBuilder<T, O, 'strength'> {
+		return this.#lock('share');
+	}
+
+	/**
+	 * Adds `for key share`: like `forShare`, but blocks only `forUpdate`,
+	 * deletes and updates that change the key, not other updates. The lock a
+	 * foreign key check takes.
+	 */
+	forKeyShare(): SelectQueryBuilder<T, O, 'strength'> {
+		return this.#lock('key share');
+	}
+
+	/**
+	 * Limits the latest locking clause to `tables`, each in this query: a
+	 * table, or the name it's referenced by (its alias, for an aliased table).
+	 * Rows of the other tables are read without a lock.
+	 *
+	 * @example .forUpdate().of(jobs)
+	 * @example .forUpdate().of('jobs', 'workers')
+	 */
+	of(
+		this: SelectQueryBuilder<T, O, 'strength'>,
+		...tables: readonly [LockTarget<T>, ...LockTarget<T>[]]
+	): SelectQueryBuilder<T, O, 'of'> {
+		const of = tables.map((table) =>
+			typeof table === 'string' ? table : table.name,
+		);
+		return this.#modifyLock<'of'>('of()', (lock) => {
+			if (lock.of.length > 0 || lock.wait !== undefined) {
+				throw new Error(
+					'of() comes right after forUpdate(), forNoKeyUpdate(), forShare() or forKeyShare()',
+				);
+			}
+			return { ...lock, of };
+		});
+	}
+
+	/**
+	 * Skips the rows another transaction has locked, rather than waiting for
+	 * them: for workers claiming jobs from a queue, each a different one.
+	 *
+	 * @example await tx.selectFrom(jobs).select(['jobs.id']).where('jobs.status', 'queued').forUpdate().skipLocked().limit(1).takeFirst().execute()
+	 */
+	skipLocked(
+		this: SelectQueryBuilder<T, O, 'strength' | 'of'>,
+	): SelectQueryBuilder<T, O, 'done'> {
+		return this.#wait('skip locked');
+	}
+
+	/**
+	 * Fails with `LockNotAvailable` if a row is locked by another
+	 * transaction, rather than waiting for it.
+	 */
+	noWait(
+		this: SelectQueryBuilder<T, O, 'strength' | 'of'>,
+	): SelectQueryBuilder<T, O, 'done'> {
+		return this.#wait('nowait');
 	}
 
 	/**
@@ -338,50 +506,121 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 	 *
 	 * @example .tag('users.findByEmail')
 	 */
-	tag(name: string): SelectQueryBuilder<T, O> {
-		return new SelectQueryBuilder<T, O>({ ...this.#state, tag: name });
+	tag(name: string): SelectQueryBuilder<T, O, L> {
+		return new SelectQueryBuilder<T, O, L>({ ...this.#state, tag: name });
+	}
+
+	/**
+	 * Adds `limit count`: the query returns at most `count` rows. No result
+	 * shape adds one. A later call replaces it.
+	 *
+	 * @example .forUpdate().skipLocked().limit(1)
+	 */
+	limit(count: number): SelectQueryBuilder<T, O, L> {
+		if (!Number.isInteger(count) || count < 0) {
+			throw new RangeError(`limit takes a whole number of rows, not ${count}`);
+		}
+		return new SelectQueryBuilder<T, O, L>({ ...this.#state, limit: count });
+	}
+
+	/**
+	 * The first row, if any; runs with `execute()`. Never throws for the
+	 * number of rows, and adds no `limit`: the query returns every row it
+	 * finds and only the first is decoded. Add `.limit(1)` to fetch (or
+	 * lock) only one.
+	 *
+	 * @example await db.selectFrom(users).where('users.email', email).select(['users.id']).takeFirst().execute()
+	 */
+	takeFirst(): Query<O | undefined> {
+		return this.#query(takeFirst<O>());
+	}
+
+	/**
+	 * The value of the one selected column in the first row, if any; runs
+	 * with `execute()`. Never throws for the number of rows, and adds no
+	 * `limit`. The row must have one column, since its type doesn't record
+	 * which comes first.
+	 *
+	 * @example await db.selectFrom(users).select((eb) => [eb.fn.count().as('count')]).takeValue().execute()
+	 */
+	takeValue(
+		..._oneColumn: ValueArgs<O, []>
+	): Query<ColumnValue<O> | undefined> {
+		return this.#query(takeValue<ColumnValue<O>>());
+	}
+
+	/**
+	 * Every row, as a non-empty array; runs with `execute()`, which throws
+	 * `NoRowError` (or what `err` makes of it) when there is none.
+	 *
+	 * @example .expectNonEmpty(() => new HttpError(404, 'No posts'))
+	 */
+	expectNonEmpty(err?: ErrorFor<NoRowError>): Query<[O, ...O[]]> {
+		return this.#query(expectNonEmpty<O>(err));
+	}
+
+	/**
+	 * The first row; runs with `execute()`, which throws `NoRowError` (or
+	 * what `err` makes of it) when there is none. Other rows are ignored;
+	 * the shape adds no `limit`.
+	 */
+	expectFirst(err?: ErrorFor<NoRowError>): Query<O> {
+		return this.#query(expectFirst<O>(err));
+	}
+
+	/**
+	 * The one row; runs with `execute()`, which throws `NoRowError` when
+	 * there is none and `TooManyRowsError` when there are several, with
+	 * their `count`; `err` makes the error to throw instead. The shape adds
+	 * no `limit`, and decodes at most two rows.
+	 *
+	 * @example .expectOne()
+	 * @example .expectOne((error) => (error instanceof NoRowError ? new HttpError(404) : error))
+	 */
+	expectOne(err?: ErrorFor<NoRowError | TooManyRowsError>): Query<O> {
+		return this.#query(expectOne<O>(err));
+	}
+
+	/**
+	 * The row, if any; runs with `execute()`, which throws
+	 * `TooManyRowsError` (or what `err` makes of it) when there are
+	 * several. The shape adds no `limit`.
+	 */
+	expectAtMostOne(err?: ErrorFor<TooManyRowsError>): Query<O | undefined> {
+		return this.#query(expectAtMostOne<O>(err));
+	}
+
+	/**
+	 * The value of the one selected column in the first row; runs with
+	 * `execute()`, which throws `NoRowError` (or what `err` makes of it)
+	 * when there is no row. The row must have one column.
+	 *
+	 * @example .select(['users.email']).expectValue()
+	 */
+	expectValue(
+		...args: ValueArgs<O, [err?: ErrorFor<NoRowError>]>
+	): Query<ColumnValue<O>> {
+		return this.#query(expectValue<ColumnValue<O>>(errorArg(args)));
 	}
 
 	/** Runs the query and returns every row. */
-	async all(options?: RunOptions): Promise<O[]> {
-		return (await this.#execute(undefined, options)).rows;
+	execute(options?: RunOptions): Promise<O[]> {
+		return this.toQuery().execute(options);
 	}
 
-	/** Runs the query with `limit 1` and returns its row, if any. */
-	async first(options?: RunOptions): Promise<O | undefined> {
-		const [row] = (await this.#execute(1, options)).rows;
-		return row;
+	/** The SQL and parameters `execute()` sends. */
+	toSQL(): CompiledQuery {
+		return compile(this.toNode());
 	}
 
-	/**
-	 * Runs the query and returns its one row: throws `NoRowError` when there
-	 * is none and `TooManyRowsError` when there are several. Fetches at most
-	 * two rows, enough to tell.
-	 */
-	async one(options?: RunOptions): Promise<O> {
-		const { query, rows } = await this.#execute(2, options);
-		const [row, ...rest] = rows;
-		if (row === undefined) {
-			throw new NoRowError(query, this.#state.from.name);
-		}
-		if (rest.length > 0) {
-			throw new TooManyRowsError(query, this.#state.from.name);
-		}
-		return row;
+	/** The query `execute()` runs: every row. */
+	toQuery(): Query<O[]> {
+		return this.#query(allRows<O>());
 	}
 
-	/**
-	 * Runs the query and returns its row, if any: throws `TooManyRowsError`
-	 * when there are several. Fetches at most two rows, enough to tell.
-	 */
-	async maybeOne(options?: RunOptions): Promise<O | undefined> {
-		const { query, rows } = await this.#execute(2, options);
-		const [row, ...rest] = rows;
-		if (rest.length > 0) {
-			throw new TooManyRowsError(query, this.#state.from.name);
-		}
-		return row;
-	}
+	/** @deprecated A query runs with `execute()`; awaiting one rejects. */
+	// oxlint-disable-next-line unicorn/no-thenable -- so that a forgotten execute() fails loudly
+	readonly then = rejectAwait;
 
 	/**
 	 * Runs the query and yields its rows as they arrive, fetching
@@ -410,7 +649,7 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 
 	/** The whole query as one node. */
 	toNode(): SelectNode {
-		const { from, joins, where, selections, limit, tag } = this.#state;
+		const { from, joins, where, selections, limit, locks, tag } = this.#state;
 		return {
 			kind: 'select',
 			selections,
@@ -418,6 +657,7 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 			joins,
 			where: where.toNode(),
 			limit,
+			locks,
 			tag,
 		};
 	}
@@ -430,6 +670,43 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 		return this.#state.where.toNode();
 	}
 
+	#lock(strength: LockNode['strength']): SelectQueryBuilder<T, O, 'strength'> {
+		return new SelectQueryBuilder<T, O, 'strength'>({
+			...this.#state,
+			locks: [...this.#state.locks, { strength, of: [], wait: undefined }],
+		});
+	}
+
+	#wait(wait: LockNode['wait']): SelectQueryBuilder<T, O, 'done'> {
+		const method = wait === 'nowait' ? 'noWait()' : 'skipLocked()';
+		return this.#modifyLock<'done'>(method, (lock) => {
+			if (lock.wait !== undefined) {
+				throw new Error(
+					'A locking clause takes one of skipLocked() and noWait()',
+				);
+			}
+			return { ...lock, wait };
+		});
+	}
+
+	/** Replaces the latest locking clause with what `modify` makes of it. */
+	#modifyLock<N extends LockState>(
+		method: string,
+		modify: (lock: LockNode) => LockNode,
+	): SelectQueryBuilder<T, O, N> {
+		const { locks } = this.#state;
+		const latest = locks.at(-1);
+		if (latest === undefined) {
+			throw new Error(
+				`${method} needs a locking clause first: forUpdate(), forNoKeyUpdate(), forShare() or forKeyShare()`,
+			);
+		}
+		return new SelectQueryBuilder<T, O, N>({
+			...this.#state,
+			locks: [...locks.slice(0, -1), modify(latest)],
+		});
+	}
+
 	#executor(): Executor {
 		const { executor } = this.#state;
 		if (executor === undefined) {
@@ -440,18 +717,14 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
 		return executor;
 	}
 
-	/** Runs the query, fetching at most `limit` rows besides any limit of its own. */
-	async #execute(limit: number | undefined, options: RunOptions | undefined) {
-		const executor = this.#executor();
-		const node = this.toNode();
-		const query = compile(
-			limit === undefined
-				? node
-				: { ...node, limit: Math.min(node.limit ?? limit, limit) },
+	/** The query, read by `shape`. */
+	#query<R>(shape: Shape<R>): Query<R> {
+		return shapedQuery(
+			this.#state.executor,
+			compile(this.toNode()),
+			this.#state.from.name,
+			shape,
 		);
-		const { rows } = await executor.execute(query, options);
-		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the select list supplies the row type
-		return { query, rows: rows as O[] };
 	}
 }
 
@@ -459,7 +732,12 @@ export class SelectQueryBuilder<T extends readonly AnyTable[], O> {
  * A join of `J` onto the tables `T`, waiting for its `on` condition. The
  * joined table is already in scope, so the condition can reference it.
  */
-export class JoinBuilder<T extends readonly AnyTable[], J extends AnyTable, O> {
+export class JoinBuilder<
+	T extends readonly AnyTable[],
+	J extends AnyTable,
+	O,
+	L extends LockState = 'none',
+> {
 	readonly #state: SelectState<[...T, J]>;
 	readonly #table: J;
 
@@ -481,9 +759,9 @@ export class JoinBuilder<T extends readonly AnyTable[], J extends AnyTable, O> {
 		RefsOf<[...T, J]>,
 		T,
 		RefsOf<[J]>,
-		SelectQueryBuilder<[...T, J], O>
+		SelectQueryBuilder<[...T, J], O, L>
 	> = (...args: OnArgs<RefsOf<[...T, J]>>) =>
-		new SelectQueryBuilder<[...T, J], O>({
+		new SelectQueryBuilder<[...T, J], O, L>({
 			...this.#state,
 			joins: [
 				...this.#state.joins,

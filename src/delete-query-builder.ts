@@ -1,4 +1,4 @@
-import type { Executor, RunOptions } from './executor.js';
+import type { Executor } from './executor.js';
 import {
 	type ExpressionBuilder,
 	expressionBuilder,
@@ -17,14 +17,7 @@ import {
 	type ConditionArgs,
 	WhereBuilder,
 } from './where-builder.js';
-import {
-	atMostOne,
-	exactlyOne,
-	executeWrite,
-	rowCount,
-	writeRows,
-	type WriteResult,
-} from './write-query.js';
+import { WriteQueryBuilder } from './write-query.js';
 
 /** What a `delete` from `T` has recorded so far. */
 interface DeleteState<T extends AnyTable> {
@@ -32,7 +25,6 @@ interface DeleteState<T extends AnyTable> {
 	readonly where: WhereBuilder<RefsOf<[T]>>;
 	readonly allRows: boolean;
 	readonly returning: readonly SelectionNode[];
-	readonly expectRows: number | undefined;
 	readonly tag: string | undefined;
 	/** What the query runs on; `undefined` when it was built on its own. */
 	readonly executor: Executor | undefined;
@@ -60,7 +52,6 @@ export function deleteFromWith<T extends AnyTable>(
 		where: new WhereBuilder(expressionBuilder(table)),
 		allRows: false,
 		returning: [],
-		expectRows: undefined,
 		tag: undefined,
 		executor,
 	});
@@ -71,18 +62,21 @@ export function deleteFromWith<T extends AnyTable>(
  * `returning`). `M` is `'where'` until `where` or `allRows` is called;
  * running it is a type error until then.
  *
+ * It runs with `execute()` (or in `db.batch`), never when awaited;
+ * the `take…` and `expect…` shapes read its `returning` rows (and
+ * `expectNonEmpty` and `expectRows` its row count).
+ *
  * Immutable: every method returns a new builder.
  */
-export class DeleteQueryBuilder<T extends AnyTable, O, M extends 'where'> {
-	/** The type of a `returning` row. Never set. */
-	declare readonly $output: O;
-
-	/** What the query still needs before it can run. Never set. */
-	declare readonly $missing: M;
-
+export class DeleteQueryBuilder<
+	T extends AnyTable,
+	O,
+	M extends 'where',
+> extends WriteQueryBuilder<O, M> {
 	readonly #state: DeleteState<T>;
 
 	constructor(state: DeleteState<T>) {
+		super(state.executor);
 		this.#state = state;
 	}
 
@@ -121,14 +115,6 @@ export class DeleteQueryBuilder<T extends AnyTable, O, M extends 'where'> {
 		});
 	}
 
-	/** Requires the query to delete exactly `count` rows. */
-	expectRows(count: number): DeleteQueryBuilder<T, O, M> {
-		return new DeleteQueryBuilder({
-			...this.#state,
-			expectRows: rowCount(count),
-		});
-	}
-
 	/** Labels the query; see `SelectQueryBuilder.tag`. */
 	tag(name: string): DeleteQueryBuilder<T, O, M> {
 		return new DeleteQueryBuilder({ ...this.#state, tag: name });
@@ -145,73 +131,14 @@ export class DeleteQueryBuilder<T extends AnyTable, O, M extends 'where'> {
 		return condition ? build(this) : this;
 	}
 
-	/**
-	 * Runs the query, resolving to the number of rows deleted. Throws
-	 * `RowCountError` if `expectRows` was set and a different number was.
-	 */
-	execute(
-		this: DeleteQueryBuilder<T, unknown, never>,
-		options?: RunOptions,
-	): Promise<WriteResult> {
-		return executeWrite(this.#state.executor, this.toNode(), options);
-	}
-
-	/** Runs the query and returns every `returning` row. */
-	async all(
-		this: DeleteQueryBuilder<T, O & object, never>,
-		options?: RunOptions,
-	): Promise<O[]> {
-		return (await writeRows<O>(this.#state.executor, this.toNode(), options))
-			.rows;
-	}
-
-	/** Runs the query and returns its first `returning` row, if any. */
-	async first(
-		this: DeleteQueryBuilder<T, O & object, never>,
-		options?: RunOptions,
-	): Promise<O | undefined> {
-		const { rows } = await writeRows<O>(
-			this.#state.executor,
-			this.toNode(),
-			options,
-		);
-		return rows[0];
-	}
-
-	/**
-	 * Runs the query and returns its one `returning` row: throws
-	 * `NoRowError` when there is none and `TooManyRowsError` when there are
-	 * several (after the statement has run).
-	 */
-	async one(
-		this: DeleteQueryBuilder<T, O & object, never>,
-		options?: RunOptions,
-	): Promise<O> {
-		return exactlyOne(
-			await writeRows<O>(this.#state.executor, this.toNode(), options),
-		);
-	}
-
-	/** Runs the query and returns its `returning` row, if any: throws `TooManyRowsError` when there are several. */
-	async maybeOne(
-		this: DeleteQueryBuilder<T, O & object, never>,
-		options?: RunOptions,
-	): Promise<O | undefined> {
-		return atMostOne(
-			await writeRows<O>(this.#state.executor, this.toNode(), options),
-		);
-	}
-
-	/** The whole query as one node. */
-	toNode(): DeleteNode {
-		const { table, where, allRows, returning, expectRows, tag } = this.#state;
+	override toNode(): DeleteNode {
+		const { table, where, allRows, returning, tag } = this.#state;
 		return {
 			kind: 'delete',
 			table: tableNode(table),
 			where: where.toNode(),
 			allRows,
 			returning,
-			expectRows,
 			tag,
 		};
 	}

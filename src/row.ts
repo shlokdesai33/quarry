@@ -1,4 +1,10 @@
-import type { AliasedExpression } from './expression.js';
+import type { Codec } from './driver/codec.js';
+import {
+	Param,
+	TypedExpression,
+	type AliasedExpression,
+	type Expression,
+} from './expression.js';
 import type { ExpressionBuilder } from './expression-builder.js';
 import type { SelectionNode } from './node.js';
 import type { Ref, Refs } from './refs.js';
@@ -49,15 +55,27 @@ export function selectionNodes<R extends Refs>(
 	eb: ExpressionBuilder<R>,
 	selections: readonly Selection<R>[],
 ): SelectionNode[] {
-	return selections.map((selection): SelectionNode =>
-		typeof selection === 'string'
-			? {
-					expression: eb.ref(selection)._quarry.node,
-					alias: selection.slice(selection.indexOf('.') + 1),
-				}
-			: {
-					expression: selection.expression._quarry.node,
-					alias: selection.alias,
-				},
-	);
+	return selections.map((selection): SelectionNode => {
+		if (typeof selection === 'string') {
+			const ref = eb.ref(selection);
+			return {
+				expression: ref._quarry.node,
+				alias: selection.slice(selection.indexOf('.') + 1),
+				codec: ref._quarry.dataType.codec,
+			};
+		}
+		return {
+			expression: selection.expression._quarry.node,
+			alias: selection.alias,
+			codec: codecOf(selection.expression),
+		};
+	});
+}
+
+/** The codec an expression's values are read with, when its SQL type is known. */
+function codecOf(expression: Expression<unknown>): Codec | undefined {
+	if (expression instanceof TypedExpression)
+		return expression._quarry.dataType.codec;
+	if (expression instanceof Param) return expression._quarry.codec;
+	return undefined;
 }

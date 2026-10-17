@@ -1,15 +1,18 @@
 import {
 	comparison,
-	quantifiedType,
 	undefinedComparison,
+	type CodecFor,
 } from './comparison.js';
 import { DataType } from './data-type/data-type.js';
+import { codecs } from './driver/codecs.js';
+import { isRange } from './range.js';
 import {
 	type Expression,
 	Param,
 	Quantified,
 	TypedExpression,
 } from './expression.js';
+import type { Codec } from './driver/codec.js';
 import type { OperationNode } from './node.js';
 import type { Predicate } from './operators.js';
 
@@ -65,10 +68,28 @@ const TESTS = {
 	isNotFalse: ['is not', false],
 } as const;
 
+/** The operators whose right-hand side is not of the left's type, and isn't encoded by its codec. */
+const OTHER_OPERAND = new Set(['@@']);
+
+/**
+ * How a value compared with an expression of SQL type `type` is encoded:
+ * by its codec, except a point a range is tested to contain (`@>`), by its
+ * point type's, and a tsquery matched against a tsvector, whose type
+ * postgres infers.
+ */
+function codecFor(type: DataType, operator: string): CodecFor {
+	if (OTHER_OPERAND.has(operator)) return () => undefined;
+	if (operator === '@>' && type.kind === 'daterange')
+		return (value) => (isRange(value) ? type.codec : codecs.date);
+	if (operator === '@>' && type.kind === 'tstzrange')
+		return (value) => (value instanceof Date ? codecs.timestamptz : type.codec);
+	return () => type.codec;
+}
+
 /**
  * `left operator value`. `left` encodes plain values and parameters on the
- * right by its SQL type; a parameter on the left, which has none, is encoded
- * by the element type of the `any` / `all` array on the right.
+ * right with its codec; a parameter on the left, which has no SQL type, is
+ * encoded by the element codec of the `any` / `all` array on the right.
  */
 export function compare(
 	left: Expression<unknown>,
@@ -83,14 +104,14 @@ export function compare(
 				'A parameter on the left needs any() or all() of an array column or expression on the right',
 			);
 		}
-		const serialize = (item: unknown) => element.serialize(item);
 		if (left._quarry.value === undefined) throw undefinedComparison(undefined);
+		const codec = left._quarry.codec ?? element.codec;
 		return predicate(
 			comparison(
-				{ kind: 'value', value: serialize(left._quarry.value) },
+				{ kind: 'value', value: left._quarry.value, codec },
 				operator,
 				value,
-				serialize,
+				() => element.codec,
 			),
 		);
 	}
@@ -98,15 +119,8 @@ export function compare(
 		throw new TypeError('Only an expression of known SQL type is compared');
 	}
 	const type: DataType = left._quarry.dataType;
-	const node = left._quarry.node;
 	return predicate(
-		comparison(
-			node,
-			operator,
-			value,
-			(item) => type.serialize(item),
-			quantifiedType(node, type.kind),
-		),
+		comparison(left._quarry.node, operator, value, codecFor(type, operator)),
 	);
 }
 
@@ -154,9 +168,9 @@ export function typedExpression(
 }
 
 /** A parameter, with its methods. Like `typedExpression`, typed by the caller. */
-export function param(value: unknown): never {
+export function param(value: unknown, codec?: Codec): never {
 	// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the signature supplies the type
-	return new MethodParam(value) as never;
+	return new MethodParam(value, codec) as never;
 }
 
 /** A boolean expression, with the boolean methods. */

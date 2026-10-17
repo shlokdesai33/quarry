@@ -48,7 +48,7 @@ export function describeTables(tables: readonly AnyTable[]): TableSpec[] {
 }
 
 /** What the code declares for a table. */
-export function describeTable(table: AnyTable): TableSpec {
+function describeTable(table: AnyTable): TableSpec {
 	return {
 		name: table._quarry.source,
 		site: table._quarry.site,

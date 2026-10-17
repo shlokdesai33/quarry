@@ -1,5 +1,4 @@
 import { DriverError } from './errors.js';
-import { arrayParser, type TextParser, type TypeParsers } from './types.js';
 
 const TIMESTAMPTZ =
 	/^(\d{4,})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)(\.\d+)?([+-])(\d\d)(?::?(\d\d))?(?::?(\d\d))?( BC)?$/;
@@ -104,10 +103,6 @@ function fastTimestamptz(text: string): number | undefined {
 	);
 }
 
-/**
- * Parses range output (`[2024-01-01,2024-02-01)`, `(,"a b"]`, `empty`) into
- * a `RangeValue`, each bound through `parse`.
- */
 /** A range value: `empty`, or bounds (`null` when unbounded) with their inclusivity. */
 export type RangeValue<T> =
 	| {
@@ -118,6 +113,10 @@ export type RangeValue<T> =
 	  }
 	| { readonly empty: true };
 
+/**
+ * Parses range output (`[2024-01-01,2024-02-01)`, `(,"a b"]`, `empty`) into
+ * a `RangeValue`, each bound through `parse`.
+ */
 export function parseRange<T>(
 	text: string,
 	parse: (bound: string) => T,
@@ -186,45 +185,9 @@ export function parseRange<T>(
  * `0.1` reads as `0.10000000149011612`. The text is the shortest decimal
  * that rounds to each float32, so this matches the binary format exactly.
  */
-export const parseVector: TextParser = (text) => {
+export function vectorValues(text: string): number[] {
 	const values: number[] = JSON.parse(text);
 	for (let i = 0; i < values.length; i++)
 		values[i] = Math.fround(values[i] ?? 0);
 	return values;
-};
-
-/** pgvector's `halfvec` output, `[1,2.5,3]`, as the decimals printed. */
-export const parseHalfvec: TextParser = (text) => JSON.parse(text);
-
-/** One row of the catalog query. */
-export interface CatalogType {
-	readonly oid: number;
-	readonly name: string;
-	/** For arrays, the element type's OID; 0 otherwise. */
-	readonly elem: number;
-	readonly delim: string;
-}
-
-/** Arrays of every type, plus pgvector's types, by OID. */
-export const catalogQuery = `select t.oid::int as oid, t.typname as name, t.typelem::int as elem, t.typdelim as delim
-from pg_type t
-where t.typname in ('vector', 'halfvec') or t.typinput = 'array_in'::regproc`;
-
-/** Adds parsers for extension types and arrays from the catalog, keeping every parser `base` already has. */
-export function catalogTypes(
-	base: TypeParsers,
-	catalog: readonly CatalogType[],
-): TypeParsers {
-	const parsers: Record<number, TextParser> = {};
-	for (const type of catalog) {
-		if (type.elem !== 0) continue;
-		if (type.name === 'vector') parsers[type.oid] = parseVector;
-		else if (type.name === 'halfvec') parsers[type.oid] = parseHalfvec;
-	}
-	for (const type of catalog) {
-		if (type.elem === 0 || base[type.oid] !== undefined) continue;
-		const element = base[type.elem] ?? parsers[type.elem];
-		parsers[type.oid] = arrayParser(element, type.delim, type.elem);
-	}
-	return Object.freeze({ ...parsers, ...base });
 }

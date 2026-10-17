@@ -4,10 +4,9 @@ import type { BackendMessage, Field, NoticeFields } from './messages.js';
 import { allocate, asBuffer, utf8 } from './text.js';
 
 const EMPTY = new Uint8Array(0);
-const EMPTY_VIEW = new DataView(EMPTY.buffer);
 
 /** The largest backend message accepted, by default: 1 GiB, Postgres's own field limit. */
-export const DEFAULT_MAX_MESSAGE_SIZE = 0x40000000;
+const DEFAULT_MAX_MESSAGE_SIZE = 0x40000000;
 
 /**
  * Splits the byte stream from the server into backend messages. Bytes are
@@ -23,7 +22,6 @@ export const DEFAULT_MAX_MESSAGE_SIZE = 0x40000000;
 export class Reader {
 	/** The chunk being read, from `#pos`. Empty while a split message is collected. */
 	#buf: Uint8Array = EMPTY;
-	#view: DataView = EMPTY_VIEW;
 	#pos = 0;
 	/** A message split across chunks: its first `#partLength` bytes so far. */
 	#part: Uint8Array = EMPTY;
@@ -70,7 +68,6 @@ export class Reader {
 
 	#set(buf: Uint8Array, pos: number): void {
 		this.#buf = buf;
-		this.#view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
 		this.#pos = pos;
 	}
 
@@ -118,10 +115,8 @@ export class Reader {
 
 	#release(): void {
 		this.#buf = EMPTY;
-		this.#view = EMPTY_VIEW;
 		this.#pos = 0;
 		this.bytes = EMPTY;
-		this.#bytesView = EMPTY_VIEW;
 	}
 
 	/** The buffer holding the message found by the latest `nextType`. */
@@ -130,7 +125,6 @@ export class Reader {
 	start = 0;
 	end = 0;
 	#type = -1;
-	#bytesView: DataView = this.#view;
 
 	/**
 	 * Finds the next complete message without decoding it: returns its type
@@ -146,11 +140,6 @@ export class Reader {
 			this.#partLength = 0;
 			this.#needed = 0;
 			this.bytes = part;
-			this.#bytesView = new DataView(
-				part.buffer,
-				part.byteOffset,
-				part.byteLength,
-			);
 			this.start = 5;
 			this.end = part.length;
 			this.#type = part[0] ?? 0;
@@ -171,7 +160,6 @@ export class Reader {
 			return -1;
 		}
 		this.bytes = buf;
-		this.#bytesView = this.#view;
 		this.start = pos + 5;
 		this.end = pos + 1 + length;
 		this.#pos = this.end;
@@ -181,13 +169,7 @@ export class Reader {
 
 	/** Decodes the message found by the latest `nextType`. */
 	parse(): BackendMessage {
-		return parseMessage(
-			this.#type,
-			this.bytes,
-			this.#bytesView,
-			this.start,
-			this.end,
-		);
+		return parseMessage(this.#type, this.bytes, this.start, this.end);
 	}
 
 	/** The next complete message, or `undefined` if more bytes are needed. */
@@ -199,15 +181,24 @@ export class Reader {
 /** Reads fields of one message body, checking each read stays inside it. */
 class Cursor {
 	readonly bytes: Uint8Array;
-	readonly view: DataView;
 	pos: number;
 	readonly end: number;
+	#view: DataView | undefined;
 
-	constructor(bytes: Uint8Array, view: DataView, start: number, end: number) {
+	constructor(bytes: Uint8Array, start: number, end: number) {
 		this.bytes = bytes;
-		this.view = view;
 		this.pos = start;
 		this.end = end;
+	}
+
+	/** Made on first use: the frequent messages don't read integers through it. */
+	get view(): DataView {
+		const bytes = this.bytes;
+		return (this.#view ??= new DataView(
+			bytes.buffer,
+			bytes.byteOffset,
+			bytes.byteLength,
+		));
 	}
 
 	#need(n: number): void {
@@ -266,10 +257,61 @@ class Cursor {
 	}
 }
 
+// Messages without fields, and ReadyForQuery, are shared: every query gets
+// several, and they are never modified.
+const PARSE_COMPLETE: BackendMessage = { type: 'ParseComplete' };
+const BIND_COMPLETE: BackendMessage = { type: 'BindComplete' };
+const CLOSE_COMPLETE: BackendMessage = { type: 'CloseComplete' };
+const NO_DATA: BackendMessage = { type: 'NoData' };
+const EMPTY_QUERY_RESPONSE: BackendMessage = { type: 'EmptyQueryResponse' };
+const PORTAL_SUSPENDED: BackendMessage = { type: 'PortalSuspended' };
+const COPY_DONE: BackendMessage = { type: 'CopyDone' };
+const READY_IDLE: BackendMessage = { type: 'ReadyForQuery', status: 'I' };
+const READY_TRANSACTION: BackendMessage = {
+	type: 'ReadyForQuery',
+	status: 'T',
+};
+const READY_FAILED: BackendMessage = { type: 'ReadyForQuery', status: 'E' };
+
+function readyForQuery(bytes: Uint8Array, start: number, end: number) {
+	if (end <= start) throw new ProtocolError('Message too short');
+	switch (bytes[start]) {
+		case 0x49: // I
+			return READY_IDLE;
+		case 0x54: // T
+			return READY_TRANSACTION;
+		case 0x45: // E
+			return READY_FAILED;
+		default:
+			throw new ProtocolError(
+				`Invalid transaction status ${String.fromCharCode(bytes[start] ?? 0)}`,
+			);
+	}
+}
+
+/** The latest command tag: queries mostly repeat it, so its string is reused rather than decoded again. */
+let lastTagBytes = EMPTY;
+let lastTag = '';
+
+function commandTag(bytes: Uint8Array, start: number, end: number): string {
+	const nul = nulAt(bytes, start, end);
+	const length = nul - start;
+	const known = lastTagBytes;
+	if (known.length === length) {
+		let i = 0;
+		while (i < length && known[i] === bytes[start + i]) i++;
+		if (i === length) return lastTag;
+	}
+	const tag = utf8(bytes, start, nul);
+	// a copy: a view would keep the whole read buffer alive
+	lastTagBytes = new Uint8Array(bytes.subarray(start, nul));
+	lastTag = tag;
+	return tag;
+}
+
 function parseMessage(
 	type: number,
 	bytes: Uint8Array,
-	view: DataView,
 	start: number,
 	end: number,
 ): BackendMessage {
@@ -277,41 +319,30 @@ function parseMessage(
 		case 0x44: // D
 			return { type: 'DataRow', payload: bytes.subarray(start, end) };
 		case 0x43: // C
-			return {
-				type: 'CommandComplete',
-				tag: new Cursor(bytes, view, start, end).cstring(),
-			};
-		case 0x5a: {
-			// Z
-			const status = String.fromCharCode(
-				new Cursor(bytes, view, start, end).int8(),
-			);
-			if (status !== 'I' && status !== 'T' && status !== 'E') {
-				throw new ProtocolError(`Invalid transaction status ${status}`);
-			}
-			return { type: 'ReadyForQuery', status };
-		}
+			return { type: 'CommandComplete', tag: commandTag(bytes, start, end) };
+		case 0x5a: // Z
+			return readyForQuery(bytes, start, end);
 		case 0x31: // 1
-			return { type: 'ParseComplete' };
+			return PARSE_COMPLETE;
 		case 0x32: // 2
-			return { type: 'BindComplete' };
+			return BIND_COMPLETE;
 		case 0x33: // 3
-			return { type: 'CloseComplete' };
+			return CLOSE_COMPLETE;
 		case 0x6e: // n
-			return { type: 'NoData' };
+			return NO_DATA;
 		case 0x49: // I
-			return { type: 'EmptyQueryResponse' };
+			return EMPTY_QUERY_RESPONSE;
 		case 0x73: // s
-			return { type: 'PortalSuspended' };
+			return PORTAL_SUSPENDED;
 		case 0x63: // c
-			return { type: 'CopyDone' };
+			return COPY_DONE;
 		case 0x64: // d
 			return { type: 'CopyData', data: bytes.subarray(start, end) };
 		case 0x54: // T
-			return rowDescription(new Cursor(bytes, view, start, end));
+			return rowDescription(new Cursor(bytes, start, end));
 		case 0x74: {
 			// t
-			const cursor = new Cursor(bytes, view, start, end);
+			const cursor = new Cursor(bytes, start, end);
 			const n = cursor.count();
 			const typeOids: number[] = [];
 			for (let i = 0; i < n; i++) typeOids.push(cursor.int32() >>> 0);
@@ -320,16 +351,16 @@ function parseMessage(
 		case 0x45: // E
 			return {
 				type: 'ErrorResponse',
-				fields: noticeFields(new Cursor(bytes, view, start, end)),
+				fields: noticeFields(new Cursor(bytes, start, end)),
 			};
 		case 0x4e: // N
 			return {
 				type: 'NoticeResponse',
-				fields: noticeFields(new Cursor(bytes, view, start, end)),
+				fields: noticeFields(new Cursor(bytes, start, end)),
 			};
 		case 0x53: {
 			// S
-			const cursor = new Cursor(bytes, view, start, end);
+			const cursor = new Cursor(bytes, start, end);
 			return {
 				type: 'ParameterStatus',
 				name: cursor.cstring(),
@@ -338,7 +369,7 @@ function parseMessage(
 		}
 		case 0x4b: {
 			// K
-			const cursor = new Cursor(bytes, view, start, end);
+			const cursor = new Cursor(bytes, start, end);
 			const pid = cursor.int32();
 			const key = cursor.bytesCopy();
 			if (key.length < 4 || key.length > 256) {
@@ -352,30 +383,24 @@ function parseMessage(
 				...decodeNotification(bytes, start, end),
 			};
 		case 0x52: // R
-			return authentication(new Cursor(bytes, view, start, end));
+			return authentication(new Cursor(bytes, start, end));
 		case 0x47: // G
-		case 0x48: // H
-		case 0x57: {
-			// W
-			const cursor = new Cursor(bytes, view, start, end);
+		case 0x48: {
+			// H
+			const cursor = new Cursor(bytes, start, end);
 			const binary = cursor.int8() === 1;
 			const n = cursor.count();
 			const columnFormats: number[] = [];
 			for (let i = 0; i < n; i++) columnFormats.push(cursor.int16());
 			return {
-				type:
-					type === 0x47
-						? 'CopyInResponse'
-						: type === 0x48
-							? 'CopyOutResponse'
-							: 'CopyBothResponse',
+				type: type === 0x47 ? 'CopyInResponse' : 'CopyOutResponse',
 				binary,
 				columnFormats,
 			};
 		}
 		case 0x76: {
 			// v
-			const cursor = new Cursor(bytes, view, start, end);
+			const cursor = new Cursor(bytes, start, end);
 			const minor = cursor.int32();
 			const n = cursor.int32();
 			if (n < 0 || n > end - start) {
@@ -385,8 +410,6 @@ function parseMessage(
 			for (let i = 0; i < n; i++) unrecognized.push(cursor.cstring());
 			return { type: 'NegotiateProtocolVersion', minor, unrecognized };
 		}
-		case 0x56: // V
-			return { type: 'FunctionCallResponse' };
 		default:
 			throw new ProtocolError(
 				`Unknown message type 0x${type.toString(16).padStart(2, '0')}`,
@@ -537,7 +560,7 @@ export function decodeNotification(
  * Splits a DataRow body into its values: `null` for SQL NULL, otherwise the
  * `[start, end)` offsets into `payload`. Throws if the body is malformed.
  */
-export function forEachValue(
+function forEachValue(
 	payload: Uint8Array,
 	visit: (index: number, start: number, end: number) => void,
 ): number {

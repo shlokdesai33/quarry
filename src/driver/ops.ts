@@ -11,39 +11,62 @@ import * as fe from './protocol/frontend.js';
 import type { WireValue } from './protocol/frontend.js';
 import type { BackendMessage, Field } from './protocol/messages.js';
 import type { Writer } from './protocol/writer.js';
-import { formatPlan, type FormatPlan } from './binary.js';
-import { rowDecoder, type RowDecoder, type RowMode } from './rows.js';
-import type { TypeParsers } from './types.js';
+import type { CodecRegistry, TypeCatalog } from './registry.js';
+import {
+	cachedPlan,
+	planDecoder,
+	resultPlan,
+	sameFormats,
+	type CachedPlan,
+	type ResultCodecs,
+	type ResultPlan,
+	type ResultSpec,
+} from './results.js';
+import type { RowDecoder, RowMode } from './rows.js';
 
-/** A prepared statement cached on a connection. */
+/** A statement cached on a connection. */
 export interface Statement {
+	/** The server-side name; '' for SQL only ever sent unnamed, whose columns are still cached. */
 	readonly name: string;
 	readonly key: string;
+	/** When the statement was last looked up, on the connection's counter: the cache evicts the lowest. */
+	used: number;
+	/** Created, and its Parse not yet written: the operation that finds it so writes it. */
+	unwritten: boolean;
 	/** Set once ParseComplete arrives. */
 	parsed: boolean;
 	fields: readonly Field[] | undefined;
-	paramTypes: readonly number[] | undefined;
 	/** The Parse error, when parsing failed; later binds of it report this. */
 	error: PostgresError | undefined;
-	/** Decoders by types and row mode, so rows of a cached statement skip rebuilding one. */
-	/** Decoders by result fields (text or binary plan), types and row mode, so rows of a cached statement skip rebuilding one. */
-	readonly decoders: Map<
-		readonly Field[],
-		Map<TypeParsers, Map<RowMode, RowDecoder>>
-	>;
-	/** Result format plans by types, once the result columns are known. */
-	readonly plans: Map<TypeParsers, FormatPlan>;
+	/**
+	 * How its results are read (formats, codecs, row decoders), once the
+	 * columns are known: by registry and expected codecs, so rows of a
+	 * cached statement skip rebuilding a decoder.
+	 */
+	readonly plans: CachedPlan[];
 }
 
 /** What an operation may use on its connection. */
 export interface OpContext {
 	readonly writer: Writer;
-	readonly types: TypeParsers;
-	/** The cached statement for this SQL, created (and to be parsed) if new; undefined when not preparing. */
-	statement(
-		sql: string,
-		types: readonly number[],
-	): { statement: Statement; created: boolean };
+	/** How result columns are read where a query doesn't say. */
+	readonly registry: CodecRegistry;
+	/** The types looked up by name, for the pool. */
+	readonly catalog: TypeCatalog;
+	/** How results are read where a query names no codecs, with and without binary. */
+	readonly specs: { readonly binary: ResultSpec; readonly text: ResultSpec };
+	/**
+	 * The cached statement for this SQL, created if new (`unwritten` until
+	 * its Parse is written). A `named` one is created with a name, to be
+	 * parsed; an unnamed entry is then replaced.
+	 */
+	statement(sql: string, types: readonly number[], named: boolean): Statement;
+	/**
+	 * Whether a statement written now should be named. Behind a pooler that
+	 * rewrites named statements, a query pipelined with others is sent
+	 * unnamed instead; behind one that can't keep them, every query is.
+	 */
+	named(): boolean;
 	/** Drops a statement from the cache (it failed or went stale). */
 	forget(statement: Statement): void;
 	/**
@@ -92,17 +115,27 @@ export abstract class Op {
 	canceledBy: 'abort' | 'timeout' | undefined;
 	/** Receives the operation's timing when it settles, if set. */
 	onTiming: ((timing: OpTiming) => void) | undefined;
+	/**
+	 * Called by the connection once the operation has settled and left its
+	 * queue, before callbacks on its result run: a pool frees the connection
+	 * before the caller's next query, without a promise of its own per query.
+	 */
+	onDone: (() => void) | undefined;
 	queuedAt = 0;
 	writtenAt = 0;
-	readonly #cleanups: (() => void)[] = [];
+	#cleanups: (() => void)[] | undefined;
 
 	onSettle(cleanup: () => void): void {
-		this.#cleanups.push(cleanup);
+		(this.#cleanups ??= []).push(cleanup);
 	}
 
 	protected settle(): void {
 		this.done = true;
-		for (const cleanup of this.#cleanups.splice(0)) cleanup();
+		const cleanups = this.#cleanups;
+		if (cleanups !== undefined) {
+			this.#cleanups = undefined;
+			for (const cleanup of cleanups) cleanup();
+		}
 		if (this.onTiming !== undefined) {
 			const now = performance.now();
 			const written = this.writtenAt || now;
@@ -119,6 +152,11 @@ export abstract class Op {
 	 */
 	dataRow(_bytes: Uint8Array, _start: number, _end: number): boolean {
 		return false;
+	}
+
+	/** How many statements it writes that may be named; more than one is pipelining. */
+	get prepares(): number {
+		return 0;
 	}
 
 	abstract write(ctx: OpContext): void;
@@ -141,64 +179,101 @@ export abstract class Op {
 	}
 }
 
-export function parseTag(tag: string): {
-	command: string;
-	rowCount: number | null;
-} {
+interface ParsedTag {
+	readonly command: string;
+	readonly rowCount: number | null;
+}
+
+/** The latest tag parsed: a connection mostly sees the same few tags in a row. */
+let lastTag = '';
+let lastParsed: ParsedTag = { command: '', rowCount: null };
+
+export function parseTag(tag: string): ParsedTag {
+	if (tag === lastTag) return lastParsed;
 	const space = tag.lastIndexOf(' ');
-	const last = tag.slice(space + 1);
-	if (space > 0 && /^\d+$/.test(last)) {
-		return { command: tag.slice(0, tag.indexOf(' ')), rowCount: Number(last) };
+	let digits = space > 0 && space < tag.length - 1;
+	for (let i = space + 1; digits && i < tag.length; i++) {
+		const code = tag.charCodeAt(i);
+		digits = code >= 0x30 && code <= 0x39;
 	}
-	return { command: tag, rowCount: null };
+	lastParsed = digits
+		? {
+				command: tag.slice(0, tag.indexOf(' ')),
+				rowCount: Number(tag.slice(space + 1)),
+			}
+		: { command: tag, rowCount: null };
+	lastTag = tag;
+	return lastParsed;
 }
 
 export interface QueryOpOptions {
 	readonly rowMode: RowMode;
-	readonly types: TypeParsers | undefined;
+	/** How result columns are read where `resultCodecs` doesn't say; the connection's when undefined. */
+	readonly registry: CodecRegistry | undefined;
+	/** The codecs the result columns are expected in, by position. */
+	readonly resultCodecs: ResultCodecs | undefined;
 	readonly prepare: boolean;
-	readonly paramTypes: readonly number[];
-	/** Ask for binary results for columns with a matching binary decoder. */
+	/** Ask for binary results for columns whose codec reads them so. */
 	readonly binary: boolean;
+	/** The rows kept, from the first; the others aren't decoded. */
+	readonly keepRows: number;
 }
 
-/** The result format plan for a described statement, cached per types. */
-function planFor(
-	statement: Statement,
-	fields: readonly Field[],
-	types: TypeParsers,
-): FormatPlan {
-	let plan = statement.plans.get(types);
-	if (plan === undefined) {
-		plan = formatPlan(fields, types);
-		statement.plans.set(types, plan);
-	}
-	return plan;
+/** How an operation's results are read on this connection. */
+function specOf(options: QueryOpOptions, ctx: OpContext): ResultSpec {
+	if (options.registry === undefined && options.resultCodecs === undefined)
+		return options.binary ? ctx.specs.binary : ctx.specs.text;
+	return {
+		registry: options.registry ?? ctx.registry,
+		catalog: ctx.catalog,
+		expected: options.resultCodecs,
+		binary: options.binary,
+	};
 }
 
-function decoderFor(
+/**
+ * The plan for columns now known: the statement's cached one when the
+ * formats asked for are its formats, otherwise one for this result alone.
+ */
+function planOf(
 	statement: Statement | undefined,
 	fields: readonly Field[],
-	types: TypeParsers,
-	mode: RowMode,
-): RowDecoder {
-	if (statement === undefined) return rowDecoder(fields, types, mode);
-	let byTypes = statement.decoders.get(fields);
-	if (byTypes === undefined) {
-		byTypes = new Map();
-		statement.decoders.set(fields, byTypes);
+	spec: ResultSpec,
+	requested: readonly number[] | 0 | undefined,
+): ResultPlan {
+	if (statement === undefined)
+		return resultPlan(fields, spec, requested ?? 'fields');
+	const plan = cachedPlan(statement.plans, fields, spec);
+	if (requested === undefined) return plan;
+	return sameFormats(plan.formats, requested)
+		? plan
+		: resultPlan(fields, spec, requested);
+}
+
+function formatsOf(fields: readonly Field[]): readonly number[] | 0 {
+	return fields.some((field) => field.format === 1)
+		? fields.map((field) => field.format)
+		: 0;
+}
+
+/** Whether a portal's columns are a cached statement's: the same names, types and (unless not `formats`) formats. */
+function sameColumns(
+	fields: readonly Field[],
+	cached: readonly Field[],
+	formats = true,
+): boolean {
+	if (fields.length !== cached.length) return false;
+	for (let i = 0; i < fields.length; i++) {
+		const a = fields[i];
+		const b = cached[i];
+		if (
+			a?.name !== b?.name ||
+			a?.typeOid !== b?.typeOid ||
+			(formats && a?.format !== b?.format)
+		)
+			return false;
 	}
-	let byMode = byTypes.get(types);
-	if (byMode === undefined) {
-		byMode = new Map();
-		byTypes.set(types, byMode);
-	}
-	let decoder = byMode.get(mode);
-	if (decoder === undefined) {
-		decoder = rowDecoder(fields, types, mode);
-		byMode.set(mode, decoder);
-	}
-	return decoder;
+	return true;
 }
 
 /**
@@ -230,16 +305,28 @@ export class QueryOp extends Op {
 	readonly #sql: string;
 	readonly #params: readonly unknown[];
 	readonly #values: readonly WireValue[];
+	/** The parameter type OIDs declared at Parse; part of the statement's cache key. */
+	readonly #paramTypes: readonly number[];
 	readonly #options: QueryOpOptions;
 	readonly #resolve: (result: QueryResult<unknown>) => void;
 	readonly #reject: (error: Error) => void;
-	#planFields: readonly Field[] | undefined;
+	#spec: ResultSpec | undefined;
+	/** The formats asked for before the columns were known; undefined when they came from a plan. */
+	#requested: readonly number[] | 0 | undefined;
+	/** The cached statement's plan, when its columns were known at write. */
+	#plan: ResultPlan | undefined;
+	/** The plan the rows are read with, once the columns are known. */
+	#current: ResultPlan | undefined;
 	#statement: Statement | undefined;
 	#createdStatement = false;
-	#types: TypeParsers | undefined;
+	/** Sent unnamed with its cached statement's columns, which the portal's description must match. */
+	#unnamed = false;
+	/** Those columns, with the formats asked for; undefined when not known yet. */
+	#expected: readonly Field[] | undefined;
 	#fields: readonly Field[] | undefined;
 	#decoder: RowDecoder | undefined;
-	#rows: unknown[] = [];
+	/** Created with the first row, sized for it: most queries return one row or none. */
+	#rows: unknown[] | undefined;
 	#tag = '';
 	#error: PostgresError | undefined;
 	/** A value that failed to decode: the query fails with it, the rest of its rows are skipped. */
@@ -250,6 +337,7 @@ export class QueryOp extends Op {
 		sql: string,
 		params: readonly unknown[],
 		values: readonly WireValue[],
+		paramTypes: readonly number[],
 		options: QueryOpOptions,
 		resolve: (result: QueryResult<unknown>) => void,
 		reject: (error: Error) => void,
@@ -259,10 +347,15 @@ export class QueryOp extends Op {
 		this.#sql = sql;
 		this.#params = params;
 		this.#values = values;
+		this.#paramTypes = paramTypes;
 		this.#options = options;
 		this.#resolve = resolve;
 		this.#reject = reject;
 		this.#retried = retried;
+	}
+
+	override get prepares(): number {
+		return this.#options.prepare ? 1 : 0;
 	}
 
 	/** The server's error for this statement, once it arrived. */
@@ -273,32 +366,51 @@ export class QueryOp extends Op {
 	/** Writes the statement; without `sync` it ends with the next one's Sync (see `SyncGroupOp`). */
 	write(ctx: OpContext, sync = true): void {
 		const w = ctx.writer;
-		this.#types = this.#options.types ?? ctx.types;
-		if (
-			this.#options.prepare &&
-			ctx.preparable(this.#sql, this.#options.paramTypes)
-		) {
-			const { statement, created } = ctx.statement(
-				this.#sql,
-				this.#options.paramTypes,
-			);
+		const spec = specOf(this.#options, ctx);
+		this.#spec = spec;
+		const types = this.#paramTypes;
+		if (this.#options.prepare && ctx.preparable(this.#sql, types)) {
+			const named = ctx.named();
+			const statement = ctx.statement(this.#sql, types, named);
 			this.#statement = statement;
+			if (!named) {
+				this.#unnamed = true;
+				// binary only for columns already described
+				let formats: readonly number[] | 0 = 0;
+				const known = statement.fields;
+				if (known !== undefined) {
+					const plan = cachedPlan(statement.plans, known, spec);
+					formats = plan.formats;
+					this.#expected = plan.fields;
+				}
+				fe.parse(w, '', this.#sql, types);
+				fe.bind(w, '', '', this.#values, formats);
+				fe.describe(w, 'P', '');
+				fe.execute(w, '', 0);
+				if (sync) fe.sync(w);
+				return;
+			}
+			const created = statement.unwritten;
+			statement.unwritten = false;
 			this.#createdStatement = created;
 			if (created) {
-				fe.parse(w, statement.name, this.#sql, this.#options.paramTypes);
+				fe.parse(w, statement.name, this.#sql, types);
 				fe.describe(w, 'S', statement.name);
 			}
 			const known = statement.fields;
-			if (!created && this.#options.binary && known !== undefined) {
-				// columns already known: ask for binary where a decoder matches
-				const plan = planFor(statement, known, this.#types);
-				this.#planFields = plan.fields;
+			if (!created && known !== undefined) {
+				// columns already known: each in the format its codec reads
+				const plan = cachedPlan(statement.plans, known, spec);
+				this.#plan = plan;
 				fe.bind(w, '', statement.name, this.#values, plan.formats);
 			} else {
+				// not yet described: text, never a format before the type is known
+				this.#requested = 0;
 				fe.bind(w, '', statement.name, this.#values);
 			}
 		} else {
-			fe.parse(w, '', this.#sql, this.#options.paramTypes);
+			this.#requested = 0;
+			fe.parse(w, '', this.#sql, types);
 			fe.bind(w, '', '', this.#values);
 			fe.describe(w, 'P', '');
 		}
@@ -306,33 +418,63 @@ export class QueryOp extends Op {
 		if (sync) fe.sync(w);
 	}
 
-	#setFields(fields: readonly Field[]): void {
-		this.#fields = fields;
-		this.#decoder = decoderFor(
-			this.#statement,
-			fields,
-			this.#types ?? {},
-			this.#options.rowMode,
+	/** Reads the result through `plan`. */
+	#use(plan: ResultPlan): void {
+		this.#current = plan;
+		this.#fields = plan.fields;
+		if (plan.unreadable !== undefined) this.#unreadable(plan.unreadable);
+		// no decoder for no columns until a row comes (building one compiles a function)
+		this.#decoder =
+			plan.fields.length > 0
+				? planDecoder(plan, this.#options.rowMode)
+				: undefined;
+	}
+
+	/** A column came in binary as a type nothing reads: the statement has run, but its rows can't be read. */
+	#unreadable(field: Field): void {
+		this.#decodeError ??= new DecodeError(
+			field.name,
+			field.typeOid,
+			new DriverError(
+				'The column is not of the type the query expected, and came in binary',
+			),
 		);
+	}
+
+	/** The columns, for a named statement: described with it, or known when it was bound. */
+	#described(fields: readonly Field[]): void {
+		// oxlint-disable-next-line typescript/no-non-null-assertion -- set by write
+		const spec = this.#spec!;
+		this.#use(planOf(this.#statement, fields, spec, this.#requested));
 	}
 
 	override dataRow(bytes: Uint8Array, start: number, end: number): boolean {
 		if (this.#decodeError !== undefined) return true;
+		if ((this.#rows?.length ?? 0) >= this.#options.keepRows) return true;
 		let decoder = this.#decoder;
 		if (decoder === undefined) {
-			const fields = this.#planFields ?? this.#statement?.fields;
-			if (fields === undefined)
-				throw new ProtocolError('DataRow before RowDescription');
-			this.#setFields(fields);
-			decoder = this.#decoder;
+			if (this.#current === undefined) {
+				if (this.#plan !== undefined) this.#use(this.#plan);
+				else {
+					const known = this.#unnamed ? undefined : this.#statement?.fields;
+					if (known === undefined)
+						throw new ProtocolError('DataRow before RowDescription');
+					this.#described(known);
+				}
+				if (this.#decodeError !== undefined) return true;
+			}
+			// oxlint-disable-next-line typescript/no-non-null-assertion -- set just above
+			decoder = planDecoder(this.#current!, this.#options.rowMode);
+			this.#decoder = decoder;
 		}
 		try {
-			// oxlint-disable-next-line typescript/no-non-null-assertion
-			this.#rows.push(decoder!(bytes, start, end));
+			const row = decoder(bytes, start, end);
+			if (this.#rows === undefined) this.#rows = [row];
+			else this.#rows.push(row);
 		} catch (error) {
 			if (!(error instanceof DecodeError)) throw error;
 			this.#decodeError = error;
-			this.#rows = [];
+			this.#rows = undefined;
 		}
 		return true;
 	}
@@ -346,9 +488,14 @@ export class QueryOp extends Op {
 					this.#statement.parsed = true;
 				return false;
 			case 'BindComplete': {
-				const fields = this.#planFields ?? this.#statement?.fields;
-				if (this.#fields === undefined && fields !== undefined)
-					this.#setFields(fields);
+				// an unnamed one's columns come next, from the portal's description
+				if (this.#unnamed || this.#current !== undefined) return false;
+				if (this.#plan !== undefined) this.#use(this.#plan);
+				else if (
+					!this.#createdStatement &&
+					this.#statement?.fields !== undefined
+				)
+					this.#described(this.#statement.fields);
 				return false;
 			}
 			case 'CloseComplete':
@@ -357,17 +504,27 @@ export class QueryOp extends Op {
 			case 'CopyOutResponse':
 			case 'CopyData':
 			case 'CopyDone':
-				return false;
 			case 'ParameterDescription':
-				if (this.#statement && this.#createdStatement)
-					this.#statement.paramTypes = msg.typeOids;
 				return false;
 			case 'RowDescription':
-				if (this.#statement && this.#createdStatement)
-					this.#statement.fields = msg.fields;
-				this.#setFields(msg.fields);
+				if (this.#unnamed) {
+					this.#describedUnnamed(msg.fields, ctx);
+					return false;
+				}
+				if (this.#statement === undefined) {
+					// unprepared: the portal's description has the formats
+					// oxlint-disable-next-line typescript/no-non-null-assertion -- set by write
+					this.#use(resultPlan(msg.fields, this.#spec!, 'fields'));
+					return false;
+				}
+				if (this.#createdStatement) this.#statement.fields = msg.fields;
+				this.#described(msg.fields);
 				return false;
 			case 'NoData':
+				if (this.#unnamed) {
+					this.#describedUnnamed([], ctx);
+					return false;
+				}
 				if (this.#statement && this.#createdStatement)
 					this.#statement.fields = [];
 				// no rows follow, so no decoder (building one compiles a function)
@@ -398,6 +555,40 @@ export class QueryOp extends Op {
 			default:
 				return this.unexpected(msg);
 		}
+	}
+
+	/**
+	 * The portal's columns, for a statement sent unnamed: decoded with the
+	 * cached statement's decoder when they are its columns. A schema change
+	 * since it was cached drops it; the rows are decoded by what the server
+	 * sent, unless a column asked for in binary changed to a type nothing
+	 * reads in binary: the statement has run, but its rows can't be read.
+	 */
+	#describedUnnamed(fields: readonly Field[], ctx: OpContext): void {
+		const statement = this.#statement;
+		const expected = this.#expected;
+		// oxlint-disable-next-line typescript/no-non-null-assertion -- set by write
+		const spec = this.#spec!;
+		if (statement === undefined) return;
+		if (expected === undefined) {
+			// asked for before the columns were known; cached as a statement describes them
+			statement.fields ??= fields.some((field) => field.format !== 0)
+				? fields.map((field) => ({ ...field, format: 0 }))
+				: fields;
+			this.#use(
+				sameColumns(fields, statement.fields, false)
+					? planOf(statement, statement.fields, spec, formatsOf(fields))
+					: resultPlan(fields, spec, 'fields'),
+			);
+			return;
+		}
+		if (sameColumns(fields, expected)) {
+			// oxlint-disable-next-line typescript/no-non-null-assertion -- the plan `expected` came from
+			this.#use(planOf(statement, statement.fields!, spec, undefined));
+			return;
+		}
+		ctx.forget(statement);
+		this.#use(resultPlan(fields, spec, 'fields'));
 	}
 
 	#onError(error: PostgresError, ctx: OpContext): void {
@@ -433,13 +624,14 @@ export class QueryOp extends Op {
 			this.#resolve({
 				command,
 				rowCount,
-				rows: this.#rows,
+				rows: this.#rows ?? [],
 				fields: this.#fields ?? [],
 			});
 			return true;
 		}
 		if (
 			this.#statement !== undefined &&
+			!this.#unnamed &&
 			status === 'I' &&
 			!this.#retried &&
 			staleStatement(error, this.#statement, this.#createdStatement)
@@ -447,17 +639,20 @@ export class QueryOp extends Op {
 			ctx.forget(this.#statement);
 			if (this.#createdStatement) ctx.unprepare(this.#statement);
 			// retried unnamed: a pooler passes that through instead of reusing its stale statement
-			ctx.retry(
-				new QueryOp(
-					this.#sql,
-					this.#params,
-					this.#values,
-					{ ...this.#options, prepare: false },
-					this.#resolve,
-					this.#reject,
-					true,
-				),
+			const retry = new QueryOp(
+				this.#sql,
+				this.#params,
+				this.#values,
+				this.#paramTypes,
+				{ ...this.#options, prepare: false },
+				this.#resolve,
+				this.#reject,
+				true,
 			);
+			// done once the retry is
+			retry.onDone = this.onDone;
+			this.onDone = undefined;
+			ctx.retry(retry);
 			return true;
 		}
 		this.#reject(error);
@@ -467,6 +662,14 @@ export class QueryOp extends Op {
 	fail(error: Error): void {
 		this.settle();
 		this.#reject(this.#error?.isFatal ? this.#error : error);
+	}
+
+	/** The server skipped the statement, so a Parse it sent never ran. */
+	skip(error: Error, ctx: OpContext): void {
+		const statement = this.#statement;
+		if (statement && this.#createdStatement && !statement.parsed)
+			ctx.forget(statement);
+		this.fail(error);
 	}
 }
 
@@ -487,6 +690,12 @@ export class SyncGroupOp extends Op {
 		this.#ops = ops;
 	}
 
+	override get prepares(): number {
+		let count = 0;
+		for (const op of this.#ops) count += op.prepares;
+		return count;
+	}
+
 	write(ctx: OpContext): void {
 		for (const op of this.#ops) op.write(ctx, false);
 		fe.sync(ctx.writer);
@@ -504,12 +713,15 @@ export class SyncGroupOp extends Op {
 				: undefined;
 			for (const [i, op] of this.#ops.entries()) {
 				if (i <= this.#current) op.handle(msg, ctx);
-				else op.fail(skipped ?? new ProtocolError('A statement was skipped'));
+				else
+					op.skip(skipped ?? new ProtocolError('A statement was skipped'), ctx);
 			}
 			return true;
 		}
 		const op = this.#ops[this.#current];
 		if (op === undefined || this.#failed) return this.unexpected(msg);
+		// a cancel is requested for the group, and hits the statement running
+		op.canceledBy = this.canceledBy;
 		op.handle(msg, ctx);
 		if (msg.type === 'ErrorResponse') this.#failed = true;
 		else if (
@@ -529,7 +741,7 @@ export class SyncGroupOp extends Op {
 /** One or more statements through the simple protocol. */
 export class SimpleQueryOp extends Op {
 	readonly #sql: string;
-	readonly #types: TypeParsers | undefined;
+	readonly #registry: CodecRegistry | undefined;
 	readonly #rowMode: RowMode;
 	readonly #resolve: (results: QueryResult<unknown>[]) => void;
 	readonly #reject: (error: Error) => void;
@@ -538,25 +750,30 @@ export class SimpleQueryOp extends Op {
 	#decoder: RowDecoder | undefined;
 	#rows: unknown[] = [];
 	#error: PostgresError | DecodeError | undefined;
-	#ctxTypes: TypeParsers = {};
+	#spec: ResultSpec | undefined;
 
 	constructor(
 		sql: string,
-		types: TypeParsers | undefined,
+		registry: CodecRegistry | undefined,
 		rowMode: RowMode,
 		resolve: (results: QueryResult<unknown>[]) => void,
 		reject: (error: Error) => void,
 	) {
 		super();
 		this.#sql = sql;
-		this.#types = types;
+		this.#registry = registry;
 		this.#rowMode = rowMode;
 		this.#resolve = resolve;
 		this.#reject = reject;
 	}
 
 	write(ctx: OpContext): void {
-		this.#ctxTypes = this.#types ?? ctx.types;
+		this.#spec = {
+			registry: this.#registry ?? ctx.registry,
+			catalog: ctx.catalog,
+			expected: undefined,
+			binary: false,
+		};
 		fe.query(ctx.writer, this.#sql);
 	}
 
@@ -577,7 +794,11 @@ export class SimpleQueryOp extends Op {
 		switch (msg.type) {
 			case 'RowDescription':
 				this.#fields = msg.fields;
-				this.#decoder = rowDecoder(msg.fields, this.#ctxTypes, this.#rowMode);
+				this.#decoder = planDecoder(
+					// oxlint-disable-next-line typescript/no-non-null-assertion -- set by write
+					resultPlan(msg.fields, this.#spec!, 'fields'),
+					this.#rowMode,
+				);
 				this.#rows = [];
 				return false;
 			case 'DataRow':
@@ -717,7 +938,10 @@ export class CursorOp extends Op {
 	readonly #values: readonly WireValue[];
 	readonly #options: QueryOpOptions;
 	readonly #batchSize: number;
+	readonly #paramTypes: readonly number[];
 	#ctx: OpContext | undefined;
+	#spec: ResultSpec | undefined;
+	#requested: readonly number[] | 0 | undefined;
 	#statement: Statement | undefined;
 	#created = false;
 	#decoder: RowDecoder | undefined;
@@ -737,6 +961,7 @@ export class CursorOp extends Op {
 		sql: string,
 		params: readonly unknown[],
 		values: readonly WireValue[],
+		paramTypes: readonly number[],
 		options: QueryOpOptions,
 		batchSize: number,
 	) {
@@ -744,31 +969,37 @@ export class CursorOp extends Op {
 		this.#sql = sql;
 		this.#params = params;
 		this.#values = values;
+		this.#paramTypes = paramTypes;
 		this.#options = options;
 		this.#batchSize = batchSize;
-	}
-
-	get fields(): readonly Field[] | undefined {
-		return this.#fields;
 	}
 
 	write(ctx: OpContext): void {
 		this.#ctx = ctx;
 		const w = ctx.writer;
-		if (this.#options.prepare) {
-			const { statement, created } = ctx.statement(
-				this.#sql,
-				this.#options.paramTypes,
-			);
+		const spec = specOf(this.#options, ctx);
+		this.#spec = spec;
+		const types = this.#paramTypes;
+		if (this.#options.prepare && ctx.named()) {
+			const statement = ctx.statement(this.#sql, types, true);
+			const created = statement.unwritten;
+			statement.unwritten = false;
 			this.#statement = statement;
 			this.#created = created;
 			if (created) {
-				fe.parse(w, statement.name, this.#sql, this.#options.paramTypes);
+				fe.parse(w, statement.name, this.#sql, types);
 				fe.describe(w, 'S', statement.name);
 			}
-			fe.bind(w, '', statement.name, this.#values);
+			const known = created ? undefined : statement.fields;
+			const formats =
+				known === undefined
+					? 0
+					: cachedPlan(statement.plans, known, spec).formats;
+			this.#requested = formats;
+			fe.bind(w, '', statement.name, this.#values, formats);
 		} else {
-			fe.parse(w, '', this.#sql, this.#options.paramTypes);
+			this.#requested = 0;
+			fe.parse(w, '', this.#sql, types);
 			fe.bind(w, '', '', this.#values);
 			fe.describe(w, 'P', '');
 		}
@@ -777,14 +1008,25 @@ export class CursorOp extends Op {
 		this.#fetching = true;
 	}
 
-	#setFields(fields: readonly Field[]): void {
-		this.#fields = fields;
-		this.#decoder = decoderFor(
-			this.#statement,
-			fields,
-			this.#options.types ?? this.#ctx?.types ?? {},
-			this.#options.rowMode,
-		);
+	/** The columns: from the portal's description (with their formats), or the statement's. */
+	#setFields(fields: readonly Field[], portal: boolean): void {
+		// oxlint-disable-next-line typescript/no-non-null-assertion -- set by write
+		const spec = this.#spec!;
+		const plan = portal
+			? resultPlan(fields, spec, 'fields')
+			: planOf(this.#statement, fields, spec, this.#requested);
+		this.#fields = plan.fields;
+		if (plan.unreadable !== undefined) {
+			this.#error ??= new DecodeError(
+				plan.unreadable.name,
+				plan.unreadable.typeOid,
+				new DriverError(
+					'The column is not of the type the query expected, and came in binary',
+				),
+			);
+			this.#sync(true);
+		}
+		this.#decoder = planDecoder(plan, this.#options.rowMode);
 	}
 
 	#deliver(last: boolean): void {
@@ -886,21 +1128,19 @@ export class CursorOp extends Op {
 				if (this.#statement && this.#created) this.#statement.parsed = true;
 				return false;
 			case 'ParameterDescription':
-				if (this.#statement && this.#created)
-					this.#statement.paramTypes = msg.typeOids;
 				return false;
 			case 'RowDescription':
 				if (this.#statement && this.#created)
 					this.#statement.fields = msg.fields;
-				this.#setFields(msg.fields);
+				this.#setFields(msg.fields, this.#statement === undefined);
 				return false;
 			case 'NoData':
 				if (this.#statement && this.#created) this.#statement.fields = [];
-				this.#setFields([]);
+				this.#setFields([], false);
 				return false;
 			case 'BindComplete':
 				if (this.#fields === undefined && this.#statement?.fields !== undefined)
-					this.#setFields(this.#statement.fields);
+					this.#setFields(this.#statement.fields, false);
 				if (this.#exhausted && !this.#synced) this.#sync(true);
 				return false;
 			case 'DataRow':
@@ -1054,16 +1294,11 @@ export class CopyToOp extends Op {
 	#waiter: Waiter<Uint8Array | undefined> | undefined;
 	#error: Error | undefined;
 	#finished = false;
-	#rowCount = 0;
 
 	constructor(sql: string, highWaterMark: number) {
 		super();
 		this.#sql = sql;
 		this.#highWaterMark = highWaterMark;
-	}
-
-	get rowCount(): number {
-		return this.#rowCount;
 	}
 
 	write(ctx: OpContext): void {
@@ -1114,7 +1349,6 @@ export class CopyToOp extends Op {
 				return false;
 			}
 			case 'CommandComplete':
-				this.#rowCount = parseTag(msg.tag).rowCount ?? 0;
 				return false;
 			case 'CopyInResponse': {
 				const w = ctx.writer;

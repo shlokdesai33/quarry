@@ -136,14 +136,9 @@ export function convert(msg: BackendMessage, length: number): any {
 			return { name: 'copyData', length, chunk: Buffer.from(msg.data) };
 		case 'CopyInResponse':
 		case 'CopyOutResponse':
-		case 'CopyBothResponse':
 			return {
 				name:
-					msg.type === 'CopyInResponse'
-						? 'copyInResponse'
-						: msg.type === 'CopyOutResponse'
-							? 'copyOutResponse'
-							: 'copyBothResponse',
+					msg.type === 'CopyInResponse' ? 'copyInResponse' : 'copyOutResponse',
 				length,
 				binary: msg.binary,
 				columnTypes: [...msg.columnFormats],

@@ -1,5 +1,6 @@
 import type { ArrayType } from './data-type/array.js';
 import type { DataType } from './data-type/data-type.js';
+import type { CustomType } from './data-type/custom.js';
 import type { EnumType } from './data-type/enum.js';
 import type {
 	Expression,
@@ -37,6 +38,7 @@ export type Kind =
 	| 'daterange'
 	| 'tstzrange'
 	| 'enum'
+	| 'custom'
 	| 'array';
 
 /** The character types, which postgres compares with each other. */
@@ -105,15 +107,10 @@ type Point<S> = [S] extends [Range<infer P>] ? P : never;
 type Text = Binary<string, DataType<TextKind>>;
 
 /**
- * Any value jsonb can hold.
+ * Any value jsonb can hold: what the jsonb codec reads.
  */
-export type JsonValue =
-	| string
-	| number
-	| boolean
-	| null
-	| readonly JsonValue[]
-	| { [key: string]: JsonValue };
+export type { JsonValue } from './driver/binary.js';
+import type { JsonValue } from './driver/binary.js';
 
 /** The kinds postgres compares a value of kind `K` with. */
 type Comparable<K extends Kind> = K extends TextKind
@@ -128,7 +125,7 @@ type Comparable<K extends Kind> = K extends TextKind
  * The SQL types postgres compares a non-array type `D` with: those of a
  * comparable kind, or, for an enum, that enum alone.
  */
-type ComparableType<D extends DataType> = D extends EnumType
+type ComparableType<D extends DataType> = D extends EnumType | CustomType
 	? D
 	: DataType<Comparable<D['kind']>>;
 
@@ -412,6 +409,32 @@ export interface InetMethods<S, N extends null> extends ComparableMethods<
 	): Predicate<N | NullIn<V>>;
 }
 
+/**
+ * The methods of a type `defineType` declares: any operator, each taking a
+ * value of the type or an expression of the same type. Postgres decides
+ * which of them the type has.
+ */
+export interface CustomMethods<
+	S,
+	D extends DataType,
+	N extends null,
+> extends TextMethods<S, D, N> {
+	/** `@>` */
+	contains<V extends Binary<S, D>>(value: V): Predicate<N | NullIn<V>>;
+	/** `<@` */
+	containedBy<V extends Binary<S, D>>(value: V): Predicate<N | NullIn<V>>;
+	/** `&&` */
+	overlaps<V extends Binary<S, D>>(value: V): Predicate<N | NullIn<V>>;
+	/** `<<` */
+	strictlyLeftOf<V extends Binary<S, D>>(value: V): Predicate<N | NullIn<V>>;
+	/** `>>` */
+	strictlyRightOf<V extends Binary<S, D>>(value: V): Predicate<N | NullIn<V>>;
+	/** `-|-` */
+	adjacentTo<V extends Binary<S, D>>(value: V): Predicate<N | NullIn<V>>;
+	/** `@@` */
+	matches<V extends Binary<S, D>>(value: V): Predicate<N | NullIn<V>>;
+}
+
 /** The methods of the tsvector type. */
 export interface TsvectorMethods<N extends null> extends NullMethods {
 	/** `@@`: matches the tsquery, e.g. `'fat & rat'`. */
@@ -448,6 +471,7 @@ export interface MethodsByKind<S, D extends DataType, N extends null> {
 	daterange: RangeMethods<S, DataType<'daterange'>, DataType<'date'>, N>;
 	tstzrange: RangeMethods<S, DataType<'tstzrange'>, DataType<TimestampKind>, N>;
 	enum: EqualityMethods<S, ComparableType<D>, N>;
+	custom: CustomMethods<S, ComparableType<D>, N>;
 	array: ArrayMethods<S, ElementOf<D>, N>;
 }
 
