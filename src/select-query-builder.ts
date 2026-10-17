@@ -24,6 +24,23 @@ import type {
 	TableNode,
 } from './node.js';
 import type { AnyPredicate, EqualsValue } from './operators.js';
+import {
+	checkSize,
+	type CursorPage,
+	type CursorPageOptions,
+	decodeCursor,
+	encodeCursor,
+	type KeyColumn,
+	type KeysetOptions,
+	type OffsetPage,
+	type OffsetPageOptions,
+	orderBy,
+	readKeys,
+	resolveKeyset,
+	runOptions,
+	seekPage,
+	settled,
+} from './pagination.js';
 import { type Query, rejectAwait } from './query.js';
 import type { Ref, Refs, RefsOf } from './refs.js';
 import {
@@ -795,7 +812,7 @@ export class SelectQueryBuilder<
 	/**
 	 * Adds `offset count`: the query skips its first `count` rows. Postgres
 	 * still reads the rows it skips, so a deep offset is slow; keyset
-	 * pagination (`where` on the last key seen, with `orderBy`) is not. A
+	 * pagination (`paginateByCursor`, `iterateChunks`) is not. A
 	 * later call replaces it.
 	 *
 	 * @example .orderBy('posts.id').limit(20).offset(40)
@@ -929,6 +946,223 @@ export class SelectQueryBuilder<
 	/** The query's parameter and result types, as the server reports them without running it. */
 	describe(): Promise<QueryDescription> {
 		return this.#executor().describe(compile(this.toNode()));
+	}
+
+	/**
+	 * Runs the query in batches of `size` rows, ordered by the key `by`, and
+	 * yields each batch as it arrives: keyset pagination, each batch its own
+	 * query. A batch adds `order by key limit size` to the query, and every
+	 * batch after the first `where key > last key` (`(a, b) > (…)` for a
+	 * composite key; `<` with `direction: 'desc'`): no `offset`, so a batch
+	 * costs the same however far in it is, and holds no connection or cursor
+	 * open between batches, unlike `stream()`. The iteration ends with a
+	 * batch of fewer than `size` rows, or an empty one. Breaking out of the
+	 * loop stops it.
+	 *
+	 * It owns the order and the limit: on a query that already has
+	 * `orderBy()`, `limit()` or `offset()`, it throws, rather than combine
+	 * them. Order with `by` and `direction` instead.
+	 *
+	 * The key columns must together be unique and non-null, and be selected,
+	 * since each batch's last row gives the next one's start. They are read
+	 * as the server's text and decoded by their codecs, so the next batch
+	 * seeks from the exact value even where the decoded one is rounded (a
+	 * timestamptz's microseconds, in a `Date`). Each batch sees
+	 * the rows committed when it runs: rows inserted ahead of the key's
+	 * position show up, those behind it don't, and no row is read twice.
+	 * Run in `db.transaction` (`repeatable read`, for one snapshot) to see
+	 * the table as of one moment, or to keep the locks of a `forUpdate()`.
+	 *
+	 * @example
+	 * for await (const batch of db.selectFrom(users).select(['users.id', 'users.email']).iterateChunks(1000, { by: 'users.id' })) { … }
+	 * @example .iterateChunks(500, { by: ['posts.createdAt', 'posts.id'], direction: 'desc' })
+	 */
+	async *iterateChunks(
+		size: number,
+		options: KeysetOptions<KeyColumn<T, O>>,
+	): AsyncGenerator<O[], void, undefined> {
+		checkSize('iterateChunks', 'size', size);
+		const executor = this.#executor();
+		const base = this.toNode();
+		const keyset = resolveKeyset(
+			'iterateChunks',
+			this.#state.tables,
+			base,
+			options.by,
+			options.direction,
+			true,
+		);
+		const run = runOptions(options);
+		let after: readonly string[] | undefined;
+		for (;;) {
+			const query = compile(seekPage(base, keyset, after, size));
+			// oxlint-disable-next-line no-await-in-loop -- each batch starts after the last
+			const { rows } = await executor.execute(query, run);
+			after = readKeys(keyset, rows, 'iterateChunks');
+			if (after === undefined) return;
+			// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the select list supplies the row type
+			yield rows as O[];
+			if (rows.length < size) return;
+		}
+	}
+
+	/**
+	 * Runs the query for one page of `perPage` rows, ordered by the key `by`,
+	 * from the row after the cursor `after`: keyset pagination, for APIs.
+	 * Adds `order by key limit perPage + 1` to the query, and with `after`,
+	 * `where key > cursor's key` (`<` with `direction: 'desc'`); the extra row
+	 * only tells whether there is a next page. `nextCursor` is what `after`
+	 * takes for the next page, or `null` on the last.
+	 *
+	 * It owns the order and the limit: on a query that already has
+	 * `orderBy()`, `limit()` or `offset()`, it throws, rather than combine
+	 * them. Order with `by` and `direction` instead.
+	 *
+	 * The key columns must together be unique and non-null, and be selected;
+	 * as with `iterateChunks`, the cursor holds their exact values. A
+	 * cursor is base64url JSON of the last row's key values: opaque to
+	 * clients, but not signed or encrypted. A cursor made for another key or
+	 * direction, or altered, rejects with `InvalidCursorError`.
+	 *
+	 * @example
+	 * const { rows, nextCursor, hasMore } = await db.selectFrom(posts).select(['posts.id', 'posts.title']).paginateByCursor({ perPage: 20, by: 'posts.id', after: request.query.cursor });
+	 */
+	async paginateByCursor(
+		options: CursorPageOptions<KeyColumn<T, O>>,
+	): Promise<CursorPage<O>> {
+		const { perPage, after } = options;
+		checkSize('paginateByCursor', 'perPage', perPage);
+		const executor = this.#executor();
+		const base = this.toNode();
+		const keyset = resolveKeyset(
+			'paginateByCursor',
+			this.#state.tables,
+			base,
+			options.by,
+			options.direction,
+			true,
+		);
+		const start =
+			after === undefined || after === null
+				? undefined
+				: decodeCursor(keyset, after);
+		const { rows } = await executor.execute(
+			compile(seekPage(base, keyset, start, perPage + 1)),
+			runOptions(options),
+		);
+		const page = rows.slice(0, perPage);
+		const last = readKeys(keyset, page, 'paginateByCursor');
+		const hasMore = rows.length > perPage && last !== undefined;
+		return {
+			// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the select list supplies the row type
+			rows: page as O[],
+			nextCursor: hasMore ? encodeCursor(keyset, last) : null,
+			hasMore,
+		};
+	}
+
+	/**
+	 * Runs the query for page `page` (from 1) of `perPage` rows, ordered by
+	 * `by`: offset pagination, for numbered pages. Adds `order by by limit
+	 * perPage + 1 offset (page - 1) * perPage` to the query; the extra row
+	 * only tells whether there is a next page. The server still reads every
+	 * row before the page, so deep pages get slower; `paginateByCursor`
+	 * doesn't. Rows inserted or deleted between requests shift the pages.
+	 *
+	 * It owns the order and the limit: on a query that already has
+	 * `orderBy()`, `limit()` or `offset()`, it throws, rather than combine
+	 * them. Order with `by` and `direction` instead.
+	 *
+	 * `by` should be unique, so that every row is on exactly one page. With
+	 * `countTotal: true`, it also runs `select count(*)` over the query's
+	 * joins and `where`, in the same round trip, into `total`.
+	 *
+	 * @example await db.selectFrom(users).select(['users.id', 'users.email']).paginateByOffset({ page: 2, perPage: 50, by: 'users.id' })
+	 * @example .paginateByOffset({ page, perPage: 50, by: ['users.lastName', 'users.id'], countTotal: true })
+	 */
+	paginateByOffset(
+		options: OffsetPageOptions<Ref<RefsOf<T>>> & { readonly countTotal: true },
+	): Promise<OffsetPage<O> & { readonly total: number }>;
+	paginateByOffset(
+		options: OffsetPageOptions<Ref<RefsOf<T>>>,
+	): Promise<OffsetPage<O>>;
+	async paginateByOffset(
+		options: OffsetPageOptions<Ref<RefsOf<T>>>,
+	): Promise<OffsetPage<O> & { readonly total?: number }> {
+		const { page, perPage, countTotal = false } = options;
+		checkSize('paginateByOffset', 'perPage', perPage);
+		if (!Number.isInteger(page) || page < 1) {
+			throw new RangeError(
+				`paginateByOffset() takes a page from 1, not ${page}`,
+			);
+		}
+		const executor = this.#executor();
+		const base = this.toNode();
+		const keyset = resolveKeyset(
+			'paginateByOffset',
+			this.#state.tables,
+			base,
+			options.by,
+			options.direction,
+			false,
+		);
+		const query = compile({
+			...base,
+			orderBy: orderBy(keyset),
+			limit: perPage + 1,
+			offset: (page - 1) * perPage,
+		});
+		const run = runOptions(options);
+		let rows: readonly unknown[];
+		let total: number | undefined;
+		if (countTotal) {
+			const unlocked: SelectNode = { ...base, locks: [] };
+			// a grouped or distinct query counts its result rows, not the table's
+			const count = compile(
+				base.distinct !== undefined ||
+					(base.groupBy?.length ?? 0) > 0 ||
+					base.having !== undefined
+					? {
+							kind: 'raw',
+							fragments: [
+								'select count(*) as "count" from (',
+								') as "quarry_rows"',
+							],
+							nodes: [unlocked],
+						}
+					: {
+							...unlocked,
+							selections: [
+								{
+									expression: {
+										kind: 'function',
+										name: 'count',
+										args: [{ kind: 'raw', fragments: ['*'], nodes: [] }],
+									},
+									alias: 'count',
+									codec: undefined,
+								},
+							],
+						},
+			);
+			const [pageResult, countResult] = await executor.batch(
+				[{ query }, { query: count, rowMode: 'array' }],
+				run,
+			);
+			rows = settled(pageResult).rows;
+			const [countRow] = settled(countResult).rows;
+			total = Number(Array.isArray(countRow) ? countRow[0] : countRow);
+		} else {
+			({ rows } = await executor.execute(query, run));
+		}
+		return {
+			// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the select list supplies the row type
+			rows: rows.slice(0, perPage) as O[],
+			page,
+			perPage,
+			hasMore: rows.length > perPage,
+			...(total === undefined ? {} : { total }),
+		};
 	}
 
 	/** The whole query as one node. */
