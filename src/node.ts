@@ -15,6 +15,7 @@ export type OperationNode =
 	| OrNode
 	| NotNode
 	| FunctionNode
+	| CaseNode
 	| RawNode
 	| SelectNode;
 
@@ -101,6 +102,21 @@ export type FunctionNode = {
 	readonly kind: 'function';
 	readonly name: string;
 	readonly args: readonly OperationNode[];
+	/** `name(distinct args)`, for an aggregate over the distinct values. */
+	readonly distinct?: boolean | undefined;
+};
+
+/**
+ * `case when condition then result ... else result end`; without `otherwise`,
+ * `else` is left out, so no branch matching yields null.
+ */
+export type CaseNode = {
+	readonly kind: 'case';
+	readonly branches: readonly {
+		readonly when: OperationNode;
+		readonly result: OperationNode;
+	}[];
+	readonly otherwise: OperationNode | undefined;
 };
 
 /**
@@ -130,10 +146,28 @@ export type SelectionNode = {
 	readonly codec: Codec | undefined;
 };
 
-/** `inner join table on condition`. */
+/** `kind join table on condition`; a cross join has no condition. */
 export type JoinNode = {
+	readonly kind: 'inner' | 'left' | 'right' | 'full' | 'cross';
 	readonly table: TableNode;
-	readonly on: OperationNode;
+	readonly on: OperationNode | undefined;
+};
+
+/**
+ * An `order by` key: `expression [asc | desc] [nulls first | nulls last]`;
+ * each left out when `undefined`, for postgres's default (ascending, nulls
+ * last when ascending and first when descending).
+ */
+export type OrderNode = {
+	readonly expression: OperationNode | AliasNode;
+	readonly direction: 'asc' | 'desc' | undefined;
+	readonly nulls: 'first' | 'last' | undefined;
+};
+
+/** A selected column by its alias, as `group by` and `order by` can name it. */
+export type AliasNode = {
+	readonly kind: 'alias';
+	readonly alias: string;
 };
 
 /**
@@ -153,11 +187,20 @@ export type LockNode = {
  */
 export type SelectNode = {
 	readonly kind: 'select';
+	/**
+	 * `select distinct`, or with expressions, `select distinct on
+	 * (expressions)`; `undefined` for every row.
+	 */
+	readonly distinct?: true | readonly (OperationNode | AliasNode)[] | undefined;
 	readonly selections: readonly SelectionNode[];
 	readonly from: TableNode;
 	readonly joins: readonly JoinNode[];
 	readonly where: OperationNode | undefined;
+	readonly groupBy?: readonly (OperationNode | AliasNode)[] | undefined;
+	readonly having?: OperationNode | undefined;
+	readonly orderBy?: readonly OrderNode[] | undefined;
 	readonly limit: number | undefined;
+	readonly offset?: number | undefined;
 	/** The locking clauses, in order. */
 	readonly locks: readonly LockNode[];
 	/** A label passed on with the compiled query, never rendered into its SQL. */

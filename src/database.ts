@@ -30,6 +30,7 @@ import {
 	selectFromWith,
 } from './select-query-builder.js';
 import type { Executable } from './query.js';
+import { type SqlQuery, sqlQuery, type SqlValue } from './sql.js';
 import type { AnyTable } from './table.js';
 import {
 	type UpdateManyOptions,
@@ -92,6 +93,21 @@ export interface Database extends AsyncDisposable {
 	deleteFrom<T extends AnyTable>(
 		table: T,
 	): DeleteQueryBuilder<T, undefined, 'where'>;
+
+	/**
+	 * A whole statement written by hand, run on this database (inside a
+	 * transaction, on its connection) by `execute()`, with every result
+	 * shape. Interpolated values are parameters; expressions, tables,
+	 * `sql.id` and `sql.lit` are written into the SQL. The row type `R` is
+	 * a promise you make; nothing checks it.
+	 *
+	 * @example const { rowCount } = await db.sql`vacuum analyze posts`.execute();
+	 * @example const n = await db.sql<{ n: string }>`select count(*) as n from posts where author_id = ${id}`.expectValue().execute();
+	 */
+	sql<R = Record<string, unknown>>(
+		strings: TemplateStringsArray,
+		...values: SqlValue[]
+	): SqlQuery<R>;
 
 	/**
 	 * Runs `queries` in one round trip, on one connection, and resolves to
@@ -221,6 +237,7 @@ function queries(
 		updateMany: (table, rows, options) =>
 			updateManyWith(table, rows, options, executor),
 		deleteFrom: (table) => deleteFromWith(table, executor),
+		sql: (strings, ...values) => sqlQuery(executor, strings, values),
 		batch: (list, options) => batchWith(executor, list, options),
 		transaction: (fn, options) =>
 			executor.transaction((tx) => fn(transactionWith(tx)), options),
