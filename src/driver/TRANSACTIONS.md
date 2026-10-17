@@ -18,7 +18,7 @@ The query builder's side is in [../EXECUTION.md](../EXECUTION.md#transactions).
 - [`afterCommit` and `afterRollback`](#aftercommit-and-afterrollback)
 - [Batches in one round trip](#batches-in-one-round-trip)
 - [What goes wrong, and what you see](#what-goes-wrong-and-what-you-see)
-- [Why it is built this way](#why-it-is-built-this-way)
+- [Decisions](#decisions)
 - [Glossary](#glossary)
 
 ## What a transaction is
@@ -259,14 +259,17 @@ S< … COMMIT … ReadyForQuery(I)
 | A `PoolClient` released while still in a transaction | the pool destroys the connection ([POOL.md](POOL.md#releasing-and-giving-back))                              |
 | Using `tx` after the callback settled                | "This transaction has already finished"                                                                      |
 
-## Why it is built this way
+## Decisions
 
-- **BEGIN with the first statement, under one Sync**: one round trip saved per transaction, and a failed BEGIN can never let a statement run outside the transaction.
-- **Deferred savepoint release**: one round trip saved per savepoint; errors still surface, on the next statement.
-- **Detect the silent rollback**: a swallowed error can't masquerade as a commit.
-- **Retries opt-in and whole-callback**: correctness first; partial replays are never right.
-- **Settings with `set_config(…, true)`**: bound values, transaction-local, pooler-safe.
-- **Callbacks that can't change the outcome**: after-commit side effects run only for the committed attempt, and their failures don't masquerade as transaction failures.
+Why transactions work this way. Each links to its full entry (what it is, why, the alternatives, the cost, measured impact) in [DECISIONS.md](DECISIONS.md):
+
+- [BEGIN shares the first statement's Sync](DECISIONS.md#begin-shares-the-first-statements-sync): one round trip saved per transaction, and a failed BEGIN can never let a statement run outside it.
+- [Deferred savepoint RELEASE](DECISIONS.md#deferred-savepoint-release): one round trip saved per savepoint; errors still surface.
+- [Detect a COMMIT that rolled back](DECISIONS.md#detect-a-commit-that-rolled-back): a swallowed error can't pass for a commit.
+- [Retries opt-in, re-running the whole callback](DECISIONS.md#retries-opt-in-re-running-the-whole-callback): partial replays are never right.
+- [Settings with `set_config(…, true)`](DECISIONS.md#settings-with-set_config-true): bound values, transaction-local, pooler-safe.
+- [`afterCommit` callbacks that can't change the outcome](DECISIONS.md#aftercommit-callbacks-that-cant-change-the-outcome): side effects only for the committed attempt.
+- [`db.batch` framing: one write, with COMMIT pipelined unless results are checked](DECISIONS.md#dbbatch-framing-one-write-with-commit-pipelined-unless-results-are-checked): many statements, atomically, in one round trip.
 
 ## Glossary
 

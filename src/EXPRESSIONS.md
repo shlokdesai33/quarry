@@ -25,11 +25,15 @@ Files: [expression.ts](expression.ts), [expression-builder.ts](expression-builde
 - [Parameters: `eb.val`](#parameters-ebval)
 - [`any` and `all`](#any-and-all)
 - [`and`, `or`, `not`](#and-or-not)
+- [Arithmetic](#arithmetic)
+- [`case`](#case)
 - [Functions: `eb.fn`](#functions-ebfn)
 - [jsonb: `eb.json`](#jsonb-ebjson)
 - [`where` and `on`: the three forms](#where-and-on-the-three-forms)
+- [Raw SQL fragments](#raw-sql-fragments)
 - [`undefined` is refused](#undefined-is-refused)
 - [Why methods and not operator strings](#why-methods-and-not-operator-strings)
+- [Decisions](#decisions)
 - [Glossary](#glossary)
 
 ## What an expression is
@@ -239,14 +243,16 @@ So `eb.ref('users.publicId').eq(eb.ref('users.email'))` (uuid vs text) is a type
 
 How a `Param` is encoded depends on where it ends up:
 
-| Position                    | Codec                                                                                                         |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| right side of a comparison  | its own codec if given, else the left side's (for `in`/`any`, `arrayOf` it)                                   |
-| `coalesce` fallback         | its own, else the first argument's                                                                            |
-| left side of `any`/`all`    | its own, else the array's element codec                                                                       |
-| anywhere else (`concat`, …) | its own if given; otherwise none: the driver encodes it by its JavaScript type and the server infers its type |
+| Position                                   | Codec                                                                                                    |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| right side of a comparison                 | its own codec if given, else the left side's (for `in`/`any`, `arrayOf` it)                              |
+| `coalesce` fallback                        | its own, else the first argument's                                                                       |
+| left side of `any`/`all`                   | its own, else the array's element codec                                                                  |
+| anywhere else (`concat`, a select list, …) | its own if given; otherwise a codec chosen from its JavaScript type, which **declares** its type (below) |
 
-A `Param` has the methods of `ParamMethods`: only comparisons against `any`/`all` of an array, since it has no SQL type of its own to compare by.
+**A bare parameter declares its type** (`codecOfValue` in [expression.ts](expression.ts), since #32). Where nothing else gives a value a type, Postgres has to infer it from the parameter's position, and in `concat($1)` or `select $1` there is nothing to infer from: it fails with "could not determine data type of parameter $1", or picks `text`. So a `Param` without a codec gets one from its JavaScript type: a string is `text` (declared, through `declareParamType`), a whole number within int4 range `integer`, any other number `double precision`, a boolean `boolean`, a bigint `int8`, a `Date` `timestamptz`. That also makes `eb.val(1).as('one')` arrive as the number `1`, matching its TypeScript type, instead of the string `'1'`. In a comparison the other side's codec still wins.
+
+A `Param` has the methods of `ParamMethods`: only comparisons against `any`/`all` of an **array column or expression**, since it has no SQL type of its own to compare by. Since #32 the types also check that the value fits the array's element type and that the operator exists for it (`like` only for text, and so on).
 
 ## `any` and `all`
 
@@ -273,25 +279,64 @@ eb.not(a); // not (a)
 
 `junction(kind)` in [expression-builder.ts](expression-builder.ts) **flattens** nested junctions of the same kind: `eb.and([eb.and([a, b]), c])` becomes one `and` node with three operands. Rendering ([COMPILER.md](COMPILER.md#and-or-and-precedence)): an empty `and` is `true`, an empty `or` is `false`, a single operand renders on its own, several are joined and parenthesised.
 
+## Arithmetic
+
+```ts
+eb.ref('posts.views').plus(1); // "posts"."views" + $1   (an integer)
+eb.ref('orders.total').times(eb.ref('orders.qty'));
+eb.ref('posts.createdAt').plus('1 day'); // timestamptz + interval → timestamptz
+eb.ref('posts.createdAt').minus(eb.ref('posts.publishedAt')); // → interval
+eb.ref('items.embedding').cosineDistance(query); // pgvector `<=>` → double precision
+```
+
+Arithmetic methods ([expression-methods.ts](expression-methods.ts) `ARITHMETIC`, `arithmetic`, `arithmeticOf`) are attached to the same prototypes as comparisons, and typed per kind in [operators.ts](operators.ts):
+
+| On                         | Methods                                                                                                            | Result                                                                                                                         |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| numbers                    | `plus`, `minus`, `times`, `dividedBy` (all numeric kinds), `mod` (exact kinds: smallint, integer, bigint, decimal) | the **wider** kind: between exact kinds the later of `smallint < integer < bigint < decimal`; with a float, `double precision` |
+| `timestamp`, `timestamptz` | `plus`/`minus` an interval; `minus` another timestamp                                                              | the same kind / `interval`                                                                                                     |
+| `date`                     | `plus`/`minus` a number of days; `minus` another date                                                              | `date` / `integer`                                                                                                             |
+| `interval`                 | `plus`, `minus`                                                                                                    | `interval`                                                                                                                     |
+| `vector`                   | `l2Distance` (`<->`), `cosineDistance` (`<=>`), `innerProduct` (`<#>`)                                             | `double precision`                                                                                                             |
+
+The result's SQL type follows Postgres's own rules, so its methods and codec are right (`count + 1` stays a bigint read as a string; `date - date` is an integer). A plain value on the right is sent with its type **declared** (`declareParamType` of the codec `arithmeticOf` picks): `timestamptz - $1` is otherwise ambiguous to Postgres (it could be an interval or a timestamp), and declaring `interval` resolves the operator. Arithmetic makes increments possible: `set((eb) => ({ views: eb.ref('posts.views').plus(1) }))` renders `"views" = "posts"."views" + $1`, computed by the server from the current value. Operands that are operations are bracketed by the compiler ([COMPILER.md](COMPILER.md#rendering-expressions-render)).
+
+## `case`
+
+```ts
+eb.case()
+	.when(eb.ref('orders.total').gte(1000), 'large')
+	.when(eb.ref('orders.total').gte(100), 'medium')
+	.else('small')
+	.end()
+	.as('size');
+// case when "orders"."total" >= $1 then $2 when … else $5 end as "size"
+```
+
+[case.ts](case.ts). `eb.case()` returns a builder whose types walk through `CaseStart` → `CaseWhen<V, D>` → `CaseElse<V, D>`:
+
+- The result type `V` is the **union** of the branch results, plus `null` without an `else` (no branch matching yields NULL).
+- The **first** result fixes the SQL type `D` (an expression's type, or a plain value's by its JavaScript type); later results must be values of that type, `null`, or expressions of a type Postgres resolves with it (`CaseResult`). At run time `caseType` finds the type the same way, and refuses a `case` whose results are only nulls or have conflicting types (an `integer` with a fractional number becomes `double precision`).
+- Values are sent with that type declared, so Postgres resolves the `case` the same way.
+- It needs at least one `when` (the start type has no `else` or `end`), as Postgres does.
+
 ## Functions: `eb.fn`
 
-[functions.ts](functions.ts). Each function builds a `function` node (or a `raw` node) and declares its result's SQL type:
+[functions.ts](functions.ts). Each function builds a `function` node (or a `raw` node) and declares its result's SQL type, following Postgres's result types:
 
-| Function                     | SQL                    | Result SQL type      | Result TypeScript type                            |
-| ---------------------------- | ---------------------- | -------------------- | ------------------------------------------------- |
-| `lower(text)`, `upper(text)` | `lower(x)`             | `text`               | `string`, null if `x` can be                      |
-| `length(text)`               | `length(x)`            | `integer`            | `number`, null if `x` can be                      |
-| `concat(...parts)`           | `concat(a, b, …)`      | `text`               | `string`, never null (Postgres skips nulls)       |
-| `coalesce(first, ...rest)`   | `coalesce(a, b, …)`    | the first argument's | non-null unless the **last** argument can be null |
-| `count()`, `count(x)`        | `count(*)`, `count(x)` | `bigint`             | `string` (int8 as digits)                         |
-| `min(x)`, `max(x)`           | `min(x)`               | `x`'s                | `x`'s, or null (no rows)                          |
-| `now()`                      | `now()`                | `timestamptz`        | `Date`                                            |
-| `cast(x, 'integer')`         | `cast(x as integer)`   | the target's         | per target (`CastValues`)                         |
-| `any(array)`, `all(array)`   | `any(…)`               | (a `Quantified`)     |                                                   |
+| Group       | Functions                                                                                                                          | Notes                                                                                                                                                                                                                                              |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| text        | `lower`, `upper`, `length`, `concat`, `trim`, `ltrim`, `rtrim`, `substring`, `replace`, `strpos`, `left`, `right`, `splitPart`     | `concat` is never null (Postgres skips nulls); the others are null if an argument is                                                                                                                                                               |
+| comparison  | `coalesce`, `nullif`, `greatest`, `least`                                                                                          | `coalesce` is non-null unless its **last** argument can be null; a `Param` fallback takes the first argument's codec                                                                                                                               |
+| aggregates  | `count`, `countDistinct`, `min`, `max`, `sum`, `avg`, `arrayAgg`, `stringAgg`, `boolAnd`, `boolOr`, `jsonbAgg`, `jsonbBuildObject` | `count` is a `bigint` (a string); `sum` of an integer is a bigint, of a bigint a numeric; `avg` a numeric; `min`/`max` keep their argument's type and are null over no rows; `countDistinct` renders `count(distinct x)` (`FunctionNode.distinct`) |
+| math        | `abs`, `round`, `ceil`, `floor`                                                                                                    | `round(x, places)` on a decimal                                                                                                                                                                                                                    |
+| dates       | `now`, `currentDate`, `dateTrunc`, `extract`, `toChar`                                                                             | `extract` and `dateTrunc` take the field as a fixed string                                                                                                                                                                                         |
+| arrays      | `cardinality`                                                                                                                      |                                                                                                                                                                                                                                                    |
+| conversion  | `cast(x, type)`                                                                                                                    | targets: text, varchar, smallint, integer, bigint, numeric, real, double precision, boolean, uuid, date, timestamp, timestamptz, time, interval, jsonb (`CAST_KINDS`); also takes a parameter                                                      |
+| quantifiers | `any`, `all`                                                                                                                       | a `Quantified`, only on the right of a comparison                                                                                                                                                                                                  |
 
-- `cast` renders through a `raw` node because `cast(x as type)` has a keyword inside the parentheses. Its target is one of a fixed list (`CAST_KINDS`); anything else throws, since the target is written into the SQL.
-- `coalesce` encodes a `Param` fallback with the first argument's codec, so `coalesce('users.deletedAt', eb.val(date))` sends the date as a `timestamptz`.
-- `count`, `min` and `max` are the aggregates the compiler knows about when checking locking clauses ([COMPILER.md](COMPILER.md#locking-clauses)).
+- `cast` renders through a `raw` node because `cast(x as type)` has a keyword inside the parentheses. Its target is one of a fixed list; anything else throws, since the target is written into the SQL.
+- The aggregates are what the compiler looks for when it refuses a locking clause on an aggregate query ([COMPILER.md](COMPILER.md#locking-clauses)).
 
 ## jsonb: `eb.json`
 
@@ -339,6 +384,26 @@ The `(column, value)` form only takes values `eq` would take for that column (`E
 
 `on`'s shorthand differs: `on('contacts.userId', 'users.id')` compares **two columns**: the joined table's column first, then a column of a table already in scope of a SQL type its `=` takes (`JoinColumn` in [select-query-builder.ts](select-query-builder.ts)). Any other join condition goes in a callback.
 
+## Raw SQL fragments
+
+```ts
+.select((eb) => [sql<number>`extract(epoch from ${eb.ref('users.createdAt')})`.as('epoch')])
+.where((eb) => sql<boolean>`${eb.ref('posts.title')} % ${search}`)
+sql.id('app', 'users')     // "app"."users"
+sql.lit('5s')              // '5s', written into the SQL
+sql.join(ids)              // $1, $2, $3
+```
+
+For anything the builder doesn't model, the `sql` tag ([sql.ts](sql.ts)) makes a fragment usable wherever an expression of type `T` is. It builds a `raw` node from the template's strings and values (`templateNode`):
+
+- An interpolated **value** becomes a parameter, with no codec: Postgres infers its type from where it stands. `undefined` is refused.
+- An **expression** (`eb.ref`, `eb.fn…`, another fragment) and a **table** are written into the SQL as their nodes.
+- `sql.id(…)` writes a quoted identifier, `sql.lit(…)` a literal (quoted string, finite number, boolean or null) for places Postgres takes no parameter, `sql.join(items, separator?)` a list.
+- It must be called as a **template literal**: passing an ordinary string (`sql(userInput)`) is refused at run time (`isTemplate` checks the `raw` property that only template calls have). This is what keeps hand-written SQL injection-safe: the literal parts are always code you wrote, and everything interpolated is either a parameter or a node quarry quoted.
+- A fragment has no SQL type, so it has no comparison methods, and its selected value is decoded by the type the server reports (the registry). `T` is a promise you make; nothing checks it. It is written without brackets, so bracket it where precedence matters.
+
+`db.sql` runs a whole statement this way ([QUERIES.md](QUERIES.md#whole-statements-dbsql)).
+
 ## `undefined` is refused
 
 ```ts
@@ -359,6 +424,20 @@ Earlier versions had `eb('users.age', '>=', 18)`. Methods won because:
 - **The result type can depend on the argument** (null propagation), per method.
 
 The runtime cost is nil: one generic `compare` and a table of operator names.
+
+## Decisions
+
+Why expressions work this way. Each links to its full entry (what it is, why, the alternatives, the cost, measured impact) in [DECISIONS.md](DECISIONS.md):
+
+- [Types follow PostgreSQL, not JavaScript](DECISIONS.md#types-follow-postgresql-not-javascript): comparisons are checked by SQL type.
+- [Comparisons are methods, typed per SQL kind](DECISIONS.md#comparisons-are-methods-typed-per-sql-kind): see also [above](#why-methods-and-not-operator-strings).
+- [Parameters everywhere, literals only where Postgres refuses a parameter](DECISIONS.md#parameters-everywhere-literals-only-where-postgres-refuses-a-parameter): where `is`, empty `in`, jsonb keys and units are written into the SQL.
+- [`undefined` is refused; optional filters use `when()`](DECISIONS.md#undefined-is-refused-optional-filters-use-when): an optional filter can't silently match nothing.
+- [`eb.val` declares a type from its JavaScript type](DECISIONS.md#ebval-declares-a-type-from-its-javascript-type): a bare value always has a type the server can use.
+- [`= any($1)` gets a declared type only for integer and boolean columns](DECISIONS.md#-any1-gets-a-declared-type-only-for-integer-and-boolean-columns): binary arrays where a declared type can't change the comparison.
+- [Arithmetic follows Postgres's result types](DECISIONS.md#arithmetic-follows-postgress-result-types): the result has the methods and codec of what Postgres returns.
+- [`case`: the first result fixes the SQL type](DECISIONS.md#case-the-first-result-fixes-the-sql-type): every branch is sent with one declared type.
+- [Raw SQL only through the `sql` template tag](DECISIONS.md#raw-sql-only-through-the-sql-template-tag): an escape hatch that stays injection-safe.
 
 ## Glossary
 

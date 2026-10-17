@@ -13,7 +13,7 @@ Code: `#enqueue`, `#abortOn`, `#timeOut`, `#abort`, `#cancelAtHead`, `cancel`, `
 - [Why later writes are held back](#why-later-writes-are-held-back)
 - [Statement timeouts](#statement-timeouts)
 - [`QueryCanceled` and its reason](#querycanceled-and-its-reason)
-- [Why it is built this way](#why-it-is-built-this-way)
+- [Decisions](#decisions)
 - [Glossary](#glossary)
 
 ## Why canceling is not simple
@@ -100,6 +100,16 @@ If another aborted op is waiting further back, `#canceling` moves to it when the
 
 In a `SyncGroupOp` (several statements under one Sync), a cancel applies to the group: `canceledBy` is passed to the statement currently running, which is the one the server interrupts; the rest are skipped by the server as after any error.
 
+## Cursors
+
+<a id="cursors"></a>
+A cursor ([STREAMING.md](STREAMING.md#cursors)) spends most of its life **suspended**: the server has sent a batch and waits for the next Execute, while your loop works. A cancel request then does nothing, since the backend isn't running anything (before #34, that is all an abort did, so aborting a stream between batches had no effect). `CursorOp.interrupt(reason)` (and the `CursorIterator`'s own signal and timer for a cursor inside a transaction) therefore distinguishes:
+
+- **Between batches**: close the portal (Close + Sync outside a transaction), with no cancel request; the next pull rejects with `AbortError` ("The cursor was aborted" / "timed out").
+- **While a batch runs**: ask the server to cancel it, as for a query; the batch fails with `QueryCanceled` (`reason: 'abort'` or `'timeout'`). Inside a transaction that fails the transaction, like any canceled statement.
+
+`statementTimeout` on a cursor bounds it from its first batch to its last, the consumer's time included, because a suspended portal keeps `statement_timeout` running across Executes.
+
 ## Statement timeouts
 
 <a id="statement-timeouts"></a>
@@ -130,13 +140,16 @@ Numbers are milliseconds (`'2000ms'`); strings are any Postgres interval (`'2s'`
 | `'statement_timeout'` | the server's `statement_timeout`                                                 | the message says "statement timeout"                              |
 | `'user'`              | anything else: `connection.cancel()`, `pg_cancel_backend()` from another session | default                                                           |
 
-## Why it is built this way
+## Decisions
 
-- **Drop if unsent, cancel if sent**: the cheapest correct action in each case; dropping touches neither the server nor the connection.
-- **Cancel only at the head, hold later writes**: the cancel can only hit its target, even with deep pipelines.
-- **Repeat the cancel**: Postgres ignores cancels that arrive too early; retrying with backoff is the only way to make them reliable.
-- **Server-side statement timeouts, transaction-local**: the server enforces them even if the client is stuck, and they can't leak through poolers.
-- **Every wait has a timeout**: connecting, acquiring, running, closing: nothing in the driver waits forever by default except an explicit `acquireTimeout: 0`.
+Why cancellation works this way. Each links to its full entry (what it is, why, the alternatives, the cost, measured impact) in [DECISIONS.md](DECISIONS.md):
+
+- [Drop unsent queries without contacting the server](DECISIONS.md#drop-unsent-queries-without-contacting-the-server): the cheapest correct action; nothing touches the server.
+- [Cancel only the query at the head, and hold back later writes](DECISIONS.md#cancel-only-the-query-at-the-head-and-hold-back-later-writes): the cancel can only hit its target, even with deep pipelines; repeated because Postgres ignores early cancels.
+- [Aborting a suspended cursor closes it instead of cancelling](DECISIONS.md#aborting-a-suspended-cursor-closes-it-instead-of-cancelling): between batches there is nothing to cancel.
+- [Server-side statement timeouts, transaction-local and pipelined](DECISIONS.md#server-side-statement-timeouts-transaction-local-and-pipelined): the server enforces them even if the client is stuck.
+- [A statement timeout bounds the whole stream](DECISIONS.md#a-statement-timeout-bounds-the-whole-stream): for cursors.
+- [Every wait has a timeout](DECISIONS.md#every-wait-has-a-timeout): nothing waits forever by default.
 
 ## Glossary
 

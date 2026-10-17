@@ -20,7 +20,7 @@ New to databases? Read [Part 1 of the builder overview](../ARCHITECTURE.md#part-
 - [Row types: `InferSelectType`, `InferInsertType`, `InferUpdateType`](#row-types)
 - [Aliases: `table.as()`](#aliases-tableas)
 - [Call sites: remembering where things were declared](#call-sites-remembering-where-things-were-declared)
-- [Why it is built this way](#why-it-is-built-this-way)
+- [Decisions](#decisions)
 - [Glossary](#glossary)
 
 ## What a declaration is, and what it is not
@@ -401,15 +401,17 @@ export function captureCallSite(fn) {
 - V8 only **formats** the stack the first time `.stack` is read. Nothing is formatted unless `verify` reports a problem.
 - `resolveCallSite(site)` parses the frame (`at … (/app/schema.ts:3:9)`), maps it through a source map when Node has one loaded (`node:module`'s `findSourceMap`), and turns a `file:` URL into a path. It reaches Node's modules through `process.getBuiltinModule` so the library still loads where Node's modules don't exist.
 
-## Why it is built this way
+## Decisions
 
-- **Classes per modifier state** instead of one class with runtime checks: invalid combinations are impossible to write, and autocomplete teaches the rules. The cost is some repetition across the five classes.
-- **Three TypeScript types per column** (`S`, `I`, `U`) instead of one: Postgres reads and writes columns differently (identity, generated, defaults), and `typed()` can express asymmetric columns without a cast.
-- **TypeScript types derived from codecs** (`Out<K>`): the declared type of a column can't drift from what the driver returns, because it is computed from the codec object itself.
-- **`DataType` separate from the column**: comparisons and encoding depend only on the SQL type, so an expression (`lower(email)`) and a column share the same rules; nullability and write rules belong to the column.
-- **Enums and custom types keyed by name in their type** (`EnumType<'order_status'>`): two enums never compare, matching Postgres.
-- **Declarations, not migrations**: the database is the source of truth for its schema; `verify` keeps the code honest without quarry owning DDL.
-- **Call sites captured eagerly but formatted lazily**: precise diagnostics at almost no cost.
+Why columns work this way. Each links to its full entry (what it is, why, the alternatives, the cost, measured impact) in [DECISIONS.md](../DECISIONS.md):
+
+- [A class per column modifier state](../DECISIONS.md#a-class-per-column-modifier-state): invalid combinations can't be written, and autocomplete teaches the rules.
+- [Phantom types: what a column reads and writes](../DECISIONS.md#phantom-types-what-a-column-reads-and-writes): three TypeScript types per column, because Postgres reads and writes columns differently.
+- [TypeScript types derived from codecs](../DECISIONS.md#typescript-types-derived-from-codecs): a column's type can't drift from what the driver returns.
+- [`DataType` separate from the column](../DECISIONS.md#datatype-separate-from-the-column): expressions and columns share the SQL type's rules.
+- [Enums and custom types keyed by name in their type](../DECISIONS.md#enums-and-custom-types-keyed-by-name-in-their-type): two enums never compare, as in Postgres.
+- [Declarations, not migrations](../DECISIONS.md#declarations-not-migrations): the database is the source of truth; `verify` keeps the code honest.
+- [Call sites captured eagerly, formatted lazily](../DECISIONS.md#call-sites-captured-eagerly-formatted-lazily): precise diagnostics at almost no cost.
 
 ## Glossary
 

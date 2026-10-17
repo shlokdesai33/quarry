@@ -19,7 +19,7 @@ Files: [codec.ts](codec.ts), [codecs.ts](codecs.ts), [registry.ts](registry.ts),
 - [The registry](#the-registry)
 - [Types looked up by name: the catalog](#types-looked-up-by-name-the-catalog)
 - [Value formats worth knowing](#value-formats-worth-knowing)
-- [Why it is built this way](#why-it-is-built-this-way)
+- [Decisions](#decisions)
 - [Glossary](#glossary)
 
 ## First principles: types, OIDs, text and binary
@@ -244,6 +244,8 @@ Why not ask for binary on the first run? Bind's result formats are sent **before
 
 Unprepared queries (`prepare: false`) never know their columns before Bind, so their results are always text.
 
+**Cursors are the exception** (since #34): a cursor whose statement's columns aren't cached sends Describe(S) + Flush **before** Bind, waits for the RowDescription, and then binds each column in its codec's format, so a stream is binary from its first run, prepared or not ([STREAMING.md](STREAMING.md#binary-from-the-first-run)). The extra round trip is paid once per statement and connection, and a streamed result is large by nature, so it pays for itself; on ordinary queries, most of which return a row or two, it would be a pure loss ([DECISIONS.md](DECISIONS.md#binary-only-after-describe)).
+
 ## Row decoders
 
 <a id="row-decoders"></a>
@@ -331,16 +333,20 @@ and not exists (select from pg_type e where e.oid = t.typelem and e.typtype = 'c
 - **`bytea`** text: `\x` hex or the old escape format (`parseBytea`); binary: the bytes, **copied** so a row never keeps the read buffer alive.
 - **Ranges** (`parseRange`): `empty`, or `[lower,upper)` with each bound unquoted and parsed by the element parser, `null` when unbounded; `Range<T>` is `{ empty: true } | { empty: false, lower, upper, bounds }`.
 
-## Why it is built this way
+## Decisions
 
-- **One object per type for both directions**: the encoding of a type lives in exactly one place, used for parameters, results, arrays and COPY alike.
-- **Codecs owned by the driver, chosen by the caller**: the driver can choose formats per column and decode in place; a query builder only says which codec applies, so its column types are true by construction.
-- **Declare non-text types, infer text-like ones**: exact where it helps, permissive where Postgres's own coercions are the right behaviour.
-- **Binary only after describe**: never a format before the type is known; identical values either way.
-- **Binary where it builds values faster, text where the value is a string anyway**: measured, not dogmatic.
-- **Generated row decoders**: the most frequent operation of the driver is straight-line code with no per-row garbage.
-- **Named types resolved once per pool**: enums and extension types work like built-ins after the first query, with no per-connection cost.
-- **`undefined` refused**: a missing value is a bug, not NULL.
+Why codecs work this way. Each links to its full entry (what it is, why, the alternatives, the cost, measured impact) in [DECISIONS.md](DECISIONS.md):
+
+- [Codecs owned by the driver, chosen by the caller](DECISIONS.md#codecs-owned-by-the-driver-chosen-by-the-caller): one object per type for both directions, so a type's encoding lives in one place.
+- [Exact parameter OIDs, except for text-like types](DECISIONS.md#exact-parameter-oids-except-for-text-like-types): exact where it helps, permissive where Postgres's coercions are right.
+- [Binary only after describe](DECISIONS.md#binary-only-after-describe): never a format before the type is known: safe against schema drift.
+- [Cursors: describe first for binary from the first run](DECISIONS.md#cursors-describe-first-for-binary-from-the-first-run): the one exception, amortised over a large result.
+- [Which types are binary and which stay text](DECISIONS.md#which-types-are-binary-and-which-stay-text): measured per type, not dogmatic.
+- [Binary array parameters, with a per-array fallback](DECISIONS.md#binary-array-parameters-with-a-per-array-fallback): binary when every element fits, a literal otherwise.
+- [Arrays of text read as one latin1 string](DECISIONS.md#arrays-of-text-read-as-one-latin1-string): faster than decoding each element.
+- [Generated, monomorphic row decoders](DECISIONS.md#generated-monomorphic-row-decoders): straight-line code with no per-row garbage.
+- [Named types resolved once per pool through the catalog](DECISIONS.md#named-types-resolved-once-per-pool-through-the-catalog): enums and extension types work like built-ins.
+- [`undefined` is refused, never sent as NULL](DECISIONS.md#undefined-is-refused-never-sent-as-null): a missing value is a bug, not NULL.
 
 ## Glossary
 

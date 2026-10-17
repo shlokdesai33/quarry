@@ -16,7 +16,7 @@
 - [Idle timeout, lifetime and `min`](#idle-timeout-lifetime-and-min)
 - [Ending the pool](#ending-the-pool)
 - [How quarry uses the pool](#how-quarry-uses-the-pool)
-- [Why it is built this way](#why-it-is-built-this-way)
+- [Decisions](#decisions)
 - [Glossary](#glossary)
 
 ## Options
@@ -264,16 +264,17 @@ The pool's **LISTEN** connection (`pool.listen`) is a dedicated connection outsi
 
 quarry's `DriverExecutor` takes the exclusive path for each operation: `pool.acquire()`, run the query on that connection, `release()` ([../EXECUTION.md](../EXECUTION.md#connections-what-a-query-borrows)). So builder queries use up to `max` connections concurrently and then wait in `#waiters`; the shared pipelining described above applies to the driver's own `pool.query()`. On a borrowed connection, what quarry sends together is still pipelined by the connection (a batch, BEGIN with its first statement, a timeout's BEGIN/`set_config`/query/COMMIT).
 
-## Why it is built this way
+## Decisions
 
-- **LIFO idle stack**: warm connections are reused; surplus ones time out when load drops.
-- **Pipeline instead of queueing once full**: throughput beyond `max` queries per round trip, without opening more server connections (each one is a server process).
-- **Only pipeline when the pool is full**: a fresh connection beats sharing; sharing is the overflow path.
-- **Adaptive depth from measured latency**: deep pipelines on slow networks, shallow ones when the server is the bottleneck, no tuning.
-- **Draining instead of priority queues**: exclusive callers get a connection within one pipeline depth of queries, however heavy the query traffic.
-- **Never hand over a connection mid-transaction**: a forgotten commit can't leak into another request.
-- **Per-waiter connection attempts and fail-fast limits**: predictable behaviour when the database is down or overloaded.
-- **Fields instead of sets, callbacks made once**: no per-query garbage in the hottest path.
+Why the pool works this way. Each links to its full entry (what it is, why, the alternatives, the cost, measured impact) in [DECISIONS.md](DECISIONS.md):
+
+- [Pipelining onto busy connections, only once the pool is full](DECISIONS.md#pipelining-onto-busy-connections-only-once-the-pool-is-full): throughput beyond `max` queries per round trip without more server connections; a fresh connection beats sharing.
+- [A FIFO of pipeline slots, with slot hand-off](DECISIONS.md#a-fifo-of-pipeline-slots-with-slot-hand-off): no throughput cliff under sustained load.
+- [Draining a shared connection for exclusive callers](DECISIONS.md#draining-a-shared-connection-for-exclusive-callers): transactions can't starve, however heavy the query traffic.
+- [Adaptive pipeline depth, from 100 to 1000](DECISIONS.md#adaptive-pipeline-depth-from-100-to-1000): deep on slow networks, shallow when the server is the bottleneck; why not a fixed 1000.
+- [Pool policies: LIFO idle, jittered lifetime, safe release, fail fast](DECISIONS.md#pool-policies-lifo-idle-jittered-lifetime-safe-release-fail-fast): LIFO idle stack, no mid-transaction hand-over, per-waiter attempts, fail-fast limits.
+- [One sweep timer for every idle connection](DECISIONS.md#one-sweep-timer-for-every-idle-connection): no timer allocated per release.
+- [Allocation cuts for the small-query tail](DECISIONS.md#allocation-cuts-for-the-small-query-tail): fields instead of sets, callbacks made once: no per-query garbage in the hottest path.
 
 ## Glossary
 
