@@ -105,7 +105,7 @@ export class InvalidCursorError extends Error {
 }
 
 /** Checks a batch or page size: a whole number of rows, at least one. */
-export function rowCount(method: string, name: string, count: number): void {
+export function checkSize(method: string, name: string, count: number): void {
 	if (!Number.isInteger(count) || count < 1) {
 		throw new RangeError(
 			`${method}() takes a whole number of rows, at least 1, as ${name}, not ${count}`,

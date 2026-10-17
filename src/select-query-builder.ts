@@ -25,6 +25,7 @@ import type {
 } from './node.js';
 import type { AnyPredicate, EqualsValue } from './operators.js';
 import {
+	checkSize,
 	type CursorPage,
 	type CursorPageOptions,
 	decodeCursor,
@@ -36,7 +37,6 @@ import {
 	orderBy,
 	readKeys,
 	resolveKeyset,
-	rowCount,
 	runOptions,
 	seekPage,
 	settled,
@@ -981,7 +981,7 @@ export class SelectQueryBuilder<
 		size: number,
 		options: KeysetOptions<KeyColumn<T, O>>,
 	): AsyncGenerator<O[], void, undefined> {
-		rowCount('iterateChunks', 'size', size);
+		checkSize('iterateChunks', 'size', size);
 		const executor = this.#executor();
 		const base = this.toNode();
 		const keyset = resolveKeyset(
@@ -1031,7 +1031,7 @@ export class SelectQueryBuilder<
 		options: CursorPageOptions<KeyColumn<T, O>>,
 	): Promise<CursorPage<O>> {
 		const { perPage, after } = options;
-		rowCount('paginateByCursor', 'perPage', perPage);
+		checkSize('paginateByCursor', 'perPage', perPage);
 		const executor = this.#executor();
 		const base = this.toNode();
 		const keyset = resolveKeyset(
@@ -1090,7 +1090,7 @@ export class SelectQueryBuilder<
 		options: OffsetPageOptions<Ref<RefsOf<T>>>,
 	): Promise<OffsetPage<O> & { readonly total?: number }> {
 		const { page, perPage, countTotal = false } = options;
-		rowCount('paginateByOffset', 'perPage', perPage);
+		checkSize('paginateByOffset', 'perPage', perPage);
 		if (!Number.isInteger(page) || page < 1) {
 			throw new RangeError(
 				`paginateByOffset() takes a page from 1, not ${page}`,
