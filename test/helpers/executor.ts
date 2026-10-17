@@ -83,6 +83,8 @@ export function executorFrom(execute: Execute): Executor {
 				throw error;
 			}
 		},
+		budget: (_limits, fn) =>
+			fn({ queries: 0, durationMs: 0, exceeded: undefined }),
 		close: async () => {},
 	};
 	return executor;
