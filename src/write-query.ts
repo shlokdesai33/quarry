@@ -37,7 +37,6 @@ import {
 	type ValueArgs,
 } from './shape.js';
 import type { AnyTable } from './table.js';
-import type { Prettify } from './types.js';
 import { codeType, renderType } from './verify/sql-type.js';
 
 /** The columns of the table `T`, by the keys they are declared under. */
@@ -71,19 +70,6 @@ export type Excluded<T extends AnyTable> = {
 		Columns<T>[K]['_quarry']['dataType']
 	>;
 };
-
-/**
- * A row of an `updateMany`: the `by` columns, which match it to the table's
- * row, and any of the columns an update can set.
- */
-export type UpdateManyRow<
-	T extends AnyTable,
-	B extends ColumnKey<T>,
-> = Prettify<
-	{ readonly [K in B]: NonNullable<Columns<T>[K]['$select']> } & {
-		readonly [K in Exclude<UpdateKey<T>, B>]?: Columns<T>[K]['$update'];
-	}
->;
 
 /** What a write query without `returning` resolves to. */
 export interface WriteResult {

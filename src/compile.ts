@@ -234,45 +234,21 @@ function renderInsert(node: InsertNode, params: Params): string {
 	return sql + renderReturning(node.returning, params);
 }
 
-/** The alias `updateMany`'s rows are joined under. */
-const MANY = 'quarry_rows';
-
 function renderUpdate(node: UpdateNode, params: Params): string {
-	const target = identifier(node.table.alias ?? node.table.name);
-	const sets: string[] = [];
-	if (node.set.length > 0) sets.push(renderSets(node.set, params));
-	const where: string[] = [];
-	let from = '';
-	const { many } = node;
-	if (many !== undefined) {
-		if (!unnestable(many)) {
+	if (node.set.length === 0) throw new Error('An update needs columns to set');
+	let sql = `update ${renderTable(node.table)} set ${renderSets(node.set, params)}`;
+	const { from } = node;
+	if (from !== undefined) {
+		if (!unnestable(from.rows)) {
 			throw new Error(
-				'updateMany needs every row to set the same columns, each to a plain value',
+				'setEach sends its rows with unnest: every value must be a plain value, and array columns are not supported',
 			);
 		}
-		const updated = many.columns.filter((c) => !many.by.includes(c));
-		if (updated.length > 0) {
-			sets.push(
-				updated
-					.map((c) => `${identifier(c)} = ${identifier(MANY)}.${identifier(c)}`)
-					.join(', '),
-			);
-		}
-		from = ` from ${renderUnnest(many, params)} as ${identifier(MANY)}(${many.columns.map(identifier).join(', ')})`;
-		where.push(
-			...many.by.map(
-				(c) =>
-					`${target}.${identifier(c)} = ${identifier(MANY)}.${identifier(c)}`,
-			),
-		);
+		sql += ` from ${renderUnnest(from.rows, params)} as ${identifier(from.alias)}(${from.rows.columns.map(identifier).join(', ')})`;
 	}
-	if (sets.length === 0) throw new Error('An update needs columns to set');
-	if (node.where !== undefined) where.push(render(node.where, params));
-	else if (!node.allRows && many === undefined)
+	if (node.where !== undefined) sql += ` where ${render(node.where, params)}`;
+	else if (!node.allRows)
 		throw new Error('An update needs where() or allRows()');
-	let sql = `update ${renderTable(node.table)} set ${sets.join(', ')}${from}`;
-	if (where.length > 0)
-		sql += ` where ${where.length === 1 ? where[0] : where.map((w) => `(${w})`).join(' and ')}`;
 	return sql + renderReturning(node.returning, params);
 }
 

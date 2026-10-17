@@ -15,7 +15,6 @@ describe('the package entry point', () => {
 			'fragment',
 			'insertInto',
 			'update',
-			'updateMany',
 			'deleteFrom',
 			'formatVerifyReport',
 			'defineConfig',

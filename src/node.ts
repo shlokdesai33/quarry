@@ -272,15 +272,21 @@ export type InsertNode = WriteNode & {
 	readonly onConflict: OnConflictNode | undefined;
 };
 
+/** Rows an `update` reads from: `from unnest(...) as alias(columns)`. */
+export type UpdateFromNode = {
+	readonly rows: RowsNode;
+	readonly alias: string;
+};
+
 /**
- * An `update` query. `many`
- * is the rows of an `updateMany`, matched to the table's by the `by`
- * columns. `allRows` is set by `allRows()`, which stands in for `where`.
+ * An `update` query. `from` is the rows of a `setEach`, which its `set` and
+ * `where` reference by `alias`. `allRows` is set by `allRows()`, which
+ * stands in for `where`.
  */
 export type UpdateNode = WriteNode & {
 	readonly kind: 'update';
 	readonly set: readonly SetNode[];
-	readonly many: (RowsNode & { readonly by: readonly string[] }) | undefined;
+	readonly from: UpdateFromNode | undefined;
 	readonly where: OperationNode | undefined;
 	readonly allRows: boolean;
 };

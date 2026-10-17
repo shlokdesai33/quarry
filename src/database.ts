@@ -32,15 +32,9 @@ import {
 import type { Executable } from './query.js';
 import { type SqlQuery, sqlQuery, type SqlValue } from './sql.js';
 import type { AnyTable } from './table.js';
-import {
-	type UpdateManyOptions,
-	type UpdateQueryBuilder,
-	updateManyWith,
-	updateWith,
-} from './update-query-builder.js';
+import { type UpdateQueryBuilder, updateWith } from './update-query-builder.js';
 import type { VerifyOptions, VerifyReport } from './verify/report.js';
 import { verifyWith } from './verify/verify.js';
-import type { ColumnKey, UpdateManyRow } from './write-query.js';
 
 /** Queries that run on one database. */
 export interface Database extends AsyncDisposable {
@@ -77,17 +71,13 @@ export interface Database extends AsyncDisposable {
 		table: T,
 	): InsertQueryBuilder<T, undefined, 'values'>;
 
-	/** Starts an `update` of `table`; see `update`. */
+	/**
+	 * Starts an `update` of `table`, of the rows a `where` picks or of
+	 * many rows each to its own values with `setEach`; see `update`.
+	 */
 	update<T extends AnyTable>(
 		table: T,
 	): UpdateQueryBuilder<T, undefined, 'set' | 'where'>;
-
-	/** Updates many rows, each to its own values; see `updateMany`. */
-	updateMany<T extends AnyTable, const B extends ColumnKey<T>>(
-		table: T,
-		rows: readonly NoInfer<UpdateManyRow<T, B>>[],
-		options: UpdateManyOptions<B>,
-	): UpdateQueryBuilder<T, undefined, never>;
 
 	/** Starts a `delete` from `table`; see `deleteFrom`. */
 	deleteFrom<T extends AnyTable>(
@@ -234,8 +224,6 @@ function queries(
 		selectFrom: (table) => selectFromWith(table, executor),
 		insertInto: (table) => insertIntoWith(table, executor),
 		update: (table) => updateWith(table, executor),
-		updateMany: (table, rows, options) =>
-			updateManyWith(table, rows, options, executor),
 		deleteFrom: (table) => deleteFromWith(table, executor),
 		sql: (strings, ...values) => sqlQuery(executor, strings, values),
 		batch: (list, options) => batchWith(executor, list, options),
