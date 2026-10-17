@@ -261,7 +261,7 @@ describe('a query that already has orderBy, limit or offset', () => {
 				.offset(10)
 				.paginateByCursor({ perPage: 5, by: 'users.id' }),
 		).rejects.toThrow(
-			message('paginateByCursor', 'orderBy(), limit(), offset()'),
+			ownsOrder('paginateByCursor', 'orderBy(), limit(), offset()'),
 		);
 		await expect(
 			q.offset(10).paginateByOffset({ page: 1, perPage: 5, by: 'users.id' }),
