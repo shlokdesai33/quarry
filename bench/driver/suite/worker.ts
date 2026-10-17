@@ -289,7 +289,7 @@ async function main() {
 				ok: true,
 				digest: digest(value),
 				n,
-				sample: JSON.stringify(Array.isArray(value) ? value[0] : value).slice(
+				sample: String(JSON.stringify(Array.isArray(value) ? value[0] : value)).slice(
 					0,
 					300,
 				),

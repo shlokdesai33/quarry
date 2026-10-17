@@ -36,10 +36,12 @@ Binaries go to `~/benchbin` (`BENCH_BIN`).
 ## Running
 
 ```sh
-node orchestrate.ts --id run1                 # everything: verify, main, conc, pipeline, rtt, bouncer, reconnect
+node orchestrate.ts --id run1                 # everything: verify, main, conc, pipeline, rtt, batch, bouncer, reconnect
 node footprint.ts --id run1                   # install/bundle size and cold start
 node analyze.ts --id run1                     # results/run1/tables.md + summary.json
 python3 charts.py results/run1/summary.json results/run1/charts
+python3 report-tables.py results/run1/summary.json   # the headline tables the published report quotes
+python3 compare-snapshots.py results-snapshots/<old>/tables.md results/run1/tables.md --column quarry   # before/after
 ```
 
 Useful options for `orchestrate.ts`:
@@ -111,6 +113,7 @@ Each client uses its public API, configured as its documentation recommends; `dr
 | Name                    | Runtimes        | Configuration                                                                                                                                                                                                                                                                                              |
 | ----------------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `quarry`                | Node, Bun, Deno | `createPool` from `dist/driver`, defaults (prepared statements with a 100-entry LRU, binary results for hot types, pipelining onto shared connections when the pool is busy). Decoding matches pg's (int8 and numeric as strings, timestamptz as `Date`); these are the parsers quarry's own adapter uses. |
+| `quarry-db`             | Node            | quarry's query builder (`database()` from the built `dist/index.js`), for the `batch` phase only: three statements (a lookup, an insert, an update) one after another, with `Promise.all`, and with `db.batch`, outside and inside a transaction, at 0 and 5 ms RTT.                                       |
 | `quarry-lossless`       | all             | Standalone driver defaults: int8 as `bigint`, timestamptz and date as text.                                                                                                                                                                                                                                |
 | `quarry-noprep`         | all             | `prepare: false`                                                                                                                                                                                                                                                                                           |
 | `quarry-nopipe`         | Node            | `pipeline: false` (exclusive checkout, like pg)                                                                                                                                                                                                                                                            |
@@ -154,13 +157,14 @@ Resource metrics:
 
 ## Files
 
-| File                      | Role                                                          |
-| ------------------------- | ------------------------------------------------------------- |
-| `env.ts`                  | Cluster, data set, PgBouncer, Toxiproxy, wsproxy, CPU pinning |
-| `drivers.ts`              | One adapter per client configuration                          |
-| `scenarios.ts`            | Every scenario: operation, check, verification                |
-| `worker.ts`               | Runs one cell; measurement and resource sampling              |
-| `orchestrate.ts`          | The matrix, order, runs, resume                               |
-| `canon.ts`                | Canonical results for the correctness check                   |
-| `footprint.ts`, `cold.ts` | Install and bundle size, cold start                           |
-| `analyze.ts`, `charts.py` | Tables and charts                                             |
+| File                                       | Role                                                                                    |
+| ------------------------------------------ | --------------------------------------------------------------------------------------- |
+| `env.ts`                                   | Cluster, data set, PgBouncer, Toxiproxy, wsproxy, CPU pinning                           |
+| `drivers.ts`                               | One adapter per client configuration                                                    |
+| `scenarios.ts`                             | Every scenario: operation, check, verification                                          |
+| `worker.ts`                                | Runs one cell; measurement and resource sampling                                        |
+| `orchestrate.ts`                           | The matrix, order, runs, resume                                                         |
+| `canon.ts`                                 | Canonical results for the correctness check                                             |
+| `footprint.ts`, `cold.ts`                  | Install and bundle size, cold start                                                     |
+| `analyze.ts`, `charts.py`                  | Tables and charts                                                                       |
+| `report-tables.py`, `compare-snapshots.py` | Headline tables for the report; one client's before/after between two `tables.md` files |

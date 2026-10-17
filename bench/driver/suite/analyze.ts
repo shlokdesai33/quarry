@@ -1088,6 +1088,36 @@ for (const runtime of RUNTIMES) {
 	summary['pipeline'] = series;
 }
 
+// ------------------------------------------------------------ db.batch
+{
+	const batchIds = SCENARIOS.filter((s) => s.group === 'batches').map(
+		(s) => s.id,
+	);
+	const series: Record<string, Record<string, Stat | undefined>> = {};
+	for (const id of batchIds)
+		for (const rtt of [0, 5])
+			(series[id] ??= {})[String(rtt)] = get('batch', 'node', 'quarry-db', id, {
+				rtt,
+			})?.m['throughput'];
+	const t = table(
+		"quarry's query builder, 3 statements per operation: operations/s (columns: RTT ms)",
+		'Scenario',
+		batchIds.map((id) => ({
+			label: title(id),
+			pick: (rtt: string) =>
+				metric('throughput')(
+					get('batch', 'node', 'quarry-db', id, { rtt: Number(rtt) }),
+				),
+		})),
+		['0', '5'],
+		fmtRate,
+		false,
+		true,
+	);
+	if (t) out.push(`## db.batch\n\n${t}`);
+	summary['batch'] = series;
+}
+
 // ------------------------------------------------------------ RTT sweep
 summary['rtt'] = {};
 {

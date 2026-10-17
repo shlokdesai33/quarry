@@ -29,6 +29,16 @@ export interface Driver {
 		paramTypes: number[],
 	): Promise<readonly Row[]>;
 	transaction(fn: (tx: Tx) => Promise<void>): Promise<void>;
+	/**
+	 * quarry's query builder only: three statements (a lookup, an insert,
+	 * an update) run one after another, with `Promise.all`, or with
+	 * `db.batch`, outside or inside a transaction.
+	 */
+	builderBatch?(
+		mode: 'seq' | 'all' | 'batch',
+		inTransaction: boolean,
+		i: number,
+	): Promise<unknown>;
 	/** COPY … FROM STDIN with pre-encoded text chunks. */
 	copyFrom?(sql: string, chunks: readonly string[]): Promise<void>;
 	/** Cursor streaming: calls `onBatch` per batch, awaiting it (backpressure). */
@@ -85,7 +95,7 @@ export const DRIVERS: Record<
 	quarry: {
 		runtimes: ['node', 'bun', 'deno'],
 		describe:
-			"quarry/driver (built dist). Like-for-like decoding (int8/numeric as string, timestamptz as Date, as pg does; quarry's own adapter config). Defaults: prepared statements (LRU 100), binary results for hot types, pipelining onto shared connections when the pool is busy (50 per connection).",
+			'quarry/driver (built dist). Like-for-like decoding (int8/numeric as string, timestamptz as Date, as pg does: `codecs: [codecs.int8AsString, codecs.timestamptz]`). Defaults: prepared statements (LRU 100), binary results for hot types, pipelining onto shared connections when the pool is busy (50 per connection).',
 		make: (o) => quarry(o, { decode: 'compat' }),
 	},
 	'quarry-candidate': {
@@ -94,6 +104,12 @@ export const DRIVERS: Record<
 			'quarry (like-for-like decoding) from the build at `QUARRY_DIST_CANDIDATE`, for A/B runs of a driver change against `quarry`. Only in the matrix when that variable is set.',
 		make: (o) =>
 			quarry(o, { decode: 'compat' }, process.env['QUARRY_DIST_CANDIDATE']),
+	},
+	'quarry-db': {
+		runtimes: ['node'],
+		describe:
+			"quarry's query builder (`database()` from the built `dist/index.js`) on its default driver pool, for the `db.batch` scenarios only.",
+		make: (o) => quarryDb(o),
 	},
 	'quarry-lossless': {
 		runtimes: ['node', 'bun', 'deno'],
@@ -204,16 +220,8 @@ async function quarry(
 	const d = await import(
 		dist.startsWith('/') ? new URL(`file://${dist}`).href : dist
 	);
-	const array = (parse?: (t: string) => unknown) => (t: string) =>
-		d.parseArray(t, parse);
-	// the parsers quarry's own adapter uses (src/decode.ts quarryTypes), for int8/numeric-as-string, timestamptz-as-Date parity with pg
-	const compat = {
-		...d.defaultTypes,
-		[d.oids.int8]: (t: string) => t,
-		[d.oids.timestamptz]: d.parseTimestamptz,
-		[d.arrayOids.int8]: array(),
-		[d.arrayOids.timestamptz]: array(d.parseTimestamptz),
-	};
+	// int8 as digits and timestamptz as Date, for parity with pg (numeric already stays text)
+	const compat = [d.codecs.int8AsString, d.codecs.timestamptz];
 	const t = o.target;
 	const pool = d.createPool({
 		host: t.host,
@@ -227,7 +235,7 @@ async function quarry(
 		env: {},
 		max: o.max,
 		...(o.pipeline === undefined ? {} : { pipeline: o.pipeline }),
-		...(v.decode === 'compat' ? { types: compat } : {}),
+		...(v.decode === 'compat' ? { codecs: compat } : {}),
 		...(v.prepare === undefined ? {} : { prepare: v.prepare }),
 	});
 	return {
@@ -253,6 +261,80 @@ async function quarry(
 			};
 		},
 		end: () => pool.end(),
+	};
+}
+
+async function quarryDb(o: DriverOptions): Promise<Driver> {
+	const q = await import(
+		process.env['QUARRY_DIST'] === undefined
+			? new URL('../../../dist/index.js', import.meta.url).href
+			: new URL('../index.js', `file://${process.env['QUARRY_DIST']}`).href
+	);
+	const users = q.defineTable('bench_users', {
+		columns: {
+			id: q.integer(),
+			name: q.text(),
+			email: q.text(),
+			score: q.doublePrecision(),
+			created: q.timestamptz(),
+			active: q.boolean(),
+		},
+	});
+	const writes = q.defineTable('bench_writes', {
+		columns: {
+			id: q.bigint().identity(),
+			name: q.text().nullable(),
+			score: q.doublePrecision().nullable(),
+			created: q.timestamptz().nullable(),
+		},
+	});
+	const upd = q.defineTable('bench_upd', {
+		columns: { id: q.integer(), score: q.doublePrecision(), name: q.text() },
+	});
+	const t = o.target;
+	const db = q.database({
+		host: t.host,
+		port: t.port,
+		user: t.user,
+		password: t.password,
+		database: t.database,
+		ssl: 'disable',
+		env: {},
+		max: o.max,
+	});
+	const statements = (d: any, i: number) => [
+		d
+			.selectFrom(users)
+			.where('bench_users.id', ((i * 7919) % 1_000_000) + 1)
+			.select(['bench_users.name'])
+			.takeFirst(),
+		d.insertInto(writes).values({ name: `batch ${i}`, score: 1 }),
+		d
+			.update(upd)
+			.set({ score: i })
+			.where('bench_upd.id', ((i * 7919) % 100_000) + 1),
+	];
+	const run = async (d: any, mode: 'seq' | 'all' | 'batch', i: number) => {
+		const qs = statements(d, i);
+		if (mode === 'batch') return d.batch(qs);
+		if (mode === 'all') return Promise.all(qs.map((x: any) => x.execute()));
+		const out = [];
+		for (const x of qs) out.push(await x.execute());
+		return out;
+	};
+	return {
+		name: 'quarry-db',
+		query: () =>
+			Promise.reject(new Error('quarry-db runs builder scenarios only')),
+		transaction: () =>
+			Promise.reject(new Error('quarry-db runs builder scenarios only')),
+		builderBatch: (mode, inTransaction, i) =>
+			!inTransaction
+				? run(db, mode, i)
+				: mode === 'batch'
+					? db.batch(statements(db, i), { transaction: true })
+					: db.transaction((tx: any) => run(tx, mode, i)),
+		end: () => db.close(),
 	};
 }
 

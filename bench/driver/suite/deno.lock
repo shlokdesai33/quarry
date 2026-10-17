@@ -2,6 +2,7 @@
   "version": "5",
   "specifiers": {
     "jsr:@db/postgres@0.19.5": "0.19.5",
+    "jsr:@deno/installer-shell-setup@*": "0.3.4",
     "jsr:@std/bytes@^1.0.5": "1.0.6",
     "jsr:@std/crypto@^1.0.4": "1.1.0",
     "jsr:@std/encoding@^1.0.9": "1.0.11",
@@ -19,6 +20,9 @@
         "jsr:@std/fmt",
         "jsr:@std/path"
       ]
+    },
+    "@deno/installer-shell-setup@0.3.4": {
+      "integrity": "48665d1a737d487cce6874bc97bba70a5aeffa7053aca3f60df93c6fab8963b4"
     },
     "@std/bytes@1.0.6": {
       "integrity": "f6ac6adbd8ccd99314045f5703e23af0a68d7f7e58364b47d2c7f408aeb5820a"

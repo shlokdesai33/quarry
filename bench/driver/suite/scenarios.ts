@@ -544,6 +544,58 @@ export const SCENARIOS: Scenario[] = [
 			}),
 	},
 
+	// ------------------------------------------------------------ query-builder batches (quarry only)
+	{
+		kind: 'ops',
+		id: 'batch3-seq',
+		group: 'batches',
+		title: '3 statements (lookup, insert, update): one after another',
+		needs: 'builderBatch',
+		op: (d, i) => d.builderBatch!('seq', false, i),
+	},
+	{
+		kind: 'ops',
+		id: 'batch3-all',
+		group: 'batches',
+		title: '3 statements (lookup, insert, update): Promise.all',
+		needs: 'builderBatch',
+		op: (d, i) => d.builderBatch!('all', false, i),
+	},
+	{
+		kind: 'ops',
+		id: 'batch3-batch',
+		group: 'batches',
+		title: '3 statements (lookup, insert, update): db.batch',
+		needs: 'builderBatch',
+		op: (d, i) => d.builderBatch!('batch', false, i),
+	},
+	{
+		kind: 'ops',
+		id: 'batch3-tx-seq',
+		group: 'batches',
+		title:
+			'3 statements (lookup, insert, update) in a transaction: one after another',
+		needs: 'builderBatch',
+		op: (d, i) => d.builderBatch!('seq', true, i),
+	},
+	{
+		kind: 'ops',
+		id: 'batch3-tx-all',
+		group: 'batches',
+		title:
+			'3 statements (lookup, insert, update) in a transaction: Promise.all',
+		needs: 'builderBatch',
+		op: (d, i) => d.builderBatch!('all', true, i),
+	},
+	{
+		kind: 'ops',
+		id: 'batch3-tx-batch',
+		group: 'batches',
+		title: '3 statements (lookup, insert, update) in a transaction: db.batch',
+		needs: 'builderBatch',
+		op: (d, i) => d.builderBatch!('batch', true, i),
+	},
+
 	// ------------------------------------------------------------ errors
 	{
 		kind: 'ops',
