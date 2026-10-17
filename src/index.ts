@@ -123,7 +123,8 @@ export type {
 } from './table.js';
 export {
 	update,
-	updateMany,
+	type SetEachOptions,
+	type SetEachRow,
 	type UpdateQueryBuilder,
 } from './update-query-builder.js';
 export type {

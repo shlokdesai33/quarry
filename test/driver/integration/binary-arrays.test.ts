@@ -606,14 +606,15 @@ describe.skipIf(noPg)('quarry’s binary array parameters', () => {
 
 	it('updates many rows in binary', async () => {
 		await db
-			.updateMany(
-				items,
+			.update(items)
+			.setEach(
 				[
 					{ id: 1, big: '1', at: new Date(0), flag: null },
 					{ id: 2, big: '-1', at: null, flag: true },
 				],
-				{ by: 'id' },
+				{ key: 'id' },
 			)
+			.expectRows(2)
 			.execute();
 		const { rows: stored } = await pool.query(
 			'select id, big, at, flag from items where id = any($1) order by id',
@@ -626,7 +627,38 @@ describe.skipIf(noPg)('quarry’s binary array parameters', () => {
 		]);
 	});
 
-	it('rejects a value too long for varchar(n) in a multi-row insert or updateMany, as a single-row insert does', async () => {
+	it('updates rows that set different columns, keeping those a row leaves out', async () => {
+		await db
+			.insertInto(items)
+			.values([
+				{ id: 20, big: '20', flag: true, label: 'a' },
+				{ id: 21, big: '21', flag: true, label: 'b' },
+				{ id: 22, big: '22', flag: true, label: 'c' },
+			])
+			.execute();
+		const updated = await db
+			.update(items)
+			.setEach(
+				[
+					{ id: 20, label: 'x', flag: false },
+					{ id: 21, label: null },
+					{ id: 22, flag: null, big: '-22' },
+					{ id: 23, label: 'no such row' },
+				],
+				{ key: 'id', as: 'v' },
+			)
+			.set((eb) => ({ big: eb.fn.coalesce('v.big', 'items.big') }))
+			.where((eb) => eb.ref('items.id').gte(20))
+			.returning(['items.id', 'items.big', 'items.flag', 'items.label'])
+			.execute();
+		expect(updated.toSorted((a, b) => a.id - b.id)).toEqual([
+			{ id: 20, big: '20', flag: false, label: 'x' },
+			{ id: 21, big: '21', flag: true, label: null },
+			{ id: 22, big: '-22', flag: null, label: 'c' },
+		]);
+	});
+
+	it('rejects a value too long for varchar(n) in a multi-row insert or setEach, as a single-row insert does', async () => {
 		expect(
 			await errorCode(
 				db.insertInto(items).values({ id: 10, code: 'abcdef' }).execute(),
@@ -646,15 +678,13 @@ describe.skipIf(noPg)('quarry’s binary array parameters', () => {
 		expect(
 			await errorCode(
 				db
-					.updateMany(
-						items,
+					.update(items)
+					.setEach(
 						[
 							{ id: 1, code: 'abcd' },
 							{ id: 2, code: 'x' },
 						],
-						{
-							by: 'id',
-						},
+						{ key: 'id' },
 					)
 					.execute(),
 			),
