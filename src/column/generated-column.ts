@@ -36,6 +36,13 @@ export class GeneratedColumn<D extends DataType, S, I, U>
 		return new GeneratedColumn<D, S, I, U>({ ...this._quarry, columnName });
 	}
 
+	override sensitive() {
+		return new GeneratedColumn<D, S, I, U>({
+			...this._quarry,
+			sensitive: true,
+		});
+	}
+
 	/**
 	 * Narrows the TypeScript view of the column when selected (branded values,
 	 * literal unions). Only the select type is given: a generated column is

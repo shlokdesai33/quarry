@@ -1,3 +1,4 @@
+import { readsSensitive } from './comparison.js';
 import type { ArrayType } from './data-type/array.js';
 import { DataType } from './data-type/data-type.js';
 import { arrayOf, type Codec } from './driver/codec.js';
@@ -184,17 +185,25 @@ function key(value: Key): OperationNode {
 	return { kind: 'literal', value };
 }
 
-/** A key or path operand: values and parameters encoded by `codec` (a parameter's own, if it has one). */
-function operand(value: unknown, codec: Codec): OperationNode {
-	if (value instanceof Param)
-		return {
-			kind: 'value',
-			value: value._quarry.value,
-			codec: value._quarry.codec ?? codec,
-		};
-	return Expression.is(value)
-		? value._quarry.node
-		: { kind: 'value', value, codec };
+/**
+ * A key or path operand: values and parameters encoded by `codec` (a
+ * parameter's own, if it has one), redacted when the json they test is
+ * sensitive.
+ */
+function operand(
+	value: unknown,
+	codec: Codec,
+	sensitive: boolean,
+): OperationNode {
+	if (Expression.is(value) && !(value instanceof Param))
+		return value._quarry.node;
+	const parameter =
+		value instanceof Param
+			? { value: value._quarry.value, codec: value._quarry.codec ?? codec }
+			: { value, codec };
+	return sensitive
+		? { kind: 'value', ...parameter, sensitive: true }
+		: { kind: 'value', ...parameter };
 }
 
 const keyCodec = codecs.text;
@@ -222,16 +231,18 @@ export function jsonFunctions<R extends Refs>({
 
 	const test =
 		(operator: string, codec: Codec) =>
-		(json: Operand<R, Jsonb>, right: unknown) =>
-			typedExpression(
+		(json: Operand<R, Jsonb>, right: unknown) => {
+			const left = node(json);
+			return typedExpression(
 				{
 					kind: 'binary',
-					left: node(json),
+					left,
 					operator,
-					right: operand(right, codec),
+					right: operand(right, codec, readsSensitive(left)),
 				},
 				new DataType('boolean'),
 			);
+		};
 
 	const call = (name: string, type: DataType) => (json: Operand<R, Jsonb>) =>
 		typedExpression({ kind: 'function', name, args: [node(json)] }, type);

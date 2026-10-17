@@ -14,6 +14,10 @@ export class IdentityColumn<D extends DataType, S, I, U>
 		return new IdentityColumn<D, S, I, U>({ ...this._quarry, columnName });
 	}
 
+	override sensitive() {
+		return new IdentityColumn<D, S, I, U>({ ...this._quarry, sensitive: true });
+	}
+
 	/**
 	 * Narrows the TypeScript view of the column when selected (branded ids,
 	 * literal unions). Only the select type is given: an identity is never

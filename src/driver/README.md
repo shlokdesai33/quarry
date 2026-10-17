@@ -196,7 +196,7 @@ await db.transaction(async (tx) => {
 });
 ```
 
-`database()` also takes a pool, client or connection from this module, or driver options. quarry decodes values to the TypeScript types its columns declare, reports `onQuery` events, and adds the query, tag and caller's stack to errors. All of that lives in quarry; this module knows nothing about quarry.
+`database()` also takes a pool, client or connection from this module, or driver options. quarry decodes values to the TypeScript types its columns declare, reports `onQuery` and `slowQuery` events, enforces `db.budget`, redacts the values of `sensitive()` columns, and adds the query, tag and caller's stack to errors. All of that lives in quarry; this module knows nothing about quarry.
 
 ## Development
 

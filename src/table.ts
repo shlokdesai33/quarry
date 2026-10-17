@@ -85,8 +85,12 @@ export type NullableTables<T extends readonly AnyTable[]> = {
 
 /** A table as `from`, `join` and the write queries render it. */
 export function tableNode(table: AnyTable): TableNode {
-	return {
+	const node = {
 		name: table._quarry.source,
 		alias: table.name === table._quarry.source ? undefined : table.name,
 	};
+	const sensitive = Object.entries(table.schema.columns)
+		.filter(([, column]) => column._quarry.sensitive)
+		.map(([key, column]) => column._quarry.columnName ?? key);
+	return sensitive.length === 0 ? node : { ...node, sensitive };
 }

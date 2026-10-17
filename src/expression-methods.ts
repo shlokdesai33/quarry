@@ -1,5 +1,6 @@
 import {
 	comparison,
+	readsSensitive,
 	undefinedComparison,
 	type CodecFor,
 } from './comparison.js';
@@ -107,12 +108,18 @@ export function compare(
 		}
 		if (left._quarry.value === undefined) throw undefinedComparison(undefined);
 		const codec = left._quarry.codec ?? element.codec;
+		const array = value instanceof Quantified ? value._quarry.array : undefined;
+		const sensitive =
+			Expression.is(array) && readsSensitive(array._quarry.node);
 		return predicate(
 			comparison(
-				{ kind: 'value', value: left._quarry.value, codec },
+				sensitive
+					? { kind: 'value', value: left._quarry.value, codec, sensitive: true }
+					: { kind: 'value', value: left._quarry.value, codec },
 				operator,
 				value,
 				() => element.codec,
+				sensitive,
 			),
 		);
 	}

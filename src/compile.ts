@@ -13,6 +13,7 @@ import type {
 	TableNode,
 	UpdateNode,
 } from './node.js';
+import { readsSensitive } from './comparison.js';
 import { arrayOf, declareParamType, type Codec } from './driver/codec.js';
 
 export interface CompiledQuery {
@@ -46,13 +47,81 @@ export type StatementNode =
 	| UpdateNode
 	| DeleteNode;
 
+/** What the compiler knows about one parameter besides its value. */
+export interface ParamInfo {
+	/** The codec the value is encoded with, when something types it. */
+	readonly codec: Codec | undefined;
+	/** Bound against a `sensitive()` column. */
+	readonly sensitive: boolean;
+	/** The cast the SQL writes right after the placeholder, e.g. `integer[]`. */
+	readonly cast: string | undefined;
+}
+
+/** What a compiled query's SQL and params don't say: kept beside it, never sent. */
+export interface QueryInfo {
+	/** What the query was compiled from, to render it again (`toSQL`'s options). */
+	readonly node: StatementNode;
+	/** Per parameter, in order. */
+	readonly params: readonly ParamInfo[];
+	/** The result columns (select list or `returning` aliases) that read a sensitive column. */
+	readonly sensitiveFields: ReadonlySet<string>;
+	/** The sensitive columns of the tables the query names, by table name in the database. */
+	readonly sensitiveColumns: ReadonlyMap<string, ReadonlySet<string>>;
+}
+
+const infos = new WeakMap<CompiledQuery, QueryInfo>();
+
+/** What `compile` recorded about `query`, if it compiled it. */
+export function queryInfo(query: CompiledQuery): QueryInfo | undefined {
+	return infos.get(query);
+}
+
+/** What a sensitive value is shown as. */
+export const REDACTED = '[redacted]';
+
+/** `query`'s params with those bound against sensitive columns redacted. */
+export function redactedParams(query: CompiledQuery): readonly unknown[] {
+	const info = infos.get(query);
+	if (info === undefined || !info.params.some((p) => p.sensitive))
+		return query.params;
+	return query.params.map((value, i) =>
+		info.params[i]?.sensitive ? REDACTED : value,
+	);
+}
+
+/**
+ * `query` with its sensitive params redacted, for errors and events: the
+ * query itself when it has none, otherwise a copy without its codecs.
+ */
+export function redactedQuery(query: CompiledQuery): CompiledQuery {
+	const params = redactedParams(query);
+	if (params === query.params) return query;
+	return query.tag === undefined
+		? { sql: query.sql, params }
+		: { sql: query.sql, params, tag: query.tag };
+}
+
+/** Renders a parameter in place of `$n`. */
+export type Inline = (value: unknown, info: ParamInfo) => string;
+
 /**
  * Renders a node tree to SQL text and a positional parameter list.
  * Parameters are numbered in the order they are encountered. A query's tag
  * is carried over as is.
  */
 export function compile(node: StatementNode): CompiledQuery {
-	const params: Params = { values: [], codecs: [], typed: false };
+	return compileWith(node, undefined);
+}
+
+/**
+ * `compile`, with each parameter rendered by `inline` instead of as `$n`
+ * when it is given (its values and codecs are still collected).
+ */
+export function compileWith(
+	node: StatementNode,
+	inline: Inline | undefined,
+): CompiledQuery {
+	const params = new Params(inline);
 	let sql: string;
 	switch (node.kind) {
 		case 'insert':
@@ -83,13 +152,20 @@ export function compile(node: StatementNode): CompiledQuery {
 		resultCodecs ??= selections.map(() => null);
 		resultCodecs[i] = codec;
 	}
-	return new Compiled(
+	const query = new Compiled(
 		sql,
 		params.values,
 		tag,
 		params.typed ? params.codecs : undefined,
 		resultCodecs,
 	);
+	infos.set(query, {
+		node,
+		params: params.info,
+		sensitiveFields: params.sensitiveFields,
+		sensitiveColumns: params.sensitiveColumns,
+	});
+	return query;
 }
 
 /**
@@ -126,20 +202,77 @@ class Compiled implements CompiledQuery {
 	}
 }
 
-/** The parameters rendered so far, and the codec of each. */
-interface Params {
-	readonly values: unknown[];
-	readonly codecs: (Codec | undefined)[];
-	/** Whether any parameter has a codec. */
-	typed: boolean;
+/** `query` with its SQL replaced by `sql`, keeping its params, tag, codecs and info. */
+export function withSQL(query: CompiledQuery, sql: string): CompiledQuery {
+	const copy = new Compiled(
+		sql,
+		query.params,
+		query.tag,
+		query.paramCodecs,
+		query.resultCodecs,
+	);
+	const info = infos.get(query);
+	if (info !== undefined) infos.set(copy, info);
+	return copy;
 }
 
-/** Adds a parameter and returns its placeholder. */
-function param(params: Params, value: unknown, codec?: Codec): string {
-	params.values.push(value);
-	params.codecs.push(codec);
-	if (codec !== undefined) params.typed = true;
-	return `$${params.values.length}`;
+/** Collects a statement's parameters, and what is known about them, as it renders. */
+class Params {
+	readonly values: unknown[] = [];
+	readonly codecs: (Codec | undefined)[] = [];
+	/** Whether any parameter has a codec. */
+	typed = false;
+	readonly info: ParamInfo[] = [];
+	readonly sensitiveFields = new Set<string>();
+	readonly sensitiveColumns = new Map<string, Set<string>>();
+	readonly #inline: Inline | undefined;
+
+	constructor(inline: Inline | undefined) {
+		this.#inline = inline;
+	}
+
+	table(table: TableNode): void {
+		if (table.sensitive === undefined) return;
+		let columns = this.sensitiveColumns.get(table.name);
+		if (columns === undefined) {
+			columns = new Set();
+			this.sensitiveColumns.set(table.name, columns);
+		}
+		for (const column of table.sensitive) columns.add(column);
+	}
+
+	selection(selection: SelectionNode): void {
+		if (readsSensitive(selection.expression))
+			this.sensitiveFields.add(selection.alias);
+	}
+
+	/** Adds a parameter; returns its placeholder, or its literal when inlining. */
+	add(
+		value: unknown,
+		codec: Codec | undefined,
+		sensitive: boolean,
+		cast: string | undefined,
+	): string {
+		const info = { codec, sensitive, cast };
+		this.values.push(value);
+		this.codecs.push(codec);
+		this.info.push(info);
+		if (codec !== undefined) this.typed = true;
+		return this.#inline === undefined
+			? `$${this.values.length}`
+			: this.#inline(value, info);
+	}
+}
+
+/** Adds a parameter and returns its placeholder (its literal, when inlining). */
+function param(
+	params: Params,
+	value: unknown,
+	codec?: Codec,
+	sensitive = false,
+	cast?: string,
+): string {
+	return params.add(value, codec, sensitive, cast);
 }
 
 /** Whether rows can go as one array parameter per column: plain values only, no defaults, no array columns. */
@@ -156,16 +289,16 @@ function renderUnnest(rows: RowsNode, params: Params): string {
 	const arrays = rows.columns.map((_, i) => {
 		const type = rows.types[i] ?? '';
 		const codec = rows.codecs[i];
+		const cells = rows.rows.map((row) => row[i]);
 		const placeholder = param(
 			params,
-			rows.rows.map((row) => {
-				const cell = row[i];
-				return cell?.kind === 'value' ? cell.value : null;
-			}),
+			cells.map((cell) => (cell?.kind === 'value' ? cell.value : null)),
 			// the cast pins the array's type, so it can be declared
 			codec === undefined || codec.element !== undefined
 				? undefined
 				: declareParamType(arrayOf(codec)),
+			cells.some((cell) => cell?.kind === 'value' && cell.sensitive === true),
+			`${type}[]`,
 		);
 		return `${placeholder}::${type}[]`;
 	});
@@ -183,6 +316,7 @@ function renderReturning(
 	params: Params,
 ): string {
 	if (returning.length === 0) return '';
+	for (const selection of returning) params.selection(selection);
 	return ` returning ${returning.map((s) => `${render(s.expression, params)} as ${identifier(s.alias)}`).join(', ')}`;
 }
 
@@ -213,7 +347,7 @@ function renderOnConflict(
 function renderInsert(node: InsertNode, params: Params): string {
 	const { columns, rows } = node.values;
 	if (rows.length === 0) throw new Error('An insert needs at least one row');
-	let sql = `insert into ${renderTable(node.table)}`;
+	let sql = `insert into ${renderTable(node.table, params)}`;
 	if (columns.length === 0) {
 		if (rows.length > 1)
 			throw new Error(
@@ -236,7 +370,7 @@ function renderInsert(node: InsertNode, params: Params): string {
 
 function renderUpdate(node: UpdateNode, params: Params): string {
 	if (node.set.length === 0) throw new Error('An update needs columns to set');
-	let sql = `update ${renderTable(node.table)} set ${renderSets(node.set, params)}`;
+	let sql = `update ${renderTable(node.table, params)} set ${renderSets(node.set, params)}`;
 	const { from } = node;
 	if (from !== undefined) {
 		if (!unnestable(from.rows)) {
@@ -253,7 +387,7 @@ function renderUpdate(node: UpdateNode, params: Params): string {
 }
 
 function renderDelete(node: DeleteNode, params: Params): string {
-	let sql = `delete from ${renderTable(node.table)}`;
+	let sql = `delete from ${renderTable(node.table, params)}`;
 	if (node.where !== undefined) sql += ` where ${render(node.where, params)}`;
 	else if (!node.allRows)
 		throw new Error('A delete needs where() or allRows()');
@@ -265,7 +399,7 @@ function render(node: OperationNode, params: Params): string {
 		case 'reference':
 			return `${identifier(node.table)}.${identifier(node.column)}`;
 		case 'value':
-			return param(params, node.value, node.codec);
+			return param(params, node.value, node.codec, node.sensitive === true);
 		case 'value_list':
 			return `(${node.values.map((value) => render(value, params)).join(', ')})`;
 		case 'literal':
@@ -317,7 +451,7 @@ function renderKeys(
 }
 
 function renderJoin(join: JoinNode, params: Params): string {
-	const table = renderTable(join.table);
+	const table = renderTable(join.table, params);
 	if (join.kind === 'cross') return ` cross join ${table}`;
 	if (join.on === undefined)
 		throw new Error(`A ${join.kind} join needs an on() condition`);
@@ -329,12 +463,12 @@ function renderSelect(node: SelectNode, params: Params): string {
 	if (node.distinct === true) sql += ' distinct';
 	else if (node.distinct !== undefined)
 		sql += ` distinct on (${renderKeys(node.distinct, params)})`;
-	const selections = node.selections.map(
-		(selection) =>
-			`${render(selection.expression, params)} as ${identifier(selection.alias)}`,
-	);
+	const selections = node.selections.map((selection) => {
+		params.selection(selection);
+		return `${render(selection.expression, params)} as ${identifier(selection.alias)}`;
+	});
 	if (selections.length > 0) sql += ` ${selections.join(', ')}`;
-	sql += ` from ${renderTable(node.from)}`;
+	sql += ` from ${renderTable(node.from, params)}`;
 	for (const join of node.joins) sql += renderJoin(join, params);
 	if (node.where !== undefined) {
 		sql += ` where ${render(node.where, params)}`;
@@ -419,7 +553,8 @@ function hasAggregate(node: OperationNode): boolean {
 	}
 }
 
-function renderTable(table: TableNode): string {
+function renderTable(table: TableNode, params: Params): string {
+	params.table(table);
 	return table.alias === undefined
 		? identifier(table.name)
 		: `${identifier(table.name)} as ${identifier(table.alias)}`;
@@ -467,7 +602,7 @@ export function identifier(name: string): string {
  * doubled, and backslashes doubled inside an `E'...'` literal, so it reads the
  * same whatever `standard_conforming_strings` is.
  */
-function stringLiteral(value: string): string {
+export function stringLiteral(value: string): string {
 	if (value.includes('\0')) {
 		throw new Error('A string literal cannot contain a NUL character');
 	}

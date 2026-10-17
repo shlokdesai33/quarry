@@ -1,4 +1,5 @@
-import type { CompiledQuery } from './compile.js';
+import type { BudgetUsage, QueryBudget } from './budget.js';
+import { type CompiledQuery, redactedQuery } from './compile.js';
 
 /** Per-query options of `execute` and `stream`. */
 export interface RunOptions {
@@ -157,6 +158,11 @@ export interface Executor {
 		fn: (executor: TransactionExecutor) => Promise<T>,
 		options?: TransactionOptions,
 	): Promise<T>;
+	/** Runs `fn` with a budget for this executor's queries; see `Database.budget`. */
+	budget<T>(
+		limits: QueryBudget,
+		fn: (usage: BudgetUsage) => Promise<T>,
+	): Promise<T>;
 	/** Releases what the executor owns (e.g. a pool it created). */
 	close(): Promise<void>;
 }
@@ -175,9 +181,12 @@ export interface TransactionExecutor extends Executor {
 const onTable = (table: string | undefined) =>
 	table === undefined ? '' : `on ${JSON.stringify(table)} `;
 
-/** Sets `query` without making it enumerable, so its params stay out of logs and `JSON.stringify`. */
+/**
+ * Sets `query` without making it enumerable, so its params stay out of logs
+ * and `JSON.stringify`, and with those of sensitive columns redacted.
+ */
 function hideQuery(error: Error, query: CompiledQuery): void {
-	Object.defineProperty(error, 'query', { value: query });
+	Object.defineProperty(error, 'query', { value: redactedQuery(query) });
 }
 
 /**

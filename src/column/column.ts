@@ -56,6 +56,10 @@ export class Column<D extends DataType, S, I = S, U = I>
 		return new Column<D, S, I, U>({ ...this._quarry, columnName });
 	}
 
+	override sensitive() {
+		return new Column<D, S, I, U>({ ...this._quarry, sensitive: true });
+	}
+
 	override typed<X extends S, Y extends I, Z extends U>() {
 		return new Column<D, X, Y, Z>(this._quarry);
 	}
