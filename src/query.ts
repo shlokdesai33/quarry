@@ -1,10 +1,11 @@
-import type { CompiledQuery } from './compile.js';
+import { type CompiledQuery, queryInfo } from './compile.js';
 import type {
 	ExecuteResult,
 	Executor,
 	ReadOptions,
 	RunOptions,
 } from './executor.js';
+import { toSQL as renderSQL, type ToSQLOptions } from './to-sql.js';
 
 /** What a `Query` holds. */
 interface QueryState<T> {
@@ -95,9 +96,19 @@ export class Query<T> {
 		);
 	}
 
-	/** The SQL and parameters `execute` sends: the builder's, whatever the shape. */
-	toSQL(): CompiledQuery {
-		return this._quarry.query;
+	/**
+	 * The SQL and parameters `execute` sends: the builder's, whatever the
+	 * shape, since no shape adds a `limit`. `inline` and `pretty` render it
+	 * as the builders' `toSQL` does.
+	 *
+	 * @example q.expectOne().toSQL({ inline: true }).sql
+	 */
+	toSQL(options?: ToSQLOptions): CompiledQuery {
+		const { query } = this._quarry;
+		const node = queryInfo(query)?.node;
+		return (options?.inline || options?.pretty) && node !== undefined
+			? renderSQL(node, options)
+			: query;
 	}
 
 	/** The query itself: what `db.batch` takes from a query or a builder. */

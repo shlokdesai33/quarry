@@ -76,6 +76,7 @@ import {
 	type NullableTables,
 	tableNode,
 } from './table.js';
+import { toSQL as renderSQL, type ToSQLOptions } from './to-sql.js';
 import type { Prettify } from './types.js';
 import {
 	type Condition,
@@ -910,9 +911,19 @@ export class SelectQueryBuilder<
 		return this.toQuery().execute(options);
 	}
 
-	/** The SQL and parameters `execute()` sends. */
-	toSQL(): CompiledQuery {
-		return compile(this.toNode());
+	/**
+	 * The SQL and parameters `execute()` sends, without running it; the
+	 * result shapes don't change them. With `inline`, each value is written
+	 * into the SQL as a Postgres literal of its type, rendered by its codec,
+	 * ready to paste into psql (values of `sensitive()` columns show as `'[redacted]'`); it is for
+	 * reading and logs, never for running SQL built from untrusted input.
+	 * `pretty` lays the SQL out over lines.
+	 *
+	 * @example q.toSQL() // { sql: '… where "users"."id" = $1', params: [42] }
+	 * @example console.log(q.toSQL({ inline: true, pretty: true }).sql)
+	 */
+	toSQL(options?: ToSQLOptions): CompiledQuery {
+		return renderSQL(this.toNode(), options);
 	}
 
 	/** The query `execute()` runs: every row. */

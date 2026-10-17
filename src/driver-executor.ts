@@ -1,4 +1,15 @@
-import type { CompiledQuery } from './compile.js';
+import {
+	budgetsOf,
+	endQuery,
+	runBudget,
+	startQueries,
+	startQuery,
+	type Budget,
+	type BudgetUsage,
+	type QueryBudget,
+	type QueryBudgetError,
+} from './budget.js';
+import { type CompiledQuery, redactedParams } from './compile.js';
 import {
 	Connection,
 	createCodecRegistry,
@@ -27,11 +38,13 @@ import type {
 	TransactionExecutor,
 	TransactionOptions,
 } from './executor.js';
+import { redactError } from './redact.js';
 
 /** One query, reported to `onQuery` when it settles. */
 export interface QueryEvent {
 	readonly kind: 'execute' | 'stream' | 'describe';
 	readonly sql: string;
+	/** The values sent, those bound against `sensitive()` columns as `'[redacted]'`. */
 	readonly params: readonly unknown[];
 	/** The label from `tag()`. */
 	readonly tag: string | undefined;
@@ -73,12 +86,26 @@ export interface DatabaseOptions {
 	/** Called once per query with its SQL, tag, timings, row count and error. */
 	readonly onQuery?: ((event: QueryEvent) => void) | undefined;
 	/**
+	 * Reports the queries that take at least `thresholdMs` (failed ones
+	 * included) to `onSlow`, with the same event `onQuery` gets.
+	 *
+	 * @example slowQuery: { thresholdMs: 200, onSlow: (e) => log.warn(e.tag ?? e.sql, e.durationMs) }
+	 */
+	readonly slowQuery?: SlowQueryOptions | undefined;
+	/**
 	 * Append the stack of the code awaiting a failed query to its error,
 	 * captured when it fails (default true).
 	 */
 	readonly callsites?: boolean | undefined;
 	/** Use cached prepared statements (default: the connection's setting). */
 	readonly prepare?: boolean | undefined;
+}
+
+/** Where `slowQuery` reports, and from what duration. */
+export interface SlowQueryOptions {
+	/** The duration, in milliseconds, from which a query is slow. */
+	readonly thresholdMs: number;
+	readonly onSlow: (event: QueryEvent) => void;
 }
 
 /** What a `DriverExecutor` runs on. */
@@ -137,9 +164,10 @@ function decorate(
 	callsite: Error | undefined,
 ): void {
 	if (!(error instanceof Error)) return;
+	if (query !== undefined) redactError(error, query);
 	if (error instanceof PostgresError && query !== undefined) {
 		Object.defineProperty(error, 'query', {
-			value: { sql: query.sql, params: query.params, tag: query.tag },
+			value: { sql: query.sql, params: redactedParams(query), tag: query.tag },
 		});
 	}
 	if (callsite?.stack && error.stack && !Reflect.has(error, CALLSITE)) {
@@ -170,6 +198,11 @@ export class DriverExecutor implements TransactionExecutor {
 	readonly #options: DatabaseOptions;
 	readonly #registry: CodecRegistry;
 	readonly #owned: boolean;
+	/**
+	 * What identifies the database to `db.budget`: shared with the
+	 * executors of its transactions, and no other database's.
+	 */
+	readonly #owner: object;
 	/** Whether the catalog was looked up (or isn't to be). */
 	#ready: boolean;
 
@@ -178,10 +211,12 @@ export class DriverExecutor implements TransactionExecutor {
 		options: DatabaseOptions = {},
 		owned = false,
 		registry?: CodecRegistry,
+		owner: object = {},
 	) {
 		this.#source = source;
 		this.#options = options;
 		this.#owned = owned;
+		this.#owner = owner;
 		this.#registry =
 			registry ??
 			(options.codecs === undefined || options.codecs.length === 0
@@ -261,13 +296,31 @@ export class DriverExecutor implements TransactionExecutor {
 		}
 	}
 
+	/** Whether queries are timed: for `onQuery`, `slowQuery` or a budget. */
+	#observing(budgets: readonly Budget[]): boolean {
+		return (
+			this.#options.onQuery !== undefined ||
+			this.#options.slowQuery !== undefined ||
+			budgets.length > 0
+		);
+	}
+
 	#emit(event: QueryEvent): void {
-		try {
-			this.#options.onQuery?.(event);
-		} catch (error) {
-			queueMicrotask(() => {
-				throw error;
-			});
+		const { onQuery, slowQuery } = this.#options;
+		const listeners = [
+			onQuery,
+			slowQuery !== undefined && event.durationMs >= slowQuery.thresholdMs
+				? slowQuery.onSlow
+				: undefined,
+		];
+		for (const listener of listeners) {
+			try {
+				listener?.(event);
+			} catch (error) {
+				queueMicrotask(() => {
+					throw error;
+				});
+			}
 		}
 	}
 
@@ -280,16 +333,22 @@ export class DriverExecutor implements TransactionExecutor {
 		command: string | undefined,
 		rowCount: number | undefined,
 		error?: unknown,
-	): void {
+	): number {
 		const end = performance.now();
+		const durationMs = end - start;
+		if (
+			this.#options.onQuery === undefined &&
+			this.#options.slowQuery === undefined
+		)
+			return durationMs;
 		this.#emit({
 			kind,
 			sql: query.sql,
-			params: query.params,
+			params: redactedParams(query),
 			tag: query.tag,
 			command,
 			rowCount,
-			durationMs: end - start,
+			durationMs,
 			phases: {
 				acquireMs: acquired - start,
 				queuedMs: timing?.queuedMs ?? 0,
@@ -302,6 +361,7 @@ export class DriverExecutor implements TransactionExecutor {
 						? error
 						: new DriverError('A non-Error value was thrown', { cause: error }),
 		});
+		return durationMs;
 	}
 
 	/**
@@ -316,13 +376,20 @@ export class DriverExecutor implements TransactionExecutor {
 		query: CompiledQuery,
 		options: ExecuteOptions = {},
 	): Promise<ExecuteResult> {
-		const observe = this.#options.onQuery !== undefined;
+		const budgets = budgetsOf(this.#owner);
+		try {
+			if (budgets.length > 0) startQuery(budgets, query);
+		} catch (error) {
+			decorate(error, query, issuedAt(this.#options));
+			throw error;
+		}
+		const observe = this.#observing(budgets);
 		const start = observe ? performance.now() : 0;
 		let acquired = start;
 		let timing: OpTiming | undefined;
+		let result: QueryResult<unknown>;
 		try {
 			const pool = this.#shared(query);
-			let result: QueryResult<unknown>;
 			if (pool !== undefined) {
 				if (!this.#ready) await this.#prepare(pool);
 				// the pool picks the connection: the time before the query
@@ -355,26 +422,10 @@ export class DriverExecutor implements TransactionExecutor {
 					);
 				});
 			}
-			if (observe) {
-				this.#report(
-					'execute',
-					query,
-					start,
-					acquired,
-					timing,
-					result.command,
-					result.rowCount ?? result.rows.length,
-				);
-			}
-			return {
-				rows: result.rows,
-				rowCount: result.rowCount,
-				command: result.command,
-			};
 		} catch (error) {
 			decorate(error, query, issuedAt(this.#options));
-			if (observe)
-				this.#report(
+			if (observe) {
+				const durationMs = this.#report(
 					'execute',
 					query,
 					start,
@@ -384,8 +435,31 @@ export class DriverExecutor implements TransactionExecutor {
 					undefined,
 					error,
 				);
+				endQuery(budgets, query, durationMs);
+			}
 			throw error;
 		}
+		if (observe) {
+			const durationMs = this.#report(
+				'execute',
+				query,
+				start,
+				acquired,
+				timing,
+				result.command,
+				result.rowCount ?? result.rows.length,
+			);
+			const over = endQuery(budgets, query, durationMs);
+			if (over !== undefined) {
+				decorate(over, query, issuedAt(this.#options));
+				throw over;
+			}
+		}
+		return {
+			rows: result.rows,
+			rowCount: result.rowCount,
+			command: result.command,
+		};
 	}
 
 	/**
@@ -401,12 +475,20 @@ export class DriverExecutor implements TransactionExecutor {
 		options: StreamOptions = {},
 	): AsyncGenerator<unknown[], void, undefined> {
 		const callsite = this.#callsite();
+		const budgets = budgetsOf(this.#owner);
+		try {
+			if (budgets.length > 0) startQuery(budgets, query);
+		} catch (error) {
+			decorate(error, query, callsite);
+			throw error;
+		}
 		const start = performance.now();
 		let acquired = start;
 		let rows = 0;
 		let failure: unknown;
 		const source = this.#source;
 		let client: PoolClient | undefined;
+		let over: QueryBudgetError | undefined;
 		try {
 			if (options.timeout !== undefined && source instanceof Transaction) {
 				throw new DriverError(
@@ -444,18 +526,21 @@ export class DriverExecutor implements TransactionExecutor {
 			throw error;
 		} finally {
 			client?.release();
-			if (this.#options.onQuery !== undefined) {
-				this.#report(
-					'stream',
-					query,
-					start,
-					acquired,
-					undefined,
-					failure === undefined ? 'SELECT' : undefined,
-					rows,
-					failure,
-				);
-			}
+			const durationMs = this.#report(
+				'stream',
+				query,
+				start,
+				acquired,
+				undefined,
+				failure === undefined ? 'SELECT' : undefined,
+				rows,
+				failure,
+			);
+			over = endQuery(budgets, query, durationMs);
+		}
+		if (over !== undefined) {
+			decorate(over, query, callsite);
+			throw over;
 		}
 	}
 
@@ -517,10 +602,17 @@ export class DriverExecutor implements TransactionExecutor {
 		let site: Error | undefined;
 		/** Captured by the first failure; every caller of it runs in this method's chain of awaits. */
 		const callsite = () => (site ??= issuedAt(this.#options));
-		const observe = this.#options.onQuery !== undefined;
+		const queries = batch.map(({ query }) => query);
+		const budgets = budgetsOf(this.#owner);
+		try {
+			if (budgets.length > 0) startQueries(budgets, queries);
+		} catch (error) {
+			decorate(error, undefined, callsite());
+			throw error;
+		}
+		const observe = this.#observing(budgets);
 		const start = observe ? performance.now() : 0;
 		let acquired = start;
-		const queries = batch.map(({ query }) => query);
 		const statements = batch.map(({ query, rowMode, keepRows }) => ({
 			sql: query.sql,
 			params: query.params,
@@ -597,60 +689,85 @@ export class DriverExecutor implements TransactionExecutor {
 					),
 				),
 			);
-		if (!inTransaction && transaction === undefined) {
-			const pool = this.#shared(queries);
-			if (pool !== undefined) {
-				if (!this.#ready) await this.#prepare(pool);
-				const settled = await pool.withShared(
-					(connection) => {
-						if (observe) acquired = performance.now();
-						return independent(connection);
-					},
-					{ signal },
-				);
-				return settle(settled, false);
+		const pool =
+			!inTransaction && transaction === undefined
+				? this.#shared(queries)
+				: undefined;
+		if (pool !== undefined && !this.#ready) await this.#prepare(pool);
+		let settled: PromiseSettledResult<ExecuteResult>[];
+		try {
+			settled =
+				pool !== undefined
+					? settle(
+							await pool.withShared(
+								(connection) => {
+									if (observe) acquired = performance.now();
+									return independent(connection);
+								},
+								{ signal },
+							),
+							false,
+						)
+					: await this.#run(signal, async (runner) => {
+							if (observe) acquired = performance.now();
+							if (inTransaction) {
+								return verified(
+									settle(
+										await Promise.allSettled(
+											runner.queryGroup(statements, { signal }),
+										),
+										true,
+									),
+								);
+							}
+							if (transaction === undefined)
+								return settle(await independent(runner), false);
+							const { results, done } = Transaction.batch(runner, statements, {
+								...transaction,
+								...(timeout === undefined
+									? {}
+									: {
+											settings: {
+												...transaction.settings,
+												statement_timeout: interval(timeout),
+											},
+										}),
+								signal,
+								...(verify === undefined
+									? {}
+									: {
+											verify: (rows: readonly QueryResult<unknown>[]) =>
+												verify(rows.map(executeResult)),
+										}),
+							});
+							done.catch(() => {});
+							const settled = settle(await Promise.allSettled(results), true);
+							try {
+								await done;
+							} catch (error) {
+								decorate(error, undefined, callsite());
+								throw error;
+							}
+							return settled;
+						});
+		} catch (error) {
+			if (budgets.length > 0)
+				endQuery(budgets, queries[0]!, performance.now() - start);
+			throw error;
+		}
+		if (budgets.length > 0) {
+			// one round trip: its time counts once
+			const over = endQuery(
+				budgets,
+				queries.at(-1)!,
+				performance.now() - start,
+			);
+			if (over !== undefined) {
+				decorate(over, undefined, callsite());
+				throw over;
 			}
 		}
-		return await this.#run(signal, async (runner) => {
-			if (observe) acquired = performance.now();
-			if (inTransaction) {
-				return verified(
-					settle(
-						await Promise.allSettled(runner.queryGroup(statements, { signal })),
-						true,
-					),
-				);
-			}
-			if (transaction === undefined)
-				return settle(await independent(runner), false);
-			const { results, done } = Transaction.batch(runner, statements, {
-				...transaction,
-				...(timeout === undefined
-					? {}
-					: {
-							settings: {
-								...transaction.settings,
-								statement_timeout: interval(timeout),
-							},
-						}),
-				signal,
-				...(verify === undefined
-					? {}
-					: {
-							verify: (rows: readonly QueryResult<unknown>[]) =>
-								verify(rows.map(executeResult)),
-						}),
-			});
-			done.catch(() => {});
-			const settled = settle(await Promise.allSettled(results), true);
-			try {
-				await done;
-			} catch (error) {
-				decorate(error, undefined, callsite());
-				throw error;
-			}
-			return settled;
-		});
+		return settled;
 	}
 
 	transaction<T>(
@@ -658,7 +775,15 @@ export class DriverExecutor implements TransactionExecutor {
 		options: TransactionOptions = {},
 	): Promise<T> {
 		const run = (tx: Transaction) =>
-			fn(new DriverExecutor(tx, this.#options, false, this.#registry));
+			fn(
+				new DriverExecutor(
+					tx,
+					this.#options,
+					false,
+					this.#registry,
+					this.#owner,
+				),
+			);
 		const source = this.#source;
 		if (source instanceof Transaction) {
 			for (const key of [
@@ -702,6 +827,13 @@ export class DriverExecutor implements TransactionExecutor {
 
 	setLocal(name: string, value: string | number | boolean): Promise<void> {
 		return this.#transaction().setLocal(name, value);
+	}
+
+	budget<T>(
+		limits: QueryBudget,
+		fn: (usage: BudgetUsage) => Promise<T>,
+	): Promise<T> {
+		return runBudget(this.#owner, limits, fn);
 	}
 
 	async close(): Promise<void> {
