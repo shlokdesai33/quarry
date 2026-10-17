@@ -204,13 +204,13 @@ describe.skipIf(noPg)('inc and dec on PostgreSQL', () => {
 		const a = await create('many-a');
 		const b = await create('many-b');
 		const rows = await db
-			.updateMany(
-				counters,
+			.update(counters)
+			.setEach(
 				[
 					{ id: a, hits: inc(1), balance: dec('1.25') },
 					{ id: b, hits: inc(10), balance: dec('50') },
 				],
-				{ by: 'id' },
+				{ key: 'id' },
 			)
 			.set({ visits: inc('10') })
 			.returning([
@@ -234,6 +234,27 @@ describe.skipIf(noPg)('inc and dec on PostgreSQL', () => {
 				balance: '50.00',
 				visits: '9007199254741000',
 			},
+		]);
+	});
+
+	it('keeps the value of a setEach row that leaves an incremented column out', async () => {
+		const a = await create('each-a');
+		const b = await create('each-b');
+		const rows = await db
+			.update(counters)
+			.setEach(
+				[
+					{ id: a, hits: inc(3), likes: inc(1, { coalesce: true }) },
+					{ id: b, key: 'each-b2' },
+				],
+				{ key: 'id' },
+			)
+			.returning(['counters.key', 'counters.hits', 'counters.likes'])
+			.expectNonEmpty()
+			.execute();
+		expect(rows.toSorted((x, y) => x.key.localeCompare(y.key))).toEqual([
+			{ key: 'each-a', hits: 3, likes: 1 },
+			{ key: 'each-b2', hits: 0, likes: null },
 		]);
 	});
 
