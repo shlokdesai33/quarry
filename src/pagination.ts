@@ -1,7 +1,9 @@
-import type { Codec } from './driver/codec.js';
+import { type Codec, decodesAsText } from './driver/codec.js';
+import { codecs } from './driver/codecs.js';
 import {
 	base64Decode,
 	base64Encode,
+	hex,
 	utf8Decode,
 	utf8Encode,
 } from './driver/auth/encoding.js';
@@ -10,6 +12,7 @@ import type {
 	OperationNode,
 	OrderNode,
 	ReferenceNode,
+	SelectionNode,
 	SelectNode,
 } from './node.js';
 import type { Ref, RefsOf } from './refs.js';
@@ -121,7 +124,6 @@ export function settled<T>(outcome: PromiseSettledResult<T> | undefined): T {
 	if (outcome.status === 'rejected') throw outcome.reason;
 	return outcome.value;
 }
-
 /** A key column, resolved. */
 export interface Key {
 	/** As written, e.g. `posts.id`. */
@@ -191,14 +193,7 @@ export function resolveKeyset(
 				`${method}() can't seek past a null: ${ref} is nullable; key by non-null columns`,
 			);
 		}
-		const isSelected = node.selections.some(
-			({ alias, expression }) =>
-				alias === key.alias &&
-				expression.kind === 'reference' &&
-				expression.table === key.node.table &&
-				expression.column === key.node.column,
-		);
-		if (!isSelected) {
+		if (!node.selections.some((selection) => isKey(key, selection))) {
 			throw new Error(
 				`${method}() reads the key from each page's last row: select ${ref}`,
 			);
@@ -212,6 +207,16 @@ export function resolveKeyset(
 	return { keys: [first, ...rest], direction: direction ?? 'asc' };
 }
 
+/** Whether `selection` is the column `key`, under its own name. */
+function isKey(key: Key, { alias, expression }: SelectionNode): boolean {
+	return (
+		alias === key.alias &&
+		expression.kind === 'reference' &&
+		expression.table === key.node.table &&
+		expression.column === key.node.column
+	);
+}
+
 /** The `order by` of a keyset. */
 export function orderBy({ keys, direction }: Keyset): OrderNode[] {
 	return keys.map((key) => ({
@@ -222,17 +227,25 @@ export function orderBy({ keys, direction }: Keyset): OrderNode[] {
 }
 
 /**
- * The query, from the row after the key values `after` (by the key's
- * order), for `limit` rows; from the first row without `after`.
+ * The query, from the row after the key `after` (by the key's order), for
+ * `limit` rows; from the first row without `after`. The key columns are
+ * read as the server's text, which `readKeys` decodes: the SQL is the
+ * same, but a value the codec decodes losslessly (a timestamptz's
+ * microseconds, as a `Date`) still seeks exactly.
  */
 export function seekPage(
 	node: SelectNode,
 	keyset: Keyset,
-	after: readonly OperationNode[] | undefined,
+	after: readonly string[] | undefined,
 	limit: number,
 ): SelectNode {
 	return {
 		...node,
+		selections: node.selections.map((selection) =>
+			keyset.keys.some((key) => isKey(key, selection))
+				? { ...selection, codec: codecs.raw }
+				: selection,
+		),
 		where:
 			after === undefined ? node.where : and(node.where, seek(keyset, after)),
 		orderBy: orderBy(keyset),
@@ -246,19 +259,23 @@ export function seekPage(
  */
 function seek(
 	{ keys, direction }: Keyset,
-	after: readonly OperationNode[],
+	after: readonly string[],
 ): OperationNode {
 	const operator = direction === 'asc' ? '>' : '<';
-	const [key] = keys;
-	const [value] = after;
+	const values = keys.map((key, i): OperationNode => ({
+		kind: 'value',
+		value: after[i],
+		codec: asText(key.codec),
+	}));
+	const [value] = values;
 	if (keys.length === 1 && value !== undefined) {
-		return { kind: 'binary', left: key.node, operator, right: value };
+		return { kind: 'binary', left: keys[0].node, operator, right: value };
 	}
 	return {
 		kind: 'binary',
-		left: { kind: 'value_list', values: keys.map((k) => k.node) },
+		left: { kind: 'value_list', values: keys.map((key) => key.node) },
 		operator,
-		right: { kind: 'value_list', values: after },
+		right: { kind: 'value_list', values },
 	};
 }
 
@@ -273,60 +290,80 @@ function and(
 	};
 }
 
-/** The key values of `row`, as parameters encoded with the key columns' codecs. */
-export function keyValues(
+/**
+ * Decodes the key columns of `rows`, which `seekPage` read as the
+ * server's text, with their codecs, and returns the last row's key as
+ * that text. An executor that decoded them anyway gives values, which
+ * are encoded back.
+ */
+export function readKeys(
 	keyset: Keyset,
-	row: unknown,
+	rows: readonly unknown[],
 	method: string,
-): readonly unknown[] {
-	// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- rows are objects keyed by the select list, which has the key columns
-	const record = row as Readonly<Record<string, unknown>>;
-	return keyset.keys.map((key) => {
-		const value = record[key.alias];
-		if (value === null || value === undefined) {
-			throw new Error(`${method}() can't seek past a null ${key.ref}`);
-		}
-		return value;
-	});
+): readonly string[] | undefined {
+	let last: string[] | undefined;
+	for (const row of rows) {
+		// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- rows are objects keyed by the select list, which has the key columns
+		const record = row as Record<string, unknown>;
+		last = keyset.keys.map((key) => {
+			const value = record[key.alias];
+			if (value === null || value === undefined) {
+				throw new Error(`${method}() can't seek past a null ${key.ref}`);
+			}
+			if (typeof value !== 'string') return textOf(key, value, method);
+			if (!decodesAsText(key.codec)) {
+				record[key.alias] = key.codec.decodeText(value);
+			}
+			return value;
+		});
+	}
+	return last;
 }
 
-/** The key values as parameters, with their columns' codecs. */
-export function keyParams(
-	keyset: Keyset,
-	values: readonly unknown[],
-): OperationNode[] {
-	return keyset.keys.map((key, i) => ({
-		kind: 'value',
-		value: values[i],
-		codec: key.codec,
-	}));
+/** A decoded key value as the server's text. */
+function textOf(key: Key, value: unknown, method: string): string {
+	const encoded = key.codec.encode(value);
+	if (typeof encoded === 'string') return encoded;
+	if (key.codec.oid === BYTEA) return `\\x${hex(encoded)}`;
+	throw new Error(
+		`${method}() can't send ${key.ref} back as text: its codec encodes it in binary`,
+	);
+}
+
+const BYTEA = 17;
+
+const textCodecs = new WeakMap<Codec, Codec>();
+
+/** `codec`, for a key value as the server's text: sent as it is, with the codec's type. */
+function asText(codec: Codec): Codec {
+	let known = textCodecs.get(codec);
+	if (known === undefined) {
+		known = Object.freeze({
+			...codec,
+			paramFormat: 'text',
+			encode: (value: unknown) => String(value),
+		});
+		textCodecs.set(codec, known);
+	}
+	return known;
 }
 
 /**
  * What a cursor holds: the key it was made for, and the last row's key
- * values as their codecs encode them (Postgres's text, or base64 of a
- * binary encoding), which the next query sends as they are.
+ * values as the server's text.
  */
 interface CursorData {
 	readonly by: readonly string[];
 	readonly direction: KeyDirection;
-	readonly after: readonly (string | { readonly b: string })[];
+	readonly after: readonly string[];
 }
 
-/** The cursor of the page after the row with the key `values`: base64url JSON. */
-export function encodeCursor(
-	keyset: Keyset,
-	values: readonly unknown[],
-): string {
+/** The cursor of the page after the row with the key `after`: base64url JSON. */
+export function encodeCursor(keyset: Keyset, after: readonly string[]): string {
 	const data: CursorData = {
 		by: keyset.keys.map((key) => key.ref),
 		direction: keyset.direction,
-		after: keyset.keys.map((key, i) => {
-			const encoded = key.codec.encode(values[i]);
-			return typeof encoded === 'string'
-				? encoded
-				: { b: base64Encode(encoded) };
-		}),
+		after,
 	};
 	return base64Encode(utf8Encode(JSON.stringify(data)))
 		.replaceAll('+', '-')
@@ -334,11 +371,15 @@ export function encodeCursor(
 		.replace(/=+$/, '');
 }
 
-/** The key values `cursor` holds, as parameters; throws `InvalidCursorError` for one not made for `keyset`. */
-export function decodeCursor(keyset: Keyset, cursor: string): OperationNode[] {
-	if (typeof cursor !== 'string' || !/^[\w-]*$/.test(cursor)) {
-		throw new InvalidCursorError('not a cursor paginateByCursor() made');
-	}
+/** The key `cursor` holds; throws `InvalidCursorError` for one not made for `keyset`. */
+export function decodeCursor(
+	keyset: Keyset,
+	cursor: string,
+): readonly string[] {
+	const invalid = new InvalidCursorError(
+		'not a cursor paginateByCursor() made',
+	);
+	if (typeof cursor !== 'string' || !/^[\w-]+$/.test(cursor)) throw invalid;
 	let data: unknown;
 	try {
 		data = JSON.parse(
@@ -347,25 +388,16 @@ export function decodeCursor(keyset: Keyset, cursor: string): OperationNode[] {
 			),
 		);
 	} catch {
-		throw new InvalidCursorError('not a cursor paginateByCursor() made');
+		throw invalid;
 	}
-	if (!isCursorData(data, keyset.keys.length)) {
-		throw new InvalidCursorError('not a cursor paginateByCursor() made');
-	}
+	if (!isCursorData(data, keyset.keys.length)) throw invalid;
 	const by = keyset.keys.map((key) => key.ref);
 	if (data.by.join() !== by.join() || data.direction !== keyset.direction) {
 		throw new InvalidCursorError(
 			`made for by ${data.by.join(', ')} ${data.direction}, not ${by.join(', ')} ${keyset.direction}`,
 		);
 	}
-	return keyset.keys.map((key, i) => {
-		const value = data.after[i];
-		return {
-			kind: 'value',
-			value: typeof value === 'string' ? value : base64Decode(value?.b ?? ''),
-			codec: preEncoded(key.codec),
-		};
-	});
+	return data.after;
 }
 
 function isCursorData(data: unknown, keys: number): data is CursorData {
@@ -373,38 +405,13 @@ function isCursorData(data: unknown, keys: number): data is CursorData {
 	const { by, direction, after } = data as Partial<
 		Record<keyof CursorData, unknown>
 	>;
+	const strings = (value: unknown) =>
+		Array.isArray(value) &&
+		value.length === keys &&
+		value.every((item) => typeof item === 'string');
 	return (
-		Array.isArray(by) &&
-		by.length === keys &&
-		by.every((ref) => typeof ref === 'string') &&
-		(direction === 'asc' || direction === 'desc') &&
-		Array.isArray(after) &&
-		after.length === keys &&
-		after.every(
-			(value: unknown) =>
-				typeof value === 'string' ||
-				(typeof value === 'object' &&
-					value !== null &&
-					typeof (value as { b?: unknown }).b === 'string'),
-		)
+		strings(by) &&
+		strings(after) &&
+		(direction === 'asc' || direction === 'desc')
 	);
-}
-
-const encodedCodecs = new WeakMap<Codec, Codec>();
-
-/** `codec`, for a value it has already encoded: sent as it is, with the codec's type. */
-function preEncoded(codec: Codec): Codec {
-	let known = encodedCodecs.get(codec);
-	if (known === undefined) {
-		known = Object.freeze({
-			...codec,
-			encode: (value: unknown) => {
-				if (typeof value === 'string' || value instanceof Uint8Array)
-					return value;
-				throw new TypeError('A cursor value is text or bytes');
-			},
-		});
-		encodedCodecs.set(codec, known);
-	}
-	return known;
 }

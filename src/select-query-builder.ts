@@ -30,12 +30,11 @@ import {
 	decodeCursor,
 	encodeCursor,
 	type KeyColumn,
-	keyParams,
 	type KeysetOptions,
-	keyValues,
 	type OffsetPage,
 	type OffsetPageOptions,
 	orderBy,
+	readKeys,
 	resolveKeyset,
 	rowCount,
 	runOptions,
@@ -965,7 +964,10 @@ export class SelectQueryBuilder<
 	 * them. Order with `by` and `direction` instead.
 	 *
 	 * The key columns must together be unique and non-null, and be selected,
-	 * since each batch's last row gives the next one's start. Each batch sees
+	 * since each batch's last row gives the next one's start. They are read
+	 * as the server's text and decoded by their codecs, so the next batch
+	 * seeks from the exact value even where the decoded one is rounded (a
+	 * timestamptz's microseconds, in a `Date`). Each batch sees
 	 * the rows committed when it runs: rows inserted ahead of the key's
 	 * position show up, those behind it don't, and no row is read twice.
 	 * Run in `db.transaction` (`repeatable read`, for one snapshot) to see
@@ -991,19 +993,13 @@ export class SelectQueryBuilder<
 			true,
 		);
 		const run = runOptions(options);
-		let after: readonly unknown[] | undefined;
+		let after: readonly string[] | undefined;
 		for (;;) {
-			const query = seekPage(
-				base,
-				keyset,
-				after === undefined ? undefined : keyParams(keyset, after),
-				size,
-			);
+			const query = compile(seekPage(base, keyset, after, size));
 			// oxlint-disable-next-line no-await-in-loop -- each batch starts after the last
-			const { rows } = await executor.execute(compile(query), run);
-			const last = rows.at(-1);
-			if (last === undefined) return;
-			after = keyValues(keyset, last, 'iterateChunks');
+			const { rows } = await executor.execute(query, run);
+			after = readKeys(keyset, rows, 'iterateChunks');
+			if (after === undefined) return;
 			// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the select list supplies the row type
 			yield rows as O[];
 			if (rows.length < size) return;
@@ -1022,8 +1018,9 @@ export class SelectQueryBuilder<
 	 * `orderBy()`, `limit()` or `offset()`, it throws, rather than combine
 	 * them. Order with `by` and `direction` instead.
 	 *
-	 * The key columns must together be unique and non-null, and be selected.
-	 * A cursor is base64url JSON of the last row's key values: opaque to
+	 * The key columns must together be unique and non-null, and be selected;
+	 * as with `iterateChunks`, the cursor holds their exact values. A
+	 * cursor is base64url JSON of the last row's key values: opaque to
 	 * clients, but not signed or encrypted. A cursor made for another key or
 	 * direction, or altered, rejects with `InvalidCursorError`.
 	 *
@@ -1053,15 +1050,13 @@ export class SelectQueryBuilder<
 			compile(seekPage(base, keyset, start, perPage + 1)),
 			runOptions(options),
 		);
-		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the select list supplies the row type
-		const page = rows.slice(0, perPage) as O[];
-		const last = page.at(-1);
+		const page = rows.slice(0, perPage);
+		const last = readKeys(keyset, page, 'paginateByCursor');
 		const hasMore = rows.length > perPage && last !== undefined;
 		return {
-			rows: page,
-			nextCursor: hasMore
-				? encodeCursor(keyset, keyValues(keyset, last, 'paginateByCursor'))
-				: null,
+			// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the select list supplies the row type
+			rows: page as O[],
+			nextCursor: hasMore ? encodeCursor(keyset, last) : null,
 			hasMore,
 		};
 	}

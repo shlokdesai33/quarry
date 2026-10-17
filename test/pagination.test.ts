@@ -70,11 +70,11 @@ describe('iterateChunks', () => {
 			},
 			{
 				sql: 'select "users"."id" as "id" from "users" where "users"."id" > $1 order by "users"."id" asc limit $2',
-				params: [2, 2],
+				params: ['2', 2],
 			},
 			{
 				sql: 'select "users"."id" as "id" from "users" where "users"."id" > $1 order by "users"."id" asc limit $2',
-				params: [4, 2],
+				params: ['4', 2],
 			},
 		]);
 	});
@@ -104,10 +104,14 @@ describe('iterateChunks', () => {
 		expect(ran).toHaveLength(1);
 	});
 
-	it('compares a composite key as a row, descending, and encodes each value with its column codec', async () => {
-		const at = new Date(Date.UTC(2026, 0, 1));
-		const { db, ran } = scripted([{ createdAt: at, id: 7, email: 'a@x' }], []);
-		await collect(
+	it('compares a composite key as a row, descending, seeking by the key exactly as the server wrote it', async () => {
+		// the driver returns the key columns as text: they're read with `codecs.raw`
+		const at = '2026-01-01 00:00:00.000123+00';
+		const { db, ran } = scripted(
+			[{ createdAt: at, id: '7', email: 'a@x' }],
+			[],
+		);
+		const batches = await collect(
 			db
 				.selectFrom(users)
 				.select(['users.createdAt', 'users.id', 'users.email'])
@@ -116,15 +120,32 @@ describe('iterateChunks', () => {
 					direction: 'desc',
 				}),
 		);
+		expect(batches).toEqual([
+			[{ createdAt: new Date(Date.UTC(2026, 0, 1)), id: 7, email: 'a@x' }],
+		]);
 		expect(plain(ran[1]!)).toEqual({
 			sql: 'select "users"."created_at" as "createdAt", "users"."id" as "id", "users"."email" as "email" from "users" where ("users"."created_at", "users"."id") < ($1, $2) order by "users"."created_at" desc, "users"."id" desc limit $3',
-			params: [at, 7, 1],
+			params: [at, '7', 1],
 		});
-		expect(codecNames(ran[1]!).params).toEqual([
-			'timestamptz',
-			'int4',
-			undefined,
-		]);
+		expect(codecNames(ran[1]!)).toEqual({
+			params: ['timestamptz', 'int4', undefined],
+			results: ['', '', 'text'],
+		});
+		expect(ran[1]!.paramCodecs?.[0]?.paramFormat).toBe('text');
+	});
+
+	it('encodes the key back to text when an executor decoded it anyway', async () => {
+		const at = new Date(Date.UTC(2026, 0, 1, 2, 3, 4, 5));
+		const { db, ran } = scripted([{ createdAt: at, id: 7 }], []);
+		await collect(
+			db
+				.selectFrom(users)
+				.select(['users.createdAt', 'users.id'])
+				.iterateChunks(1, { by: ['users.createdAt', 'users.id'] }),
+		);
+		const [createdAt, id] = ran[1]!.params;
+		expect(new Date(String(createdAt)).getTime()).toBe(at.getTime());
+		expect(id).toBe('7');
 	});
 
 	it('keeps the where, joins, locks and tag, adding the seek to the where', async () => {
@@ -147,7 +168,7 @@ describe('iterateChunks', () => {
 		);
 		expect(sql()[1]).toEqual({
 			sql: 'select "posts"."id" as "id", "posts"."title" as "title" from "posts" inner join "users" on "users"."id" = "posts"."user_id" where ("users"."email" = $1 and ("posts"."title" = $2 or "posts"."title" = $3) and "posts"."id" > $4) order by "posts"."id" asc limit $5 for update of "posts" skip locked',
-			params: ['a@x', 'a', 'b', 1, 1],
+			params: ['a@x', 'a', 'b', '1', 1],
 			tag: 'posts.batch',
 		});
 	});
@@ -160,7 +181,7 @@ describe('iterateChunks', () => {
 			.iterateChunks(1, { by: 'users.id' })) {
 			for (const row of batch) Object.assign(row, { id: 99 });
 		}
-		expect(ran[1]?.params).toEqual([1, 1]);
+		expect(ran[1]?.params).toEqual(['1', 1]);
 	});
 
 	it('stops querying when the loop breaks', async () => {
@@ -291,7 +312,7 @@ describe('paginateByCursor', () => {
 		});
 		const [createdAt, sentAvatar, id] = ran[1]!.params;
 		expect(new Date(String(createdAt)).getTime()).toBe(at.getTime());
-		expect(sentAvatar).toEqual(avatar);
+		expect(sentAvatar).toBe('\\x00ff07');
 		expect(id).toBe('1');
 		expect(codecNames(ran[1]!).params.slice(0, 3)).toEqual([
 			'timestamptz',
