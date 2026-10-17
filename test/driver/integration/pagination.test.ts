@@ -415,4 +415,38 @@ describe.skipIf(noPg)('keyset chunks and pagination on PostgreSQL', () => {
 			total,
 		});
 	});
+
+	it('counts the groups of a grouped query into total, and rejects a query that already orders', async () => {
+		const grouped = db
+			.selectFrom(items)
+			.select(['items.n'])
+			.where((eb) => eb.ref('items.id').lte(ROWS))
+			.groupBy(['items.n']);
+		const page = await grouped.paginateByOffset({
+			page: 2,
+			perPage: 4,
+			by: 'items.n',
+			direction: 'desc',
+			countTotal: true,
+		});
+		expect(page).toEqual({
+			rows: [{ n: 5 }, { n: 4 }, { n: 3 }, { n: 2 }],
+			page: 2,
+			perPage: 4,
+			hasMore: true,
+			total: 10,
+		});
+		const queries = await queriesOf(async () => {
+			await expect(
+				chunks(
+					db
+						.selectFrom(items)
+						.select(['items.id'])
+						.orderBy('items.n')
+						.iterateChunks(10, { by: 'items.id' }),
+				),
+			).rejects.toThrow('remove orderBy()');
+		});
+		expect(queries).toEqual([]);
+	});
 });

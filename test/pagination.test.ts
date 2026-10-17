@@ -206,7 +206,9 @@ describe('iterateChunks', () => {
 		).rejects.toThrow(RangeError);
 		await expect(
 			collect(q.limit(10).iterateChunks(5, { by: 'users.id' })),
-		).rejects.toThrow('iterateChunks() adds its own limit: remove limit()');
+		).rejects.toThrow(
+			"iterateChunks() sets the query's order by, limit and offset itself: remove limit(), and order with `by` and `direction`",
+		);
 		await expect(
 			// @ts-expect-error the key must be selected
 			collect(q.iterateChunks(5, { by: 'users.createdAt' })),
@@ -239,6 +241,32 @@ describe('iterateChunks', () => {
 				.iterateChunks(1, { by: 'users.id' })
 				.next(),
 		).rejects.toThrow('The query has no database to run on');
+	});
+});
+
+const ownsOrder = (method: string, clauses: string) =>
+	`${method}() sets the query's order by, limit and offset itself: remove ${clauses}, and order with \`by\` and \`direction\``;
+
+describe('a query that already has orderBy, limit or offset', () => {
+	it('makes each method throw before running anything, naming the clauses to remove', async () => {
+		const { db, ran } = scripted();
+		const q = db.selectFrom(users).select(['users.id']);
+		await expect(
+			collect(q.orderBy('users.email').iterateChunks(5, { by: 'users.id' })),
+		).rejects.toThrow(ownsOrder('iterateChunks', 'orderBy()'));
+		await expect(
+			q
+				.orderBy('users.id', 'desc')
+				.limit(5)
+				.offset(10)
+				.paginateByCursor({ perPage: 5, by: 'users.id' }),
+		).rejects.toThrow(
+			message('paginateByCursor', 'orderBy(), limit(), offset()'),
+		);
+		await expect(
+			q.offset(10).paginateByOffset({ page: 1, perPage: 5, by: 'users.id' }),
+		).rejects.toThrow(ownsOrder('paginateByOffset', 'offset()'));
+		expect(ran).toEqual([]);
 	});
 });
 
@@ -444,6 +472,31 @@ describe('paginateByOffset', () => {
 		]);
 	});
 
+	it('with countTotal, counts the groups of a grouped query', async () => {
+		const ran: CompiledQuery[] = [];
+		const db = databaseWith(
+			executorFrom(async (query) => {
+				ran.push(query);
+				return { rows: [{ count: 2n }] };
+			}),
+		);
+		await db
+			.selectFrom(users)
+			.select(['users.email'])
+			.where('users.nickname', 'n')
+			.groupBy(['users.email'])
+			.paginateByOffset({
+				page: 1,
+				perPage: 10,
+				by: 'users.email',
+				countTotal: true,
+			});
+		expect(plain(ran[1]!)).toEqual({
+			sql: 'select count(*) as "count" from (select "users"."email" as "email" from "users" where "users"."nickname" = $1 group by "users"."email") as "quarry_rows"',
+			params: ['n'],
+		});
+	});
+
 	it('validates the page and page size', async () => {
 		const { db } = scripted();
 		const q = db.selectFrom(users).select(['users.id']);
@@ -455,6 +508,6 @@ describe('paginateByOffset', () => {
 		).rejects.toThrow(RangeError);
 		await expect(
 			q.limit(1).paginateByOffset({ page: 1, perPage: 2, by: 'users.id' }),
-		).rejects.toThrow('adds its own limit');
+		).rejects.toThrow('remove limit()');
 	});
 });
