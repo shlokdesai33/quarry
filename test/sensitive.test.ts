@@ -14,7 +14,7 @@ import { insertInto } from '../src/insert-query-builder.js';
 import { redactDetail, redactError } from '../src/redact.js';
 import { selectFrom } from '../src/select-query-builder.js';
 import { sql } from '../src/sql.js';
-import { update, updateMany } from '../src/update-query-builder.js';
+import { update } from '../src/update-query-builder.js';
 import { executorFrom } from './helpers/executor.js';
 
 const users = defineTable('users', {
@@ -80,7 +80,7 @@ describe('sensitive()', () => {
 		]);
 	});
 
-	it('marks inserted, updated, upserted and updateMany values', () => {
+	it('marks inserted, updated, upserted and setEach values', () => {
 		const insert = compile(
 			insertInto(users)
 				.values({ name: 'Ada', email: 'a@x', password: 'h' })
@@ -108,16 +108,35 @@ describe('sensitive()', () => {
 		);
 		expect(redactedParams(set)).toEqual(['[redacted]', 1]);
 		const many = compile(
-			updateMany(
-				users,
-				[
-					{ id: 1, email: 'a@x' },
-					{ id: 2, email: 'b@x' },
-				],
-				{ by: ['id'] },
-			).toNode(),
+			update(users)
+				.setEach(
+					[
+						{ id: 1, email: 'a@x' },
+						{ id: 2, email: 'b@x' },
+					],
+					{ key: ['id'] },
+				)
+				.toNode(),
 		);
 		expect(redactedParams(many)).toEqual([[1, 2], '[redacted]']);
+		// a row that leaves a column out: its flags aren't secret, its values are
+		const some = compile(
+			update(users)
+				.setEach(
+					[
+						{ id: 1, email: 'a@x', name: 'Ada' },
+						{ id: 2, name: 'Alan' },
+					],
+					{ key: 'id' },
+				)
+				.toNode(),
+		);
+		expect(redactedParams(some)).toEqual([
+			[1, 2],
+			'[redacted]',
+			['Ada', 'Alan'],
+			[true, false],
+		]);
 	});
 
 	it('sends the real values', () => {
