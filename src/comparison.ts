@@ -58,7 +58,8 @@ export function readsSensitive(node: OperationNode): boolean {
 			return node.args.some(readsSensitive);
 		case 'raw':
 			return node.nodes.some(readsSensitive);
-		case 'select':
+		default:
+			// a subquery's own columns, and nodes that read no column
 			return false;
 	}
 }
