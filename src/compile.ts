@@ -264,6 +264,8 @@ function render(node: OperationNode, params: Params): string {
 	switch (node.kind) {
 		case 'reference':
 			return `${identifier(node.table)}.${identifier(node.column)}`;
+		case 'column':
+			return identifier(node.column);
 		case 'value':
 			return param(params, node.value, node.codec);
 		case 'value_list':
