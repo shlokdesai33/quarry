@@ -545,7 +545,7 @@ Text-like codecs (`text`, `varchar`, `char`, `name`, and `codecs.raw`) leave the
 
 **Binary arrays.** Arrays of `bool`, `int2`, `int4`, `int8`, `float8`, `timestamptz` (from `Date`s), `uuid`, `jsonb` and `bytea` are sent in binary by their `arrayOf` codec (and, without a codec, when `paramTypes` declares the array's type), which the server reads far more cheaply than a literal. An element that doesn't fit falls back to a literal. Text arrays go as literals of a type the server infers.
 
-The query builder gives every parameter its column's codec: multi-row inserts and `updateMany` send each column as `arrayOf` its codec, and `column = any($1)` the same.
+The query builder gives every parameter its column's codec: multi-row inserts and `setEach` updates send each column as `arrayOf` its codec, and `column = any($1)` the same.
 
 A query takes at most 65,535 parameters, the protocol's limit; more are refused before anything is sent. For more rows than that, use `unnest` with array parameters, or `COPY`.
 
@@ -1604,7 +1604,7 @@ await db
 }))
 ```
 
-**An update must say which rows it changes.** It can't run until it has a `where`, or an explicit `.allRows()`; `execute()` on an update without either is a compile error, not a production incident.
+**An update must say which rows it changes.** It can't run until it has a `where`, an explicit `.allRows()`, or a [`setEach`](#updating-many-rows-to-different-values) (whose key match is its `where`); `execute()` on an update without either is a compile error, not a production incident.
 
 ```ts
 await db.update(users).set({ verified: false }).allRows().execute();
@@ -1624,25 +1624,60 @@ await db
 
 ### Updating many rows to different values
 
-`updateMany` updates each row to its own values in one statement, matched by key:
+`setEach` updates each row to its own values in one statement, matched by key:
 
 ```ts
 await db
-	.updateMany(
-		products,
+	.update(products)
+	.setEach(
 		[
 			{ id: 1, price: '9.99', stock: 12 },
 			{ id: 2, price: '19.99', stock: 0 },
 		],
-		{ by: 'id' },
+		{ key: 'id' },
 	)
+	.expectRows(2) // RowCountError unless both rows were there
 	.execute();
-// update "products" set "price" = "quarry_rows"."price", "stock" = "quarry_rows"."stock"
-// from unnest($1::integer[], $2::numeric[], $3::integer[]) as "quarry_rows"("id", "price", "stock")
-// where "products"."id" = "quarry_rows"."id"
+// update "products" set "price" = "row"."price", "stock" = "row"."stock"
+// from unnest($1::integer[], $2::numeric[], $3::integer[]) as "row"("id", "price", "stock")
+// where "products"."id" = "row"."id"
 ```
 
-`by` is a column or a composite key (`{ by: ['tenantId', 'sku'] }`); every row must include it. Like multi-row inserts, it sends one array per column.
+`key` is a column or a composite key (`{ key: ['tenantId', 'sku'] }`); every row must include it, and no two rows can share one. The key match is the update's `where`, so it runs without another; `.where(...)` adds conditions to it. Like multi-row inserts, it sends one array per column, so the SQL is the same whatever the number of rows.
+
+**Rows can set different columns.** A column a row leaves out (or sets to `undefined`) keeps its value in that row; `null` sets it to null. Each such column is sent with a flag:
+
+```ts
+await db
+	.update(users)
+	.setEach(
+		[
+			{ id: 1, name: 'Ada' },
+			{ id: 2, email: 'alan@example.com' },
+		],
+		{ key: 'id' },
+	)
+	.execute();
+// update "users" set
+//   "name" = case when "row"."set:name" then "row"."name" else "users"."name" end,
+//   "email" = case when "row"."set:email" then "row"."email" else "users"."email" end
+// from unnest($1::integer[], $2::text[], $3::text[], $4::boolean[], $5::boolean[])
+//   as "row"("id", "name", "email", "set:name", "set:email")
+// where "users"."id" = "row"."id"
+```
+
+**The rows are in scope** as `row`, or the name given as `as`, in `set`, `where` and `returning`. A column a row may leave out is nullable there. A later `set` of a column replaces the rows' values with an expression:
+
+```ts
+// apply each edit only over an older version of its doc
+await db
+	.update(docs)
+	.setEach(edits, { key: 'id', as: 'edit' }) // { id, body, version }[]
+	.set((eb) => ({ editedAt: eb.fn.now() }))
+	.where((eb) => eb.ref('docs.version').lt(eb.ref('edit.version')))
+	.returning(['docs.id', 'edit.version'])
+	.execute();
+```
 
 ## Deleting
 
@@ -1695,7 +1730,7 @@ const { params: paramTypes, columns } = await query.describe(); // types as the 
 
 **Tagging.** `.tag('posts.feed')` labels a query for `onQuery` events and OpenTelemetry spans (`db.query.summary`). The tag never appears in the SQL, so it doesn't fragment the statement cache.
 
-**Building without a database.** `selectFrom`, `insertInto`, `update`, `updateMany` and `deleteFrom` are also exported on their own. Queries built that way can be inspected, composed, and run by a database's `batch`; `execute()` works only on queries started from `database(...)`.
+**Building without a database.** `selectFrom`, `insertInto`, `update` and `deleteFrom` are also exported on their own. Queries built that way can be inspected, composed, and run by a database's `batch`; `execute()` works only on queries started from `database(...)`.
 
 ```ts
 import { selectFrom } from 'quarry';
