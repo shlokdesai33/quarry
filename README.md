@@ -1608,10 +1608,28 @@ await db
 ```ts
 .set((eb) => ({
   email: eb.fn.lower('users.email'),
-  loginCount: eb.ref('users.loginCount').plus(1),
+  loginCount: inc(1),
   lastSeenAt: eb.fn.now(),
 }))
 ```
+
+**Incrementing.** `inc(n)` and `dec(n)` change a numeric column relative to its current value, in the statement itself, so concurrent updates never lose one:
+
+```ts
+import { dec, inc } from 'quarry';
+
+await db
+	.update(accounts)
+	.set({ logins: inc(1), balance: dec('2.50') })
+	.where('accounts.id', id)
+	.execute();
+// update "accounts" set "logins" = "logins" + $1, "balance" = "balance" - $2 where "accounts"."id" = $3
+```
+
+- Only numeric columns take them. The amount has the column's update type (a string for `bigint` and `decimal`), or is a numeric expression of that type.
+- A `null` column stays `null`, as `null + 1` is in Postgres; `inc(1, { coalesce: true })` counts it as 0.
+- In an upsert, `doUpdate((excluded) => ({ hits: inc(excluded.hits) }))` adds the proposed value to the existing row's. In a [`setEach`](#updating-many-rows-to-different-values), each row gives its own amount (`{ id: 1, balance: inc('5') }` sets `"balance" = "accounts"."balance" + "row"."balance"`); every row that gives the column must change it alike, and a row that leaves it out keeps its value.
+- Insert values take neither: there is no current value to change.
 
 **An update must say which rows it changes.** It can't run until it has a `where`, an explicit `.allRows()`, or a [`setEach`](#updating-many-rows-to-different-values) (whose key match is its `where`); `execute()` on an update without either is a compile error, not a production incident.
 
