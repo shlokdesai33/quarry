@@ -284,15 +284,16 @@ async function main() {
 			throw new Error('nothing to verify');
 		const value = await scenario.verify(d!, ctx);
 		const n = Array.isArray(value) ? value.length : 0;
+		// undefined for an empty result
+		const sample = JSON.stringify(Array.isArray(value) ? value[0] : value) as
+			| string
+			| undefined;
 		console.log(
 			JSON.stringify({
 				ok: true,
 				digest: digest(value),
 				n,
-				sample: String(JSON.stringify(Array.isArray(value) ? value[0] : value)).slice(
-					0,
-					300,
-				),
+				sample: (sample ?? '').slice(0, 300),
 			}),
 		);
 	} else if (scenario.kind === 'ops') {
