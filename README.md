@@ -1093,7 +1093,9 @@ A parameter bound against a `sensitive()` column is shown as `'[redacted]'`:
 - in `toSQL({ inline: true })`;
 - in a `DecodeError` on a result column that reads a sensitive column, which loses its `cause` (the codec's error, which may quote the value).
 
-"Bound against" covers comparisons with the column or with an expression that reads it (`where`, `eb.ref(…).in(…)`, `eb.fn.lower('accounts.email').eq(…)`, `eb.json.hasKey(…)`), inserted values (including the `unnest` arrays of multi-row inserts), `update().set()`, upserts and `updateMany` rows.
+"Bound against" covers comparisons with the column or with an expression that reads it (`where`, `eb.ref(…).in(…)`, `eb.fn.lower('accounts.email').eq(…)`, `eb.json.hasKey(…)`), inserted values (including the `unnest` arrays of multi-row inserts), `update().set()`, upserts and `updateMany` rows. It also covers values written beside such a column: the other side of arithmetic (`eb.ref('accounts.balance').plus(…)`), another argument of a function (`coalesce`), another result of a `case`, and the values of a [`sql`](#raw-sql) fragment that interpolates the column.
+
+In statements written with `db.sql` / `tx.sql`, nothing types the values, so: a statement that interpolates a table with sensitive columns (`` db.sql`select * from ${accounts} where name = ${name}` ``) redacts all its values, names those columns for constraint details, and drops the cause of any decode error. Elsewhere, mark a value with `sql.sensitive(value)`: `` db.sql`update accounts set password_hash = ${sql.sensitive(hash)} where id = ${id}` ``.
 
 Server errors are redacted too, where they repeat a value. A constraint error's `detail` that names a sensitive column, such as `Key (email)=(ada@example.com) already exists.`, becomes `Key (email)=([redacted]) already exists.`, and `violatedColumns` still works on it. A `Failing row contains (…)` detail loses its values when the table has a sensitive column. Any sensitive parameter's text of three characters or more, as its codec sent it, is also removed from the message and detail.
 
@@ -1527,6 +1529,8 @@ const row = await db.sql<{ n: string }>`select count(*) as n from posts`
 
 The type parameter is a promise you make; nothing checks it. Prefer the builder where it can express the query.
 
+`db.sql` statements show their SQL like builders (`toSQL({ inline, pretty })`), count against [query budgets](#slow-queries-and-query-budgets), and redact the values of [sensitive columns](#sensitive-columns) they interpolate, or values marked with `sql.sensitive(value)`.
+
 ## Result shapes
 
 How you want the result decides how you finish the query. A shape never changes the SQL: it only decides how the rows are read and what counts as an error.
@@ -1800,7 +1804,7 @@ console.log(query.expectOne().toSQL({ inline: true, pretty: true }).sql);
 // )
 ```
 
-- Without options, `toSQL()` is exactly what `execute()` sends, codecs and tag included. A result shape never changes it, since no shape adds a `limit`; each item of a [batch](#batches) renders the same way (`item.toQuery().toSQL()`).
+- Without options, `toSQL()` is exactly what `execute()` sends, codecs and tag included. A result shape never changes it, since no shape adds a `limit`; each item of a [batch](#batches) renders the same way (`item.toQuery().toSQL()`), and so does a `db.sql` statement.
 - **`inline`** writes each parameter into the SQL as a literal: the text its codec sends, quoted as `quote_literal` does and cast to the codec's type (`'12.50'::numeric`, `'9007199254740993'::int8`, `'{1,NULL}'::int4[]`, `'{"a":1}'::jsonb`, `'happy'::mood`, `E'\\x01ff'::bytea`; `true` and integers bare). Text-like values (`text`, `varchar`, `citext`, …) stay uncast, as their parameters stay inferred, and `unnest`'s arrays keep the cast the SQL already writes. `params` is then empty. The statement pastes into psql and behaves like the query.
 - **`pretty`** puts each clause, list item and top-level `where` condition on its own line, changing only whitespace outside quotes.
 
@@ -1911,7 +1915,7 @@ const page = await db.budget(
 );
 ```
 
-- Queries count wherever they are issued inside `fn` (anything it awaits, transactions and streams included), through `AsyncLocalStorage`. Concurrent budgets don't see each other's queries, another database's queries don't count, and budgets nest.
+- Queries count wherever they are issued inside `fn` (anything it awaits, transactions, streams and `db.sql` / `tx.sql` statements included), through `AsyncLocalStorage`. Concurrent budgets don't see each other's queries, another database's queries don't count, and budgets nest.
 - **`maxQueries`**: the query that would go over is refused before it is sent. Each query of a `db.batch` counts, and a batch that would go over is refused whole, before any of it is sent.
 - **`maxDurationMs`** (the queries' total time): the query that takes the total over has run, so it throws instead of returning, like `expectRows`; inside a transaction, that rolls it back. A batch is one round trip, so its time counts once; a batch that takes the total over has run (with `{ transaction: true }`, committed) and rejects.
 - After a strict budget is exceeded, every later query in it is refused. With **`onExceeded`**, nothing throws: it is called once, with the usage, by the query that went over.
