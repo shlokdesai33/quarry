@@ -17,7 +17,7 @@ import { databaseWith } from '../src/database.js';
 import { defineTable } from '../src/define-table.js';
 import { dec, inc, type Increment } from '../src/index.js';
 import { insertInto } from '../src/insert-query-builder.js';
-import { update, updateMany } from '../src/update-query-builder.js';
+import { update } from '../src/update-query-builder.js';
 import { fakeExecutor } from './helpers/executor.js';
 
 type UserId = number & { readonly __brand: 'UserId' };
@@ -181,20 +181,21 @@ describe('inc and dec', () => {
 		insertInto(stats).values({ views: inc(1) });
 	});
 
-	it('work in the rows of updateMany, by values', () => {
-		updateMany(
-			stats,
+	it('work in the rows of setEach, by values', () => {
+		update(stats).setEach(
 			[
 				{ id: 1, views: inc(1), visits: inc('2') },
 				{ id: 2, views: inc(5), visits: inc('3') },
 			],
-			{ by: 'id' },
+			{ key: 'id' },
 		);
 
 		// @ts-expect-error a text column can't be incremented
-		updateMany(stats, [{ id: 1, name: inc(1) }], { by: 'id' });
+		update(stats).setEach([{ id: 1, name: inc(1) }], { key: 'id' });
 		// @ts-expect-error a bigint is a string
-		updateMany(stats, [{ id: 1, visits: inc(1) }], { by: 'id' });
+		update(stats).setEach([{ id: 1, visits: inc(1) }], { key: 'id' });
+		// @ts-expect-error the key matches rows
+		update(stats).setEach([{ id: inc(1), views: 1 }], { key: 'id' });
 	});
 
 	it('keep returning, expectRows and running typed', () => {

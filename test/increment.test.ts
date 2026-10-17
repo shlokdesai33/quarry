@@ -11,7 +11,7 @@ import { databaseWith } from '../src/database.js';
 import { defineTable } from '../src/define-table.js';
 import { dec, inc } from '../src/increment.js';
 import { insertInto } from '../src/insert-query-builder.js';
-import { update, updateMany } from '../src/update-query-builder.js';
+import { update } from '../src/update-query-builder.js';
 import { fakeExecutor } from './helpers/executor.js';
 import { codecNames, plain } from './helpers/compiled.js';
 
@@ -194,17 +194,17 @@ describe('inc and dec in an upsert', () => {
 	});
 });
 
-describe('inc and dec in updateMany', () => {
+describe('inc and dec in setEach', () => {
 	it('add each row’s own amount, qualified apart from the rows', () => {
 		const query = compile(
-			updateMany(
-				posts,
-				[
-					{ id: 1, title: 'A', views: inc(1), visits: dec('2') },
-					{ id: 2, title: 'B', views: inc(5), visits: dec('3') },
-				],
-				{ by: 'id' },
-			)
+			update(posts)
+				.setEach(
+					[
+						{ id: 1, title: 'A', views: inc(1), visits: dec('2') },
+						{ id: 2, title: 'B', views: inc(5), visits: dec('3') },
+					],
+					{ key: 'id' },
+				)
 				.returning(['posts.id', 'posts.views'])
 				.toNode(),
 		);
@@ -215,7 +215,7 @@ describe('inc and dec in updateMany', () => {
 			'int8[]',
 		]);
 		expect(plain(query)).toEqual({
-			sql: 'update "posts" set "title" = "quarry_rows"."title", "views" = "posts"."views" + "quarry_rows"."views", "visit_count" = "posts"."visit_count" - "quarry_rows"."visit_count" from unnest($1::integer[], $2::text[], $3::integer[], $4::bigint[]) as "quarry_rows"("id", "title", "views", "visit_count") where "posts"."id" = "quarry_rows"."id" returning "posts"."id" as "id", "posts"."views" as "views"',
+			sql: 'update "posts" set "title" = "row"."title", "views" = "posts"."views" + "row"."views", "visit_count" = "posts"."visit_count" - "row"."visit_count" from unnest($1::integer[], $2::text[], $3::integer[], $4::bigint[]) as "row"("id", "title", "views", "visit_count") where "posts"."id" = "row"."id" returning "posts"."id" as "id", "posts"."views" as "views"',
 			params: [
 				[1, 2],
 				['A', 'B'],
@@ -225,71 +225,83 @@ describe('inc and dec in updateMany', () => {
 		});
 	});
 
-	it('count null as 0 with `coalesce`', () => {
+	it('count null as 0 with `coalesce`, and keep the value of a row that leaves the column out', () => {
 		expect(
 			compile(
-				updateMany(
-					posts,
-					[
-						{ id: 1, likes: inc(1, { coalesce: true }) },
-						{ id: 2, likes: inc(2, { coalesce: true }) },
-					],
-					{ by: 'id' },
-				).toNode(),
-			).sql,
-		).toBe(
-			'update "posts" set "likes" = coalesce("posts"."likes", 0) + "quarry_rows"."likes" from unnest($1::integer[], $2::integer[]) as "quarry_rows"("id", "likes") where "posts"."id" = "quarry_rows"."id"',
-		);
-	});
-
-	it('combine with an increment shared by every row', () => {
-		expect(
-			compile(
-				updateMany(posts, [{ id: 1, title: 'A' }], { by: 'id' })
-					.set({ views: inc(1) })
+				update(posts)
+					.setEach(
+						[
+							{ id: 1, likes: inc(1, { coalesce: true }) },
+							{ id: 2, title: 'x' },
+						],
+						{ key: 'id' },
+					)
 					.toNode(),
 			).sql,
 		).toBe(
-			'update "posts" set "views" = "views" + $1, "title" = "quarry_rows"."title" from unnest($2::integer[], $3::text[]) as "quarry_rows"("id", "title") where "posts"."id" = "quarry_rows"."id"',
+			'update "posts" set "likes" = case when "row"."set:likes" then coalesce("posts"."likes", 0) + "row"."likes" else "posts"."likes" end, "title" = case when "row"."set:title" then "row"."title" else "posts"."title" end from unnest($1::integer[], $2::integer[], $3::text[], $4::boolean[], $5::boolean[]) as "row"("id", "likes", "title", "set:likes", "set:title") where "posts"."id" = "row"."id"',
+		);
+	});
+
+	it('qualify a set’s own increment once the rows are in scope, before or after setEach', () => {
+		const rows = [{ id: 1, title: 'A' }];
+		expect(
+			compile(
+				update(posts)
+					.set({ views: inc(1) })
+					.setEach(rows, { key: 'id' })
+					.toNode(),
+			).sql,
+		).toBe(
+			'update "posts" set "views" = "posts"."views" + $1, "title" = "row"."title" from unnest($2::integer[], $3::text[]) as "row"("id", "title") where "posts"."id" = "row"."id"',
+		);
+		expect(
+			compile(
+				update(posts)
+					.setEach(rows, { key: 'id' })
+					.set({ views: inc(1, { coalesce: true }) })
+					.toNode(),
+			).sql,
+		).toBe(
+			'update "posts" set "title" = "row"."title", "views" = coalesce("posts"."views", 0) + $1 from unnest($2::integer[], $3::text[]) as "row"("id", "title") where "posts"."id" = "row"."id"',
 		);
 	});
 
 	it('need every row to change a column alike', () => {
 		expect(() =>
-			updateMany(
-				posts,
+			update(posts).setEach(
 				[
 					{ id: 1, views: inc(1) },
 					{ id: 2, views: dec(1) },
 				],
-				{ by: 'id' },
+				{ key: 'id' },
 			),
-		).toThrow('updateMany needs every row to change "views" alike');
+		).toThrow('setEach needs every row to change "views" alike');
 		expect(() =>
-			updateMany(
-				posts,
+			update(posts).setEach(
 				[
 					{ id: 1, views: inc(1) },
 					{ id: 2, views: inc(1, { coalesce: true }) },
 				],
-				{ by: 'id' },
+				{ key: 'id' },
 			),
-		).toThrow('updateMany needs every row to change "views" alike');
+		).toThrow('setEach needs every row to change "views" alike');
 		expect(() =>
-			updateMany(
-				posts,
+			update(posts).setEach(
 				[
 					{ id: 1, views: 3 },
 					{ id: 2, views: inc(1) },
 				],
-				{ by: 'id' },
+				{ key: 'id' },
 			),
 		).toThrow(/some rows set it to a value and others inc\(\) or dec\(\) it/);
 		expect(() =>
-			updateMany(posts, untyped([{ key: inc(1), views: 1 }]), { by: 'key' }),
-		).toThrow('The `by` column "key" of updateMany matches rows');
+			update(posts).setEach(untyped([{ key: inc(1), views: 1 }]), {
+				key: 'key',
+			}),
+		).toThrow('The key column "key" of setEach matches rows');
 		expect(() =>
-			updateMany(posts, [{ id: 1, title: untyped(inc(1)) }], { by: 'id' }),
+			update(posts).setEach([{ id: 1, title: untyped(inc(1)) }], { key: 'id' }),
 		).toThrow('inc() and dec() need a numeric column');
 	});
 });

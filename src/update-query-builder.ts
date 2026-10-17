@@ -433,9 +433,9 @@ export class UpdateQueryBuilder<
 			set:
 				from === undefined
 					? set
-					: set.map((node) => ({
-							...node,
-							value: qualified(node.value, table.name),
+					: set.map(({ column, value }) => ({
+							column,
+							value: qualified(value, table.name),
 						})),
 			from,
 			where: where.toNode(),

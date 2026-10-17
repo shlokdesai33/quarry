@@ -56,7 +56,10 @@ export type UpdateKey<T extends AnyTable> = {
  * The `inc` / `dec` a numeric column `C` takes, by `A`; `never` for a column
  * of any other type.
  */
-export type IncrementOf<C extends AnyColumn, A> = C['_quarry']['dataType'] extends {
+export type IncrementOf<
+	C extends AnyColumn,
+	A,
+> = C['_quarry']['dataType'] extends {
 	readonly kind: NumberKind;
 }
 	? Increment<A>
