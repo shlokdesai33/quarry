@@ -33,6 +33,7 @@ import { defineCodec } from '../../../src/driver/codec.js';
 import { oids } from '../../../src/driver/types.js';
 import { violatedColumns } from '../../../src/errors.js';
 import { NoRowError } from '../../../src/executor.js';
+import { sql as sqlTag } from '../../../src/sql.js';
 import { noPg, options, rejection, table } from './helpers.js';
 
 const schema = table('dx');
@@ -428,6 +429,29 @@ describe.skipIf(noPg)('DX features against PostgreSQL', () => {
 				db.budget({ maxQueries: -1 }, async () => 1),
 			).rejects.toThrow(RangeError);
 		});
+		it('counts db.sql and tx.sql statements, alone, in transactions and batched', async () => {
+			const used = await db.budget({}, async (usage) => {
+				await db.sql`select 1`.execute();
+				await db.transaction(async (tx) => {
+					await tx.sql<{ n: number }>`select ${1}::int as n`
+						.expectValue()
+						.execute();
+				});
+				await db.batch([db.sql`select 1`, db.sql`select 2`]);
+				return usage.queries;
+			});
+			expect(used).toBe(4);
+			const error = await rejection(
+				db.budget({ maxQueries: 1 }, async () => {
+					await db.sql`select 1`.execute();
+					await db.sql`select ${2}::int`.execute();
+				}),
+				QueryBudgetError,
+			);
+			expect(error.limit).toBe('queries');
+			expect(error.query.params).toEqual([2]);
+		});
+
 		it('counts each query of a batch, refusing a batch over maxQueries whole', async () => {
 			events.length = 0;
 			const byId = (id: number) =>
@@ -708,6 +732,36 @@ describe.skipIf(noPg)('DX features against PostgreSQL', () => {
 				expect(shown).not.toContain(secret);
 			}
 			expect(events.map((e) => e.params)).toContainEqual(['[redacted]']);
+		});
+
+		it('redacts db.sql and tx.sql statements, their events and errors', async () => {
+			events.length = 0;
+			const error = await rejection(
+				db.sql`insert into ${accounts} (name, email, password_hash) values (${'Dup'}, ${'ada@example.com'}, ${'hash-of-sql'})`.execute(),
+				UniqueViolation,
+			);
+			expect(error.detail).toBe('Key (email)=([redacted]) already exists.');
+			expect(error.query?.params).toEqual([
+				'[redacted]',
+				'[redacted]',
+				'[redacted]',
+			]);
+			await db.transaction(async (tx) => {
+				await tx.sql`update accounts set pin = ${sqlTag.sensitive('pin-from-sql')} where id = ${1}`.execute();
+			});
+			expect(
+				await db
+					.selectFrom(accounts)
+					.select(['accounts.pin'])
+					.where('accounts.id', 1)
+					.expectValue()
+					.execute(),
+			).toBe('pin-from-sql');
+			const shown = inspect([error, events], { depth: 6 });
+			for (const secret of ['ada@example.com', 'hash-of-sql', 'pin-from-sql']) {
+				expect(shown).not.toContain(secret);
+			}
+			expect(events.map((e) => e.params)).toContainEqual(['[redacted]', 1]);
 		});
 	});
 });

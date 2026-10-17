@@ -153,13 +153,25 @@ const clauses: Readonly<Record<string, boolean>> = {
 	select: true,
 	from: false,
 	'inner join': false,
+	'left join': false,
+	'right join': false,
+	'full join': false,
+	'cross join': false,
 	where: false,
+	'group by': true,
+	having: false,
+	'order by': true,
 	limit: false,
+	offset: false,
 	returning: true,
 	set: true,
 	values: true,
 	'on conflict': false,
 };
+
+/** Whether a clause's top-level conditions go one per line. */
+const filters = (clause: string): boolean =>
+	clause === 'where' || clause === 'having';
 
 /** One statement being laid out: the top level, or a subquery. */
 interface Frame {
@@ -174,9 +186,10 @@ interface Frame {
 type Paren = 'plain' | 'subquery' | 'conditions';
 
 /**
- * Lays SQL out over lines: each clause on its own line, select, set,
- * values and returning lists one item per line, and the top-level
- * conditions of a `where` one per line. It only adds or replaces
+ * Lays SQL out over lines: each clause on its own line (joins of every
+ * kind included), select, set, values, returning, group by and order by
+ * lists one item per line, and the top-level conditions of a `where` or
+ * `having` one per line, a `case`'s own conditions staying on its line. It only adds or replaces
  * whitespace outside quotes, so the statement means the same.
  */
 export function prettySQL(sql: string): string {
@@ -221,6 +234,8 @@ export function prettySQL(sql: string): string {
 		{ depth: 0, indent: 0, clause: (isWord(0) && clauseAt(0)) || '' },
 	];
 	const parens: Paren[] = [];
+	/** How many `case` expressions are open, whose `and`s stay on their line. */
+	let cases = 0;
 	/** Depths where a `between` waits for its `and`. */
 	const betweens = new Set<number>();
 	let depth = 0;
@@ -253,17 +268,17 @@ export function prettySQL(sql: string): string {
 					atFrame &&
 					lists &&
 					isWord(i - 1) &&
-					lower(i - 1) === frame.clause.split(' ')[0]
+					lower(i - 1) === frame.clause.split(' ').at(-1)
 				) {
 					out += newline(frame.indent + 1);
 					continue;
 				}
 				const parent = parens.at(-1);
 				const conditions =
-					(frame.clause === 'where' && atFrame) ||
+					(filters(frame.clause) && atFrame) ||
 					(parent === 'conditions' && depth === frame.depth + 1);
 				const word = lower(i + 1);
-				if (conditions && (word === 'and' || word === 'or')) {
+				if (conditions && cases === 0 && (word === 'and' || word === 'or')) {
 					if (word === 'and' && betweens.has(depth)) betweens.delete(depth);
 					else {
 						out += newline(frame.indent + 1);
@@ -275,6 +290,9 @@ export function prettySQL(sql: string): string {
 			}
 			case 'word':
 				if (lower(i) === 'between') betweens.add(depth);
+				// a case's own `and`s stay on its line
+				else if (lower(i) === 'case') cases++;
+				else if (lower(i) === 'end' && cases > 0) cases--;
 				out += token.text;
 				continue;
 			case 'comma':
@@ -293,11 +311,11 @@ export function prettySQL(sql: string): string {
 					out += `(${newline(lineIndent + 1)}`;
 				} else if (
 					atFrame &&
-					frame.clause === 'where' &&
+					filters(frame.clause) &&
 					end !== undefined &&
 					endsClause(end) &&
 					tokens[i - 1]?.type === 'space' &&
-					lower(i - 2) === 'where'
+					lower(i - 2) === frame.clause
 				) {
 					parens.push('conditions');
 					out += `(${newline(frame.indent + 1)}`;

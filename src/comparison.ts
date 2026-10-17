@@ -56,8 +56,19 @@ export function readsSensitive(node: OperationNode): boolean {
 			return readsSensitive(node.operand);
 		case 'function':
 			return node.args.some(readsSensitive);
+		case 'case':
+			return (
+				node.branches.some(
+					(branch) =>
+						readsSensitive(branch.when) || readsSensitive(branch.result),
+				) ||
+				(node.otherwise !== undefined && readsSensitive(node.otherwise))
+			);
 		case 'raw':
-			return node.nodes.some(readsSensitive);
+			return (
+				(node.table?.sensitive?.length ?? 0) > 0 ||
+				node.nodes.some(readsSensitive)
+			);
 		default:
 			// a subquery's own columns, and nodes that read no column
 			return false;

@@ -26,6 +26,7 @@ import { defineTable } from '../src/define-table.js';
 import { deleteFrom } from '../src/delete-query-builder.js';
 import { insertInto } from '../src/insert-query-builder.js';
 import { selectFrom } from '../src/select-query-builder.js';
+import { sql as sqlTag } from '../src/sql.js';
 import { prettySQL } from '../src/to-sql.js';
 import { update, updateMany } from '../src/update-query-builder.js';
 import { codecNames } from './helpers/compiled.js';
@@ -508,5 +509,122 @@ describe('toSQL of shaped queries and batch items', () => {
 			params: [],
 			tag: 'flags.seed',
 		});
+	});
+});
+
+describe('toSQL of everyday SQL', () => {
+	const query = selectFrom(users)
+		.leftJoin(flags)
+		.on('flags.id', 'users.id')
+		.crossJoin(users.as('c'))
+		.select((eb) => [
+			'users.name',
+			eb.fn.count().as('n'),
+			eb.ref('users.balance').plus('1.50').as('more'),
+			eb
+				.case()
+				.when(eb.ref('users.admin').isTrue(), 'admin')
+				.else('member')
+				.end()
+				.as('role'),
+			sqlTag<string>`upper(${eb.ref('users.name')})`.as('upper'),
+		])
+		.where('users.id', 7)
+		.where(
+			(eb) =>
+				sqlTag<boolean>`${sqlTag.id('users', 'name')} <> ${sqlTag.lit("O'Hara")} and ${eb.ref('users.ratio')} > ${0.5}`,
+		)
+		.groupBy(['users.name'])
+		.having((eb) => eb.and([eb.fn.count().gt('1'), eb.fn.count().lt('9')]))
+		.orderBy('n', 'desc')
+		.orderBy('users.name', 'asc', { nulls: 'first' })
+		.limit(10)
+		.offset(20);
+
+	it('inlines joins, arithmetic, case, raw fragments and every clause', () => {
+		expect(query.toSQL({ inline: true })).toEqual({
+			sql: `select "users"."name" as "name", count(*) as "n", "users"."balance" + '1.50'::numeric as "more", case when "users"."admin" is true then 'admin'::text else 'member'::text end as "role", upper("users"."name") as "upper" from "users" left join "flags" on "flags"."id" = "users"."id" cross join "users" as "c" where ("users"."id" = 7 and "users"."name" <> 'O''Hara' and "users"."ratio" > 0.5) group by "users"."name" having (count(*) > '1'::int8 and count(*) < '9'::int8) order by "n" desc, "users"."name" asc nulls first limit 10 offset 20`,
+			params: [],
+		});
+	});
+
+	it('lays out joins, group by, having, order by and offset', () => {
+		expect(query.toSQL({ inline: true, pretty: true }).sql).toBe(
+			[
+				'select',
+				'  "users"."name" as "name",',
+				'  count(*) as "n",',
+				`  "users"."balance" + '1.50'::numeric as "more",`,
+				`  case when "users"."admin" is true then 'admin'::text else 'member'::text end as "role",`,
+				'  upper("users"."name") as "upper"',
+				'from "users"',
+				'left join "flags" on "flags"."id" = "users"."id"',
+				'cross join "users" as "c"',
+				'where (',
+				'  "users"."id" = 7',
+				`  and "users"."name" <> 'O''Hara'`,
+				'  and "users"."ratio" > 0.5',
+				')',
+				'group by',
+				'  "users"."name"',
+				'having (',
+				`  count(*) > '1'::int8`,
+				`  and count(*) < '9'::int8`,
+				')',
+				'order by',
+				'  "n" desc,',
+				'  "users"."name" asc nulls first',
+				'limit 10',
+				'offset 20',
+			].join('\n'),
+		);
+		const pretty = query.toSQL({ pretty: true });
+		expect(pretty.params).toEqual(query.toSQL().params);
+		expect(
+			pretty.sql.replace(/\s+/g, ' ').replace(/\( /g, '(').replace(/ \)/g, ')'),
+		).toBe(query.toSQL().sql);
+	});
+
+	it('keeps a case’s own conditions on its line', () => {
+		expect(
+			prettySQL(
+				'select "a" as "a" from "t" where case when "b" and "c" then true else false end and "d"',
+			),
+		).toBe(
+			[
+				'select',
+				'  "a" as "a"',
+				'from "t"',
+				'where case when "b" and "c" then true else false end',
+				'  and "d"',
+			].join('\n'),
+		);
+	});
+
+	it('renders db.sql statements, sql.id and sql.lit', () => {
+		const db = databaseWith(fakeExecutor().executor);
+		const statement = db.sql`select ${sqlTag.id('flags', 'name')} from ${flags} where ${sqlTag.id('flags', 'id')} = ${7} and name <> ${sqlTag.lit('x')} order by 1`;
+		expect(statement.toSQL()).toEqual({
+			sql: `select "flags"."name" from "flags" where "flags"."id" = $1 and name <> 'x' order by 1`,
+			params: [7],
+		});
+		expect(statement.toSQL({ inline: true })).toEqual({
+			sql: `select "flags"."name" from "flags" where "flags"."id" = 7 and name <> 'x' order by 1`,
+			params: [],
+		});
+		expect(statement.toSQL({ pretty: true }).sql).toBe(
+			[
+				'select',
+				'  "flags"."name"',
+				'from "flags"',
+				`where "flags"."id" = $1`,
+				`  and name <> 'x'`,
+				'order by',
+				'  1',
+			].join('\n'),
+		);
+		expect(statement.expectOne().toSQL({ inline: true })).toEqual(
+			statement.toSQL({ inline: true }),
+		);
 	});
 });

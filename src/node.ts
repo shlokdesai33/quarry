@@ -131,6 +131,8 @@ export type RawNode = {
 	readonly kind: 'raw';
 	readonly fragments: readonly string[];
 	readonly nodes: readonly OperationNode[];
+	/** The table a `sql` template interpolated, written as its fragment: for `sensitive()` columns. */
+	readonly table?: TableNode | undefined;
 };
 
 /**

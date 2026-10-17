@@ -129,7 +129,8 @@ function redactPostgresError(
 
 /** A decode error's message never has the value; its parser's error, the `cause`, may. */
 function redactDecodeError(error: DecodeError, info: QueryInfo): void {
-	if (!info.sensitiveFields.has(error.column)) return;
+	if (!info.everyFieldSensitive && !info.sensitiveFields.has(error.column))
+		return;
 	Reflect.deleteProperty(error, 'cause');
 }
 

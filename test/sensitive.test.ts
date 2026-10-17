@@ -13,6 +13,7 @@ import { NoRowError } from '../src/executor.js';
 import { insertInto } from '../src/insert-query-builder.js';
 import { redactDetail, redactError } from '../src/redact.js';
 import { selectFrom } from '../src/select-query-builder.js';
+import { sql } from '../src/sql.js';
 import { update, updateMany } from '../src/update-query-builder.js';
 import { executorFrom } from './helpers/executor.js';
 
@@ -167,6 +168,72 @@ describe('sensitive()', () => {
 		if (!(error instanceof NoRowError)) throw error;
 		expect(error.query.params).toEqual(['[redacted]']);
 		expect(JSON.stringify(error)).not.toContain('ada@example.com');
+	});
+});
+
+describe('sensitive() in everyday SQL', () => {
+	it('marks values beside a sensitive column: arithmetic, functions, case and sql fragments', () => {
+		const query = compile(
+			selectFrom(users)
+				.select((eb) => [
+					eb
+						.case()
+						.when(eb.ref('users.name').eq('Ada'), eb.ref('users.email'))
+						.else('hidden')
+						.end()
+						.as('contact'),
+				])
+				.where((eb) => eb.fn.coalesce('users.email', eb.val('none')).eq('x'))
+				.where((eb) => sql<boolean>`${eb.ref('users.email')} like ${'%@a.com'}`)
+				.where((eb) => sql<boolean>`${eb.ref('users.name')} like ${'A%'}`)
+				.where((eb) => eb.ref('users.id').plus(1).gt(2))
+				.toNode(),
+		);
+		expect(query.params).toEqual([
+			'Ada',
+			'hidden',
+			'none',
+			'x',
+			'%@a.com',
+			'A%',
+			1,
+			2,
+		]);
+		expect(sensitiveOf(query)).toEqual([
+			false,
+			true,
+			true,
+			true,
+			true,
+			false,
+			false,
+			false,
+		]);
+	});
+
+	it('redacts db.sql values marked with sql.sensitive, or beside a sensitive table', () => {
+		const db = databaseWith(executorFrom(async () => ({ rows: [] })));
+		const marked = db.sql`update accounts set hash = ${sql.sensitive('s3cret')} where id = ${1}`;
+		expect(redactedParams(marked.toSQL())).toEqual(['[redacted]', 1]);
+		expect(marked.toSQL().params).toEqual(['s3cret', 1]);
+		const reading = db.sql`select * from ${users} where name = ${'Ada'}`;
+		expect(redactedParams(reading.toSQL())).toEqual(['[redacted]']);
+		expect(queryInfo(reading.toSQL())?.sensitiveColumns).toEqual(
+			new Map([['users', new Set(['email', 'password_hash', 'secrets'])]]),
+		);
+		const plain = db.sql`select * from accounts where name = ${'Ada'}`;
+		expect(redactedParams(plain.toSQL())).toEqual(['Ada']);
+	});
+
+	it('drops the cause of any decode error of a db.sql statement that reads a sensitive table', () => {
+		const db = databaseWith(executorFrom(async () => ({ rows: [] })));
+		const reading = db.sql`select * from ${users}`.toSQL();
+		const error = new DecodeError('anything', 25, new Error('value: 1234'));
+		redactError(error, reading);
+		expect(error.cause).toBeUndefined();
+		const other = new DecodeError('anything', 25, new Error('value: 1234'));
+		redactError(other, db.sql`select 1`.toSQL());
+		expect(other.cause).toBeInstanceOf(Error);
 	});
 });
 
