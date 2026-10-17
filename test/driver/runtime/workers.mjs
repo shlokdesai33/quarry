@@ -34,7 +34,7 @@ if (process.argv[2]) {
 }
 
 const worker = `
-import { arrayOf, cloudflareSockets, codecs, connect, createPool, QueryCanceled, typed } from './driver/index.js';
+import { AbortError, arrayOf, cloudflareSockets, codecs, connect, createPool, QueryCanceled, typed } from './driver/index.js';
 
 async function check(results, name, fn) {
 	try { await fn(); results.push(['ok', name]); }
@@ -176,6 +176,34 @@ export default {
 			await conn.query('create temp table w (id int)');
 			assert((await conn.copyRows('copy w from stdin', [[1], [2], [3]])) === 3, 'copy');
 			await conn.close();
+		});
+		await check(results, 'streams: pool, early break, abort, transactions, web streams', async () => {
+			const pool = createPool({ ...base, max: 1 });
+			let sum = 0;
+			for await (const row of pool.stream('select generate_series(1, 50000) as n', [], { batchSize: 5000 })) sum += row.n;
+			assert(sum === (50000 * 50001) / 2, String(sum));
+			for await (const row of pool.stream('select generate_series(1, 50000) as n')) if (row.n === 10) break;
+			assert(pool.stats.busy === 0, JSON.stringify(pool.stats));
+			const controller = new AbortController();
+			const aborted = await (async () => {
+				for await (const row of pool.stream('select generate_series(1, 50000) as n', [], { batchSize: 10, signal: controller.signal }))
+					if (row.n === 5) controller.abort();
+			})().catch((e) => e);
+			assert(aborted instanceof AbortError, String(aborted));
+			const seen = await pool.transaction(async (tx) => {
+				const out = [];
+				for await (const row of tx.stream('select generate_series(1, 30) as n', [], { batchSize: 4 }))
+					out.push((await tx.query('select $1::int + 1 as m', [row.n])).rows[0].m);
+				return out;
+			});
+			assert(seen.length === 30 && seen[29] === 31, JSON.stringify(seen));
+			if (typeof ReadableStream.from === 'function') {
+				const reader = ReadableStream.from(pool.stream('select generate_series(1, 50000) as n')).getReader();
+				assert((await reader.read()).value.n === 1, 'web stream');
+				await reader.cancel();
+			}
+			assert((await pool.query('select 1 as x')).rows[0].x === 1, 'pool');
+			await pool.end();
 		});
 		await check(results, 'cancel with an AbortSignal', async () => {
 			const conn = await connect(base);

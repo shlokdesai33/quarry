@@ -14,7 +14,10 @@ import { readFileSync } from 'node:fs';
 import { arrayOf, typed } from '../../../src/driver/codec.js';
 import { codecs } from '../../../src/driver/codecs.js';
 import { connect } from '../../../src/driver/connect.js';
-import { QueryCanceled } from '../../../src/driver/errors.js';
+import { integer } from '../../../src/column-factories.js';
+import { database } from '../../../src/database.js';
+import { defineTable } from '../../../src/define-table.js';
+import { AbortError, QueryCanceled } from '../../../src/driver/errors.js';
 import { createPool } from '../../../src/driver/pool.js';
 import type { ConnectionOptions } from '../../../src/driver/config.js';
 import { nodeSockets } from '../../../src/driver/node-socket.js';
@@ -210,6 +213,81 @@ await check('cursor, COPY in and out', async () => {
 		out += new TextDecoder().decode(chunk);
 	assert(out === '1\ta\n2\tb\n', JSON.stringify(out));
 });
+
+await check(
+	'streams: pool, early break, abort, transactions, web streams',
+	async () => {
+		await using pool = createPool({ ...base, max: 1 });
+		let sum = 0;
+		for await (const row of pool.stream<{ n: number }>(
+			'select generate_series(1, 100000) as n',
+			[],
+			{ batchSize: 5000 },
+		))
+			sum += row.n;
+		assert(sum === (100_000 * 100_001) / 2, String(sum));
+		for await (const row of pool.stream<{ n: number }>(
+			'select generate_series(1, 100000) as n',
+		))
+			if (row.n === 10) break;
+		assert(pool.stats.busy === 0, JSON.stringify(pool.stats));
+		const controller = new AbortController();
+		const aborted = await (async () => {
+			for await (const row of pool.stream<{ n: number }>(
+				'select generate_series(1, 100000) as n',
+				[],
+				{ batchSize: 10, signal: controller.signal },
+			))
+				if (row.n === 5) controller.abort();
+		})().catch((error: unknown) => error);
+		assert(aborted instanceof AbortError, String(aborted));
+		const pairs = await pool.transaction(async (tx) => {
+			const seen: number[] = [];
+			for await (const row of tx.stream<{ n: number }>(
+				'select generate_series(1, 30) as n',
+				[],
+				{ batchSize: 4 },
+			))
+				seen.push(
+					(await tx.query<{ m: number }>('select $1::int + 1 as m', [row.n]))
+						.rows[0]?.m ?? 0,
+				);
+			return seen;
+		});
+		assert(pairs.length === 30 && pairs[29] === 31, JSON.stringify(pairs));
+		if (typeof ReadableStream.from === 'function') {
+			const reader = ReadableStream.from(
+				pool.stream<{ n: number }>('select generate_series(1, 100000) as n'),
+			).getReader();
+			const first = await reader.read();
+			assert(first.value?.n === 1, JSON.stringify(first));
+			await reader.cancel();
+		}
+		{
+			await using rows = pool.stream<{ n: number }>(
+				'select generate_series(1, 100000) as n',
+			);
+			await rows.next();
+		}
+		assert(
+			(await pool.query<{ x: number }>('select 1 as x')).rows[0]?.x === 1,
+			'pool',
+		);
+		await using conn = await connect(base);
+		await conn.query(
+			'create temp view smoke_nums as select generate_series(1, 20000) as n',
+		);
+		const nums = defineTable('smoke_nums', { columns: { n: integer() } });
+		const db = database(conn);
+		let count = 0;
+		for await (const row of db
+			.selectFrom(nums)
+			.select(['smoke_nums.n'])
+			.stream({ batchSize: 999 }))
+			if (row.n > 0) count++;
+		assert(count === 20_000, String(count));
+	},
+);
 
 await check('pool with pipelining', async () => {
 	await using pool = createPool({ ...base, max: 2 });
