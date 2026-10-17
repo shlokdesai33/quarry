@@ -97,6 +97,17 @@ export {
 	type InsertQueryBuilder,
 	type OnConflictBuilder,
 } from './insert-query-builder.js';
+export {
+	InvalidCursorError,
+	type CursorPage,
+	type CursorPageOptions,
+	type KeyColumn,
+	type KeyColumns,
+	type KeyDirection,
+	type KeysetOptions,
+	type OffsetPage,
+	type OffsetPageOptions,
+} from './pagination.js';
 export type { AnyQuery, Query } from './query.js';
 export type { Range } from './range.js';
 export {
