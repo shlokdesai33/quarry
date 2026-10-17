@@ -673,7 +673,15 @@ for await (const chunk of pool.copyTo(
 }
 ```
 
-A paused consumer pauses the socket: the driver doesn't read ahead of what you've consumed, so memory stays flat however large the result.
+A cursor fetches a batch only when you ask for the next one, so a slow consumer holds one batch in memory however large the result; a paused COPY consumer pauses the socket the same way. Its columns come in the formats their codecs read, binary where they can, from the first run: a statement not yet cached is described first (one more round trip, once per statement and connection).
+
+- **Outside a transaction**, the portal lives in the implicit transaction of one protocol sync, so the cursor holds its connection until it is read to the end or closed, and other queries on that connection wait. `pool.cursor` and `pool.stream` take a connection of their own; on a single connection or a reserved client, don't run queries on the same connection inside the loop.
+- **Inside a transaction**, the cursor is a named portal read with one Execute and Sync per batch, so the transaction's other queries run between its batches, and several cursors can be read at once. The portal is closed when the iteration ends.
+- **Leaving early** (`break`, `return`, a throw, `return()`, or `await using` on a stream) closes the portal and frees the connection.
+- **`signal` and `timeout`** stop the whole cursor, whenever they fire. Between batches, the portal is closed without a cancel request and the next batch rejects with `AbortError`; while a batch runs, it is canceled (`QueryCanceled`, reason `'abort'` or `'timeout'`), which inside a transaction fails the transaction like any canceled statement.
+- **`statementTimeout`** bounds the cursor from its first batch to its last, your loop's time included. It runs the cursor in a transaction of its own (`begin`, `set_config(…, true)`, the cursor, `commit`, pipelined), and is refused inside a transaction, where other queries run between batches: use `set_config` there.
+- **A stream is an async iterable**, so `Readable.from(stream)` and `ReadableStream.from(stream)` read it with backpressure and close it when destroyed or canceled.
+- **Long streams hold a snapshot.** An open cursor keeps its backend's `xmin`, which holds back vacuum, and outside a transaction it is never "idle in transaction", so `idle_in_transaction_session_timeout` doesn't end it; use `statementTimeout` to bound it.
 
 ## LISTEN and NOTIFY
 
@@ -791,6 +799,7 @@ await pool.end({ timeout: 5000 }); // fail whatever is still running after 5 s
 - **Prepared statements** work from PgBouncer 1.21 with `max_prepared_statements` set. PgBouncer 1.26+ without it is detected at login, and no statement is named. For older versions or other poolers without prepared-statement support, use `prepare: false`.
 - **Pipelined queries are sent unnamed.** PgBouncer rewrites the statement name in every named Bind, flushing what it holds and writing the new name separately, so each named query reaches the server in two writes instead of sharing one. Under load the single-threaded pooler is the bottleneck, and that costs it more than re-parsing costs the server. So a query pipelined with others on its connection is sent unnamed (Parse, Bind, Describe), still with its cached columns and binary formats; a query alone on its connection stays named. PgBouncer 1.26+ reports itself at login (`connection.capabilities.pgbouncer`); for 1.21–1.25, set `preparePipelined: false`.
 - **Stale statements.** Behind PgBouncer, which maps a new Parse of the same text back to the statement it already prepared, SQL that still comes back stale after a retry is no longer prepared on that connection.
+- **Cursors and streams** work in transaction mode without an explicit transaction: until the cursor ends, the server sends no ReadyForQuery, so PgBouncer keeps the server connection linked to it. Each open stream holds one server connection for its lifetime, so `default_pool_size` streams at once fill the pool; keep long streams on a pool sized for them. Statement mode can't run cursors.
 
 **Session state** (`SET`, `LISTEN`, temporary tables, session advisory locks) doesn't survive between transactions in transaction mode. The driver's own settings never rely on it: `statementTimeout`, transaction `settings` and `timeout` all go through `set_config(…, true)` inside a transaction.
 
@@ -1675,16 +1684,42 @@ await query.execute({ signal: request.signal, timeout: '2s' });
 
 **Awaiting a builder is an error.** `await db.selectFrom(users)` throws a `TypeError` explaining that queries run with `execute()`. A forgotten `execute()` can't silently do nothing.
 
-**Streaming.** Large results stream through a cursor, a batch of rows per round trip:
+**Streaming.** `stream()` reads every row through a cursor, decoded as `execute()` decodes them, without holding the result in memory. It fetches `batchSize` rows (default 1000) at a time, each batch once the rows before it are taken, so a slow loop holds one batch. Nothing runs until the first row is asked for.
 
 ```ts
 for await (const event of db
 	.selectFrom(events)
-	.selectAll()
-	.stream({ batchSize: 1000 })) {
+	.select(['events.id', 'events.payload'])
+	.stream({ batchSize: 1000, signal: request.signal })) {
 	await handle(event);
+	if (done) break; // closes the cursor and frees its connection
 }
 ```
+
+- **On the pool**, a stream takes a connection of its own, and frees it when the loop ends however it ends: read to the end, `break`, `return`, a throw, or the `signal`. `await using rows = query.stream()` frees it when the block ends.
+- **Inside `db.transaction`**, other queries of the transaction run between the stream's batches, so the loop can read and write through `tx`:
+
+```ts
+await db.transaction(async (tx) => {
+	for await (const job of tx
+		.selectFrom(jobs)
+		.select(['jobs.id'])
+		.where('jobs.status', 'queued')
+		.forUpdate()
+		.stream()) {
+		await tx
+			.update(jobs)
+			.set({ status: 'done' })
+			.where('jobs.id', job.id)
+			.execute();
+	}
+});
+```
+
+- **`signal`** stops the stream whenever it fires: between batches the next pull rejects with `AbortError`, and a batch being read is canceled (`QueryCanceled`). **`timeout`** bounds the whole stream, the loop's time included; it can't be set inside a transaction (use `tx.setLocal('statement_timeout', …)`).
+- **Errors** in the middle of a stream (a division by zero at row 10,001, a value a codec rejects) reject the pull that reaches them, after the rows before them.
+- **Node and web streams**: a stream is an async iterable, so `Readable.from(query.stream())` and `ReadableStream.from(query.stream())` pull from it with backpressure, and close it when destroyed or canceled.
+- **Only every row streams.** The `take…` and `expect…` shapes read a whole result, so they have no `stream()`.
 
 **Inspecting.** Every builder can show its SQL without running it, and the database can describe it:
 
