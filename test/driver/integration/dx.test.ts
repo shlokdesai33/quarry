@@ -429,7 +429,7 @@ describe.skipIf(noPg)('DX features against PostgreSQL', () => {
 				db.budget({ maxQueries: -1 }, async () => 1),
 			).rejects.toThrow(RangeError);
 		});
-		it('counts db.sql and tx.sql statements, alone, in transactions and batched', async () => {
+		it('counts db.sql and tx.sql statements, alone, in transactions and batched, and setEach updates', async () => {
 			const used = await db.budget({}, async (usage) => {
 				await db.sql`select 1`.execute();
 				await db.transaction(async (tx) => {
@@ -438,9 +438,14 @@ describe.skipIf(noPg)('DX features against PostgreSQL', () => {
 						.execute();
 				});
 				await db.batch([db.sql`select 1`, db.sql`select 2`]);
+				await db
+					.update(items)
+					.setEach([{ id: 1, done: true }], { key: 'id' })
+					.expectRows(1)
+					.execute();
 				return usage.queries;
 			});
-			expect(used).toBe(4);
+			expect(used).toBe(5);
 			const error = await rejection(
 				db.budget({ maxQueries: 1 }, async () => {
 					await db.sql`select 1`.execute();
@@ -542,7 +547,8 @@ describe.skipIf(noPg)('DX features against PostgreSQL', () => {
 				.expectRows(1)
 				.execute();
 			await db
-				.updateMany(accounts, [{ id: 1, pin: '1111' }], { by: ['id'] })
+				.update(accounts)
+				.setEach([{ id: 1, pin: '1111' }], { key: ['id'] })
 				.execute();
 			const shown = inspect(events, { depth: 5 });
 			for (const secret of [

@@ -28,7 +28,7 @@ import { insertInto } from '../src/insert-query-builder.js';
 import { selectFrom } from '../src/select-query-builder.js';
 import { sql as sqlTag } from '../src/sql.js';
 import { prettySQL } from '../src/to-sql.js';
-import { update, updateMany } from '../src/update-query-builder.js';
+import { update } from '../src/update-query-builder.js';
 import { codecNames } from './helpers/compiled.js';
 import { fakeExecutor } from './helpers/executor.js';
 
@@ -378,17 +378,20 @@ describe('toSQL({ pretty })', () => {
 			].join('\n'),
 		);
 		expect(
-			updateMany(users, [{ id: 1, name: 'a' }], { by: ['id'] })
+			update(users)
+				.setEach([{ id: 1, name: 'a' }], { key: ['id'] })
 				.where('users.admin', true)
 				.toSQL({ pretty: true }).sql,
 		).toBe(
 			[
 				'update "users"',
 				'set',
-				'  "name" = "quarry_rows"."name"',
-				'from unnest($1::integer[], $2::text[]) as "quarry_rows"("id", "name")',
-				'where ("users"."id" = "quarry_rows"."id")',
-				'  and ("users"."admin" = $3)',
+				'  "name" = "row"."name"',
+				'from unnest($1::integer[], $2::text[]) as "row"("id", "name")',
+				'where (',
+				'  "users"."id" = "row"."id"',
+				'  and "users"."admin" = $3',
+				')',
 			].join('\n'),
 		);
 		expect(
@@ -599,6 +602,28 @@ describe('toSQL of everyday SQL', () => {
 				'  and "d"',
 			].join('\n'),
 		);
+	});
+
+	it('inlines setEach’s unnest arrays and the case of a row that leaves a column out', () => {
+		const each = update(users).setEach(
+			[
+				{ id: 1, name: "O'Hara", password: 'p1' },
+				{ id: 2, admin: false },
+			],
+			{ key: 'id' },
+		);
+		expect(each.toSQL({ inline: true, pretty: true }).sql).toBe(
+			[
+				'update "users"',
+				'set',
+				'  "name" = case when "row"."set:name" then "row"."name" else "users"."name" end,',
+				'  "password_hash" = case when "row"."set:password_hash" then "row"."password_hash" else "users"."password_hash" end,',
+				'  "admin" = case when "row"."set:admin" then "row"."admin" else "users"."admin" end',
+				`from unnest('{1,2}'::integer[], '{O''Hara,NULL}'::text[], '[redacted]'::text[], '{NULL,f}'::boolean[], '{t,f}'::boolean[], '{t,f}'::boolean[], '{f,t}'::boolean[]) as "row"("id", "name", "password_hash", "admin", "set:name", "set:password_hash", "set:admin")`,
+				'where "users"."id" = "row"."id"',
+			].join('\n'),
+		);
+		expect(each.toSQL({ inline: true }).params).toEqual([]);
 	});
 
 	it('renders db.sql statements, sql.id and sql.lit', () => {
