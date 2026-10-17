@@ -120,7 +120,7 @@ export abstract class BaseColumn<D extends DataType, S, I, U> {
 	/**
 	 * Marks the column as holding secrets or personal data. Every value
 	 * bound against it (compared in a `where`, inserted, set by an update or
-	 * upsert, or a row of `updateMany`) is shown as `'[redacted]'` in
+	 * upsert, or a row of `setEach`) is shown as `'[redacted]'` in
 	 * `onQuery` events, in errors' `query`, in `toSQL({ inline })`, and in
 	 * decode errors; a constraint error's `detail` naming it is redacted too.
 	 * What is sent to the database and the rows returned are unchanged.
