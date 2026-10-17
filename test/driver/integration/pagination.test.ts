@@ -175,7 +175,10 @@ describe.skipIf(noPg)('keyset chunks and pagination on PostgreSQL', () => {
 			const seen: string[] = [];
 			let after: string | null = null;
 			do {
-				const page: { rows: unknown[]; nextCursor: string | null } = await db
+				const page: {
+					rows: Record<string, unknown>[];
+					nextCursor: string | null;
+				} = await db
 					.selectFrom(typed)
 					.select([`typed.${column}`])
 					.paginateByCursor({
@@ -185,7 +188,7 @@ describe.skipIf(noPg)('keyset chunks and pagination on PostgreSQL', () => {
 						after,
 					});
 				seen.push(
-					...(page.rows as Record<string, unknown>[]).map((row) => {
+					...page.rows.map((row) => {
 						const value = row[column];
 						return value instanceof Uint8Array
 							? `\\x${Buffer.from(value).toString('hex')}`
