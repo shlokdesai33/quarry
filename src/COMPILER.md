@@ -15,13 +15,13 @@ Background: builders produce nodes ([QUERIES.md](QUERIES.md)); expressions produ
 - [Locking clauses](#locking-clauses)
 - [Insert](#insert)
 - [Upserts: `on conflict`](#upserts-on-conflict)
-- [Update and `updateMany`](#update-and-updatemany)
+- [Update and `setEach`](#update-and-seteach)
 - [Delete](#delete)
 - [`returning`](#returning)
 - [Result codecs](#result-codecs)
 - [Errors the compiler raises](#errors-the-compiler-raises)
 - [`toSQL()` and when compiling happens](#tosql-and-when-compiling-happens)
-- [Why it is built this way](#why-it-is-built-this-way)
+- [Decisions](#decisions)
 - [Glossary](#glossary)
 
 ## Input and output
@@ -86,22 +86,23 @@ Values are passed through **as given**. The compiler never encodes them: the dri
 
 `render(node, params)` is a `switch` over the node kinds:
 
-| Node         | Renders as                                                      | Example                                            |
-| ------------ | --------------------------------------------------------------- | -------------------------------------------------- |
-| `reference`  | `"table"."column"`                                              | `"users"."created_at"`                             |
-| `value`      | `$n`, recording the value and codec                             | `$1`                                               |
-| `value_list` | `(a, b, …)`                                                     | `($3, $4)`                                         |
-| `literal`    | quoted string, or `String(value)`                               | `'theme'`, `true`, `null`, `0`                     |
-| `binary`     | `left op right`, operands parenthesised if they are comparisons | `"users"."age" >= $1`                              |
-| `and` / `or` | see [below](#and-or-and-precedence)                             | `(a and b)`                                        |
-| `not`        | `not (operand)`                                                 | `not ("users"."admin" = $1)`                       |
-| `function`   | `name(args, …)`                                                 | `lower("users"."email")`, `count(*)`               |
-| `raw`        | fragments interleaved with rendered nodes                       | `cast(count(*) as integer)`, `x between $1 and $2` |
-| `select`     | a whole select ([below](#select))                               |                                                    |
+| Node         | Renders as                                                      | Example                                               |
+| ------------ | --------------------------------------------------------------- | ----------------------------------------------------- |
+| `reference`  | `"table"."column"`                                              | `"users"."created_at"`                                |
+| `value`      | `$n`, recording the value and codec                             | `$1`                                                  |
+| `value_list` | `(a, b, …)`                                                     | `($3, $4)`                                            |
+| `literal`    | quoted string, or `String(value)`                               | `'theme'`, `true`, `null`, `0`                        |
+| `binary`     | `left op right`, operands parenthesised if they are comparisons | `"users"."age" >= $1`                                 |
+| `and` / `or` | see [below](#and-or-and-precedence)                             | `(a and b)`                                           |
+| `not`        | `not (operand)`                                                 | `not ("users"."admin" = $1)`                          |
+| `function`   | `name(args, …)`, or `name(distinct args)`                       | `lower("users"."email")`, `count(*)`                  |
+| `case`       | `case when … then … [else …] end`                               | `case when "posts"."views" >= $1 then $2 else $3 end` |
+| `raw`        | fragments interleaved with rendered nodes                       | `cast(count(*) as integer)`, `x between $1 and $2`    |
+| `select`     | a whole select ([below](#select))                               |                                                       |
 
 `raw` nodes are internal only: `fragments` has one more element than `nodes`, and they alternate starting with a fragment. The fragments are fixed strings from quarry's own code (`'cast('`, `' as integer)'`, `' and '`, `'*'`), never user input.
 
-`renderOperand` wraps an operand in parentheses when it is itself a comparison (`rendersAsBinary`), so Postgres's operator precedence can't regroup it: `(a = b) = true`, `("users"."settings" -> 'beta') = $1`. A single-operand `and`/`or` renders as its operand, so it is treated as what it contains.
+`renderOperand` wraps an operand in parentheses when it is itself an operation (`rendersAsOperation`: a `binary` node, which covers comparisons and arithmetic, or a `not`), so Postgres's operator precedence can't regroup it: `(a = b) = true`, `("users"."settings" -> 'beta') = $1`, `("posts"."views" + $1) * $2`, `(not (…)) is null`. The `not` case was a bug found by the SQL coverage audit (#32): `not` binds looser than `is`, so `not (a) is null` reads as `not ((a) is null)`. A single-operand `and`/`or` renders as its operand, so it is treated as what it contains.
 
 ## Identifiers and literals
 
@@ -159,17 +160,33 @@ So `.where(a).where((eb) => eb.or([b, c]))` renders `where (a and (b or c))`.
 `renderSelect` builds the clauses in SQL's required order:
 
 ```
-select <expr> as "<alias>", …
+select [distinct | distinct on (<key>, …)] <expr> as "<alias>", …
 from "<table>" [as "<alias>"]
-[inner join "<table>" [as "<alias>"] on <condition>] …
+[inner | left | right | full join "<table>" [as "<alias>"] on <condition> | cross join "<table>"] …
 [where <condition>]
+[group by <key>, …]
+[having <condition>]
+[order by <key> [asc | desc] [nulls first | nulls last], …]
 [limit $n]
+[offset $n]
 [for <strength> [of "<table>", …] [skip locked | nowait]] …
 ```
 
+A **key** of `distinct on`, `group by` or `order by` is an expression, or an `AliasNode` for a selected key of the row, rendered as the quoted alias (`order by "postCount" desc`), which Postgres resolves against the select list (`renderKey`). Direction and `nulls` are written only when given. `renderJoin` writes each join's kind and refuses a non-cross join without `on`.
+
 Every selected entry is aliased to its key in the result row, including plain columns (`"users"."created_at" as "createdAt"`), so the driver returns rows keyed the way your TypeScript names them. An empty select list renders `select from …`, which Postgres accepts (rows with no columns).
 
-`limit` is a parameter without a codec: the driver sends the number as text and the server infers its type.
+`limit` and `offset` are parameters without a codec: the driver sends the numbers as text and the server infers their type.
+
+With the clauses added in #32 (real `toSQL()`):
+
+```sql
+select "users"."id" as "id", "users"."name" as "name", count("posts"."id") as "postCount"
+from "users" left join "posts" on "posts"."author_id" = "users"."id"
+group by "users"."id" having count("posts"."id") >= $1
+order by "postCount" desc, "users"."id" limit $2 offset $3
+-- params: ['5', 20, 40]   paramCodecs: [int8, (none), (none)]
+```
 
 Example, from `toSQL()`:
 
@@ -214,7 +231,7 @@ function renderLock(lock) {
 
 `for update of "posts" skip locked` locks the matched rows of `posts` until the transaction ends, skipping rows another transaction already locked: the standard way for workers to claim jobs from a queue table without blocking each other. ([QUERIES.md](QUERIES.md#row-locking) explains the strengths.)
 
-Postgres rejects a locking clause on a query with aggregates. The compiler checks first, so the error is clear: `hasAggregate` walks each selection's node looking for a `function` node named `count`, `min` or `max` (the aggregates `eb.fn` builds), and throws "A locking clause (forUpdate() and the like) cannot be used with aggregate functions".
+Postgres rejects a locking clause on a query with aggregates. The compiler checks first, so the error is clear: `hasAggregate` walks each selection's node (through functions, operations, lists, `case` branches and raw nodes) looking for a `function` node named `count`, `min`, `max`, `sum`, `avg`, `array_agg`, `string_agg`, `bool_and` or `bool_or` (the aggregates `eb.fn` builds), and throws "A locking clause (forUpdate() and the like) cannot be used with aggregate functions".
 
 ## Insert
 
@@ -257,24 +274,24 @@ on conflict ("email") do update set "name" = "excluded"."name"
 - `doUpdate((excluded) => ({ … }))` sets what you return; `excluded.name` is a reference node to table `excluded` (rendered `"excluded"."name"`).
 - An upsert that would set nothing throws ("An upsert that merges needs columns to set").
 
-## Update and `updateMany`
+## Update and `setEach`
 
 ```sql
 update "users" set "name" = $1 where "users"."id" = $2 returning "users"."id" as "id", "users"."name" as "name"
 ```
 
-`renderUpdate` requires something to set and either a `where`, `allRows()`, or `updateMany` rows: an update of every row only happens if you say so (the types enforce this too, see [TYPES.md](TYPES.md#builder-state-in-type-parameters)).
+`renderUpdate` requires something to set and either a `where` or `allRows()`: an update of every row only happens if you say so (the types enforce this too, see [TYPES.md](TYPES.md#builder-state-in-type-parameters)).
 
-`updateMany(table, rows, { by })` updates each row to its own values in one statement, joining the table with the rows sent as arrays:
+An `UpdateNode` may also have a `from`: the rows of a `setEach` ([QUERIES.md](QUERIES.md#bulk-update-seteach)), `{ rows: RowsNode, alias }`. It renders as `from unnest($1::type[], …) as "alias"(columns)`, the same `renderUnnest` as multi-row inserts. The key match and the assignments are **ordinary** `SetNode`s and `where` conditions built by the builder (references to `"row"."col"`, and a `case` node for columns some rows leave out), so the compiler needs no special case for bulk updates:
 
 ```sql
-update "users" set "name" = "quarry_rows"."name"
-from unnest($1::integer[], $2::text[]) as "quarry_rows"("id", "name")
-where "users"."id" = "quarry_rows"."id"
--- params: [[1, 2], ['A', 'B']]
+update "products" set "price" = "row"."price"
+from unnest($1::integer[], $2::numeric[]) as "row"("id", "price")
+where ("products"."id" = "row"."id" and "products"."stock" > $3)
+-- params: [[1, 2], ['9.99', '19.99'], 0]   paramCodecs: [int4[], numeric[], int4]
 ```
 
-The `by` columns match rows (`where "users"."id" = "quarry_rows"."id"`); the other columns are set from `quarry_rows`. Every row must set the same columns to plain values (`unnestable`), or it throws. A `where` added on top is and-ed with the match conditions, each parenthesised.
+Every cell must be a plain value and no column an array type (`unnestable`), or it throws.
 
 ## Delete
 
@@ -305,17 +322,18 @@ A selection's codec comes from `selectionNodes` in [row.ts](row.ts): a column's 
 
 ## Errors the compiler raises
 
-| Message                                                                   | When                                                                     |
-| ------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| An insert needs at least one row                                          | `values([])`, or `toSQL()` before `values`                               |
-| An insert of several rows needs at least one column to set                | several rows, all empty                                                  |
-| An upsert that merges needs columns to set                                | `merge([])` with nothing inserted                                        |
-| updateMany needs every row to set the same columns, each to a plain value | rows with different keys, or expressions                                 |
-| An update needs columns to set                                            | no `set` and no `updateMany` columns                                     |
-| An update needs where() or allRows()                                      | `toSQL()` on an update without either (`execute()` is a type error then) |
-| A delete needs where() or allRows()                                       | the same, for a delete                                                   |
-| A locking clause … cannot be used with aggregate functions                | `forUpdate()` with `count`/`min`/`max` selected                          |
-| A string literal cannot contain a NUL character                           | a jsonb key with `\0`                                                    |
+| Message                                                                                                    | When                                                                     |
+| ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| An insert needs at least one row                                                                           | `values([])`, or `toSQL()` before `values`                               |
+| An insert of several rows needs at least one column to set                                                 | several rows, all empty                                                  |
+| An upsert that merges needs columns to set                                                                 | `merge([])` with nothing inserted                                        |
+| setEach sends its rows with unnest: every value must be a plain value, and array columns are not supported | a `setEach` with expression values or array columns                      |
+| An update needs columns to set                                                                             | no `set` and no `setEach`                                                |
+| A left join needs an on() condition                                                                        | (only reachable by casting around the types)                             |
+| An update needs where() or allRows()                                                                       | `toSQL()` on an update without either (`execute()` is a type error then) |
+| A delete needs where() or allRows()                                                                        | the same, for a delete                                                   |
+| A locking clause … cannot be used with aggregate functions                                                 | `forUpdate()` with `count`/`min`/`max` selected                          |
+| A string literal cannot contain a NUL character                                                            | a jsonb key with `\0`                                                    |
 
 These are plain `Error`s: they are programming mistakes, not database errors.
 
@@ -323,19 +341,25 @@ These are plain `Error`s: they are programming mistakes, not database errors.
 
 Every builder and `Query` has `toSQL()`, which returns the same `CompiledQuery` that `execute()` sends. On a builder it compiles on each call. A **result shape** (`takeFirst()`, `expectOne()`, …, and `toQuery()`) compiles once, when the shape is applied, and the `Query` holds the result; `execute()` doesn't compile again. So a compile error surfaces when the shape is applied (or at `execute()` for a builder without a shape), not at the earlier builder calls.
 
-## Why it is built this way
+## Decisions
 
-- **One renderer for every node**: quoting, numbering and parenthesising are written once. Builders and expressions only produce data.
-- **References resolved before compiling**: nodes hold database names already, so `compile` needs no schema and can't get a name wrong.
-- **Always quote identifiers**: no reserved-word list to keep in sync, and case is preserved.
-- **Parameters in text order**: the placeholder numbering is the natural one, and identical queries produce identical SQL, so the driver's statement cache gets hits.
-- **Values not encoded here**: encoding belongs to the codec, in the driver, so it happens once and in one place.
-- **`unnest` for many rows**: constant SQL text and parameter count whatever the number of rows ([Insert](#insert)).
-- **Codecs as getters**: compiled queries print and compare as `{ sql, params }`.
+Why the compiler works this way. Each links to its full entry (what it is, why, the alternatives, the cost, measured impact) in [DECISIONS.md](DECISIONS.md):
+
+- [A node tree, and one compiler](DECISIONS.md#a-node-tree-and-one-compiler): quoting, numbering and parenthesising are written once; builders only produce data.
+- [References resolved before compiling](DECISIONS.md#references-resolved-before-compiling): `compile` needs no schema and can't get a name wrong.
+- [Every identifier quoted](DECISIONS.md#every-identifier-quoted): no reserved-word list, and case is preserved.
+- [Parameters everywhere, literals only where Postgres refuses a parameter](DECISIONS.md#parameters-everywhere-literals-only-where-postgres-refuses-a-parameter): injection-safe and cache-friendly, with checked exceptions.
+- [Parameters numbered in text order, and `in` as `= any($1)`](DECISIONS.md#parameters-numbered-in-text-order-and-in-as--any1): identical queries give identical SQL, so the statement cache gets hits.
+- [Every operation operand bracketed](DECISIONS.md#every-operation-operand-bracketed): no precedence table to get wrong.
+- [Codecs as getters on the compiled query](DECISIONS.md#codecs-as-getters-on-the-compiled-query): compiled queries print and compare as `{ sql, params }`.
+- [Many rows through `unnest`, one array per column](DECISIONS.md#many-rows-through-unnest-one-array-per-column): constant SQL text and parameter count whatever the number of rows.
+- [`unnest` casts without type modifiers](DECISIONS.md#unnest-casts-without-type-modifiers): a too-long value is rejected, not truncated.
+- [`setEach`: one method for the source, the assignments and the key match](DECISIONS.md#seteach-one-method-for-the-source-the-assignments-and-the-key-match): rendered with ordinary set and where nodes.
+- [The driver owns the codecs; the builder only chooses them](DECISIONS.md#the-driver-owns-the-codecs-the-builder-only-chooses-them): values are not encoded here.
 
 ## Glossary
 
-**Aggregate**: a function that combines many rows into one value (`count`, `min`, `max`).
+**Aggregate**: a function that combines many rows into one value (`count`, `sum`, `max`, …).
 
 **`excluded`**: in an upsert's `do update`, the row the insert proposed.
 

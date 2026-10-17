@@ -19,7 +19,7 @@ Files: [database.ts](database.ts), [executor.ts](executor.ts), [driver-executor.
 - [`onQuery` events](#onquery-events)
 - [Errors](#errors)
 - [Closing](#closing)
-- [Why it is built this way](#why-it-is-built-this-way)
+- [Decisions](#decisions)
 - [Glossary](#glossary)
 
 ## `database()`
@@ -48,7 +48,7 @@ export function database(
 - A driver `Pool`, `PoolClient` or `Connection` is used as is, and `db.close()` leaves it alone.
 - `databaseWith(executor)` (internal) builds the `Database` object over **any** executor; tests use it with a fake ([test/helpers/executor.ts](../test/helpers/executor.ts)).
 
-The `Database` object is a plain object of functions (`queries(executor)`), each starting a builder or an operation with that executor: `selectFrom`, `insertInto`, `update`, `updateMany`, `deleteFrom`, `batch`, `transaction`, `verify`, plus `close` and `[Symbol.asyncDispose]` (so `await using db = database(url)` closes it at the end of the scope). Inside a transaction, `transactionWith(tx)` makes the same object over the transaction's executor, plus `afterCommit`, `afterRollback` and `setLocal`, and without `close`.
+The `Database` object is a plain object of functions (`queries(executor)`), each starting a builder or an operation with that executor: `selectFrom`, `insertInto`, `update`, `deleteFrom`, `sql` (a hand-written statement, [QUERIES.md](QUERIES.md#whole-statements-dbsql)), `batch`, `transaction`, `verify`, plus `close` and `[Symbol.asyncDispose]` (so `await using db = database(url)` closes it at the end of the scope). Inside a transaction, `transactionWith(tx)` makes the same object over the transaction's executor, plus `afterCommit`, `afterRollback` and `setLocal`, and without `close`.
 
 `DatabaseOptions` ([driver-executor.ts](driver-executor.ts)):
 
@@ -303,16 +303,25 @@ The driver's framing (BEGIN sharing the first statement's Sync, deferred savepoi
 ## Streaming
 
 ```ts
-for await (const user of db.selectFrom(users).select(['users.id']).stream({ batchSize: 500 })) { … }
+for await (const user of db.selectFrom(users).select(['users.id']).stream({ batchSize: 500, signal })) { … }
+
+await db.transaction(async (tx) => {
+	for await (const job of tx.selectFrom(jobs).select(['jobs.id']).forUpdate().stream())
+		await tx.update(jobs).set({ status: 'done' }).where('jobs.id', job.id).execute(); // runs between batches
+});
 ```
 
-`SelectQueryBuilder.stream` calls `executor.stream(compiled, options)` and yields each batch's rows one by one. `DriverExecutor.stream`:
+`SelectQueryBuilder.stream` (reworked in #34) checks `batchSize`, compiles the query, and returns a `RowStream` over `executor.stream(compiled, options)`, without starting anything: the executor's generator only runs when the first row is pulled. `DriverExecutor.stream`:
 
-1. Reserves a connection for the **whole** iteration (a cursor holds the connection; nothing else can run on it until it's closed).
-2. With a `timeout`, outside a transaction, opens one on that connection (`begin`) and sets `statement_timeout` with `set_config(…, true)`, so the setting can't outlive the stream; inside a transaction it only sets it.
-3. Iterates `runner.cursor(sql, params, { batchSize, …codecs })`, which fetches `batchSize` rows per round trip ([driver/STREAMING.md](driver/STREAMING.md#cursors)).
-4. On finish, commits the transaction it opened; on an error or an early `break`, rolls it back and releases the connection (`finally`).
+1. Refuses a `timeout` inside a transaction (other queries of the transaction run between the stream's batches, so a transaction-local `statement_timeout` would apply to them too; use `tx.setLocal`).
+2. Over a pool, **acquires a connection** when the first batch is asked for, and releases it in `finally`, however the iteration ends: read to the end, `break`, `return`, a throw, an abort. Inside a transaction, it uses the transaction's connection.
+3. Iterates `runner.cursor(sql, params, { batchSize, …codecs, signal, statementTimeout })` ([driver/STREAMING.md](driver/STREAMING.md#cursors)): each batch is fetched only once the rows before it are taken, columns come in their codecs' formats (binary where they can) **from the first run**, and outside a transaction a `timeout` becomes the cursor's `statementTimeout`, run as pipelined `begin` / `set_config(…, true)` / cursor / `commit`, so it bounds the whole stream (the loop's time included) and can't leak.
+4. Decorates an error with the query and the call site, as `execute` does; an error in the middle (a division by zero at row 10,001) rejects the pull that reaches it, after the rows before it.
 5. Reports one `onQuery` event of kind `'stream'` with the total row count.
+
+A `RowStream` is an async iterable, so `Readable.from(query.stream())` (Node) and `ReadableStream.from(query.stream())` (web) read it with backpressure, and close it when destroyed or canceled; `await using rows = query.stream()` closes it at the end of the block.
+
+The keyset helpers (`iterateChunks`, `paginateByCursor`, `paginateByOffset`) are the other way to read big results in pieces: each batch is its own query, holding no connection or cursor between batches ([PAGINATION.md](PAGINATION.md)). `paginateByOffset({ countTotal: true })` runs its page and its `count(*)` through `executor.batch`, in one round trip.
 
 ## Timeouts and cancellation
 
@@ -376,14 +385,20 @@ Error classes: the driver's `PostgresError` subclasses (`UniqueViolation`, `Seri
 
 `db.close()` calls `executor.close()`, which ends the pool **only if the database created it** (`#owned`). `pool.end()` waits for work already issued, then closes every connection ([driver/POOL.md](driver/POOL.md#ending-the-pool)).
 
-## Why it is built this way
+## Decisions
 
-- **An executor interface**: the builder can be tested in memory, and the driver integration is one file.
-- **The builder chooses codecs, the driver applies them**: encoding and decoding exist once, in the driver, and the driver can pick binary formats per column. quarry adds no per-row work of its own.
-- **The catalog loaded up front**: the first query already declares enum parameter types and reads named types in binary; without it, the first queries would behave slightly differently from later ones.
-- **Server-side timeouts, transaction-local**: a client-side timer can't stop the server from working; `set_config(…, true)` can't leak a setting into another request through a pooler.
-- **Batches with explicit modes**: "run these together" and "run these atomically" are different requests with different failure behaviour, and the API names them.
-- **Errors carry the query (hidden) and your stack**: debuggable without leaking parameters into logs.
+Why execution works this way. Each links to its full entry (what it is, why, the alternatives, the cost, measured impact) in [DECISIONS.md](DECISIONS.md):
+
+- [One small `Executor` interface between the builder and the driver](DECISIONS.md#one-small-executor-interface-between-the-builder-and-the-driver): the builder can be tested in memory, and the driver integration is one file.
+- [The driver owns the codecs; the builder only chooses them](DECISIONS.md#the-driver-owns-the-codecs-the-builder-only-chooses-them): quarry adds no per-row work of its own.
+- [The type catalog loaded before the first query](DECISIONS.md#the-type-catalog-loaded-before-the-first-query): the first query behaves like every later one.
+- [Each operation borrows a connection](DECISIONS.md#each-operation-borrows-a-connection): simple and predictable; `db.batch` for one round trip.
+- [Server-side statement timeouts, transaction-local and pipelined](driver/DECISIONS.md#server-side-statement-timeouts-transaction-local-and-pipelined): a client-side timer can't stop the server; a transaction-local setting can't leak.
+- [`db.batch`: two modes with names](DECISIONS.md#dbbatch-two-modes-with-names): "together" and "atomically" fail differently.
+- [`db.batch` framing: one write, with COMMIT pipelined unless results are checked](driver/DECISIONS.md#dbbatch-framing-one-write-with-commit-pipelined-unless-results-are-checked): how a batch goes on the wire.
+- [`stream()`: only for every-row reads, and it runs immediately](DECISIONS.md#stream-only-for-every-row-reads-and-it-runs-immediately): and why its `timeout` is refused in a transaction.
+- [Errors carry the query (hidden) and your call site](DECISIONS.md#errors-carry-the-query-hidden-and-your-call-site): debuggable without leaking parameters into logs.
+- [Nested `durable` transactions throw](DECISIONS.md#nested-durable-transactions-throw): a durable request never silently becomes a savepoint.
 
 ## Glossary
 

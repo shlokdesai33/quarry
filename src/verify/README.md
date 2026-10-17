@@ -19,7 +19,7 @@ The command-line front end is [../cli/README.md](../cli/README.md).
 - [Every rule](#every-rule)
 - [Step 5: the report (`report.ts`)](#step-5-the-report-reportts)
 - [Step 6: rendering (`render/`)](#step-6-rendering-render)
-- [Why it is built this way](#why-it-is-built-this-way)
+- [Decisions](#decisions)
 - [Glossary](#glossary)
 
 ## The pipeline
@@ -228,15 +228,13 @@ A `pretty` diagnostic looks like this (from the integration test's snapshot):
 
 `code-frame.ts` reads the schema file (`readSource`, cached), finds the span of the declaration on that line (`findSpan`), expands tabs to keep columns aligned, and draws the frame. [render/terminal.ts](render/terminal.ts) detects what the output supports (`detectTerminal`: colour from `NO_COLOR`/`FORCE_COLOR`/TTY, Unicode box characters or ASCII, width, hyperlinks), so the same report renders well in a terminal, a CI log or a file.
 
-## Why it is built this way
+## Decisions
 
-- **One catalog query** for any number of tables: fast enough to run at every boot or in every CI job, and read-only, so safe against production.
-- **Resolve names as queries do** (`to_regclass`, `search_path`): verify checks the tables your queries will actually hit.
-- **Driver-neutral SQL**: only text, booleans and integers come back, so the parsing doesn't depend on any codec.
-- **Severity by consequence**: an error means some query will fail or return values your types don't describe; a warning means a likely mistake; info means the code could be more precise.
-- **Fixes in both directions**: either SQL to change the database or the code to declare, since either side may be the one that's wrong.
-- **Plain-data report, separate renderers**: one comparison serves humans, CI annotations and machines.
-- **Stable rule codes**: tooling and suppressions can rely on them.
+Why verify works this way. Each links to its full entry (what it is, why, the alternatives, the cost, measured impact) in [DECISIONS.md](../DECISIONS.md):
+
+- [`verify` instead of trusting that code and database agree](../DECISIONS.md#verify-instead-of-trusting-that-code-and-database-agree): one read-only catalog query, names resolved as queries resolve them, driver-neutral SQL, severity by consequence, fixes in both directions, a plain-data report and stable rule codes.
+- [Declarations, not migrations](../DECISIONS.md#declarations-not-migrations): why there is something to verify at all.
+- [Call sites captured eagerly, formatted lazily](../DECISIONS.md#call-sites-captured-eagerly-formatted-lazily): how diagnostics point at the declaring line.
 
 ## Glossary
 

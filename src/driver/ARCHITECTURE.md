@@ -16,6 +16,7 @@ The driver documentation:
 | [TRANSACTIONS.md](TRANSACTIONS.md)       | transactions, savepoints, retries, and how BEGIN, COMMIT and batches are framed on the wire                                                                  |
 | [STREAMING.md](STREAMING.md)             | cursors and streams, COPY in and out, LISTEN/NOTIFY                                                                                                          |
 | [CANCELLATION.md](CANCELLATION.md)       | `AbortSignal`, client timeouts, cancel requests, statement and transaction timeouts                                                                          |
+| [DECISIONS.md](DECISIONS.md)             | every design decision and optimisation in the driver: what it is, why, the alternatives, the cost, the measured impact                                       |
 
 ## Contents
 
@@ -33,7 +34,7 @@ The driver documentation:
 - [Part 12: Errors](#errors)
 - [Part 13: The driver knows nothing about quarry](#the-driver-knows-nothing-about-quarry)
 - [Part 14: Testing](#part-14-testing)
-- [Why it is built this way](#why-it-is-built-this-way)
+- [Decisions](#decisions)
 - [Glossary](#glossary)
 
 ## Part 1: Foundations
@@ -83,7 +84,7 @@ flowchart TD
     Pool["Pool (pool.ts)<br/>slots, waiters, pipelining onto busy connections"]
     Tx["Transaction / Session (transaction.ts)"]
     Conn["Connection (connection.ts)<br/>startup, queue of Ops, flush, dispatch, statement cache"]
-    Ops["Ops (ops.ts)<br/>QueryOp, SyncGroupOp, SimpleQueryOp, DescribeOp, CursorOp, CopyFromOp, CopyToOp"]
+    Ops["Ops (ops.ts)<br/>QueryOp, SyncGroupOp, SimpleQueryOp, DescribeOp, CursorOp, FetchOp, CopyFromOp, CopyToOp"]
     Codecs["Codecs (codec.ts, codecs.ts, registry.ts, params.ts, results.ts, rows.ts, binary.ts, …)"]
     Proto["Protocol (protocol/)<br/>Writer + frontend.ts → bytes, bytes → Reader → messages"]
     Sock["DriverSocket (socket.ts)<br/>node-socket.ts · cloudflare-socket.ts · yours"]
@@ -116,7 +117,9 @@ flowchart TD
 | [connect.ts](connect.ts)                     | `connect()`, `openConnection()`: hosts in turn, TLS plans, protocol-version retry, connect timeout, cancel requests. [auth/README.md](auth/README.md)                                                       |
 | [config.ts](config.ts)                       | `ConnectionOptions`, connection-string parsing, `PG*` environment variables, `resolveConfig`, `.pgpass`. [auth/README.md](auth/README.md#configuration)                                                     |
 | [connection.ts](connection.ts)               | `Connection`: startup and authentication, the op queue, flushing, dispatching replies, the statement cache, `query`/`queryGroup`/`simpleQuery`/`describe`/`cursor`/`copy*`/`listen`, cancellation, closing. |
-| [ops.ts](ops.ts)                             | The operations: `Op`, `QueryOp`, `SyncGroupOp`, `SimpleQueryOp`, `DescribeOp`, `CursorOp`, `CopyFromOp`, `CopyToOp`; `QueryResult`, `OpTiming`, `Statement`.                                                |
+| [ops.ts](ops.ts)                             | The operations: `Op`, `QueryOp`, `SyncGroupOp`, `SimpleQueryOp`, `DescribeOp`, `CursorOp`, `FetchOp`, `ClosePortalOp`, `CopyFromOp`, `CopyToOp`; `QueryResult`, `OpTiming`, `Statement`.                    |
+| [cursor.ts](cursor.ts)                       | `CursorIterator`: one run of a cursor (opening, serialised `next()`, `return()`, `statementTimeout`, aborts). [STREAMING.md](STREAMING.md#cursors)                                                          |
+| [row-stream.ts](row-stream.ts)               | `RowStream`: rows one at a time over a cursor's batches; async iterable and disposable.                                                                                                                     |
 | [queue.ts](queue.ts)                         | `Queue<T>`: a FIFO that keeps its array's capacity.                                                                                                                                                         |
 | [pool.ts](pool.ts)                           | `Pool`, `PoolClient`, `createPool`, the adaptive `Depth`, the pool's LISTEN connection. [POOL.md](POOL.md)                                                                                                  |
 | [transaction.ts](transaction.ts)             | `Transaction`, `Session`, `TransactionRolledBack`, `Transaction.run`/`batch`. [TRANSACTIONS.md](TRANSACTIONS.md)                                                                                            |
@@ -323,15 +326,16 @@ abstract class Op {
 
 `OpContext` is what an op may use on its connection: the writer, the registry and catalog, the statement cache (`statement`, `forget`, `unprepare`, `preparable`), the naming decision (`named`), `send` and `drain` for ops that talk after being written, `pause`/`resume` for COPY backpressure, and `retry` to requeue a replacement op.
 
-| Op                       | Messages written                                                            | Used by                                                             |
-| ------------------------ | --------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| `QueryOp`                | [Parse, Describe] Bind Execute [Sync]                                       | `query`, and each statement of a group                              |
-| `SyncGroupOp`            | several `QueryOp`s, one Sync                                                | `queryGroup`: BEGIN with the first statement, transactional batches |
-| `SimpleQueryOp`          | Query                                                                       | `simpleQuery`: several statements, no parameters                    |
-| `DescribeOp`             | Parse Describe(S) Sync                                                      | `describe`                                                          |
-| `CursorOp` (exclusive)   | [Parse Describe] Bind Execute(n) Flush, then Execute(n) Flush …, Close Sync | `cursor`, `stream` ([STREAMING.md](STREAMING.md))                   |
-| `CopyFromOp` (exclusive) | Query, then CopyData … CopyDone                                             | `copyFrom`, `copyRows`                                              |
-| `CopyToOp` (exclusive)   | Query                                                                       | `copyTo`                                                            |
+| Op                         | Messages written                                                                                                                                                             | Used by                                                             |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `QueryOp`                  | [Parse, Describe] Bind Execute [Sync]                                                                                                                                        | `query`, and each statement of a group                              |
+| `SyncGroupOp`              | several `QueryOp`s, one Sync                                                                                                                                                 | `queryGroup`: BEGIN with the first statement, transactional batches |
+| `SimpleQueryOp`            | Query                                                                                                                                                                        | `simpleQuery`: several statements, no parameters                    |
+| `DescribeOp`               | Parse Describe(S) Sync                                                                                                                                                       | `describe`                                                          |
+| `CursorOp`                 | outside a transaction (exclusive): [Parse] [Describe Flush] Bind Execute(n) Flush, then Execute(n) Flush per pull, Sync; inside one: Bind on a named portal, Execute(n) Sync | `cursor`, `stream` ([STREAMING.md](STREAMING.md))                   |
+| `FetchOp`, `ClosePortalOp` | Execute(n) Sync / Close Sync on a transaction's named portal                                                                                                                 | the later batches and the end of a cursor inside a transaction      |
+| `CopyFromOp` (exclusive)   | Query, then CopyData … CopyDone                                                                                                                                              | `copyFrom`, `copyRows`                                              |
+| `CopyToOp` (exclusive)     | Query                                                                                                                                                                        | `copyTo`                                                            |
 
 ### `QueryOp.write`: four ways to send one statement
 
@@ -478,7 +482,7 @@ A driver runs the same code millions of times; small allocations per query or pe
 | [binary.ts](binary.ts), [rows.ts](rows.ts)      | `bytea` values and undecoded binary columns are **copied** out of the read buffer                                                                                         | a row must never keep the whole read buffer alive or alias it                                                                                              |
 | [connection.ts](connection.ts) flush            | Queued ops stay unencoded while the socket is full                                                                                                                        | memory bounded by the socket, not by the queue length                                                                                                      |
 | [ops.ts](ops.ts) `CopyToOp`                     | Pauses the socket past a high-water mark                                                                                                                                  | COPY output can't outrun the consumer                                                                                                                      |
-| [ops.ts](ops.ts) `CursorOp`                     | Fetches `batchSize` rows at a time                                                                                                                                        | a large result never sits in memory at once                                                                                                                |
+| [ops.ts](ops.ts) `CursorOp`                     | Fetches `batchSize` rows at a time, only when the consumer asks                                                                                                           | a large result never sits in memory at once                                                                                                                |
 | [protocol/reader.ts](protocol/reader.ts)        | `maxMessageSize` (default 1 GiB, Postgres's own field limit)                                                                                                              | a corrupt length can't make the driver allocate without bound                                                                                              |
 
 The benchmarks behind these choices live in `bench/driver` (`pnpm bench:driver`).
@@ -597,18 +601,23 @@ This keeps the driver testable against other drivers' test suites (`pnpm test:co
 - `pnpm test:compat` runs node-postgres's and postgres.js's own suites against this driver ([test/driver/compat/](../../test/driver/compat/)); `expectations.ts` lists every test allowed to fail and why.
 - `pnpm test:runtimes` and `pnpm test:workers`: smoke tests on Bun, Deno and workerd.
 
-## Why it is built this way
+## Decisions
 
-- **No runtime dependencies, our own protocol implementation**: full control over allocation, pipelining and binary formats, and nothing to audit or update.
-- **Requests as op objects in one queue**: the protocol answers in order, so a FIFO of ops that each know how to write themselves and handle their replies is the whole concurrency model. No locks, no per-request state machines elsewhere.
-- **Automatic pipelining with a Sync per query**: the throughput of pipelining without its usual failure coupling.
-- **Prepared statements by default, cached and named per connection**: the server parses and plans each distinct statement once per connection; repeated queries send only Bind/Execute.
-- **Binary only after describe**: no column is ever requested in a format before its type is known ([CODECS.md](CODECS.md#binary-after-describe)).
-- **Rows decoded in place by generated code**: the most frequent work is the cheapest.
-- **Backpressure everywhere**: memory is bounded by the socket's buffer, not by how much work is queued.
-- **One `DriverSocket` interface**: new runtimes need one small adapter.
-- **PostgreSQL 18 or later**: the driver can rely on protocol 3.2 (longer cancel keys), current SCRAM behaviour and catalog columns, instead of carrying compatibility code for old servers. A pooler that hides the version is assumed to front 18+.
-- **Errors that carry everything, and leak nothing**: every server field is kept; parameters stay out of logs; values that fail to decode are never printed.
+Why the driver is built this way. Each links to its full entry (what it is, why, the alternatives, the cost, measured impact) in [DECISIONS.md](DECISIONS.md):
+
+- [Our own wire-protocol implementation, with no dependencies](DECISIONS.md#our-own-wire-protocol-implementation-with-no-dependencies): full control over allocation, pipelining and binary formats.
+- [Requests as operations in one FIFO queue](DECISIONS.md#requests-as-operations-in-one-fifo-queue): the protocol answers in order, so a FIFO of ops is the whole concurrency model.
+- [The driver knows nothing about the query builder](DECISIONS.md#the-driver-knows-nothing-about-the-query-builder): testable, benchmarkable and publishable alone.
+- [Pipelining, with one Sync per query](DECISIONS.md#pipelining-with-one-sync-per-query): the throughput of pipelining without its usual failure coupling.
+- [Coalesced writes: one write per microtask](DECISIONS.md#coalesced-writes-one-write-per-microtask): everything issued in one tick goes out in one `write`.
+- [Backpressure: 64 KiB chunks, and queued ops stay unencoded](DECISIONS.md#backpressure-64-kib-chunks-and-queued-ops-stay-unencoded): memory is bounded by the socket, not by queued work.
+- [Prepared statements by default, named per connection](DECISIONS.md#prepared-statements-by-default-named-per-connection): each distinct statement is parsed and planned once per connection.
+- [Binary only after describe](DECISIONS.md#binary-only-after-describe): no column is requested in a format before its type is known.
+- [Zero-copy reads: messages decoded in place](DECISIONS.md#zero-copy-reads-messages-decoded-in-place): and [generated row decoders](DECISIONS.md#generated-monomorphic-row-decoders): the most frequent work is the cheapest.
+- [Allocation cuts for the small-query tail](DECISIONS.md#allocation-cuts-for-the-small-query-tail): less garbage, fewer GC pauses in the tail.
+- [One small socket interface](DECISIONS.md#one-small-socket-interface): a new runtime needs one small adapter.
+- [PostgreSQL 18 or later only](DECISIONS.md#postgresql-18-or-later-only): no compatibility code for old servers.
+- [Errors carry everything and leak nothing](DECISIONS.md#errors-carry-everything-and-leak-nothing): every server field kept; parameters stay out of logs.
 
 ## Glossary
 
