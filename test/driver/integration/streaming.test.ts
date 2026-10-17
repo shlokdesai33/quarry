@@ -1,15 +1,20 @@
 /* oxlint-disable no-await-in-loop -- tests run their steps in order */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { defineCodec } from '../../../src/driver/codec.js';
 import type { Connection } from '../../../src/driver/connection.js';
 import {
 	AbortError,
+	DecodeError,
 	PostgresError,
 	QueryCanceled,
 } from '../../../src/driver/errors.js';
 import type { Notification } from '../../../src/driver/notice.js';
-import { noPg, open, rejection, table } from './helpers.js';
+import { noPg, open, rejection, roundTripSockets, table } from './helpers.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const iterate = <T>(iterable: AsyncIterable<T>) =>
+	iterable[Symbol.asyncIterator]();
 
 describe.skipIf(noPg)('cancellation and timeouts', () => {
 	it('cancels a running query with cancel() and keeps the connection', async () => {
@@ -242,6 +247,288 @@ describe.skipIf(noPg)('cursors', () => {
 		expect(ns).toEqual([1, 2, 3, 4, 5]);
 		expect(tx.transactionStatus).toBe('transaction');
 		await tx.query('commit');
+	});
+
+	it('sends the next Execute only when the next batch is asked for', async () => {
+		const net = roundTripSockets();
+		await using c = await open({ socket: net.factory });
+		const iterator = iterate(
+			c.cursor('select generate_series(1, 100) as n', [], { batchSize: 10 }),
+		);
+		await iterator.next();
+		const after = net.writes();
+		await sleep(30);
+		expect(net.writes()).toBe(after);
+		await iterator.next();
+		expect(net.writes()).toBe(after + 1);
+		await iterator.return?.();
+	});
+
+	it('runs other queries of the transaction between its batches', async () => {
+		await using c = await open();
+		const rows = await c.transaction(async (tx) => {
+			const seen: [number, number][] = [];
+			for await (const row of tx.stream<{ n: number }>(
+				'select generate_series(1, 25) as n',
+				[],
+				{ batchSize: 4 },
+			)) {
+				const { rows: inner } = await tx.query<{ m: number }>(
+					'select $1::int * 2 as m',
+					[row.n],
+				);
+				seen.push([row.n, inner[0]?.m ?? 0]);
+			}
+			// two cursors of one transaction, read in step
+			const a = iterate(
+				tx.cursor<{ n: number }>('select generate_series(1, 6) as n', [], {
+					batchSize: 2,
+				}),
+			);
+			const b = iterate(
+				tx.cursor<{ n: number }>('select generate_series(10, 15) as n', [], {
+					batchSize: 3,
+				}),
+			);
+			const [x, y] = await Promise.all([a.next(), b.next()]);
+			const [z] = await Promise.all([a.next(), b.return?.()]);
+			expect([x.value, y.value, z.value]).toEqual([
+				[{ n: 1 }, { n: 2 }],
+				[{ n: 10 }, { n: 11 }, { n: 12 }],
+				[{ n: 3 }, { n: 4 }],
+			]);
+			await a.return?.();
+			return seen;
+		});
+		expect(rows).toEqual(
+			Array.from({ length: 25 }, (_, i) => [i + 1, (i + 1) * 2]),
+		);
+		expect(c.transactionStatus).toBe('idle');
+		const { rows: portals } = await c.query<{ n: number }>(
+			`select count(*)::int as n from pg_cursors where name <> ''`,
+		);
+		expect(portals).toEqual([{ n: 0 }]);
+	});
+
+	it('fails a cursor inside a transaction with the error, and the transaction with it', async () => {
+		await using c = await open();
+		const error = await rejection(
+			c.transaction(async (tx) => {
+				for await (const _ of tx.stream(
+					'select 10 / (3 - n) as v from generate_series(1, 5) n',
+					[],
+					{ batchSize: 1 },
+				));
+			}),
+			PostgresError,
+		);
+		expect(error.code).toBe('22012');
+		expect(c.transactionStatus).toBe('idle');
+	});
+
+	it('bounds a cursor with statementTimeout, and refuses one inside a transaction', async () => {
+		await using c = await open();
+		const error = await rejection(
+			(async () => {
+				for await (const _ of c.cursor(
+					'select generate_series(1, 1000000) as n',
+					[],
+					{ batchSize: 10, statementTimeout: 100 },
+				))
+					await sleep(10);
+			})(),
+			QueryCanceled,
+		);
+		expect(error.reason).toBe('statement_timeout');
+		expect(c.transactionStatus).toBe('idle');
+		expect((await c.query('show statement_timeout')).rows).toEqual([
+			{ statement_timeout: '0' },
+		]);
+		let n = 0;
+		for await (const batch of c.cursor('select generate_series(1, 50)', [], {
+			batchSize: 20,
+			statementTimeout: '5s',
+		}))
+			n += batch.length;
+		expect(n).toBe(50);
+		const bad = await rejection(
+			iterate(c.cursor('select 1', [], { statementTimeout: 'soon' })).next(),
+			PostgresError,
+		);
+		expect(bad.code).toBe('22023');
+		await expect(
+			c.transaction(async (tx) => {
+				for await (const _ of tx.cursor('select 1', [], {
+					statementTimeout: '1s',
+				}));
+			}),
+		).rejects.toThrow(/statementTimeout/);
+	});
+
+	it('stops on a signal or a client timeout, whether a batch is running or not', async () => {
+		await using c = await open();
+		const idle = new AbortController();
+		const iterator = iterate(
+			c.cursor('select generate_series(1, 1000) as n', [], {
+				batchSize: 10,
+				signal: idle.signal,
+			}),
+		);
+		await iterator.next();
+		idle.abort();
+		await expect(iterator.next()).rejects.toThrow('The cursor was aborted');
+		expect((await c.query('select 1 as x')).rows).toEqual([{ x: 1 }]);
+
+		const timedOut = await rejection(
+			(async () => {
+				for await (const _ of c.cursor(
+					'select pg_sleep(0.02) from generate_series(1, 100)',
+					[],
+					{ batchSize: 5, timeout: 150 },
+				));
+			})(),
+			QueryCanceled,
+		);
+		expect(timedOut.reason).toBe('timeout');
+
+		await c.transaction(async (tx) => {
+			const signal = new AbortController();
+			const inner = iterate(
+				tx.cursor('select generate_series(1, 1000) as n', [], {
+					batchSize: 10,
+					signal: signal.signal,
+				}),
+			);
+			await inner.next();
+			signal.abort();
+			await expect(inner.next()).rejects.toBeInstanceOf(AbortError);
+			// aborted between batches, nothing failed on the server
+			expect(tx.transactionStatus).toBe('transaction');
+			expect((await tx.query('select 2 as x')).rows).toEqual([{ x: 2 }]);
+		});
+	});
+
+	it('reads binary from the first run, unprepared and in transactions too', async () => {
+		let binary = 0;
+		const counted = defineCodec({
+			name: 'int8',
+			oid: 20,
+			encode: (value: bigint) => String(value),
+			decodeText: (value: string) => BigInt(value),
+			decodeBinary: (bytes: Uint8Array, start: number) => {
+				binary++;
+				return new DataView(bytes.buffer, bytes.byteOffset + start).getBigInt64(
+					0,
+				);
+			},
+		});
+		for (const prepare of [true, false]) {
+			await using c = await open({ prepare });
+			const read = async (source: Pick<Connection, 'cursor'>) => {
+				const ns: bigint[] = [];
+				for await (const batch of source.cursor<{ n: bigint }>(
+					'select n::int8 as n from generate_series(1, 3) n',
+					[],
+					{ codecs: [counted], batchSize: 2 },
+				))
+					ns.push(...batch.map((row) => row.n));
+				return ns;
+			};
+			binary = 0;
+			expect(await read(c)).toEqual([1n, 2n, 3n]);
+			expect(await read(c)).toEqual([1n, 2n, 3n]);
+			expect(await c.transaction((tx) => read(tx))).toEqual([1n, 2n, 3n]);
+			expect({ prepare, binary }).toEqual({ prepare, binary: 9 });
+		}
+	});
+
+	it('runs a cached statement again when the schema changed under it', async () => {
+		await using c = await open();
+		const name = table('stale');
+		await c.query(`create temp table ${name} (id int, v int)`);
+		await c.query(`insert into ${name} values (1, 10), (2, 20)`);
+		const read = async () => {
+			const rows: unknown[] = [];
+			for await (const batch of c.cursor(`select * from ${name} order by id`))
+				rows.push(...batch);
+			return rows;
+		};
+		expect(await read()).toEqual([
+			{ id: 1, v: 10 },
+			{ id: 2, v: 20 },
+		]);
+		await c.query(`alter table ${name} alter column v type text`);
+		expect(await read()).toEqual([
+			{ id: 1, v: '10' },
+			{ id: 2, v: '20' },
+		]);
+	});
+
+	it('takes next() calls in order, and a return() before it is sent', async () => {
+		const iterator = iterate(
+			conn.cursor<{ n: number }>('select generate_series(1, 5) as n', [], {
+				batchSize: 2,
+			}),
+		);
+		const results = await Promise.all([
+			iterator.next(),
+			iterator.next(),
+			iterator.next(),
+			iterator.next(),
+		]);
+		expect(results.map((r) => r.value)).toEqual([
+			[{ n: 1 }, { n: 2 }],
+			[{ n: 3 }, { n: 4 }],
+			[{ n: 5 }],
+			undefined,
+		]);
+		const held = iterate(
+			conn.cursor('select generate_series(1, 3)', [], { batchSize: 1 }),
+		);
+		await held.next();
+		const queued = conn.cursor('select 1')[Symbol.asyncIterator]();
+		const first = queued.next();
+		await queued.return?.();
+		await held.return?.();
+		expect((await first).done).toBe(true);
+		expect((await conn.query('select 4 as x')).rows).toEqual([{ x: 4 }]);
+	});
+
+	it('fails on a value it cannot decode and keeps the connection', async () => {
+		const picky = defineCodec({
+			name: 'int4',
+			oid: 23,
+			encode: (value: number) => String(value),
+			decodeText: (value: string) => {
+				if (value === '7') throw new Error('no sevens');
+				return Number(value);
+			},
+		});
+		await using c = await open();
+		const consume = async (source: Pick<Connection, 'cursor'>) => {
+			const seen: number[] = [];
+			const error = await rejection(
+				(async () => {
+					for await (const batch of source.cursor<{ n: number }>(
+						'select generate_series(1, 20)::int4 as n',
+						[],
+						{ batchSize: 3, codecs: [picky] },
+					))
+						seen.push(...batch.map((row) => row.n));
+				})(),
+				DecodeError,
+			);
+			throw Object.assign(error, { seen });
+		};
+		for (const run of [
+			() => consume(c),
+			() => c.transaction((tx) => consume(tx)),
+		]) {
+			const error = await rejection(run(), DecodeError);
+			expect(Reflect.get(error, 'seen')).toEqual([1, 2, 3, 4, 5, 6]);
+			expect((await c.query('select 5 as x')).rows).toEqual([{ x: 5 }]);
+			expect(c.transactionStatus).toBe('idle');
+		}
 	});
 });
 

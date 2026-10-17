@@ -71,7 +71,7 @@ export class CursorIterator implements AsyncIterator<unknown[], undefined> {
 	#setup: Promise<unknown> | undefined;
 	#commit: Promise<unknown> | undefined;
 	#cleanup: (() => void) | undefined;
-	/** Calls run one after another, as an async generator's do. */
+	/** `next` calls run one after another, as an async generator's do. */
 	#last: Promise<unknown> = Promise.resolve();
 
 	constructor(host: CursorHost, request: CursorRequest) {
@@ -83,8 +83,9 @@ export class CursorIterator implements AsyncIterator<unknown[], undefined> {
 		return this.#serial(() => this.#next());
 	}
 
+	/** Stops at once, without waiting for a batch being read: a `next` waiting for it gets the end. */
 	return(): Promise<IteratorResult<unknown[], undefined>> {
-		return this.#serial(() => this.#return());
+		return this.#return();
 	}
 
 	#serial<T>(run: () => Promise<T>): Promise<T> {
@@ -113,8 +114,8 @@ export class CursorIterator implements AsyncIterator<unknown[], undefined> {
 			this.#done = true;
 			return DONE;
 		}
-		if (!this.#held) await this.#op?.close();
-		await this.#end(undefined);
+		const close = this.#held ? undefined : this.#op?.close();
+		await Promise.all([close, this.#end(undefined)]);
 		return DONE;
 	}
 

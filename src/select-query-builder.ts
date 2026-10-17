@@ -657,13 +657,14 @@ export class SelectQueryBuilder<
 			);
 		}
 		const query = compile(this.toNode());
-		return new RowStream<O>({
+		const iterate = () => {
 			// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the select list supplies the row type
-			[Symbol.asyncIterator]: () =>
-				(executor.stream(query, options) as AsyncIterable<readonly O[]>)[
-					Symbol.asyncIterator
-				](),
-		});
+			const batches = executor.stream(query, options) as AsyncIterable<
+				readonly O[]
+			>;
+			return batches[Symbol.asyncIterator]();
+		};
+		return new RowStream<O>({ [Symbol.asyncIterator]: iterate });
 	}
 
 	/** The query's parameter and result types, as the server reports them without running it. */

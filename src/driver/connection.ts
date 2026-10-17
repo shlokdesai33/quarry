@@ -1389,11 +1389,10 @@ export class Connection implements AsyncDisposable {
 				return op;
 			},
 		};
-		return {
+		const iterate = (): AsyncIterator<R[]> =>
 			// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- rows are typed by the caller, as in `asRows`
-			[Symbol.asyncIterator]: () =>
-				new CursorIterator(this.#cursors(), request) as AsyncIterator<R[]>,
-		};
+			new CursorIterator(this.#cursors(), request) as AsyncIterator<R[]>;
+		return { [Symbol.asyncIterator]: iterate };
 	}
 
 	#cursors(): CursorHost {
