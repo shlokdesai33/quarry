@@ -13,6 +13,7 @@ import { dec, inc } from '../src/increment.js';
 import { insertInto } from '../src/insert-query-builder.js';
 import { update, updateMany } from '../src/update-query-builder.js';
 import { fakeExecutor } from './helpers/executor.js';
+import { codecNames, plain } from './helpers/compiled.js';
 
 const posts = defineTable('posts', {
 	columns: {
@@ -195,20 +196,25 @@ describe('inc and dec in an upsert', () => {
 
 describe('inc and dec in updateMany', () => {
 	it('add each row’s own amount, qualified apart from the rows', () => {
-		expect(
-			compile(
-				updateMany(
-					posts,
-					[
-						{ id: 1, title: 'A', views: inc(1), visits: dec('2') },
-						{ id: 2, title: 'B', views: inc(5), visits: dec('3') },
-					],
-					{ by: 'id' },
-				)
-					.returning(['posts.id', 'posts.views'])
-					.toNode(),
-			),
-		).toEqual({
+		const query = compile(
+			updateMany(
+				posts,
+				[
+					{ id: 1, title: 'A', views: inc(1), visits: dec('2') },
+					{ id: 2, title: 'B', views: inc(5), visits: dec('3') },
+				],
+				{ by: 'id' },
+			)
+				.returning(['posts.id', 'posts.views'])
+				.toNode(),
+		);
+		expect(codecNames(query).params).toEqual([
+			'int4[]',
+			'text[]',
+			'int4[]',
+			'int8[]',
+		]);
+		expect(plain(query)).toEqual({
 			sql: 'update "posts" set "title" = "quarry_rows"."title", "views" = "posts"."views" + "quarry_rows"."views", "visit_count" = "posts"."visit_count" - "quarry_rows"."visit_count" from unnest($1::integer[], $2::text[], $3::integer[], $4::bigint[]) as "quarry_rows"("id", "title", "views", "visit_count") where "posts"."id" = "quarry_rows"."id" returning "posts"."id" as "id", "posts"."views" as "views"',
 			params: [
 				[1, 2],
@@ -216,7 +222,6 @@ describe('inc and dec in updateMany', () => {
 				[1, 5],
 				['2', '3'],
 			],
-			paramTypes: [1007, 1009, 1007, 1016],
 		});
 	});
 
