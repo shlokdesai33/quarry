@@ -66,6 +66,11 @@ export interface QueryInfo {
 	readonly params: readonly ParamInfo[];
 	/** The result columns (select list or `returning` aliases) that read a sensitive column. */
 	readonly sensitiveFields: ReadonlySet<string>;
+	/**
+	 * Whether every result column counts as sensitive: a statement written
+	 * with `sql` that reads a sensitive column, whose columns aren't known.
+	 */
+	readonly everyFieldSensitive: boolean;
 	/** The sensitive columns of the tables the query names, by table name in the database. */
 	readonly sensitiveColumns: ReadonlyMap<string, ReadonlySet<string>>;
 }
@@ -164,6 +169,7 @@ export function compileWith(
 		node,
 		params: params.info,
 		sensitiveFields: params.sensitiveFields,
+		everyFieldSensitive: node.kind === 'raw' && readsSensitive(node),
 		sensitiveColumns: params.sensitiveColumns,
 	});
 	return query;
@@ -451,7 +457,7 @@ function render(node: OperationNode, params: Params): string {
 				? stringLiteral(node.value)
 				: String(node.value);
 		case 'binary':
-			return `${renderOperand(node.left, params)} ${node.operator} ${renderOperand(node.right, params)}`;
+			return `${renderOperand(node.left, params, readsSensitive(node.right))} ${node.operator} ${renderOperand(node.right, params, readsSensitive(node.left))}`;
 		case 'and':
 			return renderLogical(node.operands, 'and', 'true', params);
 		case 'or':
@@ -459,24 +465,35 @@ function render(node: OperationNode, params: Params): string {
 		case 'not':
 			return `not (${render(node.operand, params)})`;
 		case 'function': {
-			const args = node.args.map((arg) => render(arg, params)).join(', ');
+			const sensitive = node.args.some(readsSensitive);
+			const args = node.args
+				.map((arg) => renderBeside(arg, params, sensitive))
+				.join(', ');
 			return `${node.name}(${node.distinct === true ? `distinct ${args}` : args})`;
 		}
 		case 'case': {
+			const results = node.branches.map((branch) => branch.result);
+			if (node.otherwise !== undefined) results.push(node.otherwise);
+			const sensitive = results.some(readsSensitive);
 			let sql = 'case';
 			for (const branch of node.branches) {
-				sql += ` when ${render(branch.when, params)} then ${render(branch.result, params)}`;
+				sql += ` when ${render(branch.when, params)} then ${renderBeside(branch.result, params, sensitive)}`;
 			}
 			if (node.otherwise !== undefined)
-				sql += ` else ${render(node.otherwise, params)}`;
+				sql += ` else ${renderBeside(node.otherwise, params, sensitive)}`;
 			return `${sql} end`;
 		}
-		case 'raw':
+		case 'raw': {
+			if (node.table !== undefined) params.table(node.table);
+			const sensitive = readsSensitive(node);
 			return node.nodes.reduce(
 				(sql, embedded, i) =>
-					sql + render(embedded, params) + (node.fragments[i + 1] ?? ''),
+					sql +
+					renderBeside(embedded, params, sensitive) +
+					(node.fragments[i + 1] ?? ''),
 				node.fragments[0] ?? '',
 			);
+		}
 		case 'select':
 			return renderSelect(node, params);
 	}
@@ -605,9 +622,29 @@ function renderTable(table: TableNode, params: Params): string {
  * are parenthesised, so postgres precedence cannot regroup them: `not` binds
  * looser than `is`, so `not (a) is null` would read as `not ((a) is null)`.
  */
-function renderOperand(node: OperationNode, params: Params): string {
-	const sql = render(node, params);
+function renderOperand(
+	node: OperationNode,
+	params: Params,
+	sensitive = false,
+): string {
+	const sql = renderBeside(node, params, sensitive);
 	return rendersAsOperation(node) ? `(${sql})` : sql;
+}
+
+/**
+ * `node`, a parameter redacted when `sensitive`: one written beside an
+ * operand that reads a `sensitive()` column (the other side of an operator,
+ * another argument of a function, a raw fragment's column or table, another
+ * result of a case), whatever built it.
+ */
+function renderBeside(
+	node: OperationNode,
+	params: Params,
+	sensitive: boolean,
+): string {
+	return sensitive && node.kind === 'value'
+		? param(params, node.value, node.codec, true)
+		: render(node, params);
 }
 
 /** A single-operand `and` / `or` renders as its operand, unparenthesised. */
