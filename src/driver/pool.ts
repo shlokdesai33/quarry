@@ -5,6 +5,7 @@ import {
 } from './config.js';
 import { openConnection, preloadSockets } from './connect.js';
 import type { Connection, CursorOptions, QueryOptions } from './connection.js';
+import { RowStream } from './row-stream.js';
 import { AbortError, ConnectionError, DriverError } from './errors.js';
 import type { Notification } from './notice.js';
 import type { Description, QueryResult } from './ops.js';
@@ -182,7 +183,7 @@ export class PoolClient implements AsyncDisposable {
 		sql: string,
 		params?: readonly unknown[],
 		options?: CursorOptions,
-	): AsyncIterable<R> {
+	): RowStream<R> {
 		return this.connection.stream<R>(sql, params, options);
 	}
 
@@ -945,7 +946,11 @@ export class Pool implements AsyncDisposable {
 		);
 	}
 
-	/** Streams batches on a connection held for the whole iteration. */
+	/**
+	 * Streams batches on a connection of its own, taken by the first batch
+	 * and held until the iteration ends: read to the end, broken out of, or
+	 * failed.
+	 */
 	async *cursor<R = Record<string, unknown>>(
 		sql: string,
 		params?: readonly unknown[],
@@ -959,13 +964,13 @@ export class Pool implements AsyncDisposable {
 		}
 	}
 
-	async *stream<R = Record<string, unknown>>(
+	/** Like `cursor`, one row at a time. */
+	stream<R = Record<string, unknown>>(
 		sql: string,
 		params?: readonly unknown[],
 		options?: CursorOptions,
-	): AsyncGenerator<R, void, undefined> {
-		for await (const batch of this.cursor<R>(sql, params, options))
-			yield* batch;
+	): RowStream<R> {
+		return new RowStream(this.cursor<R>(sql, params, options));
 	}
 
 	copyFrom(

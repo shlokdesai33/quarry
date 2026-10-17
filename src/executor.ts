@@ -30,8 +30,13 @@ export interface BatchQuery extends ReadOptions {
 	readonly query: CompiledQuery;
 }
 
+/**
+ * Options of `stream`. `signal` stops the stream whenever it fires; a
+ * `timeout` bounds it from its first row to its last, the time the loop
+ * takes included, and can't be set inside a transaction.
+ */
 export interface StreamOptions extends RunOptions {
-	/** Rows fetched per round trip (default 1000). */
+	/** Rows fetched per round trip (default 1000), each batch once the rows before it are taken. */
 	readonly batchSize?: number | undefined;
 }
 
@@ -121,7 +126,12 @@ export interface Executor {
 		query: CompiledQuery,
 		options?: ExecuteOptions,
 	): Promise<ExecuteResult>;
-	/** Reads the rows in batches, without holding the whole result in memory. */
+	/**
+	 * Reads the rows in batches, without holding the whole result in
+	 * memory: nothing runs until the first batch is asked for, and each
+	 * batch is fetched once the one before it is taken. Ending the
+	 * iteration early (`return()`) stops the query.
+	 */
 	stream(
 		query: CompiledQuery,
 		options?: StreamOptions,

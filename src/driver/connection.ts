@@ -26,6 +26,7 @@ import {
 	ProtocolError,
 	postgresError,
 } from './errors.js';
+import { CursorIterator, type CursorHost } from './cursor.js';
 import { toNotice, type Notice, type Notification } from './notice.js';
 import {
 	CopyFromOp,
@@ -49,7 +50,8 @@ import type { BackendMessage } from './protocol/messages.js';
 import { ChannelNames, decodeNotification, Reader } from './protocol/reader.js';
 import { Writer } from './protocol/writer.js';
 import { Queue } from './queue.js';
-import { asResult, asResultPromise, asRows, type RowMode } from './rows.js';
+import { RowStream } from './row-stream.js';
+import { asResult, asResultPromise, type RowMode } from './rows.js';
 import type { DriverSocket } from './socket.js';
 import { startQuerySpan } from './telemetry.js';
 import { Transaction, type TransactionOptions } from './transaction.js';
@@ -140,9 +142,14 @@ export interface GroupStatement {
 		| undefined;
 }
 
-/** A cursor's options: a query's, without `keepRows` (a cursor reads every row it fetches). */
+/**
+ * A cursor's options: a query's, without `keepRows` (a cursor reads every
+ * row it fetches). `signal` and `timeout` stop the whole cursor, whenever
+ * they fire; `statementTimeout` bounds it from its first batch to its last,
+ * the consumer's time included, and is refused inside a transaction.
+ */
 export interface CursorOptions extends Omit<QueryOptions, 'keepRows'> {
-	/** Rows fetched per round trip (default 1000). */
+	/** Rows fetched per round trip (default 1000), each batch once the one before is taken. */
 	readonly batchSize?: number;
 }
 
@@ -192,6 +199,8 @@ export class Connection implements AsyncDisposable {
 	/** Statement keys never prepared again on this connection (see `OpContext.unprepare`). */
 	readonly #unprepared = new Set<string>();
 	#statementCount = 0;
+	#portalCount = 0;
+	#cursorHost: CursorHost | undefined;
 	#statementUses = 0;
 	/** Which cached statements are written named: every one, those written alone, or none (see `OpContext.named`). */
 	#naming: 'always' | 'alone' | 'never' = 'always';
@@ -881,6 +890,7 @@ export class Connection implements AsyncDisposable {
 			return;
 		}
 		op.canceledBy = reason;
+		if (op.interrupt(reason, cause)) return;
 		// hold back later queries so the cancel can't hit one of them
 		this.#canceling ??= op;
 		this.#cancelAtHead();
@@ -1334,8 +1344,14 @@ export class Connection implements AsyncDisposable {
 
 	/**
 	 * Reads a query's rows in batches through a portal, so large results
-	 * never sit in memory at once. The connection runs nothing else until
-	 * the iteration ends; breaking out early closes the portal.
+	 * never sit in memory at once: each batch is fetched once the one
+	 * before it is taken. Its columns come in the formats their codecs read
+	 * (binary where they can), described first if not cached.
+	 *
+	 * Outside a transaction, the portal holds the connection until it is
+	 * read or closed: other queries on it wait. Inside one, other queries of
+	 * the transaction run between its batches. Breaking out early closes
+	 * the portal.
 	 */
 	cursor<R = Record<string, unknown>>(
 		sql: string,
@@ -1350,56 +1366,53 @@ export class Connection implements AsyncDisposable {
 				}),
 			};
 		}
-		return {
-			[Symbol.asyncIterator]: () => {
+		const batchSize = options?.batchSize ?? 1000;
+		const request = {
+			sql,
+			params,
+			batchSize,
+			signal: options?.signal,
+			timeout: options?.timeout,
+			statementTimeout: options?.statementTimeout,
+			open: (portal: string, held: boolean) => {
 				const op = new CursorOp(
 					sql,
 					params,
 					encodeParams(sql, params, options?.paramCodecs, options?.paramTypes),
 					this.#types(params, options),
 					this.#options(options),
-					options?.batchSize ?? 1000,
+					batchSize,
+					portal,
+					held,
 				);
-				let started = false;
-				let failed: Error | undefined;
-				const start = () => {
-					if (started) return;
-					started = true;
-					const original = op.fail.bind(op);
-					op.fail = (error: Error) => {
-						failed = error;
-						original(error);
-					};
-					this.#enqueue(op, options?.signal, options?.timeout);
-					if (!this.#config.catalog.loaded)
-						this.#loadTypesAfter(params, options);
-				};
-				return {
-					next: async (): Promise<IteratorResult<R[]>> => {
-						start();
-						if (failed && !op.written) throw failed;
-						const rows = await op.next();
-						return rows === undefined
-							? { done: true, value: undefined }
-							: { done: false, value: asRows<R>(rows) };
-					},
-					return: async (): Promise<IteratorResult<R[]>> => {
-						if (started) await op.close();
-						return { done: true, value: undefined };
-					},
-				};
+				if (!this.#config.catalog.loaded) this.#loadTypesAfter(params, options);
+				return op;
 			},
+		};
+		return {
+			// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- rows are typed by the caller, as in `asRows`
+			[Symbol.asyncIterator]: () =>
+				new CursorIterator(this.#cursors(), request) as AsyncIterator<R[]>,
 		};
 	}
 
+	#cursors(): CursorHost {
+		return (this.#cursorHost ??= {
+			status: () => this.#status,
+			enqueue: (op, signal, timeout) => this.#enqueue(op, signal, timeout),
+			abort: (op, reason, cause) => this.#abort(op, reason, cause),
+			query: (sql, params) => this.#query(sql, params, undefined),
+			portal: () => `quarry_${++this.#portalCount}`,
+		});
+	}
+
 	/** Like `cursor`, one row at a time. */
-	async *stream<R = Record<string, unknown>>(
+	stream<R = Record<string, unknown>>(
 		sql: string,
 		params: readonly unknown[] = [],
 		options?: CursorOptions,
-	): AsyncGenerator<R, void, undefined> {
-		for await (const batch of this.cursor<R>(sql, params, options))
-			yield* batch;
+	): RowStream<R> {
+		return new RowStream(this.cursor<R>(sql, params, options));
 	}
 
 	/**

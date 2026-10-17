@@ -71,6 +71,7 @@ export {
 	UndefinedTable,
 	UniqueViolation,
 	type PoolOptions,
+	type RowStream,
 } from './driver/index.js';
 export type { DatabaseOptions, QueryEvent } from './driver-executor.js';
 export { violatedColumns } from './errors.js';
