@@ -111,6 +111,22 @@ const executeResult = (result: QueryResult<unknown>): ExecuteResult => ({
 
 const CALLSITE = Symbol('quarry.callsite');
 
+/**
+ * The stack of the code awaiting a query, captured once the query has
+ * failed. It must be called in the executor method's own continuation (its
+ * `catch`, after an `await`), where the engine's async stack trace lists
+ * the async functions awaiting it, the caller's included: nothing is
+ * captured for queries that succeed. Every link up to the caller has to
+ * be an `await` for the chain to reach it. `undefined` with `callsites: false`.
+ */
+function issuedAt(options: DatabaseOptions): Error | undefined {
+	if (options.callsites === false) return undefined;
+	const site = new Error();
+	if (typeof Error.captureStackTrace === 'function')
+		Error.captureStackTrace(site, issuedAt);
+	return site;
+}
+
 /** Adds the query and its tag to a server error, and the caller's stack to any error. */
 function decorate(
 	error: unknown,
@@ -232,7 +248,8 @@ export class DriverExecutor implements TransactionExecutor {
 		if (!(source instanceof Pool)) {
 			const runner = source instanceof PoolClient ? source.connection : source;
 			await this.#prepare(runner);
-			return fn(runner);
+			// awaited, so a failure's call site traces back through it
+			return await fn(runner);
 		}
 		const client = await source.acquire(signal === undefined ? {} : { signal });
 		try {
@@ -286,6 +303,10 @@ export class DriverExecutor implements TransactionExecutor {
 		});
 	}
 
+	/**
+	 * The call site captured up front, for the operations that run once per
+	 * stream or description rather than per query.
+	 */
 	#callsite(): Error | undefined {
 		return this.#options.callsites === false ? undefined : new Error();
 	}
@@ -294,7 +315,6 @@ export class DriverExecutor implements TransactionExecutor {
 		query: CompiledQuery,
 		options: ExecuteOptions = {},
 	): Promise<ExecuteResult> {
-		const callsite = this.#callsite();
 		const observe = this.#options.onQuery !== undefined;
 		const start = observe ? performance.now() : 0;
 		let acquired = start;
@@ -351,7 +371,7 @@ export class DriverExecutor implements TransactionExecutor {
 				command: result.command,
 			};
 		} catch (error) {
-			decorate(error, query, callsite);
+			decorate(error, query, issuedAt(this.#options));
 			if (observe)
 				this.#report(
 					'execute',
@@ -493,7 +513,9 @@ export class DriverExecutor implements TransactionExecutor {
 				'A batch inside a transaction takes no timeout: set statement_timeout with setLocal',
 			);
 		}
-		const callsite = this.#callsite();
+		let site: Error | undefined;
+		/** Captured by the first failure; every caller of it runs in this method's chain of awaits. */
+		const callsite = () => (site ??= issuedAt(this.#options));
 		const observe = this.#options.onQuery !== undefined;
 		const start = observe ? performance.now() : 0;
 		let acquired = start;
@@ -504,16 +526,16 @@ export class DriverExecutor implements TransactionExecutor {
 			options: this.#queryOptions({ rowMode, keepRows }, undefined, query),
 		}));
 		/** Each query's outcome, reported to `onQuery`; `shared` when a failure skipped the rest with its error. */
-		const settle = async (
-			results: readonly Promise<QueryResult<unknown>>[],
+		const settle = (
+			settled: readonly PromiseSettledResult<QueryResult<unknown>>[],
 			shared: boolean,
 		) => {
-			const settled = await Promise.allSettled(results);
 			let decorated = false;
 			return queries.map((query, i) => {
 				const outcome = settled[i]!;
 				if (outcome.status === 'rejected') {
-					if (!shared || !decorated) decorate(outcome.reason, query, callsite);
+					if (!shared || !decorated)
+						decorate(outcome.reason, query, callsite());
 					decorated = true;
 					if (observe) {
 						this.#report(
@@ -554,14 +576,14 @@ export class DriverExecutor implements TransactionExecutor {
 			try {
 				verify?.(values);
 			} catch (error) {
-				decorate(error, undefined, callsite);
+				decorate(error, undefined, callsite());
 				throw error;
 			}
 			return settled;
 		};
-		/** Each query with its own Sync, all in one write. */
+		/** Each query with its own Sync, all in one write, settled. */
 		const independent = (runner: Pick<Runner, 'query'>) =>
-			settle(
+			Promise.allSettled(
 				batch.map(({ query, rowMode, keepRows }) =>
 					runner.query<unknown>(
 						query.sql,
@@ -573,29 +595,33 @@ export class DriverExecutor implements TransactionExecutor {
 						),
 					),
 				),
-				false,
 			);
 		if (!inTransaction && transaction === undefined) {
 			const pool = this.#shared(timeout, queries);
 			if (pool !== undefined) {
 				if (!this.#ready) await this.#prepare(pool);
-				return pool.withShared(
+				const settled = await pool.withShared(
 					(connection) => {
 						if (observe) acquired = performance.now();
 						return independent(connection);
 					},
 					{ signal },
 				);
+				return settle(settled, false);
 			}
 		}
-		return this.#run(signal, async (runner) => {
+		return await this.#run(signal, async (runner) => {
 			if (observe) acquired = performance.now();
 			if (inTransaction) {
 				return verified(
-					await settle(runner.queryGroup(statements, { signal }), true),
+					settle(
+						await Promise.allSettled(runner.queryGroup(statements, { signal })),
+						true,
+					),
 				);
 			}
-			if (transaction === undefined) return independent(runner);
+			if (transaction === undefined)
+				return settle(await independent(runner), false);
 			const { results, done } = Transaction.batch(runner, statements, {
 				...transaction,
 				...(timeout === undefined
@@ -615,11 +641,11 @@ export class DriverExecutor implements TransactionExecutor {
 						}),
 			});
 			done.catch(() => {});
-			const settled = await settle(results, true);
+			const settled = settle(await Promise.allSettled(results), true);
 			try {
 				await done;
 			} catch (error) {
-				decorate(error, undefined, callsite);
+				decorate(error, undefined, callsite());
 				throw error;
 			}
 			return settled;
