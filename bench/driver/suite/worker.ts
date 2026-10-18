@@ -73,6 +73,18 @@ function gcNow(): void {
 	else (Reflect.get(globalThis, 'gc') as (() => void) | undefined)?.();
 }
 
+/**
+ * A forced GC from a fresh macrotask. Bun's JavaScriptCore scans the
+ * stack conservatively, and the frame that delivered the last result
+ * (node:net's data callback) stays live through the microtask drain, so a
+ * GC inside that drain keeps the just-settled result alive. That inflates
+ * the following measurement for every client.
+ */
+async function freshGc(): Promise<void> {
+	await new Promise((r) => setTimeout(r, 0));
+	gcNow();
+}
+
 /** CPU time (µs) of every PostgreSQL process, from /proc. */
 function serverCpuUs(): number | null {
 	try {
@@ -227,7 +239,7 @@ async function runOps(
 	};
 	// warm-up: JIT, prepared statements, every pool connection opened
 	await loopFor(warmupMs, warmupOps);
-	gcNow();
+	await freshGc();
 	let lat = new Float64Array(1 << 14);
 	let n = 0;
 	const record = (ms: number) => {
@@ -303,7 +315,7 @@ async function main() {
 			scenario.id === 'reconnect'
 				? createInterface({ input: process.stdin })[Symbol.asyncIterator]()
 				: undefined;
-		gcNow();
+		await freshGc();
 		const rssBase = process.memoryUsage().rss / 1048576;
 		const mon = await monitor();
 		const cpu0 = process.cpuUsage();
