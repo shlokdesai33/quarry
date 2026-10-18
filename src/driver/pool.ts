@@ -135,11 +135,13 @@ class Depth {
 }
 
 /** Completions per adjustment of the adaptive width. */
-const WIDTH_EPOCH = 2048;
+const WIDTH_EPOCH = 4096;
 /** Above this share of stalled time, the width shrinks; below the other, it may grow. */
 const STALLED_HIGH = 0.25;
 const STALLED_LOW = 0.05;
-/** The most adjustments to wait before trying a wider pool again after a failed try. */
+/** A narrower pool is kept unless queries then take this much longer on average. */
+const NARROWER_WORSE = 1.5;
+/** The most epochs to wait before trying again after a change that didn't help. */
 const WIDTH_BACKOFF = 64;
 
 /**
@@ -155,39 +157,70 @@ const WIDTH_BACKOFF = 64;
  * many times the average.
  *
  * The pool sees that as stalls: a connection completing nothing while the
- * rest of the pool completes twice everything in flight. Counted in
+ * rest of the pool completes everything in flight. Counted in
  * completions rather than time, it needs no clock, ignores client pauses
  * (GC stops every connection at once), and doesn't fire on a round trip,
- * which by Little's law takes about one turnover. Each epoch of
- * `WIDTH_EPOCH` completions compares the stalled share of connections'
- * time with thresholds: above `STALLED_HIGH`, the width shrinks by a
- * quarter; below `STALLED_LOW`, while queries are pipelined or queued at
- * the width, it grows by one. A growth that brings stalls back makes the
- * next try wait twice as long (up to `WIDTH_BACKOFF` epochs), so the
- * pool settles at the widest the server can run without stalls. Queries
- * beyond the width's pipelines wait in the shared queue, in order.
+ * which by Little's law takes about one turnover. With W such backends
+ * sharing C CPUs, each is descheduled about 1 − C/W of the time, so the
+ * stalled share of connections' time also tells how many the server
+ * runs at once: W × (1 − stalled). Each epoch of `WIDTH_EPOCH`
+ * completions:
+ *
+ * - above `STALLED_HIGH`, the width narrows to that estimate. A slow
+ *   query stalls its connection too, and there fewer connections would
+ *   only queue more queries behind it, so the epoch after next judges
+ *   the change: unless stalls fell by half (or below `STALLED_HIGH`) and
+ *   the mean latency (queries in flight and queued over the completion
+ *   rate, Little's law again: one clock read per epoch) didn't rise by
+ *   more than `NARROWER_WORSE`, the width goes back, and the next try
+ *   waits twice as long (up to `WIDTH_BACKOFF` epochs);
+ * - below `STALLED_LOW`, while queries are pipelined or queued at the
+ *   width, it grows by one. A growth that brings stalls back makes the
+ *   next one wait twice as long.
+ *
+ * So the pool settles at the widest the server runs without stalls.
+ * Queries beyond the width's pipelines wait in the shared queue, in
+ * order, for whichever connection frees a slot first. The epoch after a
+ * change, or in which the pool ran out of queries, isn't judged.
  */
 class Width {
 	limit: number;
 	readonly #max: number;
 	#ticks = 0;
+	/** The completion count when the epoch began, and when it ends. */
+	#first = 0;
 	#end = WIDTH_EPOCH;
+	#started = 0;
 	#gaps = 0;
 	#stalled = 0;
+	/** Queries in flight or queued, summed over the epoch's completions. */
+	#load = 0;
 	#demand = false;
-	#holdoff = 0;
-	#backoff = 1;
+	#settling = true;
+	/** The width before the narrowing being judged (0: none), and its stalls and mean latency. */
+	#from = 0;
+	#before = 0;
+	#stalledBefore = 0;
+	#growHoldoff = 0;
+	#growBackoff = 1;
 	#probing = false;
-	#settling = false;
+	#narrowHoldoff = 0;
+	#narrowBackoff = 4;
+	/** The previous epoch's stalled share, as narrowing takes two in a row. */
+	#lastStalled = 0;
+	/** When the narrowing being judged began, and how long its two epochs may take. */
+	#trialStart = 0;
+	#trialBudget = 0;
 
 	constructor(max: number) {
 		this.limit = max;
 		this.#max = max;
 	}
 
-	/** A connection starts taking queries. */
-	start(slot: Slot): void {
+	/** A connection starts taking queries; `first` when no other has any. */
+	start(slot: Slot, first: boolean): void {
 		slot.lastDone = this.#ticks;
+		if (first) this.#settling = true;
 	}
 
 	/** Queries are pipelined, or queued, because every connection the width allows is in use. */
@@ -197,48 +230,123 @@ class Width {
 
 	/**
 	 * Records a completion on `slot`, with `inFlight` queries still in
-	 * flight on `shared` connections; true when the width grew.
+	 * flight on `shared` of the pool's `slots` and `waiting` queued; true
+	 * when the width grew.
 	 */
-	done(slot: Slot, inFlight: number, shared: number): boolean {
+	done(
+		slot: Slot,
+		inFlight: number,
+		waiting: number,
+		shared: number,
+		slots: ReadonlyMap<unknown, Slot>,
+	): boolean {
 		const tick = ++this.#ticks;
-		const gap = tick - slot.lastDone - 1;
+		this.#gap(tick - slot.lastDone - 1, inFlight);
 		slot.lastDone = tick;
-		this.#gaps += gap;
-		if (gap > 2 * inFlight + 16) this.#stalled += gap;
-		return tick >= this.#end && this.#adjust(shared);
+		this.#load += inFlight + waiting;
+		// a narrowing that slows completions down by more than a third is undone without waiting for its epochs
+		if (this.#from > 0 && (tick & 255) === 0) {
+			const now = performance.now();
+			if (now - this.#trialStart > this.#trialBudget) return this.#revert(now);
+		}
+		if (tick < this.#end) return false;
+		// stalls still going on count too: a backend can be off its CPU for longer than an epoch
+		for (const other of slots.values())
+			if (other.shared > 0) this.#gap(tick - other.lastDone, inFlight);
+		return this.#adjust(shared);
+	}
+
+	/** Counts the part of a connection's gap between completions that falls in this epoch, as stalled if it is longer than a turnover. */
+	#gap(gap: number, inFlight: number): void {
+		const counted = Math.min(gap, this.#ticks - 1 - this.#first);
+		this.#gaps += counted;
+		if (gap > inFlight + 16) this.#stalled += counted;
+	}
+
+	/** Starts a new epoch: a half one while a change settles, as it only has to let dropped connections finish. */
+	#epoch(now: number): void {
+		this.#first = this.#ticks;
+		this.#end = this.#ticks + (this.#settling ? WIDTH_EPOCH / 2 : WIDTH_EPOCH);
+		this.#started = now;
+		this.#gaps = 0;
+		this.#stalled = 0;
+		this.#load = 0;
+		this.#demand = false;
+	}
+
+	/** Goes back to the width before a narrowing that didn't help; the next try waits twice as long. */
+	#revert(now: number): true {
+		this.limit = this.#from;
+		this.#from = 0;
+		this.#narrowBackoff = Math.min(WIDTH_BACKOFF, this.#narrowBackoff * 2);
+		this.#narrowHoldoff = this.#narrowBackoff;
+		this.#settling = true;
+		this.#epoch(now);
+		return true;
 	}
 
 	#adjust(shared: number): boolean {
-		this.#end = this.#ticks + WIDTH_EPOCH;
+		const now = performance.now();
+		const elapsed = now - this.#started;
+		// Little's law: mean queries in the pool over the completion rate
+		const latency = (this.#load / WIDTH_EPOCH) * (elapsed / WIDTH_EPOCH);
 		const stalled = this.#gaps > 0 ? this.#stalled / this.#gaps : 0;
 		const demand = this.#demand;
-		this.#gaps = 0;
-		this.#stalled = 0;
-		this.#demand = false;
-		// the epoch after a change measured the change itself, not the new width
 		if (this.#settling) {
 			this.#settling = false;
+			this.#epoch(now);
 			return false;
+		}
+		this.#epoch(now);
+		const lastStalled = this.#lastStalled;
+		this.#lastStalled = stalled;
+		if (this.#from > 0) {
+			if (
+				stalled >= Math.max(STALLED_HIGH, this.#stalledBefore * 0.75) ||
+				latency > this.#before * NARROWER_WORSE
+			)
+				return this.#revert(now);
+			this.#from = 0;
+			this.#narrowBackoff = Math.max(4, this.#narrowBackoff >> 1);
 		}
 		if (stalled > STALLED_HIGH) {
-			this.#settling = true;
-			this.limit = Math.max(1, Math.floor(Math.min(this.limit, shared) * 0.75));
+			if (this.#narrowHoldoff > 0) {
+				this.#narrowHoldoff--;
+				return false;
+			}
+			if (lastStalled <= STALLED_HIGH) return false;
+			const width = Math.min(this.limit, shared);
+			const runs = Math.round(width * (1 - (stalled + lastStalled) / 2));
+			// one step at a time below 2: a single connection is the costliest guess
+			const narrower = Math.min(width - 1, width > 2 ? Math.max(2, runs) : 1);
+			if (narrower < 1) return false;
 			if (this.#probing)
-				this.#backoff = Math.min(WIDTH_BACKOFF, this.#backoff * 2);
+				this.#growBackoff = Math.min(WIDTH_BACKOFF, this.#growBackoff * 2);
 			this.#probing = false;
-			this.#holdoff = this.#backoff;
+			this.#growHoldoff = this.#growBackoff;
+			this.#from = this.limit;
+			this.#before = latency;
+			this.#stalledBefore = (stalled + lastStalled) / 2;
+			this.#trialStart = now;
+			// the settling half epoch and the judged one, at three fifths of this one's rate
+			this.#trialBudget = 2.5 * elapsed;
+			this.#settling = true;
+			this.#epoch(now);
+			this.limit = narrower;
 			return false;
 		}
-		if (this.#holdoff > 0) {
-			this.#holdoff--;
+		if (this.#narrowHoldoff > 0) this.#narrowHoldoff--;
+		if (this.#growHoldoff > 0) {
+			this.#growHoldoff--;
 			return false;
 		}
 		if (stalled >= STALLED_LOW || !demand || this.limit >= this.#max)
 			return false;
 		// the last try held: try again sooner
-		if (this.#probing) this.#backoff = Math.max(1, this.#backoff >> 1);
+		if (this.#probing) this.#growBackoff = Math.max(1, this.#growBackoff >> 1);
 		this.#probing = true;
 		this.#settling = true;
+		this.#epoch(now);
 		this.limit++;
 		return true;
 	}
@@ -698,8 +806,8 @@ export class Pool implements AsyncDisposable {
 	#share(slot: Slot): void {
 		if (slot.shared >= 0) return;
 		slot.shared = 0;
+		this.#width?.start(slot, this.#sharedSlots === 0);
 		this.#sharedSlots++;
-		this.#width?.start(slot);
 	}
 
 	/** Counts one more query in flight on a connection lent for queries. */
@@ -1054,7 +1162,13 @@ export class Pool implements AsyncDisposable {
 			slot.shared--;
 			this.#inFlight--;
 			wider =
-				this.#width?.done(slot, this.#inFlight, this.#sharedSlots) ?? false;
+				this.#width?.done(
+					slot,
+					this.#inFlight,
+					this.#sharedWaiters.length,
+					this.#sharedSlots,
+					this.#slots,
+				) ?? false;
 		}
 		if (started >= 0) this.#sample(slot, performance.now() - started);
 		this.#fillShared(slot);
