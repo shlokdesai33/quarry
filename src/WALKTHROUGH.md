@@ -93,13 +93,13 @@ Notice:
 `DriverExecutor.execute` ([driver-executor.ts](driver-executor.ts), [EXECUTION.md](EXECUTION.md#execute-step-by-step)):
 
 1. captures `new Error()` for the call-site stack (in case the query fails);
-2. `#run`: `pool.acquire()` to reserve a connection;
+2. `#shared`: over a pool, a query without a `timeout` can share the pool's connections with other callers' queries;
 3. `#prepare`: the first time, loads the type catalog (Stage 6);
-4. `connection.query(sql, params, { codecs: quarryRegistry, rowMode: 'object', keepRows: 2, paramCodecs: [text], resultCodecs: [int4, text, timestamptz] })`.
+4. `pool.query(sql, params, { codecs: quarryRegistry, rowMode: 'object', keepRows: 2, paramCodecs: [text], resultCodecs: [int4, text, timestamptz] })`: the pool picks a connection and runs `connection.query` on it.
 
 ## Stage 4: the pool opens a connection
 
-`pool.acquire()` ([driver/POOL.md](driver/POOL.md)) finds no idle connection and room under `max`, so it queues the caller and opens one: `openConnection(config)` ([driver/auth/README.md](driver/auth/README.md)):
+`pool.query` ([driver/POOL.md](driver/POOL.md)) finds no idle connection and room under `max`, so it queues the query for a pipeline slot and opens a connection: `openConnection(config)` ([driver/auth/README.md](driver/auth/README.md)):
 
 - The configuration was resolved once when the pool was created (`resolveConfig`): host `db.internal`, port 5432, user `app`, database `app`, `sslmode` (here `disable`; by default `verify-full` for a remote host).
 - `connectHost` opens a TCP socket through the socket factory (Node's `net` by default), with `TCP_NODELAY` so small writes aren't delayed.
@@ -352,6 +352,6 @@ S< ParseComplete BindComplete NoData CommandComplete(BEGIN)  ParseComplete … D
 
 **A statement timeout.** `.execute({ timeout: '2s' })` outside a transaction pipelines four statements in one write: `begin`, `select set_config('statement_timeout', $1, true)`, the query, `commit`. [driver/CANCELLATION.md](driver/CANCELLATION.md).
 
-**Concurrent driver queries.** Three `pool.query(…)` calls issued together on a pool of one connection go out in **one** write, three Bind/Execute/Sync groups back to back, and their replies come back in order. [driver/ARCHITECTURE.md](driver/ARCHITECTURE.md#pipelining). (Builder queries each reserve their own connection instead: [EXECUTION.md](EXECUTION.md#connections-what-a-query-borrows).)
+**Concurrent driver queries.** Three `pool.query(…)` calls issued together on a pool of one connection go out in **one** write, three Bind/Execute/Sync groups back to back, and their replies come back in order. [driver/ARCHITECTURE.md](driver/ARCHITECTURE.md#pipelining). Builder queries take the same path, and once the pool is full, pipeline onto busy connections: [EXECUTION.md](EXECUTION.md#connections-shared-or-exclusive).
 
 **A schema change.** If someone runs `alter table users alter column id type bigint` between the two runs, the server reports the cached plan as stale (`0A000 cached plan must not change result type`); outside a transaction, the driver drops `q1` and retries once unprepared, and the `id` column (now OID 20) is read with the registry's codec for its new type. [driver/ARCHITECTURE.md](driver/ARCHITECTURE.md#the-prepared-statement-cache).

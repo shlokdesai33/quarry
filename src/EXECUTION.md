@@ -11,7 +11,7 @@ Files: [database.ts](database.ts), [executor.ts](executor.ts), [driver-executor.
 - [`DriverExecutor`](#driverexecutor)
 - [How the builder picks codecs](#how-the-builder-picks-codecs)
 - [`execute`, step by step](#execute-step-by-step)
-- [Connections: what a query borrows](#connections-what-a-query-borrows)
+- [Connections: shared or exclusive](#connections-shared-or-exclusive)
 - [Batches](#batches)
 - [Transactions](#transactions)
 - [Streaming](#streaming)
@@ -103,7 +103,7 @@ Not part of the public API: it exists so the builder can be tested without a dat
 1. chooses the **codec registry** for untyped columns, once, at construction;
 2. loads the **type catalog** before the first query (unless `catalog: false`);
 3. turns quarry's options into the driver's `QueryOptions`;
-4. borrows a connection for each operation from a pool, or uses the source directly;
+4. over a pool, runs plain queries on its shared, pipelined connections and gives what holds state a connection of its own; otherwise uses the source directly;
 5. times queries and reports `onQuery` events;
 6. **decorates errors** with the query and the caller's stack.
 
@@ -164,10 +164,17 @@ async execute(query, options = {}) {
 	const observe = this.#options.onQuery !== undefined;
 	const start = observe ? performance.now() : 0;
 	try {
-		const result = await this.#run(options.signal, (runner) => {
-			if (observe) acquired = performance.now();
-			return runner.query(query.sql, query.params, this.#queryOptions(options, onTiming, query));
-		});
+		const pool = this.#shared(options.timeout, query); // the pool, if the query can share its connections
+		let result;
+		if (pool !== undefined) {
+			if (!this.#ready) await this.#prepare(pool);
+			result = await pool.query(query.sql, query.params, this.#queryOptions(options, onTiming, query));
+		} else {
+			result = await this.#run(options.signal, (runner) => {        // a connection of its own
+				if (observe) acquired = performance.now();
+				return runner.query(query.sql, query.params, this.#queryOptions(options, onTiming, query));
+			});
+		}
 		if (observe) this.#report('execute', query, start, acquired, timing, result.command, result.rowCount ?? result.rows.length);
 		return { rows: result.rows, rowCount: result.rowCount, command: result.command };
 	} catch (error) {
@@ -192,7 +199,37 @@ async execute(query, options = {}) {
 | `onQuery` timing callback                  | `onTiming`                       |
 | `query.tag`                                | `tag`                            |
 
-## Connections: what a query borrows
+## Connections: shared or exclusive
+
+Over a pool, an operation runs either on the pool's **shared** connections, pipelined with other callers' queries, or on a connection **of its own**, depending on whether it leaves anything on the connection that another caller's query could see:
+
+| Operation                                                                                                                                                    | Over a pool                                              | Why                                                                                                                                                                                                   |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `execute()`: a builder query or a `db.sql` statement                                                                                                         | shared: `pool.query`                                     | one statement with its own Sync; nothing stays on the connection                                                                                                                                      |
+| `describe()`                                                                                                                                                 | shared: `pool.describe`                                  | the same                                                                                                                                                                                              |
+| `db.batch` (default)                                                                                                                                         | shared: `pool.withShared`, one connection, one write     | independent statements, each with its own Sync                                                                                                                                                        |
+| `execute()` or `db.batch` with a `timeout`                                                                                                                   | its own: `pool.acquire()`                                | the timeout is `begin` / `set_config(…, true)` / query / `commit`, framed by the connection's transaction status, which other callers' pipelined queries change ([below](#timeouts-and-cancellation)) |
+| `db.sql` whose first keyword changes session or transaction state: `begin`, `commit`, `set`, `reset`, `discard`, `listen`, `declare`, `create temp table`, … | its own: `pool.acquire()`                                | queries pipelined behind it would run in that state (inside the transaction a `begin` opens)                                                                                                          |
+| `db.batch(…, { transaction })`                                                                                                                               | its own: `pool.acquire()`                                | BEGIN … COMMIT                                                                                                                                                                                        |
+| `db.transaction`                                                                                                                                             | its own: `pool.transaction`                              | the whole callback                                                                                                                                                                                    |
+| `stream()`                                                                                                                                                   | its own: `pool.acquire()`, held until the iteration ends | the cursor's portal (and, with a `timeout`, its transaction)                                                                                                                                          |
+
+COPY and LISTEN aren't builder operations: the driver's `pool.copyFrom`, `copyRows` and `copyTo` take a connection of their own, and `pool.listen` a dedicated one outside `max` ([driver/POOL.md](driver/POOL.md#two-ways-to-use-a-connection)).
+
+```ts
+#shared(timeout, queries): Pool | undefined {
+	const source = this.#source;
+	if (!(source instanceof Pool) || timeout !== undefined) return undefined;
+	// undefined as well when a statement matches SESSION_STATEMENT
+	return source;
+}
+```
+
+**Shared.** Until the pool is full, a query takes an idle connection or waits for one being opened; once it is full, it pipelines onto the least loaded busy connection, waits in the pool's FIFO of pipeline slots beyond each connection's (adaptive) depth, and a connection is drained for a caller who needs one of its own, so transactions and streams aren't starved ([driver/POOL.md](driver/POOL.md#pipelining-onto-busy-connections)). Each query keeps its own behaviour, because all of it is per query in the connection: codecs and binary results once its statement is described (the statement cache is per connection), `keepRows`, the tag, the signal (a cancel is only sent once the query is at the head of the connection's queue, so it can't hit another caller's query: [driver/CANCELLATION.md](driver/CANCELLATION.md)), the unnamed statements behind PgBouncer, and the retry of a stale cached statement. A failing query fails alone: each has its own Sync. A batch runs as one pipeline slot: `withShared` hands it one connection, its statements go out together, and the slot ends when the last one settles.
+
+**What sharing doesn't see.** The keyword check only reads a statement's first word. Session state a `select` sets (`set_config(…, false)`, `pg_advisory_lock`) or a `do` block, run with `db.sql` on a pool, lands on whichever connection runs it and stays there, as it always did. For session state, reserve a connection (`database(await pool.acquire())`) or use a transaction (`tx.setLocal`, `pg_advisory_xact_lock`).
+
+**Its own.** `#run` reserves a connection with `pool.acquire()` (or `pool.transaction` holds one for the callback), runs the operation, and releases it; the driver still pipelines what quarry sends together on it: a transaction's BEGIN with its first statement, a timeout's BEGIN/`set_config`/query/COMMIT, an atomic batch.
 
 ```ts
 async #run(signal, fn) {
@@ -212,7 +249,7 @@ async #run(signal, fn) {
 }
 ```
 
-Over a pool, **each operation reserves a connection** with `pool.acquire()` for its duration and releases it after. So concurrent `execute()` calls from your code each get their own connection (up to the pool's `max`), and beyond that wait in the pool's queue for one to be released. They do not go through the pool's shared-connection pipelining (`pool.query`), which applies to the driver's own `query`/`simpleQuery`/`describe` ([driver/POOL.md](driver/POOL.md#pipelining-onto-busy-connections)). Within one borrowed connection, the driver still pipelines what quarry sends together: a `db.batch`, a transaction's BEGIN with its first statement, a statement timeout's BEGIN/`set_config`/query/COMMIT. To send many independent queries in one round trip, use `db.batch`.
+Until #37, every operation took this path, so concurrent builder queries never pipelined: beyond `max`, each waited for a whole connection ([DECISIONS.md](DECISIONS.md#plain-queries-share-the-pools-pipelined-connections) has the measurements).
 
 Over a `PoolClient` or `Connection`, every operation uses that one connection, and concurrent queries on it are pipelined by the connection ([driver/ARCHITECTURE.md](driver/ARCHITECTURE.md#pipelining)).
 
@@ -238,7 +275,7 @@ There are three modes. The message sequences below were captured from the driver
 
 ### Outside a transaction (default)
 
-Each query is sent with its own Sync, all in one write. They run independently: one failing doesn't stop the others, and what the others wrote stays committed.
+Each query is sent with its own Sync, all in one write. They run independently: one failing doesn't stop the others, and what the others wrote stays committed. Over a pool, the batch runs on a shared connection (`pool.withShared`), after whatever other callers' queries are in flight on it ([above](#connections-shared-or-exclusive)).
 
 ```
 C> Bind q1 Execute Sync  Bind q1 Execute Sync          (one write)
@@ -326,7 +363,7 @@ The keyset helpers (`iterateChunks`, `paginateByCursor`, `paginateByOffset`) are
 ## Timeouts and cancellation
 
 - **`signal`** (`RunOptions`): aborting it cancels the query: if it was already sent, the driver sends a **cancel request** to the server over a separate connection; if it was still waiting, it is dropped without contacting the server. Over a pool, the signal also aborts waiting for a connection.
-- **`timeout`** (`RunOptions`): a **server-side** `statement_timeout` for this query only. The driver applies it with `set_config('statement_timeout', $1, true)`, transaction-local, so it never leaks into later queries or other clients behind a pooler. Outside a transaction it wraps the query in `begin … commit`, all pipelined in one write:
+- **`timeout`** (`RunOptions`): a **server-side** `statement_timeout` for this query only. The driver applies it with `set_config('statement_timeout', $1, true)`, transaction-local, so it never leaks into later queries or other clients behind a pooler. Outside a transaction it wraps the query in `begin … commit`, all pipelined in one write. Over a pool, a query with a `timeout` takes a connection of its own: the driver chooses between this framing and the one for inside a transaction by the connection's last reported transaction status, which, on a shared connection, other callers' pipelined `begin`s change, and the setting could then silently not apply:
 
 ```
 C> begin Sync  select set_config('statement_timeout', $1, true) Sync  <the query> Sync  commit Sync   (one write)
@@ -352,7 +389,7 @@ interface QueryEvent {
 	rowCount: number | undefined;
 	durationMs: number;
 	phases: {
-		acquireMs: number; // waiting for a pool connection
+		acquireMs: number; // waiting for a pool connection or pipeline slot
 		queuedMs: number; // waiting on the connection behind other pipelined queries
 		execMs: number; // sent → finished (server work, transfer, decoding)
 	};
@@ -360,7 +397,7 @@ interface QueryEvent {
 }
 ```
 
-The timestamps come from `performance.now()`; `queuedMs` and `execMs` come from the driver's `onTiming` callback ([driver/ARCHITECTURE.md](driver/ARCHITECTURE.md#timing)). Nothing is timed when there is no `onQuery`. A listener that throws doesn't break the query: `#emit` rethrows its error in a microtask, where it surfaces as an uncaught exception instead of rejecting your query.
+The timestamps come from `performance.now()`; `queuedMs` and `execMs` come from the driver's `onTiming` callback ([driver/ARCHITECTURE.md](driver/ARCHITECTURE.md#timing)). On a shared connection the pool picks the connection inside `pool.query`, so `acquireMs` is the time before the query reached one (a connection being opened, or a pipeline slot), worked out from the driver's timing: the time it settled, less `queuedMs` and `execMs`; and `queuedMs` includes other callers' queries pipelined ahead of it. Nothing is timed when there is no `onQuery`. A listener that throws doesn't break the query: `#emit` rethrows its error in a microtask, where it surfaces as an uncaught exception instead of rejecting your query.
 
 ## Errors
 
@@ -392,7 +429,7 @@ Why execution works this way. Each links to its full entry (what it is, why, the
 - [One small `Executor` interface between the builder and the driver](DECISIONS.md#one-small-executor-interface-between-the-builder-and-the-driver): the builder can be tested in memory, and the driver integration is one file.
 - [The driver owns the codecs; the builder only chooses them](DECISIONS.md#the-driver-owns-the-codecs-the-builder-only-chooses-them): quarry adds no per-row work of its own.
 - [The type catalog loaded before the first query](DECISIONS.md#the-type-catalog-loaded-before-the-first-query): the first query behaves like every later one.
-- [Each operation borrows a connection](DECISIONS.md#each-operation-borrows-a-connection): simple and predictable; `db.batch` for one round trip.
+- [Plain queries share the pool's pipelined connections](DECISIONS.md#plain-queries-share-the-pools-pipelined-connections): concurrent builder queries pipeline beyond `max`; what holds state keeps a connection of its own.
 - [Server-side statement timeouts, transaction-local and pipelined](driver/DECISIONS.md#server-side-statement-timeouts-transaction-local-and-pipelined): a client-side timer can't stop the server; a transaction-local setting can't leak.
 - [`db.batch`: two modes with names](DECISIONS.md#dbbatch-two-modes-with-names): "together" and "atomically" fail differently.
 - [`db.batch` framing: one write, with COMMIT pipelined unless results are checked](driver/DECISIONS.md#dbbatch-framing-one-write-with-commit-pipelined-unless-results-are-checked): how a batch goes on the wire.

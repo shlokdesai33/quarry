@@ -110,7 +110,7 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 ### Execution and errors
 
 - [One small `Executor` interface between the builder and the driver](src/DECISIONS.md#one-small-executor-interface-between-the-builder-and-the-driver)
-- [Each operation borrows a connection](src/DECISIONS.md#each-operation-borrows-a-connection)
+- [Plain queries share the pool's pipelined connections](src/DECISIONS.md#plain-queries-share-the-pools-pipelined-connections)
 - [Errors carry the query (hidden) and your call site](src/DECISIONS.md#errors-carry-the-query-hidden-and-your-call-site)
 - [Nested `durable` transactions throw](src/DECISIONS.md#nested-durable-transactions-throw)
 

@@ -936,6 +936,20 @@ export class Pool implements AsyncDisposable {
 		);
 	}
 
+	/**
+	 * @internal Runs `fn` on a shareable connection as one query of its
+	 * pipeline, like `query`: how quarry sends a batch's independent
+	 * statements together on one connection without reserving it. `fn` must
+	 * only issue queries, all before its promise settles, and leave no
+	 * session or transaction state behind.
+	 */
+	withShared<T>(
+		fn: (connection: Connection) => Promise<T>,
+		options?: { signal?: AbortSignal | undefined },
+	): Promise<T> {
+		return this.#withShared(options?.signal, fn);
+	}
+
 	/** Runs `fn` in a transaction on one connection; see `Connection.transaction`. */
 	transaction<T>(
 		fn: (tx: Transaction) => Promise<T>,

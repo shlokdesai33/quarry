@@ -63,12 +63,12 @@ State lives in fields of the slot (`busy`, `shared`) rather than in sets of busy
 
 ## Two ways to use a connection
 
-|                      | Exclusive                                                                                            | Shared                                                     |
-| -------------------- | ---------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| Who                  | `acquire()` (→ `PoolClient`), `transaction()`, `cursor()`/`stream()`, `copyFrom`/`copyRows`/`copyTo` | `query()`, `simpleQuery()`, `describe()`, `loadTypes()`    |
-| Holds the connection | until released / the callback or iteration ends                                                      | for one query                                              |
-| Can share it         | no: session state, open transactions or a portal belong to one caller                                | yes: one query at a time per caller, pipelined with others |
-| Path                 | `#take` → `#waiters`                                                                                 | `#claimShared` → `#sharedWaiters`                          |
+|                      | Exclusive                                                                                            | Shared                                                                  |
+| -------------------- | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| Who                  | `acquire()` (→ `PoolClient`), `transaction()`, `cursor()`/`stream()`, `copyFrom`/`copyRows`/`copyTo` | `query()`, `simpleQuery()`, `describe()`, `loadTypes()`, `withShared()` |
+| Holds the connection | until released / the callback or iteration ends                                                      | for one query (`withShared`: one group of queries)                      |
+| Can share it         | no: session state, open transactions or a portal belong to one caller                                | yes: one query at a time per caller, pipelined with others              |
+| Path                 | `#take` → `#waiters`                                                                                 | `#claimShared` → `#sharedWaiters`                                       |
 
 ## Exclusive use: `acquire`, transactions, cursors, COPY
 
@@ -262,7 +262,12 @@ The pool's **LISTEN** connection (`pool.listen`) is a dedicated connection outsi
 
 ## How quarry uses the pool
 
-quarry's `DriverExecutor` takes the exclusive path for each operation: `pool.acquire()`, run the query on that connection, `release()` ([../EXECUTION.md](../EXECUTION.md#connections-what-a-query-borrows)). So builder queries use up to `max` connections concurrently and then wait in `#waiters`; the shared pipelining described above applies to the driver's own `pool.query()`. On a borrowed connection, what quarry sends together is still pipelined by the connection (a batch, BEGIN with its first statement, a timeout's BEGIN/`set_config`/query/COMMIT).
+quarry's `DriverExecutor` ([../EXECUTION.md](../EXECUTION.md#connections-shared-or-exclusive)) takes both paths:
+
+- **Shared**, for what leaves nothing on the connection: a builder query or `db.sql` statement through `pool.query`, `describe` through `pool.describe`, and a default `db.batch` through `withShared`. So concurrent builder queries get everything above: idle connections first, pipelining onto busy ones once the pool is full, the FIFO of slots, the adaptive depth, and draining for exclusive callers.
+- **Exclusive**, for what holds state: `db.transaction` through `pool.transaction`; `stream()`, an atomic `db.batch`, a query or batch with a `timeout`, and `db.sql` statements that change session or transaction state (`begin`, `set`, `listen`, `create temp table`, …) through `acquire()`. On that connection, what quarry sends together is still pipelined by the connection (BEGIN with its first statement, a timeout's BEGIN/`set_config`/query/COMMIT).
+
+`withShared(fn, { signal })` (internal) is `#withShared`: it claims one pipeline slot (an idle connection, a busy one when the pool is full, or the next free slot in line), runs `fn` on that connection, and ends the slot when `fn`'s promise settles. A batch's statements thus go out together on one connection, counted as one query of its pipeline; `fn` must issue all its queries before settling and leave no session or transaction state behind. Until #37, quarry took the exclusive path for every operation, so its queries beyond `max` waited in `#waiters` for a whole connection.
 
 ## Decisions
 
