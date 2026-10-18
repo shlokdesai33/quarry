@@ -1127,6 +1127,8 @@ export class Connection implements AsyncDisposable {
 		const promise = new Promise<QueryResult<unknown>>(capture);
 		const resolve = capturedResolve;
 		const reject = capturedReject;
+		capturedResolve = noop;
+		capturedReject = noop;
 		let op: QueryOp | undefined;
 		try {
 			const invalid = invalidSql(sql);
@@ -1691,9 +1693,14 @@ function naming(
 	return (preparePipelined ?? names === 'kept') ? 'always' : 'alone';
 }
 
-/** The resolving functions of the latest promise `capture` executed for. */
-let capturedResolve: (result: QueryResult<unknown>) => void = () => {};
-let capturedReject: (error: unknown) => void = () => {};
+const noop = () => {};
+/**
+ * The resolving functions of the promise `capture` just executed for. Reset
+ * as soon as they're read: a resolving function keeps its promise, and so
+ * the settled result, reachable for as long as it is.
+ */
+let capturedResolve: (result: QueryResult<unknown>) => void = noop;
+let capturedReject: (error: unknown) => void = noop;
 const capture = (
 	resolve: (result: QueryResult<unknown>) => void,
 	reject: (error: unknown) => void,
