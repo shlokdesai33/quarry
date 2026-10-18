@@ -1,6 +1,6 @@
 # The connection pool
 
-[pool.ts](pool.ts). A **pool** keeps a set of open connections and lends them out, so programs don't pay for a new connection per request ([ARCHITECTURE.md](ARCHITECTURE.md#why-connections-are-expensive-and-why-pools-exist)). quarry's pool does more than lend: when every connection is busy, it **pipelines** further queries onto the connections already in use, adapting how many it puts on each to the network; and it guarantees that callers who need a connection to themselves (transactions, cursors) aren't starved by that pipelining.
+[pool.ts](pool.ts). A **pool** keeps a set of open connections and lends them out, so programs don't pay for a new connection per request ([ARCHITECTURE.md](ARCHITECTURE.md#why-connections-are-expensive-and-why-pools-exist)). quarry's pool does more than lend: when every connection is busy, it **pipelines** further queries onto the connections already in use, adapting how many it puts on each to the network and how many connections it spreads them over to the server's CPUs; and it guarantees that callers who need a connection to themselves (transactions, cursors) aren't starved by that pipelining.
 
 ## Contents
 
@@ -12,6 +12,7 @@
 - [Releasing and giving back](#releasing-and-giving-back)
 - [Pipelining onto busy connections](#pipelining-onto-busy-connections)
 - [Adaptive pipeline depth](#adaptive-pipeline-depth)
+- [Adaptive width](#adaptive-width)
 - [Draining for exclusive callers](#draining-for-exclusive-callers)
 - [Idle timeout, lifetime and `min`](#idle-timeout-lifetime-and-min)
 - [Ending the pool](#ending-the-pool)
@@ -23,16 +24,16 @@
 
 `PoolOptions` extends the connection options ([auth/README.md](auth/README.md#configuration)) with:
 
-| Option           | Default   | Meaning                                                                                                          |
-| ---------------- | --------- | ---------------------------------------------------------------------------------------------------------------- |
-| `max`            | 10        | most connections open at once (opening ones count)                                                               |
-| `min`            | 0         | connections kept open even when idle                                                                             |
-| `idleTimeout`    | 30 s      | close a connection idle this long (0: never)                                                                     |
-| `maxLifetime`    | 1 h       | replace connections older than this, minus up to 10% random jitter (0: never)                                    |
-| `acquireTimeout` | 30 s      | how long a caller waits for a connection (0: forever)                                                            |
-| `maxWaiting`     | unlimited | fail fast once this many callers are waiting                                                                     |
-| `pipeline`       | adaptive  | pipeline depth per shared connection: adaptive from 100 to 1000; a number fixes it; `false`/`0` disables sharing |
-| `onConnect`      |           | runs on each new connection before first use (e.g. to `SET` session state)                                       |
+| Option           | Default   | Meaning                                                                                                                                                                                    |
+| ---------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `max`            | 10        | most connections open at once (opening ones count)                                                                                                                                         |
+| `min`            | 0         | connections kept open even when idle                                                                                                                                                       |
+| `idleTimeout`    | 30 s      | close a connection idle this long (0: never)                                                                                                                                               |
+| `maxLifetime`    | 1 h       | replace connections older than this, minus up to 10% random jitter (0: never)                                                                                                              |
+| `acquireTimeout` | 30 s      | how long a caller waits for a connection (0: forever)                                                                                                                                      |
+| `maxWaiting`     | unlimited | fail fast once this many callers are waiting                                                                                                                                               |
+| `pipeline`       | adaptive  | pipeline depth per shared connection: adaptive from 100 to 1000, over an adaptive number of connections; a number fixes the depth and spreads over all `max`; `false`/`0` disables sharing |
+| `onConnect`      |           | runs on each new connection before first use (e.g. to `SET` session state)                                                                                                                 |
 
 `createPool(options | connectionString)` resolves the configuration once (`resolveConfig`), fills `min`, and in the background preloads the socket modules the connections will need (`preloadSockets`) so the first query doesn't pay for loading `node:tls`.
 
@@ -46,18 +47,24 @@ interface Slot {             // one per open connection
 	readonly expiresAt: number; // end of its lifetime
 	idleSince: number;
 	depth: Depth | undefined;   // its adaptive pipeline depth, once a query was timed
+	lastDone: number;           // the pool's completion count at its last completion (for the width)
+	retiring: boolean;          // taking no new queries since the width narrowed
 	readonly settled; readonly fulfilled; readonly rejected; // callbacks made once per connection
 }
 #slots = new Map<Connection, Slot>(); // every open connection
 #idle: Slot[] = [];                   // a stack: most recently used last
 #busy = 0;                            // slots lent out
+#sharedSlots = 0;                     // slots lent for queries (shared >= 0)
+#retiring = 0;                        // of those, the ones retiring; #taking() is the rest
+#inFlight = 0;                        // queries in flight on them
+#width: Width | undefined;            // how many slots queries may spread across (adaptive mode)
 #waiters: Waiter[] = [];              // callers waiting for a connection of their own
 #sharedWaiters: Waiter[] = [];        // queries waiting for a pipeline slot
 #draining = new Set<Slot>();          // shared connections taking no new queries, reserved for #waiters
 #opening = 0;                         // connections being opened
 ```
 
-State lives in fields of the slot (`busy`, `shared`) rather than in sets of busy or shared connections: adding and removing a connection from a set on every query makes the set rehash, garbage that shows up as GC pauses. The three callbacks are made once per connection for the same reason: a closure per query would allocate a context per query.
+State lives in fields of the slot (`busy`, `shared`) rather than in sets of busy or shared connections: adding and removing a connection from a set on every query makes the set rehash, garbage that shows up as GC pauses. The three callbacks are made once per connection for the same reason: a closure per query would allocate a context per query. `shared` changes only through `#share` (lent for queries: `#sharedSlots` + 1), `#claim` (one more query: `#inFlight` + 1) and `#unshare` (back to −1, no longer retiring), so the counters always match the slots.
 
 `stats` reports `{ total, idle, busy, waiting }`.
 
@@ -103,7 +110,7 @@ State lives in fields of the slot (`busy`, `shared`) rather than in sets of busy
 }
 ```
 
-- It opens one connection per waiter not already covered by one being opened, up to `max`.
+- It opens one connection per waiter not already covered by one being opened, up to `max`. Queued queries count only up to the [width](#adaptive-width) (`#sharedWanted`): once that many connections carry queries, more connections wouldn't take any.
 - `#open()` calls `openConnection(config)` ([auth/README.md](auth/README.md)), runs `onConnect` (destroying the connection if it throws), creates the slot with a **jittered** expiry (`maxLifetime × (1 − random × 0.1)`, so connections opened together don't all expire together), and registers `connection.onClose(() => this.#forget(slot))`.
 - **A failure rejects one waiter** (the first) with the connection error, then calls `#serveWaiters` again: each waiter gets its own attempt, so a transient failure doesn't fail every waiter at once, and a persistent one fails them one by one with the real error.
 - `#forget(slot)`: a connection closed on its own (server restart, network loss, the server's idle timeout) is removed everywhere, and the pool re-serves waiters, rebalances and refills `min`.
@@ -126,7 +133,7 @@ State lives in fields of the slot (`busy`, `shared`) rather than in sets of busy
 `#giveBack(slot)` decides where an available connection goes, in priority order:
 
 1. the first **exclusive waiter**;
-2. else, if queries wait for a pipeline slot, it becomes **shared**: `shared = 0` and `#fillShared` gives it queued queries, at most `ceil(sharedWaiters / (opening + 1))` of them, so a burst is spread across the connections still being opened instead of piling onto the first;
+2. else, if queries wait for a pipeline slot and fewer connections than the [width](#adaptive-width) carry queries, it becomes **shared**: `#share` and `#fillShared` gives it queued queries, at most `ceil(sharedWaiters / (opening + 1))` of them, so a burst is spread across the connections still being opened instead of piling onto the first;
 3. else, if the pool is ending, it is closed;
 4. else it is parked idle, and the idle sweep is armed.
 
@@ -148,17 +155,21 @@ query(sql, params, options) {
 
 #claimShared(signal) {
 	if (this.#pipeline <= 1 || signal?.aborted || this.#ended) return undefined;
-	const slot = this.#takeIdle() ?? this.#pickShared(); // claimed before any await
-	if (slot !== undefined) slot.shared = Math.max(0, slot.shared) + 1;
+	const slot = this.#taking() < this.#widthLimit() // claimed before any await
+		? (this.#takeIdle() ?? this.#pickShared())
+		: this.#pickShared();
+	if (slot === undefined) return undefined;
+	this.#claim(slot);
+	if (slot.shared > 1) this.#width?.demand(); // pipelined: a wider pool might help
 	return slot;
 }
 ```
 
-- **An idle connection first.** Only when there is none does it pipeline.
-- **`#pickShared()`** picks a connection to pipeline onto only when the pool is **full** (`total >= max`), no connection is idle, and no query is already queued (`sharedWaiters` empty: queued queries go first, in order). Among shared connections, it takes the **least loaded** that is below its pipeline depth, not draining, and `#shareable` (open, not in a transaction, not expired). Before the pool is full, a new connection is better than pipelining.
+- **An idle connection first**, while fewer connections than the [width](#adaptive-width) carry queries. Only when there is none, or at the width, does it pipeline.
+- **`#pickShared()`** picks a connection to pipeline onto only when the pool is **full** (`total >= max`, no connection idle) or **at its width**, and no query is already queued (`sharedWaiters` empty: queued queries go first, in order). Among shared connections, it takes the **least loaded** that is below its pipeline depth, not draining or retiring, and `#shareable` (open, not in a transaction, not expired), preferring one that isn't **stalled** (see [Adaptive width](#adaptive-width)): a connection that completed nothing while the rest of the pool completed everything in flight is behind a slow query, or its backend is off its CPU, and a query sent there waits with it. Before the pool is full or at its width, a new connection is better than pipelining.
 - **Claimed synchronously**, before any `await`: queries issued in the same tick see each other's claims and spread out.
 - `connection.queryThen(…, onDone)`: the connection calls `onDone` when the query settles, **before** the caller's `.then` callbacks run ([ARCHITECTURE.md](ARCHITECTURE.md#reading-replies)), so the slot is freed before the caller's next query is issued.
-- **`#done(slot, started)`** ends a query's turn: decrement `shared`; feed its latency to the adaptive depth if it was timed; hand the free slot straight to the next queued query (`#fillShared`); when the last query finishes, the connection stops being shared and goes back through `#releaseSlot` (to an exclusive waiter, a queued query, or idle).
+- **`#done(slot, started)`** ends a query's turn: decrement `shared`; count the completion for the [width](#adaptive-width); feed its latency to the adaptive depth if it was timed; hand the free slot straight to the next queued query (`#fillShared`); when the last query finishes, the connection stops being shared and goes back through `#releaseSlot` (to an exclusive waiter, a queued query, or idle). If the width grew, or a connection left while queries are queued, `#serveShared` lends idle connections to them (and opens more, up to the width).
 - If no slot can be claimed, `#queryShared` → `#withShared` → `#waitShared` queues the query in `#sharedWaiters` (and opens a connection if there's room). It runs when `#fillShared` hands it a slot on any connection, or `#giveBack` makes one shared.
 
 ```mermaid
@@ -212,6 +223,26 @@ class Depth {
 - At 0 ms network latency it stays at 100; at 5 ms with 1000 callers on one connection it grows until it reaches the server's throughput rather than 100 queries per round trip.
 
 `pipeline: n` fixes the depth at n (no sampling).
+
+## Adaptive width
+
+<a id="adaptive-width"></a>
+How many connections should queries be spread over? All of them, says intuition: more backends, more parallelism. That holds while the server has a CPU for each. Beyond that, pipelining makes it backfire.
+
+**Why.** A pipelined connection always has queries waiting, so its backend never runs out of input and never sleeps. With more such backends than CPUs, the operating system time-slices them: each runs for a slice (a few milliseconds), then waits while the others run, and every query pipelined on a backend that is waiting waits too. Throughput doesn't gain (the CPUs were already busy) but the tail does: queries on a running backend finish in microseconds, while those on a descheduled one wait for whole slices, longer the more backends there are. Measured on 4 vCPUs (PostgreSQL on 2), pool 10, 500 callers doing point lookups: each connection had queries in flight but nothing arriving for 83% of the time, one gap after another of 1–40 ms; the ten backends spent, together, ~9.5 s per second waiting for a CPU, against ~8 ms for a pool of 2; and p50 0.5 ms, p99 20 ms, with almost all of it between writing a query and its result, not queued in the pool. A pool of 2 gave more throughput (227k/s against 206k) with p99 4.4 ms. pg, with one query per connection, has no such tail because its backends sleep after every query (but it does 50k/s).
+
+**How.** `Width` (one per pool, adaptive mode only, `max` > 1) keeps `limit`, the most connections lent for queries at once (`#sharedSlots`), from `max` down to 1. Shared queries beyond the width's pipelines wait in `#sharedWaiters`, in order, for whichever connection frees a slot first; connections beyond it go idle and time out. Exclusive callers still get up to `max`.
+
+- **Stalls, without a clock.** Every completion increments a counter; each slot remembers the count at its own last completion (`lastDone`). A connection's gap is how many queries the rest of the pool completed since: a **stall** if that is more than everything in flight (one turnover of the pool). A round trip doesn't trigger it (by Little's law, a query takes about one turnover, so its connection's gap is a bit less), and a GC pause doesn't either (it stops every connection at once). Each epoch of 4096 completions adds up the gaps and the stalled ones, including stalls still going on at its end (a backend can be off its CPU for longer than an epoch), as a share of connections' time.
+- **Narrowing.** With W such backends on C CPUs, each is off its CPU about 1 − C/W of the time, so W × (1 − stalled) estimates how many the server runs at once. Above 25% stalled two epochs in a row, the width drops to that estimate (not below 2 in one step). `#retire` marks the connections to drop (`retiring`: stalled ones first, then the least loaded): they take no new queries and go idle once theirs finish, while the others keep pipelining. Retiring connections aren't counted in the stalls.
+- **Judging it.** A slow query stalls its connection too, and there fewer connections only queue more queries behind it. So a narrowing is undone unless, the epoch after it settles, stalls fell by a quarter (or below 25%) and the mean latency (queries in flight and queued over the completion rate, from one clock read per epoch) didn't double; each such undo makes the next try wait four times as long (4 to 1024 epochs). It is also undone at once if, once it settled, completions come at under three fifths of the rate before. Under CPU contention the CPUs stay busy whatever the width, so that only happens behind slow queries, and the next try waits the full 1024 epochs: a workload of fast and slow queries can be bistable (slow queries starved, or fast ones stuck behind them), and every try can tip it from one to the other for a while.
+- **Growing.** Below 5% stalled, while queries are pipelined or queued at the width, it grows by one. A growth that brings stalls back doubles the wait before the next (1 to 64 epochs), one that holds halves it, so it settles at the widest the server runs without stalls, probing upwards now and then in case the server got more room.
+- **Not judged:** the epoch after a change, one in which the pool ran out of queries, and one in which a connection took queries for the first time (while the pool fills up, not every connection is busy yet, and stalls read low).
+- **What it costs.** A few integer operations per completion; per epoch, one `performance.now()` and a scan of the slots; while a narrowing is judged, one more clock read per 256 completions.
+
+The controller is tested on synthetic completion streams in [test/driver/pool-width.test.ts](../../test/driver/pool-width.test.ts) (C CPUs time-slicing the backends; slow queries, with callers waiting on each other or arriving at a steady rate; a server that frees up), and against a real server behind a simulated one-CPU scheduler (`timeSlicedSockets`) in the pool's integration tests.
+
+On the VM above, pools of 5, 10 or 50 settle at 2 under 100–1000 callers; with 10 callers, or at 5 ms RTT where the network rather than the server is the limit, nothing stalls and the width stays at `max`. `pipeline: n` (a fixed depth) keeps the old behaviour, spreading over all `max` connections.
 
 ## Draining for exclusive callers
 
@@ -277,6 +308,7 @@ Why the pool works this way. Each links to its full entry (what it is, why, the 
 - [A FIFO of pipeline slots, with slot hand-off](DECISIONS.md#a-fifo-of-pipeline-slots-with-slot-hand-off): no throughput cliff under sustained load.
 - [Draining a shared connection for exclusive callers](DECISIONS.md#draining-a-shared-connection-for-exclusive-callers): transactions can't starve, however heavy the query traffic.
 - [Adaptive pipeline depth, from 100 to 1000](DECISIONS.md#adaptive-pipeline-depth-from-100-to-1000): deep on slow networks, shallow when the server is the bottleneck; why not a fixed 1000.
+- [Adaptive width: no more pipelined backends than the server runs at once](DECISIONS.md#adaptive-width-no-more-pipelined-backends-than-the-server-runs-at-once): a CPU-saturated server time-slices pipelined backends, and the queries on a descheduled one make the tail; why stalls, why each narrowing is judged.
 - [Pool policies: LIFO idle, jittered lifetime, safe release, fail fast](DECISIONS.md#pool-policies-lifo-idle-jittered-lifetime-safe-release-fail-fast): LIFO idle stack, no mid-transaction hand-over, per-waiter attempts, fail-fast limits.
 - [One sweep timer for every idle connection](DECISIONS.md#one-sweep-timer-for-every-idle-connection): no timer allocated per release.
 - [Allocation cuts for the small-query tail](DECISIONS.md#allocation-cuts-for-the-small-query-tail): fields instead of sets, callbacks made once: no per-query garbage in the hottest path.
@@ -295,6 +327,10 @@ Why the pool works this way. Each links to its full entry (what it is, why, the 
 
 **Slot**: the pool's bookkeeping for one open connection.
 
+**Stall**: a connection with queries in flight that completes nothing while the rest of the pool completes everything in flight.
+
 **Starvation**: a waiter that never gets served because others keep going first.
 
 **Waiter**: a caller queued for a connection (`#waiters`) or a pipeline slot (`#sharedWaiters`).
+
+**Width**: how many connections the pool lends for queries at once; adaptive, up to `max` ([Adaptive width](#adaptive-width)).

@@ -191,6 +191,7 @@ Full entries: [src/driver/DECISIONS.md](src/driver/DECISIONS.md).
 - [A FIFO of pipeline slots, with slot hand-off](src/driver/DECISIONS.md#a-fifo-of-pipeline-slots-with-slot-hand-off) (measured)
 - [Draining a shared connection for exclusive callers](src/driver/DECISIONS.md#draining-a-shared-connection-for-exclusive-callers) (measured)
 - [Adaptive pipeline depth, from 100 to 1000](src/driver/DECISIONS.md#adaptive-pipeline-depth-from-100-to-1000) (measured)
+- [Adaptive width: no more pipelined backends than the server runs at once](src/driver/DECISIONS.md#adaptive-width-no-more-pipelined-backends-than-the-server-runs-at-once) (measured)
 - [Pool policies: LIFO idle, jittered lifetime, safe release, fail fast](src/driver/DECISIONS.md#pool-policies-lifo-idle-jittered-lifetime-safe-release-fail-fast)
 
 ### Connecting
