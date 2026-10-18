@@ -166,14 +166,16 @@ const WIDTH_BACKOFF = 64;
  * runs at once: W × (1 − stalled). Each epoch of `WIDTH_EPOCH`
  * completions:
  *
- * - above `STALLED_HIGH`, the width narrows to that estimate. A slow
- *   query stalls its connection too, and there fewer connections would
- *   only queue more queries behind it, so the epoch after next judges
- *   the change: unless stalls fell by half (or below `STALLED_HIGH`) and
- *   the mean latency (queries in flight and queued over the completion
- *   rate, Little's law again: one clock read per epoch) didn't rise by
- *   more than `NARROWER_WORSE`, the width goes back, and the next try
- *   waits twice as long (up to `WIDTH_BACKOFF` epochs);
+ * - above `STALLED_HIGH` two epochs in a row, the width narrows to that
+ *   estimate (not below 2 in one step). A slow query stalls its
+ *   connection too, and there fewer connections would only queue more
+ *   queries behind it, so the epoch after next judges the change: unless
+ *   stalls fell by a quarter (or below `STALLED_HIGH`) and the mean
+ *   latency (queries in flight and queued over the completion rate,
+ *   Little's law again: one clock read per epoch) didn't rise by more
+ *   than `NARROWER_WORSE`, the width goes back, and the next try waits
+ *   twice as long (up to `WIDTH_BACKOFF` epochs). It goes back at once
+ *   if completions slow down by two fifths meanwhile;
  * - below `STALLED_LOW`, while queries are pipelined or queued at the
  *   width, it grows by one. A growth that brings stalls back makes the
  *   next one wait twice as long.
@@ -241,10 +243,12 @@ class Width {
 		slots: ReadonlyMap<unknown, Slot>,
 	): boolean {
 		const tick = ++this.#ticks;
+		// its own completion is a tick of its time too
+		this.#gaps++;
 		this.#gap(tick - slot.lastDone - 1, inFlight);
 		slot.lastDone = tick;
 		this.#load += inFlight + waiting;
-		// a narrowing that slows completions down by more than a third is undone without waiting for its epochs
+		// a narrowing that slows completions down by two fifths is undone without waiting for its epochs
 		if (this.#from > 0 && (tick & 255) === 0) {
 			const now = performance.now();
 			if (now - this.#trialStart > this.#trialBudget) return this.#revert(now);
@@ -506,7 +510,8 @@ export class Pool implements AsyncDisposable {
 		this.#pipeline = o.pipeline === false ? 0 : (o.pipeline ?? PIPELINE_FLOOR);
 		this.#adaptive = o.pipeline === undefined;
 		if (this.#max < 1) throw new DriverError('max must be at least 1');
-		this.#width = this.#adaptive ? new Width(this.#max) : undefined;
+		this.#width =
+			this.#adaptive && this.#max > 1 ? new Width(this.#max) : undefined;
 		this.#fillMin();
 		// in the background: no cost to createPool, a faster first query
 		unref(setTimeout(() => preloadSockets(this.#config), 0));
