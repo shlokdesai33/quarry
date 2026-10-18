@@ -148,7 +148,9 @@ export interface GroupStatement {
  * A cursor's options: a query's, without `keepRows` (a cursor reads every
  * row it fetches). `signal` and `timeout` stop the whole cursor, whenever
  * they fire; `statementTimeout` bounds it from its first batch to its last,
- * the consumer's time included, and is refused inside a transaction.
+ * the consumer's time included, and is refused by a `Transaction` (on a
+ * plain connection it holds the connection between batches, as outside a
+ * transaction).
  */
 export interface CursorOptions extends Omit<QueryOptions, 'keepRows'> {
 	/** Rows fetched per round trip (default 1000), each batch once the one before is taken. */

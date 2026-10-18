@@ -889,11 +889,13 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 
 ### A statement timeout bounds the whole stream
 
-**What it is.** `statementTimeout` on a cursor (or quarry's `stream({ timeout })`) runs the cursor in a transaction of its own: `begin`, `set_config('statement_timeout', $1, true)`, the cursor, `commit`, pipelined. It is refused inside a transaction.
+**What it is.** `statementTimeout` on a cursor (or quarry's `stream({ timeout })`) opens it as an unnamed portal in the implicit transaction of one Sync, with `STATEMENT_TIMEOUT` setting the timeout before the portal and restoring it before the Sync ([CANCELLATION.md](CANCELLATION.md#a-cursors-statement-timeout)). A `Transaction` refuses it.
 
-**Why.** A suspended portal keeps `statement_timeout` running across Executes (verified on PG 18), so the timeout bounds the stream from its first batch to its last, the consumer's time included; transaction-local, so it can't leak. Before #34 the setup took two extra round trips, and inside a transaction it leaked into the rest of the transaction.
+**Why.** A suspended portal keeps `statement_timeout` running across Executes (verified on PG 18), so the timeout bounds the stream from its first batch to its last, the consumer's time included; transaction-local, so it can't leak. Before #34 the setup took two extra round trips, and inside a transaction it leaked into the rest of the transaction. From #34 to #38 it was `begin`, the setting, the cursor and `commit` with their own Syncs, chosen by the transaction status: behind an unanswered `begin`, its `commit` committed the other caller's transaction ([below](#a-statement-timeout-is-framed-under-the-querys-sync-whatever-the-transaction-status)).
 
-**Code.** [cursor.ts](cursor.ts) `#start`.
+**Cost.** The Sync (with Close and the restore) of a timed cursor closed mid-batch waits for that batch to end, which the server finishes anyway. On a plain connection after `begin`, a timed cursor runs as one operation, holding the connection between batches, instead of being refused.
+
+**Code.** [cursor.ts](cursor.ts) `#start`; [ops.ts](ops.ts) `CursorOp`; [transaction.ts](transaction.ts) `Session.cursor`.
 
 ## COPY and LISTEN/NOTIFY
 
@@ -971,17 +973,28 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 
 ### A statement timeout is framed under the query's Sync, whatever the transaction status
 
-**What it is.** A timed query goes out as one `SyncGroupOp`: a statement setting `statement_timeout` (keeping the previous value in the transaction-local custom setting `quarry.statement_timeout`), the query, and the same statement with null, restoring it. Outside a transaction block the three share one implicit transaction, which ends the setting at the Sync; inside one, the restore ends it. The connection's transaction status isn't read ([CANCELLATION.md](CANCELLATION.md#statement-timeouts)).
+**What it is.** A timed query goes out as one `SyncGroupOp`: a statement setting `statement_timeout` (keeping the previous value in the transaction-local custom setting `quarry.statement_timeout`), the query, and the same statement with null, restoring it. Outside a transaction block the three share one implicit transaction, which ends the setting at the Sync; inside one, the restore ends it. A cursor's timeout is framed the same way around its portal ([above](#a-statement-timeout-bounds-the-whole-stream)). The connection's transaction status isn't read ([CANCELLATION.md](CANCELLATION.md#statement-timeouts)). Since nothing stays on the connection, quarry's executor runs builder queries and default batches with a `timeout` on the pool's shared connections.
 
 **Why.** The status is the last ReadyForQuery's, which says nothing about what is queued or in flight ahead. Choosing the framing from it (`begin … commit` with four Syncs when idle, an in-transaction variant otherwise) broke on pipelined connections: a timed query issued while another caller's transaction was open, with its `commit` queued ahead, ran unbounded (its `set_config` landed after that commit); one pipelined behind an unanswered `begin` committed that caller's transaction with its own `commit`; and in a transaction, the restore sent after the answer left the timeout on the statements pipelined behind. A pool reaches the first case with no misuse: a caller waiting for a pipeline slot is handed one mid-read, and the rest of that read can bring another timed query's `begin`. The pool's refusal to pipeline onto a connection reporting a transaction narrowed it but couldn't close it.
 
-**Alternatives.** Route timed queries to exclusive use (`acquire`, what [#37](https://github.com/shlokdesai33/quarry/pull/37) did in quarry's executor): it fixes the pool, not a connection pipelined by its owner (a `begin` and a timed query issued together), and costs each timed query a whole connection. Choose the framing when the query reaches the head of the queue: the status is still unknown while earlier queries are in flight, so it would have to wait for them, a round trip per timed query. `begin`/`set_config`/query/`commit` under one Sync: right outside a transaction, but inside one its `commit` would end the caller's transaction. Two statements for the set and the restore: once the query fails, the server skips the restore's Parse, while groups pipelined behind have already bound its name; one statement keeps its only Parse first in the group. Sending them unprepared avoids that too, but parsing them for every query cut timed throughput to about half of `main`'s.
+**Alternatives.** Route timed queries to exclusive use (`acquire`, what [#37](https://github.com/shlokdesai33/quarry/pull/37) did in quarry's executor until #38): it fixes the pool, not a connection pipelined by its owner (a `begin` and a timed query issued together), and costs each timed query a whole connection. Choose the framing when the query reaches the head of the queue: the status is still unknown while earlier queries are in flight, so it would have to wait for them, a round trip per timed query. `begin`/`set_config`/query/`commit` under one Sync: right outside a transaction, but inside one its `commit` would end the caller's transaction. Two statements for the set and the restore: once the query fails, the server skips the restore's Parse, while groups pipelined behind have already bound its name; one statement keeps its only Parse first in the group. Sending them unprepared avoids that too, but parsing them for every query cut timed throughput to about half of `main`'s.
 
 **Cost.** A custom placeholder setting, `quarry.statement_timeout`, exists in the session once a timed query ran (transaction-local, so `current_setting('quarry.statement_timeout', true)` is empty afterwards; not listed in `pg_settings`; harmless behind a pooler). A stale statement in a timed group isn't retried, since the statements after it were skipped (nor was it before, inside `begin … commit`). `vacuum` and `create index concurrently` with a timeout are refused as before ("cannot run inside a transaction block"). Relies on `statement_timeout` being re-armed for each Execute of a pipeline (PostgreSQL 13+).
 
 **Measured.** `pool.query('select $1::int')` from 200 callers on 4 connections, Node 24, PostgreSQL 18 on the same 4-core VM, median of 3 interleaved 2 s runs: every query timed 152,466 → 218,568/s (+43%); 1 in 10 timed 460,449 → 534,603/s (+16%; a timed query no longer makes its connection report a transaction, which stopped the pool pipelining onto it); untimed 551,240 → 546,982/s (unchanged path, within noise). At a simulated 5 ms round trip all three are bound by the callers (31,700–35,300/s either way). One Sync per timed query instead of four.
 
-**Code.** [connection.ts](connection.ts) `#queryWithTimeout`, `STATEMENT_TIMEOUT`; [ops.ts](ops.ts) `SyncGroupOp`.
+Builder point lookups (`selectFrom(users).where(id).select([3 columns]).expectOne().execute({ timeout: '5s' })`) on a pool of 10, shared instead of a connection each, same VM, median of 3 interleaved 2 s runs, the 5 ms round trip simulated in the socket:
+
+| Round trip | Callers | Before (`acquire`) | After (shared) | Untimed, after |
+| ---------- | ------- | ------------------ | -------------- | -------------- |
+| 0 ms       | 100     | 33,233/s           | 57,208/s       | 75,783/s       |
+| 0 ms       | 500     | 31,390/s           | 59,076/s       | 81,176/s       |
+| 5 ms       | 100     | 1,738/s            | 14,640/s       | 15,142/s       |
+| 5 ms       | 500     | 1,729/s            | 48,548/s       | 54,595/s       |
+
+Untimed lookups are unchanged (77,092, 79,339, 14,941 and 56,411/s before).
+
+**Code.** [connection.ts](connection.ts) `#queryWithTimeout`; [ops.ts](ops.ts) `STATEMENT_TIMEOUT`, `SyncGroupOp`, `CursorOp`; [../driver-executor.ts](../driver-executor.ts) `#shared`.
 
 ### Every wait has a timeout
 

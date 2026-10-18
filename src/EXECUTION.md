@@ -163,7 +163,7 @@ async execute(query, options = {}) {
 	const observe = this.#options.onQuery !== undefined;
 	const start = observe ? performance.now() : 0;
 	try {
-		const pool = this.#shared(options.timeout, query); // the pool, if the query can share its connections
+		const pool = this.#shared(query);                  // the pool, if the query can share its connections
 		let result;
 		if (pool !== undefined) {
 			if (!this.#ready) await this.#prepare(pool);
@@ -202,23 +202,22 @@ async execute(query, options = {}) {
 
 Over a pool, an operation runs either on the pool's **shared** connections, pipelined with other callers' queries, or on a connection **of its own**, depending on whether it leaves anything on the connection that another caller's query could see:
 
-| Operation                                                                                                                                                    | Over a pool                                              | Why                                                                                                                                                                                                   |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `execute()`: a builder query or a `db.sql` statement                                                                                                         | shared: `pool.query`                                     | one statement with its own Sync; nothing stays on the connection                                                                                                                                      |
-| `describe()`                                                                                                                                                 | shared: `pool.describe`                                  | the same                                                                                                                                                                                              |
-| `db.batch` (default)                                                                                                                                         | shared: `pool.withShared`, one connection, one write     | independent statements, each with its own Sync                                                                                                                                                        |
-| `execute()` or `db.batch` with a `timeout`                                                                                                                   | its own: `pool.acquire()`                                | the timeout is `begin` / `set_config(…, true)` / query / `commit`, framed by the connection's transaction status, which other callers' pipelined queries change ([below](#timeouts-and-cancellation)) |
-| `db.sql` whose first keyword changes session or transaction state: `begin`, `commit`, `set`, `reset`, `discard`, `listen`, `declare`, `create temp table`, … | its own: `pool.acquire()`                                | queries pipelined behind it would run in that state (inside the transaction a `begin` opens)                                                                                                          |
-| `db.batch(…, { transaction })`                                                                                                                               | its own: `pool.acquire()`                                | BEGIN … COMMIT                                                                                                                                                                                        |
-| `db.transaction`                                                                                                                                             | its own: `pool.transaction`                              | the whole callback                                                                                                                                                                                    |
-| `stream()`                                                                                                                                                   | its own: `pool.acquire()`, held until the iteration ends | the cursor's portal (and, with a `timeout`, its transaction)                                                                                                                                          |
+| Operation                                                                                                                                                    | Over a pool                                              | Why                                                                                                                           |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `execute()`: a builder query or a `db.sql` statement, with or without a `timeout`                                                                            | shared: `pool.query`                                     | one statement with its own Sync (a `timeout` shares it: [below](#timeouts-and-cancellation)); nothing stays on the connection |
+| `describe()`                                                                                                                                                 | shared: `pool.describe`                                  | the same                                                                                                                      |
+| `db.batch` (default, `timeout` or not)                                                                                                                       | shared: `pool.withShared`, one connection, one write     | independent statements, each with its own Sync                                                                                |
+| `db.sql` whose first keyword changes session or transaction state: `begin`, `commit`, `set`, `reset`, `discard`, `listen`, `declare`, `create temp table`, … | its own: `pool.acquire()`                                | queries pipelined behind it would run in that state (inside the transaction a `begin` opens)                                  |
+| `db.batch(…, { transaction })`                                                                                                                               | its own: `pool.acquire()`                                | BEGIN … COMMIT                                                                                                                |
+| `db.transaction`                                                                                                                                             | its own: `pool.transaction`                              | the whole callback                                                                                                            |
+| `stream()`                                                                                                                                                   | its own: `pool.acquire()`, held until the iteration ends | the cursor's portal, which holds the connection between batches                                                               |
 
 COPY and LISTEN aren't builder operations: the driver's `pool.copyFrom`, `copyRows` and `copyTo` take a connection of their own, and `pool.listen` a dedicated one outside `max` ([driver/POOL.md](driver/POOL.md#two-ways-to-use-a-connection)).
 
 ```ts
-#shared(timeout, queries): Pool | undefined {
+#shared(queries): Pool | undefined {
 	const source = this.#source;
-	if (!(source instanceof Pool) || timeout !== undefined) return undefined;
+	if (!(source instanceof Pool)) return undefined;
 	// undefined as well when a statement matches SESSION_STATEMENT
 	return source;
 }
@@ -228,7 +227,7 @@ COPY and LISTEN aren't builder operations: the driver's `pool.copyFrom`, `copyRo
 
 **What sharing doesn't see.** The keyword check only reads a statement's first word. Session state a `select` sets (`set_config(…, false)`, `pg_advisory_lock`) or a `do` block, run with `db.sql` on a pool, lands on whichever connection runs it and stays there, as it always did. For session state, reserve a connection (`database(await pool.acquire())`) or use a transaction (`tx.setLocal`, `pg_advisory_xact_lock`).
 
-**Its own.** `#run` reserves a connection with `pool.acquire()` (or `pool.transaction` holds one for the callback), runs the operation, and releases it; the driver still pipelines what quarry sends together on it: a transaction's BEGIN with its first statement, a timeout's BEGIN/`set_config`/query/COMMIT, an atomic batch.
+**Its own.** `#run` reserves a connection with `pool.acquire()` (or `pool.transaction` holds one for the callback), runs the operation, and releases it; the driver still pipelines what quarry sends together on it: a transaction's BEGIN with its first statement, an atomic batch.
 
 ```ts
 async #run(signal, fn) {
@@ -351,7 +350,7 @@ await db.transaction(async (tx) => {
 
 1. Refuses a `timeout` inside a transaction (other queries of the transaction run between the stream's batches, so a transaction-local `statement_timeout` would apply to them too; use `tx.setLocal`).
 2. Over a pool, **acquires a connection** when the first batch is asked for, and releases it in `finally`, however the iteration ends: read to the end, `break`, `return`, a throw, an abort. Inside a transaction, it uses the transaction's connection.
-3. Iterates `runner.cursor(sql, params, { batchSize, …codecs, signal, statementTimeout })` ([driver/STREAMING.md](driver/STREAMING.md#cursors)): each batch is fetched only once the rows before it are taken, columns come in their codecs' formats (binary where they can) **from the first run**, and outside a transaction a `timeout` becomes the cursor's `statementTimeout`, run as pipelined `begin` / `set_config(…, true)` / cursor / `commit`, so it bounds the whole stream (the loop's time included) and can't leak.
+3. Iterates `runner.cursor(sql, params, { batchSize, …codecs, signal, statementTimeout })` ([driver/STREAMING.md](driver/STREAMING.md#cursors)): each batch is fetched only once the rows before it are taken, columns come in their codecs' formats (binary where they can) **from the first run**, and outside a transaction a `timeout` becomes the cursor's `statementTimeout`: the driver sets it before the portal and restores it before the portal's Sync, so it bounds the whole stream (the loop's time included) and can't leak.
 4. Decorates an error with the query and the call site, as `execute` does; an error in the middle (a division by zero at row 10,001) rejects the pull that reaches it, after the rows before it.
 5. Reports one `onQuery` event of kind `'stream'` with the total row count.
 
@@ -367,6 +366,8 @@ The keyset helpers (`iterateChunks`, `paginateByCursor`, `paginateByOffset`) are
 ```
 C> <set statement_timeout = $1>  <the query>  <restore it>  Sync   (one write)
 ```
+
+Since that leaves nothing on the connection, a query or a default `db.batch` with a `timeout` runs on the pool's shared, pipelined connections like any other ([above](#connections-shared-or-exclusive)): each of the batch's queries gets its own. On a `stream()`, the setting goes before the cursor's portal and the restore before its Sync.
 
 A canceled query fails with `QueryCanceled` (`reason`: `'abort'`, `'timeout'`, `'statement_timeout'` or `'user'`). The mechanics are in [driver/CANCELLATION.md](driver/CANCELLATION.md).
 

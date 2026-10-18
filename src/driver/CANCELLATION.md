@@ -108,7 +108,7 @@ A cursor ([STREAMING.md](STREAMING.md#cursors)) spends most of its life **suspen
 - **Between batches**: close the portal (Close + Sync outside a transaction), with no cancel request; the next pull rejects with `AbortError` ("The cursor was aborted" / "timed out").
 - **While a batch runs**: ask the server to cancel it, as for a query; the batch fails with `QueryCanceled` (`reason: 'abort'` or `'timeout'`). Inside a transaction that fails the transaction, like any canceled statement.
 
-`statementTimeout` on a cursor bounds it from its first batch to its last, the consumer's time included, because a suspended portal keeps `statement_timeout` running across Executes.
+`statementTimeout` on a cursor bounds it from its first batch to its last, the consumer's time included, because a suspended portal keeps `statement_timeout` running across Executes ([framed like a query's](#a-cursors-statement-timeout)).
 
 ## Statement timeouts
 
@@ -151,6 +151,19 @@ Numbers are milliseconds (`'2000ms'`); strings are any Postgres interval (`'2s'`
 In one Sync group nothing can come between the setting, the query and the restore, and the same statements are right in or out of a transaction block, so the status isn't read. Behind PgBouncer in transaction mode, the group ends with one Sync and ReadyForQuery, so the server connection stays linked for all three and is released after, as for any query.
 
 `S` is one statement for both ends because its Parse then comes first in the group, where nothing can make the server skip it. With two statements, a query that failed made the server skip the restore's Parse, while groups pipelined behind it had already bound that name (`26000 prepared statement does not exist`).
+
+Because the timeout leaves nothing on the connection, quarry's executor runs a builder query or a default `db.batch` with a `timeout` on the pool's shared, pipelined connections, like any other ([../EXECUTION.md](../EXECUTION.md#connections-shared-or-exclusive)).
+
+<a id="a-cursors-statement-timeout"></a>
+**A cursor's statement timeout.** A cursor with a `statementTimeout` is always opened as an unnamed portal in the implicit transaction of one Sync (the kind used outside a transaction: [STREAMING.md](STREAMING.md#cursors)), whatever the transaction status says, and `CursorOp` frames it like a query:
+
+```
+C> S('2000ms')  Parse/Bind/Execute(portal) Flush   … Execute Flush per batch …   [Close]  S(null)  Sync
+```
+
+`S` (unnamed: a cursor runs rarely enough) shares the portal's implicit transaction, so the setting covers every batch; outside a transaction block the Sync ends it, inside one the restore does. The restore is written only once nothing the portal asked for is unanswered (its statement's Describe, a running batch), so its answers come last and can't be mistaken for the portal's: a cursor closed while the server runs a batch writes Close, the restore and Sync when that batch ends, which costs nothing, since the server finishes the batch anyway. After an error the server skips to the Sync, restore included, which a failed implicit transaction doesn't need (an explicit one is failed and rolls the setting back). A cursor that goes stale on its first batch is reopened with `S` again, since its implicit transaction ended with the error.
+
+Until #38 the cursor read the status instead: when idle it queued `begin` and the setting before the cursor and `commit` after it, each with its own Sync, so behind a `begin` not yet answered, its `commit` committed the other caller's transaction. The refusal inside a transaction (whose other queries run between a held portal's batches) now comes from the `Transaction`, which knows it is one; on a plain connection after `begin`, a timed cursor holds the connection between batches, like a cursor outside a transaction.
 
 ## `QueryCanceled` and its reason
 
