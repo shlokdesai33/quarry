@@ -269,7 +269,65 @@ describe.skipIf(noPg)('builder queries on a pool', () => {
 		}
 	});
 
-	it('gives transactions, streams, atomic batches, timeouts and session statements a connection of their own', async () => {
+	it('pipelines queries and batches with a timeout on the shared connections, each bounding only itself', async () => {
+		const net = slowSockets(5);
+		await using p = pool({ max: 1, pipeline: 20, socket: net.factory });
+		const db = database(p);
+		await backendPid(db);
+		const acquire = vi.spyOn(p, 'acquire');
+		const withShared = vi.spyOn(p, 'withShared');
+		net.reset();
+		const [slow, canceled, untimed, batch, failed] = await Promise.all([
+			db.sql<{
+				pid: number;
+			}>`select pg_backend_pid() as pid, pg_sleep(0.2)::text as slept`
+				.expectOne()
+				.execute({ timeout: '5s' }),
+			rejection(
+				db.sql`select pg_sleep(3)`.execute({ timeout: 100 }),
+				QueryCanceled,
+			),
+			// behind both, without a timeout: runs past the 100 ms
+			db.sql<{
+				slept: string;
+			}>`select pg_sleep(0.3)::text as slept`
+				.expectValue()
+				.execute(),
+			db.batch([lookup(db, 1), lookup(db, 2)], { timeout: '5s' }),
+			rejection(
+				db.batch([lookup(db, 3), db.sql`select pg_sleep(3)`], { timeout: 100 }),
+				BatchError,
+			),
+		]);
+		expect(slow.pid).toBe(await backendPid(db));
+		expect(canceled.reason).toBe('statement_timeout');
+		expect(untimed).toBe('');
+		expect(batch).toEqual([
+			{ id: 1, name: 'item 1' },
+			{ id: 2, name: 'item 2' },
+		]);
+		expect(failed.results.map((r) => r.status)).toEqual([
+			'fulfilled',
+			'rejected',
+		]);
+		const reason =
+			failed.results[1]?.status === 'rejected' && failed.results[1].reason;
+		expect(reason).toBeInstanceOf(QueryCanceled);
+		expect((reason as QueryCanceled).reason).toBe('statement_timeout');
+		// all in flight together on the one connection
+		expect(net.maxInFlight()).toBeGreaterThanOrEqual(7);
+		expect(withShared).toHaveBeenCalledTimes(2);
+		expect(acquire).not.toHaveBeenCalled();
+		expect(
+			await db.sql<{
+				t: string;
+			}>`select current_setting('statement_timeout') as t`
+				.expectValue()
+				.execute(),
+		).toBe('0');
+	});
+
+	it('gives transactions, streams, atomic batches and session statements a connection of their own', async () => {
 		await using p = pool({ max: 2 });
 		const db = database(p);
 		await Promise.all([backendPid(db), backendPid(db)]);
@@ -290,16 +348,6 @@ describe.skipIf(noPg)('builder queries on a pool', () => {
 		}
 		expect(acquire).toHaveBeenCalledTimes(1);
 
-		const slow = db.sql<{
-			pid: number;
-		}>`select pg_backend_pid() as pid, pg_sleep(0.2)::text as slept`
-			.expectOne()
-			.execute({ timeout: '5s' });
-		await sleep(50);
-		const duringTimeout = await sharedPids(db);
-		expect(duringTimeout).not.toContain((await slow).pid);
-		expect(acquire).toHaveBeenCalledTimes(2);
-
 		const atomic = db.batch(
 			[
 				db.sql<{
@@ -311,10 +359,7 @@ describe.skipIf(noPg)('builder queries on a pool', () => {
 		await sleep(50);
 		const duringAtomic = await sharedPids(db);
 		expect(duringAtomic).not.toContain((await atomic)[0].pid);
-		expect(acquire).toHaveBeenCalledTimes(3);
-
-		await db.batch([lookup(db, 1)], { timeout: '5s' });
-		expect(acquire).toHaveBeenCalledTimes(4);
+		expect(acquire).toHaveBeenCalledTimes(2);
 
 		for (const statement of [
 			db.sql`set application_name = 'quarry_session'`,
@@ -324,10 +369,10 @@ describe.skipIf(noPg)('builder queries on a pool', () => {
 			db.sql`create temp table scratch (id int)`,
 		])
 			await statement.execute();
-		expect(acquire).toHaveBeenCalledTimes(8);
+		expect(acquire).toHaveBeenCalledTimes(6);
 		// a connection left in a transaction is closed, not shared
 		await sharedPids(db);
-		expect(acquire).toHaveBeenCalledTimes(8);
+		expect(acquire).toHaveBeenCalledTimes(6);
 		expect(
 			await db.sql<{
 				n: string;
@@ -335,7 +380,7 @@ describe.skipIf(noPg)('builder queries on a pool', () => {
 				.expectValue()
 				.execute(),
 		).toBe('10');
-		expect(acquire).toHaveBeenCalledTimes(8);
+		expect(acquire).toHaveBeenCalledTimes(6);
 	});
 });
 
