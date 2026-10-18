@@ -90,7 +90,7 @@ const timeoutOf = async (conn: Pick<Connection, 'query'>) =>
 		)
 	).rows[0]?.t;
 
-describe.skipIf(noPg).each(targets)('statementTimeout %s', (_, target) => {
+describe.skipIf(noPg).each(targets)('statementTimeout %s', (_name, target) => {
 	let name: string;
 	beforeAll(async () => {
 		name = table('st');
@@ -234,6 +234,21 @@ describe.skipIf(noPg).each(targets)('statementTimeout %s', (_, target) => {
 		expect(unbounded).toEqual([]);
 		expect(failed).toEqual([]);
 		for (let i = 0; i < 4; i++) expect(await timeoutOf(pool)).toBe('0');
+	});
+
+	it('runs timed queries pipelined behind one that fails on a new connection', async () => {
+		await using conn = await open(target());
+		const [failed, ...rest] = await Promise.allSettled([
+			conn.query('select pg_sleep(1)', [], { statementTimeout: 20 }),
+			conn.query('select 1 as x', [], { statementTimeout: '1s' }),
+			conn.query('select 2 as x', [], { statementTimeout: '1s' }),
+		]);
+		expect(failed?.status === 'rejected' && failed.reason).toBeInstanceOf(
+			QueryCanceled,
+		);
+		expect(
+			rest.map((r) => (r.status === 'fulfilled' ? r.value.rows : r.reason)),
+		).toEqual([[{ x: 1 }], [{ x: 2 }]]);
 	});
 
 	it('is written with its query under one Sync', async () => {

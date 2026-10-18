@@ -109,8 +109,9 @@ export interface QueryOptions {
 	/**
 	 * A server-side `statement_timeout` for this query only (milliseconds,
 	 * or a Postgres interval such as `'2s'`). Applied with
-	 * `set_config(…, true)`: outside a transaction the query is wrapped in
-	 * `begin … commit`; inside one, the previous value is restored after it.
+	 * `set_config(…, true)` just before the query and restored just after
+	 * it, all three under the query's Sync, so it bounds this query alone,
+	 * in a transaction or not, whatever else is pipelined.
 	 */
 	readonly statementTimeout?: number | string;
 	/** Receives where the query spent its time once it settles. */
@@ -170,16 +171,18 @@ type Listener<T> = (value: T) => void;
 const FLUSH_BYTES = 65_536;
 
 /**
- * Sets `statement_timeout` to $1 until the transaction ends, keeping the
- * value it replaces in a custom setting, `quarry.statement_timeout`
- * (transaction-local too): the select list is evaluated in order.
+ * With $1, sets `statement_timeout` to it until the transaction ends,
+ * keeping the value it replaces in a custom setting,
+ * `quarry.statement_timeout` (transaction-local too; `||` evaluates its
+ * left side first). With null, puts that value back.
+ *
+ * One statement for both, so a group's only Parse of it comes first,
+ * where nothing can make the server skip it: groups pipelined behind
+ * bind its name before it is answered.
  */
-const SET_STATEMENT_TIMEOUT =
-	"select set_config('quarry.statement_timeout', current_setting('statement_timeout'), true), set_config('statement_timeout', $1, true)";
-/** Puts back the value `SET_STATEMENT_TIMEOUT` replaced. */
-const RESTORE_STATEMENT_TIMEOUT =
-	"select set_config('statement_timeout', current_setting('quarry.statement_timeout'), true)";
-const UNNAMED = { prepare: false } as const;
+const STATEMENT_TIMEOUT =
+	"select case when $1::text is null then set_config('statement_timeout', current_setting('quarry.statement_timeout'), true) else set_config('quarry.statement_timeout', current_setting('statement_timeout'), true) || set_config('statement_timeout', $1, true) end";
+const STATEMENT_TIMEOUT_OPTIONS = { paramTypes: [25] } as const;
 
 /**
  * One session with the server. Queries can be issued concurrently: they
@@ -1288,12 +1291,18 @@ export class Connection implements AsyncDisposable {
 				? `${statementTimeout}ms`
 				: statementTimeout;
 		const [set, query, restore] = this.#queryGroup(
-			// unnamed: once the query fails, the server skips the restore's
-			// Parse, while groups pipelined behind would Bind the name
 			[
-				{ sql: SET_STATEMENT_TIMEOUT, params: [interval], options: UNNAMED },
+				{
+					sql: STATEMENT_TIMEOUT,
+					params: [interval],
+					options: STATEMENT_TIMEOUT_OPTIONS,
+				},
 				{ sql, params, options: rest },
-				{ sql: RESTORE_STATEMENT_TIMEOUT, options: UNNAMED },
+				{
+					sql: STATEMENT_TIMEOUT,
+					params: [null],
+					options: STATEMENT_TIMEOUT_OPTIONS,
+				},
 			],
 			signal,
 			timeout,
