@@ -190,6 +190,20 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
 
 **Code.** [connection.ts](connection.ts) `#statement`.
 
+### Statements keyed by their SQL, with the declared types compared
+
+**What it is.** A cached statement is found by its SQL text, and its declared parameter types are compared with the query's. Only the same SQL with other types gets a combined key, `types\0sql` ([ARCHITECTURE.md](ARCHITECTURE.md#entries)).
+
+**Why.** The key used to be `types\0sql` whenever a type was declared, which is every query of quarry's builder (its codecs declare them). That string was built and hashed in full on every query, about 450 ns for a 200-character point lookup even when the SQL string itself was a constant. Keyed by the SQL, a string used again keeps its hash, and a hit is a `Map` lookup and a comparison of a few numbers.
+
+**Alternatives.** A cache of compiled queries in the builder that hands back the same SQL string each time: it doesn't help while the key is a new string per query, and the builder's tree is new per query too ([../COMPILER.md](../COMPILER.md#what-is-rendered-once)). A two-level map (SQL, then types): a second structure to evict from, for a case (one SQL, several type lists) that hardly happens.
+
+**Cost.** A miss also tries the combined key, so SQL that never repeats builds one key per query, as before. Each statement keeps its SQL and a copy of its types.
+
+**Measured.** With the builder's own caches ([../DECISIONS.md](../DECISIONS.md#columns-resolved-and-quoted-once-per-table)), a builder point lookup at 100 concurrent callers went from 5.8 to 4.8 µs of client CPU (in-process, Node 24, 0 ms RTT).
+
+**Code.** [connection.ts](connection.ts) `#statement`, `variantKey`.
+
 ### Retry a stale statement once, unprepared
 
 **What it is.** When a cached statement fails because the schema changed under it ("cached plan must not change result type", a parameter type that no longer fits, or the server no longer has it after `DEALLOCATE`/`DISCARD ALL`), the driver drops it and retries the query once as an unnamed statement, outside a transaction ([ops.ts](ops.ts) `staleStatement`).

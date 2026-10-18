@@ -120,7 +120,7 @@ Every join goes through `#joined(table)`: it refuses a table whose name is alrea
 .selectAll(users)                                         // every column of one table
 ```
 
-`selectionNodes(eb, list)` ([row.ts](row.ts)) makes one `SelectionNode` per entry: the expression's node, the **alias** (the column key after the dot, or the expression's alias), and the **codec** to read it with (the column's or typed expression's `DataType.codec`). Each call appends; the row type grows with it ([TYPES.md](TYPES.md#part-6-result-row-types)).
+`selectionNodes(eb, list)` ([row.ts](row.ts)) makes one `SelectionNode` per entry (a column's is made once per table and shared): the expression's node, the **alias** (the column key after the dot, or the expression's alias), and the **codec** to read it with (the column's or typed expression's `DataType.codec`). Each call appends; the row type grows with it ([TYPES.md](TYPES.md#part-6-result-row-types)).
 
 - **Each key can be in the row once.** Selecting a second `id` is a type error (`UniqueKeys`, an impossible extra argument naming the duplicate) and a build-time error (`checkUniqueKeys`); `.as('managerId')` resolves it. Before #32, two `id`s were both rendered and the driver's object row silently kept the last.
 - **`selectAll` lists the columns**, never `select *`: each column keeps its TypeScript key (`createdAt` from `created_at`) and its codec, and the SQL doesn't change meaning if the table gains a column.

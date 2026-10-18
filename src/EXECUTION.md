@@ -57,7 +57,7 @@ The `Database` object is a plain object of functions (`queries(executor)`), each
 | `codecs`    | quarry's         | codecs for result columns no query types ([below](#how-the-builder-picks-codecs))        |
 | `catalog`   | `true`           | look up named types (enums, `vector`, custom types) before the first query               |
 | `onQuery`   |                  | called once per query with its SQL, timings, row count, error ([below](#onquery-events)) |
-| `callsites` | `true`           | append the stack of the code that ran a query to its error                               |
+| `callsites` | `true`           | append the stack of the code awaiting a failed query to its error ([below](#errors))     |
 | `prepare`   | the connection's | use cached prepared statements                                                           |
 
 ## The `Executor` interface
@@ -160,7 +160,6 @@ With `catalog: false` it doesn't wait for it; the driver then loads the catalog 
 
 ```ts
 async execute(query, options = {}) {
-	const callsite = this.#callsite();                 // new Error(), unless callsites: false
 	const observe = this.#options.onQuery !== undefined;
 	const start = observe ? performance.now() : 0;
 	try {
@@ -178,7 +177,7 @@ async execute(query, options = {}) {
 		if (observe) this.#report('execute', query, start, acquired, timing, result.command, result.rowCount ?? result.rows.length);
 		return { rows: result.rows, rowCount: result.rowCount, command: result.command };
 	} catch (error) {
-		decorate(error, query, callsite);
+		decorate(error, query, issuedAt(this.#options)); // the call site, captured now: see Errors
 		if (observe) this.#report('execute', …, error);
 		throw error;
 	}
@@ -237,7 +236,7 @@ async #run(signal, fn) {
 	if (!(source instanceof Pool)) {
 		const runner = source instanceof PoolClient ? source.connection : source;
 		await this.#prepare(runner);
-		return fn(runner);
+		return await fn(runner); // awaited, so a failure's call site traces back through it
 	}
 	const client = await source.acquire(signal === undefined ? {} : { signal });
 	try {
@@ -410,11 +409,24 @@ The timestamps come from `performance.now()`; `queuedMs` and `execMs` come from 
 UniqueViolation: duplicate key value violates unique constraint "users_email_key"
     at … (driver internals)
     --- query issued at ---
-    at createUser (/app/src/users.ts:42:7)
-    at …
+    at DriverExecutor.execute (…/quarry/dist/index.js:…)
+    at async Query.execute (…/quarry/dist/index.js:…)
+    at async createUser (/app/src/users.ts:42:7)
+    at async signUp (/app/src/routes.ts:18:3)
 ```
 
-Without this, a server error's stack shows only the driver's code (the error is created when the server's reply is read, long after your call returned to the event loop). `#callsite()` captures `new Error()` at the start of every `execute` (a few hundred nanoseconds); `callsites: false` turns it off.
+Without this, a server error's stack shows only the driver's code (the error is created when the server's reply is read, long after your call returned to the event loop).
+
+**When the call site is captured.** Only when a query fails. `issuedAt()` creates the `Error` in `execute`'s `catch`, after the `await`, where the engine's **async stack trace** lists the async functions awaiting the query: `Query.execute`, then your function, then whatever awaits it, up to `Error.stackTraceLimit` frames (10 by default). Node, Deno, Bun and Workers all record them. A query that succeeds captures nothing. Before, `execute` and `batch` ran `new Error()` for every query: about 2 µs on V8 however few frames it keeps, a quarter of a pipelined point lookup's client CPU ([DECISIONS.md](DECISIONS.md#errors-carry-the-query-hidden-and-the-code-awaiting-it)).
+
+What it lists, compared with a stack taken when the query was issued:
+
+- `await q.execute()` in an async function: that function and its awaiting callers, those that resumed after an `await` of their own included (a stack taken at issue time ends at the first of them).
+- `Promise.all([q.execute(), …])`: `at async Promise.all (index 0)`, then the function awaiting it.
+- A plain function returning `q.execute()` to an async caller: the caller, not the plain function, which isn't awaiting anything.
+- A query started now and awaited later, or never: the code awaiting it **when it fails**, which may be no code of yours (the stack then ends at `Query.execute`).
+
+`batch` captures once, at its first failure, in its own continuation: `settle` runs after `await pool.withShared(…)` or inside `#run`'s callback, and `#run` awaits that callback, so the chain reaches `batchWith` and your code. Each link has to be an `await`; a returned promise breaks the chain. `stream` and `describe` still capture when they start: once per stream or description, not per query. `callsites: false` turns it all off.
 
 Error classes: the driver's `PostgresError` subclasses (`UniqueViolation`, `SerializationFailure`, …), `ConnectionError`, `DecodeError`, `AbortError`, `QueryCanceled`, `TransactionRolledBack`, all re-exported from `quarry` ([driver/ARCHITECTURE.md](driver/ARCHITECTURE.md#errors)); and quarry's own `NoRowError`, `TooManyRowsError`, `RowCountError`, `BatchError` ([QUERIES.md](QUERIES.md#errors)).
 
@@ -434,7 +446,7 @@ Why execution works this way. Each links to its full entry (what it is, why, the
 - [`db.batch`: two modes with names](DECISIONS.md#dbbatch-two-modes-with-names): "together" and "atomically" fail differently.
 - [`db.batch` framing: one write, with COMMIT pipelined unless results are checked](driver/DECISIONS.md#dbbatch-framing-one-write-with-commit-pipelined-unless-results-are-checked): how a batch goes on the wire.
 - [`stream()`: only for every-row reads, and it runs immediately](DECISIONS.md#stream-only-for-every-row-reads-and-it-runs-immediately): and why its `timeout` is refused in a transaction.
-- [Errors carry the query (hidden) and your call site](DECISIONS.md#errors-carry-the-query-hidden-and-your-call-site): debuggable without leaking parameters into logs.
+- [Errors carry the query (hidden) and the code awaiting it](DECISIONS.md#errors-carry-the-query-hidden-and-the-code-awaiting-it): debuggable without leaking parameters into logs, and without a stack captured per query.
 - [Nested `durable` transactions throw](DECISIONS.md#nested-durable-transactions-throw): a durable request never silently becomes a savepoint.
 
 ## Glossary

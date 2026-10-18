@@ -72,7 +72,10 @@ export interface DatabaseOptions {
 	readonly catalog?: boolean | undefined;
 	/** Called once per query with its SQL, tag, timings, row count and error. */
 	readonly onQuery?: ((event: QueryEvent) => void) | undefined;
-	/** Append the stack of the code that ran a query to its error (default true). */
+	/**
+	 * Append the stack of the code awaiting a failed query to its error,
+	 * captured when it fails (default true).
+	 */
 	readonly callsites?: boolean | undefined;
 	/** Use cached prepared statements (default: the connection's setting). */
 	readonly prepare?: boolean | undefined;

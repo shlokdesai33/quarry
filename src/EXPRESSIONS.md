@@ -68,46 +68,48 @@ The classes ([expression.ts](expression.ts)):
 
 ```ts
 return {
-	ref: (column) => { … },
+	ref: (column) => resolve(column).expression,
 	val: (value, codec) => param(value, codec),
 	fn: functions({ node, dataType }),
 	json: jsonFunctions({ node }),
 	and: junction('and'),
 	or: junction('or'),
-	not: (expression) => predicate({ kind: 'not', operand: expression._quarry.node }),
+	not: (expression) =>
+		predicate({ kind: 'not', operand: expression._quarry.node }),
 };
 ```
 
 - Every member is an arrow function that doesn't use `this`, so `({ ref, fn }) => …` destructuring works.
 - The runtime implementation only builds nodes; the `ExpressionBuilder<R>` **interface** supplies the precise types. That split is how all of quarry's expression code works: simple runtime, rich types on top.
-- Builders make a new `eb` whenever their table list changes (`select`, `innerJoin`, `on` each call `expressionBuilder(...tables)`), and callbacks for `where`, `on`, `select`, `set`, `returning` all receive the same kind of object.
+- An `eb` holds no per-query state, so a single table's is made once and shared (frozen); a scope of several tables gets a new one whenever the table list changes (`innerJoin`, `on`). Callbacks for `where`, `on`, `select`, `set`, `returning` all receive the same kind of object.
 
 ## References: `eb.ref`
 
 ```ts
-const resolve = (reference: string) => {
+const resolve = (reference: string): ResolvedColumn => {
+	let resolved = references.get(reference); // this scope's, by the string as written
+	if (resolved !== undefined) return resolved;
 	const dot = reference.indexOf('.');
-	const tableName = reference.slice(0, dot);
-	const key = reference.slice(dot + 1);
-	const column = tables.find((table) => table.name === tableName)?.schema
-		.columns[key];
-	if (column === undefined)
+	const table = tables.find(
+		(candidate) => candidate.name === reference.slice(0, dot),
+	);
+	resolved =
+		table === undefined
+			? undefined
+			: resolveColumn(table, reference.slice(dot + 1));
+	if (resolved === undefined)
 		throw new Error(`Unknown column reference "${reference}"`);
-	return {
-		node: {
-			kind: 'reference',
-			table: tableName,
-			column: column._quarry.columnName ?? key,
-		},
-		column,
-	};
+	references.set(reference, resolved);
+	return resolved;
 };
 ```
+
+`resolveColumn(table, key)` resolves a column **once per table object** and keeps the result in a `WeakMap`: the `ReferenceNode` (`{ kind: 'reference', table: table.name, column: column._quarry.columnName ?? key }`), the typed expression `eb.ref` returns, and the `SelectionNode` a select list uses. Every query over the table shares them; nodes are immutable, and the compiler renders their SQL once ([COMPILER.md](COMPILER.md#what-is-rendered-once)).
 
 - The reference is split at the **first** dot: table (or alias) name, then the TypeScript key.
 - The node records the table **as referenced** (`managers` for an alias) and the column's **database** name (`created_at` for key `createdAt`). So the tree is already in database terms, and the compiler needs no schema.
 - `eb.ref` returns a `TypedExpression` with the column's `DataType`, so values compared with it are encoded by the column's codec.
-- `nameReference(node, column)` ([comparison.ts](comparison.ts)) remembers the reference as you wrote it (`users.createdAt`) in a `WeakMap`, only so error messages can name it ([below](#undefined-is-refused)).
+- `nameReference(node, reference)` ([comparison.ts](comparison.ts)) remembers the reference as written (`users.createdAt`) in a `WeakMap`, only so error messages can name it ([below](#undefined-is-refused)). It runs once per column, when `resolveColumn` makes the node.
 
 Functions accept a reference string directly (`eb.fn.lower('users.email')`) and resolve it the same way through the `node`/`dataType` helpers passed to `functions()`.
 
