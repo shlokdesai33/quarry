@@ -179,7 +179,7 @@ const WIDTH_BACKOFF = 64;
  *   rate before (a clock read per 256 completions while judged);
  * - below `STALLED_LOW`, while queries are pipelined or queued at the
  *   width, it grows by one. A growth that brings stalls back makes the
- *   next one wait twice as long; one that holds lets the next follow.
+ *   next one wait twice as long; one that holds halves the wait.
  *
  * So the pool settles at the widest the server runs without stalls.
  * Queries beyond the width's pipelines wait in the shared queue, in
@@ -368,8 +368,8 @@ export class Width {
 		}
 		if (stalled >= STALLED_LOW || !demand || this.limit >= this.#max)
 			return false;
-		// the last try held: the server has room again, so keep growing
-		if (this.#probing) this.#growBackoff = 1;
+		// the last try held: try again sooner
+		if (this.#probing) this.#growBackoff = Math.max(1, this.#growBackoff >> 1);
 		this.#probing = true;
 		this.#settling = true;
 		this.#epoch(now);
