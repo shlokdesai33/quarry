@@ -270,6 +270,20 @@ export function slowSockets(delay: number): {
 	};
 }
 
+/** A connection of `timeSlicedSockets`, as the simulated server sees it. */
+interface Backend {
+	held: Uint8Array[];
+	/** When its oldest held reply arrived. */
+	heldSince: number;
+	deliver: (data: Uint8Array) => void;
+	lastWrite: number;
+}
+
+/** Delivers a backend's held replies. */
+function flush(backend: Backend): void {
+	for (const data of backend.held.splice(0)) backend.deliver(data);
+}
+
 /**
  * A socket factory that makes the server look like one with `cpus` CPUs
  * time-slicing its backends: a connection's replies are delivered only
@@ -287,24 +301,14 @@ export function timeSlicedSockets(
 	/** Stops time-slicing: every connection gets a CPU of its own. */
 	stop(): void;
 } {
-	interface Backend {
-		held: Uint8Array[];
-		/** When its oldest held reply arrived. */
-		heldSince: number;
-		deliver: (data: Uint8Array) => void;
-		lastWrite: number;
-	}
 	const backends: Backend[] = [];
 	let running = new Set<Backend>();
-	const flush = (backend: Backend) => {
-		for (const data of backend.held.splice(0)) backend.deliver(data);
-	};
 	// the ones waiting longest run next
 	const schedule = () => {
 		running = new Set(
 			backends
 				.filter((b) => b.held.length > 0)
-				.sort((a, b) => a.heldSince - b.heldSince)
+				.toSorted((a, b) => a.heldSince - b.heldSince)
 				.slice(0, cpus),
 		);
 		for (const backend of running) flush(backend);

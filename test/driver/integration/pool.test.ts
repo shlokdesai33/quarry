@@ -37,15 +37,15 @@ const waited = async (work: () => Promise<unknown>) => {
 };
 /** Runs `op` in a loop on `callers` callers until stopped. */
 const sustain = (callers: number, op: () => Promise<unknown>) => {
-	let running = true;
+	const state = { running: true };
 	const all = Promise.all(
 		Array.from({ length: callers }, async () => {
-			while (running) await op();
+			while (state.running) await op();
 		}),
 	);
 	return {
 		stop: () => {
-			running = false;
+			state.running = false;
 			return all;
 		},
 	};
