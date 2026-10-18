@@ -253,7 +253,12 @@ export class Width {
 
 	/** Whether a connection has completed nothing while the rest of the pool completed everything in flight. */
 	stalls(slot: WidthSlot, inFlight: number): boolean {
-		return slot.shared > 0 && this.#ticks - slot.lastDone > inFlight + 16;
+		return slot.shared > 0 && slot.lastDone < this.stalledBefore(inFlight);
+	}
+
+	/** A connection with queries in flight whose last completion came before this count stalls. */
+	stalledBefore(inFlight: number): number {
+		return this.#ticks - inFlight - 16;
 	}
 
 	/** Queries are pipelined, or queued, because every connection the width allows is in use. */
@@ -1138,23 +1143,28 @@ export class Pool implements AsyncDisposable {
 		// a stalled connection (behind a slow query, or a backend off its CPU) only if every one is
 		let stalled: Slot | undefined;
 		let fewestStalled = Number.POSITIVE_INFINITY;
+		const stalledBefore =
+			this.#width?.stalledBefore(this.#inFlight) ?? Number.NEGATIVE_INFINITY;
 		for (const slot of this.#slots.values()) {
 			const count = slot.shared;
+			if (count < 0) continue;
+			const fresh = count === 0 || slot.lastDone >= stalledBefore;
+			// the cheap checks first: this runs per connection per query
 			if (
-				count >= 0 &&
-				(count < fewest || count < fewestStalled) &&
-				// below the floor, without a lookup: this runs per connection per query
+				fresh ? count >= fewest : best !== undefined || count >= fewestStalled
+			)
+				continue;
+			if (
+				// below the floor, without a lookup
 				(count < this.#pipeline || count < this.#depth(slot)) &&
 				!this.#draining.has(slot) &&
 				!slot.retiring &&
 				this.#shareable(slot)
 			) {
-				if (this.#width?.stalls(slot, this.#inFlight) !== true) {
-					if (count < fewest) {
-						best = slot;
-						fewest = count;
-					}
-				} else if (count < fewestStalled) {
+				if (fresh) {
+					best = slot;
+					fewest = count;
+				} else {
 					stalled = slot;
 					fewestStalled = count;
 				}

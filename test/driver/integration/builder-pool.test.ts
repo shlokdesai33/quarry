@@ -10,7 +10,14 @@ import { codecs } from '../../../src/driver/codecs.js';
 import { PostgresError, QueryCanceled } from '../../../src/driver/errors.js';
 import { createPool, type PoolOptions } from '../../../src/driver/pool.js';
 import { sql } from '../../../src/sql.js';
-import { noPg, options, rejection, slowSockets, table } from './helpers.js';
+import {
+	noPg,
+	options,
+	rejection,
+	slowSockets,
+	table,
+	timeSlicedSockets,
+} from './helpers.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const schema = table('builder_pool');
@@ -226,6 +233,38 @@ describe.skipIf(noPg)('builder queries on a pool', () => {
 		);
 		expect(net.maxInFlight()).toBe(22);
 		expect(one.stats).toMatchObject({ total: 1, busy: 0, waiting: 0 });
+	});
+
+	it('narrows builder queries and batches to the connections the server runs at once', async () => {
+		// one CPU time-slicing every backend with replies waiting (see pool.test.ts)
+		const net = timeSlicedSockets(1, 5);
+		await using p = pool({ max: 4, socket: net.factory });
+		const db = database(p);
+		const state = { running: true };
+		const load = Promise.all(
+			Array.from({ length: 200 }, async (_, i) => {
+				for (let n = 0; state.running; n++)
+					await (n % 10 === 0
+						? db.batch([lookup(db, 1 + (i % 1000)), lookup(db, 2)])
+						: lookup(db, 1 + ((i + n) % 1000)).execute());
+			}),
+		);
+		try {
+			let wide = false;
+			let streak = 0;
+			for (let i = 0; i < 200 && streak < 4; i++) {
+				await sleep(50);
+				const sending = net.sending(100);
+				if (sending === 4) wide = true;
+				streak = wide && sending <= 2 ? streak + 1 : 0;
+			}
+			expect(wide).toBe(true);
+			expect(streak).toBe(4);
+		} finally {
+			net.stop();
+			state.running = false;
+			await load;
+		}
 	});
 
 	it('gives transactions, streams, atomic batches, timeouts and session statements a connection of their own', async () => {
