@@ -285,7 +285,10 @@ export function param(value: unknown, codec?: Codec): never {
 	return new MethodParam(value, codec) as never;
 }
 
+/** Data types are immutable: every predicate shares this one. */
+const BOOLEAN = new DataType('boolean');
+
 /** A boolean expression, with the boolean methods. */
 export function predicate(node: OperationNode): Predicate {
-	return typedExpression(node, new DataType('boolean'));
+	return typedExpression(node, BOOLEAN);
 }
