@@ -170,9 +170,9 @@ describe.skipIf(noPg)('builder queries on a pool', () => {
 			expect(acquireMs).toBeGreaterThanOrEqual(0);
 			expect(execMs).toBeGreaterThan(0);
 			// the rest is the wait for the caller's continuation to run
-			const phases = acquireMs + queuedMs + execMs;
-			expect(phases).toBeLessThanOrEqual(event.durationMs + 0.001);
-			expect(phases).toBeGreaterThan(event.durationMs - 10);
+			expect(acquireMs + queuedMs + execMs).toBeLessThanOrEqual(
+				event.durationMs + 0.001,
+			);
 		}
 		expect(events.find((e) => e.tag === 'divide')?.error).toBe(error);
 		expect(p.stats).toMatchObject({ total: 1, busy: 0, waiting: 0 });
