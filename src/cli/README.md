@@ -14,7 +14,7 @@ It loads your `quarry.config.ts`, runs [`db.verify`](../verify/README.md) on the
 - [Files](#files)
 - [What happens when you run it](#what-happens-when-you-run-it)
 - [Exit codes](#exit-codes)
-- [Why it is built this way](#why-it-is-built-this-way)
+- [Decisions](#decisions)
 
 ## The config file
 
@@ -68,9 +68,8 @@ export default defineConfig({ db: database(process.env.DATABASE_URL), schema });
 
 So a CI step `npx quarry verify --format github` fails the build on errors and shows each one as an annotation on the changed line.
 
-## Why it is built this way
+## Decisions
 
-- **Config as code** (`quarry.config.ts` exporting a real `Database`): the CLI connects exactly as your application does, with no second way to configure a connection.
-- **Dependency injection through `Io`**: the command is a function, testable without spawning processes.
-- **Re-launching for TypeScript** instead of bundling a TypeScript loader: no dependency, and on current Node versions nothing happens at all.
-- **Distinct exit codes** for "schema differs" and "couldn't check": CI can tell a drifted schema from a broken pipeline.
+Why the CLI works this way. Each links to its full entry (what it is, why, the alternatives, the cost, measured impact) in [DECISIONS.md](../DECISIONS.md):
+
+- [The CLI: config as code, re-launched for TypeScript, distinct exit codes](../DECISIONS.md#the-cli-config-as-code-re-launched-for-typescript-distinct-exit-codes): one way to configure a connection, no TypeScript loader dependency, CI can tell drift from breakage, and the command is a testable function.

@@ -22,7 +22,7 @@ Files: [../config.ts](../config.ts) (options), [../connect.ts](../connect.ts) (h
 - [Client certificates](#client-certificates)
 - [Crypto](#crypto)
 - [After startup: version check and capabilities](#after-startup-version-check-and-capabilities)
-- [Why it is built this way](#why-it-is-built-this-way)
+- [Decisions](#decisions)
 - [Glossary](#glossary)
 
 ## The whole sequence
@@ -329,18 +329,19 @@ On ReadyForQuery:
 2. **`detectCapabilities`**: `{ protocol, protocolMinor, serverVersion, saslMechanisms, pgbouncer }`, where `pgbouncer` is read from the parameters PgBouncer 1.26+ reports (`pgbouncer.version`, `.pool_mode`, `.max_prepared_statements`). Exposed as `connection.capabilities`.
 3. **Statement naming**: `naming(statementNames(capabilities.pgbouncer), config.preparePipelined)` decides whether cached statements are always named, named only when alone, or never ([../ARCHITECTURE.md](../ARCHITECTURE.md#part-8-behind-pgbouncer)).
 
-## Why it is built this way
+## Decisions
 
-- **libpq-compatible configuration**: the same connection strings, environment variables and `.pgpass` that every Postgres tool understands.
-- **`verify-full` by default for remote hosts**: secure unless you opt out, unlike libpq's `prefer`.
-- **Refuse extra bytes after the SSLRequest answer**: closes a known class of man-in-the-middle injection.
-- **SCRAM with channel binding when possible, and a verified server signature always**: the client authenticates the server, not just the reverse.
-- **`requireAuth`**: the server can't downgrade the client to sending a password in clear.
-- **Password functions called per connection**: rotating IAM tokens work without restarting the pool.
-- **Derived-key cache**: pools open quickly without weakening anything.
-- **Ask for 3.2, accept 3.0, retry once**: the stronger cancel keys where available, and compatibility with every pooler.
-- **PostgreSQL 18 minimum, with a clear error**: no compatibility code for old servers, and no silent misbehaviour on them.
-- **Work overlapped with network waits** (certificate files, `node:tls`, crypto modules): faster cold connects.
+Why connecting works this way. Each links to its full entry (what it is, why, the alternatives, the cost, measured impact) in [DECISIONS.md](../DECISIONS.md):
+
+- [libpq-compatible configuration](../DECISIONS.md#libpq-compatible-configuration): the same connection strings, environment variables and `.pgpass` every Postgres tool understands.
+- [`verify-full` by default, and strict TLS and SCRAM checks](../DECISIONS.md#verify-full-by-default-and-strict-tls-and-scram-checks): secure unless you opt out; extra bytes after SSLRequest refused; the server's SCRAM signature always verified; `requireAuth`.
+- [Password functions, called for every new connection](../DECISIONS.md#password-functions-called-for-every-new-connection): rotating IAM tokens work without restarting the pool.
+- [SCRAM with `node:crypto`, and a derived-key cache](../DECISIONS.md#scram-with-nodecrypto-and-a-derived-key-cache): pools open quickly without weakening anything.
+- [A TLS secure-context cache](../DECISIONS.md#a-tls-secure-context-cache): the CA is parsed once, not per connection.
+- [Lazy `node:tls`, `getBuiltinModule`, and preloading](../DECISIONS.md#lazy-nodetls-getbuiltinmodule-and-preloading): work overlapped with network waits: faster cold connects.
+- [Ask for protocol 3.2, accept 3.0, retry once](../DECISIONS.md#ask-for-protocol-32-accept-30-retry-once): stronger cancel keys where available, compatibility with every pooler.
+- [PostgreSQL 18 or later only](../DECISIONS.md#postgresql-18-or-later-only): with a clear error on older servers.
+- [`close()` with libpq semantics](../DECISIONS.md#close-with-libpq-semantics): no waiting for the backend to exit.
 
 ## Glossary
 

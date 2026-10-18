@@ -18,6 +18,7 @@ Related: [column/README.md](column/README.md) (what columns are), [EXPRESSIONS.m
 - [Part 8: Tricks for better errors](#part-8-tricks-for-better-errors)
 - [Part 9: Type-checking speed](#type-checking-speed)
 - [Testing the types](#testing-the-types)
+- [Decisions](#decisions)
 - [Glossary](#glossary)
 
 ## Part 1: The TypeScript you need
@@ -399,6 +400,73 @@ type JoinedBy<Q, P extends readonly AnyTable[]> =
 		: never;
 ```
 
+### Outer joins: `NullableTable`
+
+<a id="outer-joins-nullabletable"></a>
+A left join keeps rows with no match, so the joined table's columns can be NULL in the result even when the columns are `not null`. The scope must say so, or `row.title` would be typed `string` and arrive as `null`. [table.ts](table.ts):
+
+```ts
+interface NullableColumn<C extends AnyColumn> {
+	readonly $select: C['$select'] | null; // only this changes
+	readonly $insert: C['$insert'];
+	readonly $update: C['$update'];
+	readonly _quarry: C['_quarry']; // same SQL type, methods and codec
+}
+type NullableTable<X> =
+	X extends Table<infer N, infer S>
+		? Table<
+				N,
+				{
+					columns: {
+						[K in keyof S['columns']]: NullableColumn<S['columns'][K]>;
+					};
+				}
+			>
+		: never;
+```
+
+`leftJoin(posts)` puts `NullableTable<typeof posts>` into the scope tuple; `rightJoin` turns the earlier tables into `NullableTables<T>` (a mapped tuple type) **and** the row already selected into `NullableRow<O>` (every key `| null`); `fullJoin` does both. Since only `$select` changes, comparisons on an outer table still take the column's values and its codec still decodes it: nullability is a property of the row, not of the SQL type. The run-time table object is the same; the cast in each join method is the type-level change only.
+
+### `setEach`: rows in scope
+
+<a id="seteach-rows-in-scope"></a>
+`setEach(rows, { key, as })` adds the rows to the update's scope as a pseudo-table named `A` (`'row'` by default). The update builder therefore has a fourth type parameter `R` (its scope, defaulting to `RefsOf<[T]>`), and `setEach` returns `UpdateQueryBuilder<T, O, Exclude<M, UpdateNeeds>, R & SetEachRefs<T, K, A>>`:
+
+```ts
+type SetEachRefs<T, K, A> = {
+	[C in K | UpdateKey<T> as `${A}.${C}`]: RowColumn<
+		Columns<T>[C],
+		C extends K
+			? NonNullable<Columns<T>[C]['$select']>
+			: Columns<T>[C]['$select'] | null
+	>;
+};
+```
+
+- The **rows** are typed by the table, not inferred from the first object: `SetEachRow<T, K>` requires the key columns (non-null) and allows any writable column (`UpdateKey<T>`), each of its update type. `NoInfer` on the parameter stops TypeScript from inferring `K` from the rows instead of from `key`.
+- In scope, `row.<key>` is non-null, and every other column is `T | null`, since any row may leave it out (where the `case` keeps the table's value, `row.col` is NULL).
+- A `RowColumn` has `$insert`/`$update` of `never`: the rows can be read, never written.
+
+### Keyset keys: `KeyColumn`
+
+`iterateChunks` and `paginateByCursor` take `by` of type `KeyColumn<T, O>` ([pagination.ts](pagination.ts)):
+
+```ts
+type KeyColumn<T, O> = {
+	[K in Ref<RefsOf<T>>]: null extends RefsOf<T>[K]['$select']
+		? never
+		: KeyOf<K> extends keyof O
+			? K
+			: never;
+}[Ref<RefsOf<T>>];
+```
+
+A key column must be **non-null** (a seek can't continue past a NULL) and **selected under its own name** (each page's last row gives the next page's start). Both are checked again at run time for JavaScript callers ([PAGINATION.md](PAGINATION.md#the-key-rules)). `paginateByOffset` takes any reference, since it doesn't read keys back; its `countTotal: true` overload adds `total: number` to the result type.
+
+### Streams: `RowStream<O>`
+
+`stream()` returns `RowStream<O>`, which is an `AsyncIterator<O>`, `AsyncIterable<O>` and `AsyncDisposable`. Result shapes return a `Query`, which has no `stream` method, so `q.expectOne().stream()` is a type error: only an every-row read streams.
+
 ### Writes: `returning` and `WriteOutput`
 
 Write builders start with `O = undefined` ("no `returning`"). `returning([...])` makes `O` a row type, with the same `RowOf`/`AddRow`. What `execute()` resolves to depends on it ([write-query.ts](write-query.ts)):
@@ -439,7 +507,7 @@ update(users) // UpdateQueryBuilder<T, undefined, 'set' | 'where'>
 - [update-query-builder.ts](update-query-builder.ts): `set(…)` returns `UpdateQueryBuilder<T, O, Exclude<M, 'set'>>`, `where` and `allRows()` return `Exclude<M, 'where'>`. `Exclude<'set' | 'where', 'set'>` is `'where'`.
 - [insert-query-builder.ts](insert-query-builder.ts): `M` starts as `'values'`; `values(…)` makes it `never`.
 - [delete-query-builder.ts](delete-query-builder.ts): `M` starts as `'where'`.
-- `updateMany(…)` starts at `never`: its rows are the values and its `by` columns the condition.
+- `setEach(rows, { key })` returns `Exclude<M, 'set' | 'where'>`: its rows are the values and its generated key match is the condition ([below](#seteach-rows-in-scope)).
 
 The methods that run are gated with `this` parameters in [write-query.ts](write-query.ts):
 
@@ -493,6 +561,15 @@ type InScope<T, P> = [P[number]] extends [T[number]] ? [] : [missingTables: Excl
 
 When the fragment's tables are all in the query, the rest parameter is the empty tuple: `pipe(piece)` is fine. When one is missing, the signature demands one more argument named `missingTables` whose type is the missing table's name, so the error reads "Expected 2 arguments, but got 1" and points at `missingTables: "contacts"`, which says exactly what is wrong. The same trick is `ValueArgs` in [shape.ts](shape.ts): `takeValue()` on a row with more than one column demands an argument of type `'select exactly one column to read a value'`.
 
+### `NewName` and `UniqueKeys`: the same trick for joins and selections
+
+Two more checks from #32 use an impossible extra argument:
+
+- `innerJoin(table, ..._newName: NewName<T, J>)` and the other joins: if a table of the same name is already in the query, the rest parameter becomes `[alreadyJoined: '"users" is already in the query: join it under another name, e.g. users.as(\'other\')']`, so the error message tells you the fix.
+- `select(list, ..._unique: UniqueKeys<O, S>)`, `selectAll(…, ..._unique: UniqueColumns<…>)` and `returning(…)`: if a selection's key is already in the row (or appears twice in the list), the extra argument names the duplicate key.
+
+Both are also checked at run time (`#joined`, `checkUniqueKeys`), because a mistake there silently corrupts results (an ambiguous reference resolves to the first table; a duplicate key loses a column in object rows).
+
 ### `NotExecuted`: awaiting a builder
 
 ```ts
@@ -542,6 +619,21 @@ Types that are correct but slow make editors lag on real schemas with dozens of 
 ## Testing the types
 
 Type behaviour is tested in `*.test-d.ts` files under [test/](../test/) (`select-query-builder.test-d.ts`, `expression-builder.test-d.ts`, `write-queries.test-d.ts`, `codecs.test-d.ts`, `database.test-d.ts`, `batch.test-d.ts`), which Vitest type-checks (`pnpm test` runs them with `--typecheck`; `pnpm test:types` runs only them). They use `expectTypeOf(x).toEqualTypeOf<…>()` for what should compile, and `// @ts-expect-error` above lines that must **not** compile: if such a line ever starts compiling, the directive itself becomes an error, so a loosened type is caught.
+
+## Decisions
+
+Why the types work this way. Each links to its full entry (what it is, why, the alternatives, the cost, measured impact) in [DECISIONS.md](DECISIONS.md):
+
+- [Phantom types: what a column reads and writes](DECISIONS.md#phantom-types-what-a-column-reads-and-writes): `$select`, `$insert`, `$update`.
+- [What a builder still needs, in its type: `M` and `this` gating](DECISIONS.md#what-a-builder-still-needs-in-its-type-m-and-this-gating): required clauses as a type parameter.
+- [The locking clause as a state machine: `L`](DECISIONS.md#the-locking-clause-as-a-state-machine-l): modifier order as a type parameter.
+- [Errors as an impossible extra argument](DECISIONS.md#errors-as-an-impossible-extra-argument): `InScope`, `NewName`, `UniqueKeys`, `ValueArgs`: errors that say what is wrong.
+- [`takeValue` needs a one-column row](DECISIONS.md#takevalue-needs-a-one-column-row): an object type has no column order.
+- [Outer joins make the joined side nullable: `NullableTable`](DECISIONS.md#outer-joins-make-the-joined-side-nullable-nullabletable): only `$select` changes.
+- [`setEach` rows are typed by the table, and duplicate keys are refused](DECISIONS.md#seteach-rows-are-typed-by-the-table-and-duplicate-keys-are-refused): `SetEachRow` and `SetEachRefs`.
+- [Key rules in the types: non-null and selected under its own name](DECISIONS.md#key-rules-in-the-types-non-null-and-selected-under-its-own-name): `KeyColumn`.
+- [Awaiting a builder rejects](DECISIONS.md#awaiting-a-builder-rejects): `NotExecuted`.
+- [Speed is a design constraint, measured](DECISIONS.md#speed-is-a-design-constraint-measured): every trick in [Type-checking speed](#type-checking-speed), with numbers.
 
 ## Glossary
 

@@ -26,7 +26,7 @@ The official reference is the PostgreSQL documentation's [Frontend/Backend Proto
 - [Protocol versions: 3.0 and 3.2](#protocol-versions-30-and-32)
 - [The writer](#the-writer)
 - [The reader](#the-reader)
-- [Why it is built this way](#why-it-is-built-this-way)
+- [Decisions](#decisions)
 - [Glossary](#glossary)
 
 ## Bytes, integers and strings
@@ -273,13 +273,18 @@ Every length is checked: a message length below 4 or above `maxMessageSize` (def
 
 `utf8(bytes, start, end)` decodes with Node `Buffer.toString('utf8', …)` when the bytes are a `Buffer` (native and fast for short strings), otherwise builds short ASCII strings by hand and uses `TextDecoder` for the rest. `asBuffer` wraps a chunk as a `Buffer` sharing its memory (no copy) so that fast path applies.
 
-## Why it is built this way
+## Decisions
 
-- **One write buffer, many messages**: pipelining for free, and one system call per flush.
-- **Back-filled lengths**: messages are written once, front to back, with no size pre-computation.
-- **Read in place, copy only split messages**: the common case (a chunk holding whole messages) allocates nothing per message; the rare case copies each byte once.
-- **Strict bounds checks**: a protocol error closes the connection instead of corrupting later results.
-- **Shared constant messages and cached strings**: the messages every query receives cost nothing.
+Why the protocol layer works this way. Each links to its full entry (what it is, why, the alternatives, the cost, measured impact) in [DECISIONS.md](../DECISIONS.md):
+
+- [Coalesced writes: one write per microtask](../DECISIONS.md#coalesced-writes-one-write-per-microtask): one write buffer, many messages: pipelining for free, one system call per flush.
+- [Back-filled message lengths](../DECISIONS.md#back-filled-message-lengths): messages written once, front to back.
+- [The writer: reserve one byte per character, hand off big buffers](../DECISIONS.md#the-writer-reserve-one-byte-per-character-hand-off-big-buffers): no tripled or pinned buffers for large values.
+- [Zero-copy reads: messages decoded in place](../DECISIONS.md#zero-copy-reads-messages-decoded-in-place): read in place, copy only split messages.
+- [DataRow fast path: no message objects for rows](../DECISIONS.md#datarow-fast-path-no-message-objects-for-rows): rows go straight to the decoder.
+- [Strict bounds checks on every read](../DECISIONS.md#strict-bounds-checks-on-every-read): a protocol error closes the connection instead of corrupting later results.
+- [Shared constant messages and repeated-string caches](../DECISIONS.md#shared-constant-messages-and-repeated-string-caches): the messages every query receives cost nothing.
+- [A NOTIFY fast path and a channel-name cache](../DECISIONS.md#a-notify-fast-path-and-a-channel-name-cache): notifications without message objects.
 
 ## Glossary
 

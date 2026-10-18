@@ -2,7 +2,7 @@
 
 Most queries return a result small enough to hold in memory at once. This guide covers the ways to move data that isn't: reading a large result in batches (**cursors** and **streams**), bulk loading and unloading (**COPY**), and receiving events pushed by the server (**LISTEN/NOTIFY**).
 
-Code: `CursorOp`, `CopyFromOp`, `CopyToOp` in [ops.ts](ops.ts); `cursor`, `stream`, `copyFrom`, `copyRows`, `copyTo`, `listen`, `notify` in [connection.ts](connection.ts); the pool's versions and its `Listener` in [pool.ts](pool.ts); COPY text helpers in [types.ts](types.ts).
+Code: `CursorOp`, `FetchOp`, `ClosePortalOp`, `CopyFromOp`, `CopyToOp` in [ops.ts](ops.ts); `CursorIterator` in [cursor.ts](cursor.ts); `RowStream` in [row-stream.ts](row-stream.ts); `cursor`, `stream`, `copyFrom`, `copyRows`, `copyTo`, `listen`, `notify` in [connection.ts](connection.ts); the pool's versions and its `Listener` in [pool.ts](pool.ts); COPY text helpers in [types.ts](types.ts).
 
 ## Contents
 
@@ -10,7 +10,7 @@ Code: `CursorOp`, `CopyFromOp`, `CopyToOp` in [ops.ts](ops.ts); `cursor`, `strea
 - [Streams](#streams)
 - [COPY](#copy)
 - [LISTEN and NOTIFY](#listen-and-notify)
-- [Why it is built this way](#why-it-is-built-this-way)
+- [Decisions](#decisions)
 - [Glossary](#glossary)
 
 ## Cursors
@@ -21,48 +21,91 @@ Code: `CursorOp`, `CopyFromOp`, `CopyToOp` in [ops.ts](ops.ts); `cursor`, `strea
 for await (const batch of conn.cursor(
 	'select * from events where day = $1',
 	[day],
-	{ batchSize: 1000 },
+	{ batchSize: 1000, signal },
 )) {
 	for (const row of batch) handle(row);
 }
 ```
 
+Code: `CursorOp`, `FetchOp`, `ClosePortalOp` in [ops.ts](ops.ts); `CursorIterator` in [cursor.ts](cursor.ts); `Connection.cursor` in [connection.ts](connection.ts). This was reworked in #34; what changed and why is in [DECISIONS.md](DECISIONS.md#streams-strict-pull).
+
 ### How it works on the wire
 
-The extended protocol's **Execute** takes a maximum row count. With one, the server sends that many rows and then **PortalSuspended** instead of CommandComplete; the portal (the running query) stays open, and another Execute continues it. **Flush** (instead of Sync) asks the server to send what it has without ending the request:
+The extended protocol's **Execute** takes a maximum row count. With one, the server sends that many rows and then **PortalSuspended** instead of CommandComplete; the portal (the running query) stays open, and another Execute continues it. **Flush** (instead of Sync) asks the server to send what it has without ending the request.
+
+A cursor has two modes, chosen when it opens, by the connection's transaction status.
+
+**Outside a transaction** (status `I`): the unnamed portal lives in the **implicit transaction** of one Sync, so the cursor uses Execute + Flush per batch and a single Sync at the end:
 
 ```
-C> [Parse Describe] Bind Execute(1000) Flush
-S< … RowDescription BindComplete DataRow × 1000 PortalSuspended
+C> [Parse] Describe(S) Flush                       ← only if the statement's columns aren't cached
+S< [ParseComplete] ParameterDescription RowDescription
+C> Bind(formats from the codecs) Execute(1000) Flush
+S< BindComplete DataRow × 1000 PortalSuspended
+                                                   ← nothing more until the consumer asks
 C> Execute(1000) Flush
 S< DataRow × 1000 PortalSuspended
 C> Execute(1000) Flush
-S< DataRow × 312 CommandComplete       ← exhausted
+S< DataRow × 312 CommandComplete                   ← exhausted
 C> Sync
 S< ReadyForQuery
 ```
 
-Until the final Sync, the portal and its query stay open on the server (outside an explicit transaction, inside an implicit one that lasts until the Sync), so nothing else can be written on the connection: another Bind would replace the unnamed portal. `CursorOp` is therefore **exclusive** ([ARCHITECTURE.md](ARCHITECTURE.md#writing-the-flush)): the connection writes nothing after it until it completes.
+Until the final Sync, nothing else can be written on the connection: another Bind would replace the unnamed portal, and a Sync would end the implicit transaction and destroy it. So `CursorOp` is **exclusive** in this mode ([ARCHITECTURE.md](ARCHITECTURE.md#writing-the-flush)). Behind PgBouncer in transaction mode this needs no BEGIN: until the final Sync the server sends no ReadyForQuery, so PgBouncer keeps the server connection linked to the client (each open stream holds one server connection).
 
-### `CursorOp`
+**Inside a transaction** (status `T`): a **named portal** (`quarry_1`, `quarry_2`, …, from `CursorHost.portal()`) survives Sync until the transaction ends, so each batch is a self-contained Execute + Sync:
 
-- **`write`**: like a query, with a named cached statement when allowed (`ctx.named()`), else unprepared with a Describe of the portal; then `Execute(batchSize)` and `Flush`. Binary formats come from the cached plan as for queries ([CODECS.md](CODECS.md#binary-after-describe)).
-- **Rows**: decoded into the current batch as DataRows arrive (`dataRow`).
-- **PortalSuspended** → `#deliver(false)`: the batch is ready. **CommandComplete** → `#deliver(true)` and Sync. A result whose row count is a multiple of `batchSize` ends with an empty batch, which isn't delivered.
-- **`next()`**: the iterator's `next` waits for a ready batch (`#pump`). When it hands one out, it immediately sends the next `Execute + Flush` (`#fetch`): the next batch is fetched **while your code processes this one**, one batch ahead, never more. That bounds memory to about two batches, and overlaps network time with your work.
-- **Early exit**: `break` (or `return`, or an exception in the loop) calls the iterator's `return()` → `op.close()`: Close the portal, Sync, and wait for ReadyForQuery so the connection is free again.
-- **Errors**: an ErrorResponse fails the iteration and Syncs. A value that fails to decode fails the iteration with a `DecodeError` and closes the portal, so no more rows come. A connection failure fails it too.
+```
+C> Bind("quarry_1", …) Execute("quarry_1", 1000) Sync     ← CursorOp: the first batch
+S< BindComplete DataRow × 1000 PortalSuspended ReadyForQuery(T)
+C> (other queries of the transaction, if the loop runs any)
+C> Execute("quarry_1", 1000) Sync                          ← FetchOp: each later batch
+S< DataRow × 1000 PortalSuspended ReadyForQuery(T)
+C> Close(P "quarry_1") Sync                                ← ClosePortalOp at the end
+```
+
+The cursor is exclusive only while it describes the statement; between batches the connection is free, so `for await (… tx.stream()) await tx.update(…)` works, and several cursors can be read in step. (Before #34 the cursor was always exclusive, and that loop **deadlocked**: the update waited for the cursor, which waited for the loop.)
+
+### Strict pull
+
+A batch is fetched **only when the consumer asks for it** (`#pump` sends the next Execute when a `next()` waits and no batch is unread). Before #34 the cursor sent the next Execute as soon as it handed a batch out, one batch ahead; strict pull means a slow loop holds exactly one batch in memory, and the server does no work the consumer won't take. The cost is that the consumer waits one round trip per batch.
+
+### Binary from the first run
+
+Unlike `query()`, whose columns are asked for in binary only once a cached statement has been described ([CODECS.md](CODECS.md#binary-after-describe)), a cursor **describes the statement first** when its columns aren't cached (Describe(S) + Flush, then Bind once the RowDescription arrives, in `#described`), so its Bind already asks for each column in its codec's format, binary where it can, even on the first run and even unprepared or unnamed (PgBouncer pipelining). That costs one extra round trip once per statement and connection, which a large streamed result amortises; a small query wouldn't (see [DECISIONS.md](DECISIONS.md#binary-only-after-describe)). An unnamed statement bound from cached columns adds a Describe of the portal, and if the columns changed (a schema change), the rows are decoded by what the server sent.
+
+### The iterator: `CursorIterator`
+
+[cursor.ts](cursor.ts) is what `conn.cursor()` returns per iteration:
+
+- **Opens on the first `next()`**, synchronously inside the call, so queries issued after that call run after the cursor.
+- **`next()` calls are serialised** (`#serial`), so concurrent `next()`s are answered in order (before #34, the first of two concurrent calls never settled).
+- **`return()` is immediate**: an unsent cursor is dropped from the queue; a sent one is closed (Close + Sync, then waits for the connection to be free).
+- **`statementTimeout`** (outside a transaction) runs the cursor in a transaction of its own: `begin` and `select set_config('statement_timeout', $1, true)` are queued before the cursor and `commit` after it, all pipelined, so the timeout bounds the cursor from its first batch to its last, the consumer's time included, and can't outlive it. A suspended portal keeps `statement_timeout` running across Executes (verified on PG 18). Inside a transaction it is refused, since other queries run between batches.
+- **`signal` and `timeout`** stop the whole cursor whenever they fire ([CANCELLATION.md](CANCELLATION.md#cursors)): between batches the portal is closed without a cancel request and the next pull rejects with `AbortError`; while a batch runs, the server is asked to cancel it (`QueryCanceled`).
+- `batchSize` must be a whole number from 1 (`RangeError`); before #34, `0` meant Execute(0), which fetches every row.
+
+### `CursorOp` details
+
+- **Rows** are decoded into the current batch as DataRows arrive (`dataRow`).
+- **PortalSuspended** ends a batch with more to come; **CommandComplete** ends the last one (then Sync, outside a transaction). A result whose row count is a multiple of `batchSize` ends with an empty batch, which isn't delivered.
+- **Errors**: an ErrorResponse fails the iteration. A value that fails to decode fails it with a `DecodeError` and closes the portal, so no more rows come.
+- **Stale statement**: if a cached named statement went stale (a schema change) before any batch was read, outside a transaction, the cursor reopens it unnamed in place, as `QueryOp` retries.
 - Cursors don't take `keepRows` (they read every row they fetch).
-
-`Connection.cursor` creates the op lazily: nothing is queued until the first `next()`, so creating an iterator and never iterating it costs nothing.
 
 ## Streams
 
-`stream(sql, params, options)` is `cursor` flattened: an async generator yielding rows one at a time (`yield* batch`). Breaking out of it closes the cursor the same way.
+`stream(sql, params, options)` (on a connection, pool, client or transaction) returns a **`RowStream`** ([row-stream.ts](row-stream.ts)) over `cursor`: rows one at a time.
 
-- **`pool.cursor` / `pool.stream`** take a connection with `#take` for the whole iteration and release it in `finally`, including on `break`.
+- `RowStream` is a hand-written `AsyncIterator`, `AsyncIterable` and `AsyncDisposable`, not an async generator: `next()` returns the next row of the current batch with a resolved promise, and only pulls the next batch when the current one is used up. It handles concurrent `next()` calls (later ones wait for the batch being read), and `return()` (or `await using`) closes the cursor. Measured in #34, it has about half an async generator's per-row overhead.
+- It runs once: iterating it again yields nothing.
+- **`pool.cursor` / `pool.stream`** take a connection with `#take` when the first batch is asked for, and release it in `finally`, including on `break`.
 - Inside a **transaction**, the session waits for BEGIN (and any deferred savepoint release) before starting the cursor ([TRANSACTIONS.md](TRANSACTIONS.md#the-session)).
-- quarry's `select(…).stream()` uses `cursor` on a reserved connection, wrapping it in a transaction when a timeout is given ([../EXECUTION.md](../EXECUTION.md#streaming)).
+- `Readable.from(stream)` and `ReadableStream.from(stream)` read it with backpressure and close it when destroyed or canceled.
+- A long stream holds a **snapshot**: an open cursor keeps its backend's `xmin`, which holds back vacuum, and outside a transaction it is never "idle in transaction", so `idle_in_transaction_session_timeout` doesn't end it. Bound it with `statementTimeout`.
+- quarry's `select(…).stream()` is this, through `DriverExecutor.stream` ([../EXECUTION.md](../EXECUTION.md#streaming)).
+
+Measured in #34 (5M rows of `int4, text, timestamptz`, batch 1000, Node 24, local PG 18): 2,494 → 1,480 ms (2.0M → 3.4M rows/s), peak heap growth 55 → 27 MB, peak RSS growth 107 → 50 MB. 5M rows stream under `--max-old-space-size=32`, where `execute()` of 1M rows runs out of heap. Batch size trades memory for round trips: 100 rows → 3.0 s and 13 MB of heap, 10,000 → 1.5 s and 102 MB.
 
 ## COPY
 
@@ -152,14 +195,21 @@ A pooled connection is lent to different callers for each query, and `LISTEN` is
 
 `LISTEN` needs a real session: through PgBouncer in transaction mode it doesn't work; connect the listener directly or through a session-mode pool.
 
-## Why it is built this way
+## Decisions
 
-- **Cursors with one batch of prefetch**: bounded memory, overlapping network and processing.
-- **Exclusive ops for anything that keeps talking**: the protocol has one unnamed portal and one COPY state per connection; letting other queries interleave would corrupt them.
-- **Pull-based iterators** (`for await`): the consumer sets the pace; backpressure is the default, not an option.
-- **COPY backpressure both ways**: the driver never buffers more than the socket and a high-water mark.
-- **A dedicated, self-healing LISTEN connection**: subscriptions survive reconnects, and never leak into pooled sessions.
-- **`pg_notify` with parameters**: payloads can't inject SQL.
+Why cursors, streams, COPY and LISTEN/NOTIFY work this way. Each links to its full entry (what it is, why, the alternatives, the cost, measured impact) in [DECISIONS.md](DECISIONS.md):
+
+- [Streams: strict pull](DECISIONS.md#streams-strict-pull): a batch is fetched only when the consumer asks: bounded memory, and no work the consumer may never take.
+- [Cursors: describe first for binary from the first run](DECISIONS.md#cursors-describe-first-for-binary-from-the-first-run): an extra round trip that pays for itself on a large result.
+- [Exclusive ops for anything that keeps talking](DECISIONS.md#exclusive-ops-for-anything-that-keeps-talking): one unnamed portal and one COPY state per connection.
+- [Cursors inside a transaction use a named portal](DECISIONS.md#cursors-inside-a-transaction-use-a-named-portal): other queries can run between batches, so the common loop doesn't deadlock.
+- [Aborting a suspended cursor closes it instead of cancelling](DECISIONS.md#aborting-a-suspended-cursor-closes-it-instead-of-cancelling): aborts work between batches.
+- [`RowStream`: a hand-written iterator instead of an async generator](DECISIONS.md#rowstream-a-hand-written-iterator-instead-of-an-async-generator): about half the per-row overhead.
+- [A statement timeout bounds the whole stream](DECISIONS.md#a-statement-timeout-bounds-the-whole-stream): from the first batch to the last, without leaking.
+- [COPY with backpressure both ways](DECISIONS.md#copy-with-backpressure-both-ways): never more buffered than the socket and a high-water mark.
+- [A NOTIFY fast path and a channel-name cache](DECISIONS.md#a-notify-fast-path-and-a-channel-name-cache): notifications decoded straight from the read buffer.
+- [A dedicated, self-healing LISTEN connection, re-subscribing in one round trip](DECISIONS.md#a-dedicated-self-healing-listen-connection-re-subscribing-in-one-round-trip): subscriptions survive reconnects and never leak into pooled sessions.
+- [`notify` with `pg_notify($1, $2)`](DECISIONS.md#notify-with-pg_notify1-2): payloads can't inject SQL.
 
 ## Glossary
 

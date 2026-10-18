@@ -5,7 +5,7 @@ This guide covers the four builders (select, insert, update, delete), what each 
 - Files: [select-query-builder.ts](select-query-builder.ts), [insert-query-builder.ts](insert-query-builder.ts), [update-query-builder.ts](update-query-builder.ts), [delete-query-builder.ts](delete-query-builder.ts), [write-query.ts](write-query.ts), [row.ts](row.ts), [shape.ts](shape.ts), [query.ts](query.ts), [executor.ts](executor.ts) (the error classes), [errors.ts](errors.ts).
 - The type-level side of these builders (how the row type grows, how a builder knows it still needs a `where`) is in [TYPES.md](TYPES.md). The SQL they produce is in [COMPILER.md](COMPILER.md). Running them is in [EXECUTION.md](EXECUTION.md).
 
-> **What exists on `main` today.** The [public README](../README.md#part-ii-the-query-builder) describes the query builder's intended 1.0 surface, and is ahead of the code in places. On `main`, the select builder has `where`, `innerJoin`, `select`, `when`, `pipe`, locking, `limit` and `tag`; there is no `orderBy`, `offset`, outer join, `groupBy`/`having`, `distinct`, subquery, CTE or raw-SQL helper yet. This guide documents what the code does now.
+The builders on `main` cover everyday SQL: inner, outer and cross joins, `distinct`/`distinct on`, `group by`/`having`, `order by`, `limit`/`offset`, row locks, `case`, arithmetic, aggregates and raw `sql` fragments, plus keyset pagination ([PAGINATION.md](PAGINATION.md)) and streaming. Subqueries, CTEs, set operations and `insert … select` are still only in the [public README](../README.md#part-ii-the-query-builder)'s intended surface.
 
 ## Contents
 
@@ -14,11 +14,13 @@ This guide covers the four builders (select, insert, update, delete), what each 
 - [Row locking](#row-locking)
 - [Insert](#insert)
 - [Update](#update)
+- [Bulk update: `setEach`](#bulk-update-seteach)
 - [Delete](#delete)
+- [Whole statements: `db.sql`](#whole-statements-dbsql)
 - [Result shapes](#result-shapes)
 - [Errors](#errors)
 - [Inspecting a query: `toSQL`, `toNode`, `toQuery`, `describe`](#inspecting-a-query)
-- [Why it is built this way](#why-it-is-built-this-way)
+- [Decisions](#decisions)
 - [Glossary](#glossary)
 
 ## How every builder is built
@@ -29,10 +31,15 @@ Each builder class holds an immutable `#state` and returns a new instance from e
 interface SelectState<T> {
 	tables: T; // the from table, then each joined table
 	from: TableNode;
-	joins: readonly JoinNode[];
+	joins: readonly JoinNode[]; // { kind: 'inner' | 'left' | 'right' | 'full' | 'cross', table, on }
 	where: WhereBuilder<RefsOf<T>>; // conditions, joined by and
+	distinct: true | readonly (OperationNode | AliasNode)[] | undefined;
 	selections: readonly SelectionNode[];
+	groupBy: readonly (OperationNode | AliasNode)[];
+	having: WhereBuilder<RefsOf<T>>;
+	orderBy: readonly OrderNode[];
 	limit: number | undefined;
+	offset: number | undefined;
 	locks: readonly LockNode[];
 	tag: string | undefined;
 	executor: Executor | undefined; // undefined when built without a database
@@ -45,10 +52,12 @@ interface InsertState<T> {
 	tag;
 	executor;
 }
-interface UpdateState<T> {
+interface UpdateState<T, R> {
 	table;
+	scope: readonly AnyTable[]; // the table, plus the rows of a setEach
+	eb: ExpressionBuilder<R>; // over that scope
 	set: SetNode[];
-	many;
+	from: UpdateFromNode | undefined; // setEach's rows: unnest(...) as alias(columns)
 	where;
 	allRows: boolean;
 	returning;
@@ -71,39 +80,68 @@ interface DeleteState<T> {
 
 ### Starting: `selectFrom`
 
-`db.selectFrom(users)` (or the standalone `selectFrom(users)`, without an executor) calls `selectFromWith(table, executor)`, which creates the state: one table, `from` rendered from it, an empty `WhereBuilder` over an expression builder for that table, nothing selected.
+`db.selectFrom(users)` (or the standalone `selectFrom(users)`, without an executor) calls `selectFromWith(table, executor)`, which creates the state: one table, `from` rendered from it, empty `WhereBuilder`s for `where` and `having` over an expression builder for that table, nothing selected.
 
-### `where`
+### `where` and `having`
 
 ```ts
 .where('users.role', 'admin')
 .where((eb) => eb.ref('users.age').gte(18))
 .where(predicate)
+.having((eb) => eb.fn.count('posts.id').gte('5'))
 ```
 
-Each call adds one condition to the `WhereBuilder`; they are joined with `and`. The three forms are explained in [EXPRESSIONS.md](EXPRESSIONS.md#where-and-on-the-three-forms). `where` is declared as a **property** holding an arrow function, not a method, so that it can have the `Condition` overloaded call signatures while still being generic in the builder's types.
+Each call adds one condition to its `WhereBuilder`; they are joined with `and`. The three forms are explained in [EXPRESSIONS.md](EXPRESSIONS.md#where-and-on-the-three-forms). `having` takes the same forms and filters the groups of `groupBy` (or the single group of an aggregate query). Both are declared as **properties** holding an arrow function, not methods, so that they can have the `Condition` overloaded call signatures while still being generic in the builder's types.
 
-### Joins: `innerJoin(table).on(…)`
+### Joins
 
 ```ts
 .innerJoin(contacts).on('contacts.userId', 'users.id')
-.innerJoin(contacts).on((eb) => eb.and([eb.ref('contacts.userId').eq(eb.ref('users.id')), eb.ref('contacts.kind').eq('primary')]))
+.leftJoin(posts).on('posts.authorId', 'users.id')      // posts.* nullable in the row
+.rightJoin(teams).on('teams.id', 'users.teamId')       // the earlier tables nullable
+.fullJoin(archive).on('archive.postId', 'posts.id')    // both sides nullable
+.crossJoin(regions)                                     // every pair of rows, no condition
 ```
 
-`innerJoin(table)` appends the table to `tables`, rescopes the `WhereBuilder` to the new list (so later `where`s can reference the joined table), and returns a `JoinBuilder`, which has only `on`. An **inner join** keeps only rows that have a match on both sides.
+Every join goes through `#joined(table)`: it refuses a table whose name is already in the query (a second `users` would make every `users.…` reference ambiguous; join it as `users.as('managers')`), appends the table to `tables`, and **rescopes** the `where` and `having` builders to the new list, so later conditions can reference the joined table. Except `crossJoin`, each returns a `JoinBuilder`, which has only `on`. Its `#conditionOf` turns `on`'s arguments into a node: the two-column shorthand becomes `joined = earlier` (both resolved with `eb.ref`), a callback gets an `eb` over every table including the joined one, a predicate is used as is.
 
-`JoinBuilder.#conditionOf` turns `on`'s arguments into a node: the two-column shorthand becomes `joined = earlier` (both resolved with `eb.ref`), a callback is called with an `eb` over every table including the joined one, a predicate is used as is. Self-joins need an alias (`users.as('managers')`), since two tables of the same name in scope would be ambiguous.
+- An **inner join** keeps only rows with a match on both sides.
+- A **left join** also keeps the left rows with no match, with NULLs for the joined table's columns. So the joined table enters the scope as `NullableTable<J>` ([table.ts](table.ts)): the same table at run time, but at the type level every column's `$select` gains `| null`. Only the selected type changes; the SQL type, comparison methods and codec stay the column's ([TYPES.md](TYPES.md#outer-joins-nullabletable)).
+- A **right join** keeps the joined table's unmatched rows, so the tables joined **before** become nullable, including columns already selected (the row type `O` becomes `NullableRow<O>`).
+- A **full join** keeps unmatched rows on both sides: everything nullable.
+- A **cross join** pairs every row with every row (`JoinNode.on` is `undefined`; the compiler refuses a non-cross join without one).
 
-### `select`
+### `select` and `selectAll`
 
 ```ts
 .select(['users.id', 'contacts.email'])                   // keyed by column key
 .select((eb) => [eb.fn.lower('users.email').as('email')]) // expressions need an alias
+.selectAll()                                              // every column of every table
+.selectAll(users)                                         // every column of one table
 ```
 
-`selectionNodes(eb, list)` ([row.ts](row.ts)) makes one `SelectionNode` per entry: the expression's node, the **alias** (the column key after the dot, or the expression's alias), and the **codec** to read it with (the column's or typed expression's `DataType.codec`). Each `select` call appends; the row type grows with it ([TYPES.md](TYPES.md#part-6-result-row-types)).
+`selectionNodes(eb, list)` ([row.ts](row.ts)) makes one `SelectionNode` per entry: the expression's node, the **alias** (the column key after the dot, or the expression's alias), and the **codec** to read it with (the column's or typed expression's `DataType.codec`). Each call appends; the row type grows with it ([TYPES.md](TYPES.md#part-6-result-row-types)).
 
-Two selections with the same key are not merged: both are rendered, and the driver's object rows keep the last one.
+- **Each key can be in the row once.** Selecting a second `id` is a type error (`UniqueKeys`, an impossible extra argument naming the duplicate) and a build-time error (`checkUniqueKeys`); `.as('managerId')` resolves it. Before #32, two `id`s were both rendered and the driver's object row silently kept the last.
+- **`selectAll` lists the columns**, never `select *`: each column keeps its TypeScript key (`createdAt` from `created_at`) and its codec, and the SQL doesn't change meaning if the table gains a column.
+
+### `distinct`, `distinctOn`, `groupBy`, `orderBy`, `limit`, `offset`
+
+```ts
+.distinct()
+.distinctOn(['posts.authorId']).orderBy('posts.authorId').orderBy('posts.createdAt', 'desc') // latest post per author
+.groupBy(['users.id'])
+.groupBy((eb) => [eb.fn.dateTrunc('month', 'orders.createdAt')])
+.orderBy('postCount', 'desc')                          // a selected key of the row
+.orderBy((eb) => eb.fn.lower('users.name'), 'asc', { nulls: 'last' })
+.limit(20).offset(40)
+```
+
+- A **key** (for `groupBy`, `orderBy`, `distinctOn`) is a column reference (`'users.id'`), a **selected key** of the row (`'postCount'`, rendered as the quoted alias, an `AliasNode`), an expression, or a callback making one (`#keys`). A string with a dot is always read as a column reference.
+- `orderBy` calls add keys; `direction` and `nulls` are left out of the SQL unless given, so Postgres's defaults apply (ascending; nulls last ascending, first descending).
+- `distinct()` compares whole rows; `distinctOn(keys)` keeps the first row of each group of equal keys, by `orderBy`, whose leading keys must be the same (Postgres checks).
+- `groupBy` doesn't check at the type level that every selected column is grouped or aggregated; Postgres does.
+- `limit(count)` and `offset(count)` take non-negative integers (`RangeError` otherwise); a later call replaces the earlier. Both are parameters. No result shape adds either ([below](#shapes-never-change-the-sql)).
 
 ### `when`: optional pieces
 
@@ -125,19 +163,19 @@ const withContacts = fragment(users, (qb) =>
 db.selectFrom(users).pipe(withContacts).pipe(active).select(['contacts.email']);
 ```
 
-`fragment(tables, build)` returns `build` itself: at run time it is the identity. Its job is typing: it fixes the tables the piece needs, so `build` gets a builder over exactly those tables. `pipe(piece)` calls `piece(this)` and keeps the builder it returns, whose state now includes the piece's conditions, joins and columns. At the type level, `pipe` checks that the piece's tables are in the query (`InScope`) and adds the tables it joins (`JoinedBy`) ([TYPES.md](TYPES.md#part-8-tricks-for-better-errors)).
+`fragment(tables, build)` returns `build` itself: at run time it is the identity. Its job is typing: it fixes the tables the piece needs, so `build` gets a builder over exactly those tables. `pipe(piece)` calls `piece(this)` and keeps the builder it returns, whose state now includes the piece's conditions, joins and columns. At the type level, `pipe` checks that the piece's tables are in the query (`InScope`) and adds the tables it joins (`JoinedBy`, which since #32 also carries the piece's row and lock types) ([TYPES.md](TYPES.md#part-8-tricks-for-better-errors)).
 
-### `limit` and `tag`
+### `tag`
 
-- `limit(count)` sets `limit $n` (a later call replaces it); it throws a `RangeError` unless `count` is a non-negative integer. No result shape adds a limit.
-- `tag(name)` labels the query for `onQuery`, telemetry spans and error messages. It is never rendered into the SQL, so tagging doesn't change the statement the driver caches.
+`tag(name)` labels the query for `onQuery`, telemetry spans and error messages. It is never rendered into the SQL, so tagging doesn't change the statement the driver caches.
 
-### Running: `execute`, `stream`, `describe`
+### Running: `execute`, `stream`, `describe`, pagination
 
 - `execute(options?)` runs the query and resolves to every row (`O[]`). It is `this.toQuery().execute(options)`: the default shape.
-- `stream(options?)` is an async generator over the rows, fetched through a **cursor** in batches of `batchSize` (default 1000), so a large result never sits in memory at once. Breaking out of the `for await` loop stops the query ([EXECUTION.md](EXECUTION.md#streaming)).
+- `stream(options?)` returns a **`RowStream<O>`** ([driver/row-stream.ts](driver/row-stream.ts)): an async iterator over the rows, read through a **cursor** `batchSize` rows (default 1000) at a time, each batch fetched only when the rows before it have been taken. Nothing runs until the first row is asked for; a bad `batchSize` throws a `RangeError` at once. Leaving the loop early (`break`, `return`, a throw, `await using`) closes the cursor and frees its connection. Inside `db.transaction`, other queries of the transaction can run between batches. Only every-row reads stream: the `take…`/`expect…` shapes read a whole result and have no `stream` ([EXECUTION.md](EXECUTION.md#streaming), [driver/STREAMING.md](driver/STREAMING.md)).
+- `iterateChunks(size, { by })`, `paginateByCursor({ perPage, by, after })` and `paginateByOffset({ page, perPage, by })` read the result batch by batch or page by page with keyset (or offset) pagination ([PAGINATION.md](PAGINATION.md)).
 - `describe()` asks the server for the query's parameter types and result columns without running it.
-- `options` (`RunOptions`): `signal` (an `AbortSignal` that cancels the query on the server) and `timeout` (a server-side statement timeout: milliseconds or an interval like `'2s'`).
+- `options` (`RunOptions`): `signal` (an `AbortSignal` that cancels the query on the server) and `timeout` (a server-side statement timeout: milliseconds or an interval like `'2s'`; for a stream it bounds the whole stream, the loop's time included, and is refused inside a transaction).
 
 ## Row locking
 
@@ -229,19 +267,57 @@ db.update(users)
 	.set((eb) => ({ email: eb.fn.lower('users.email') }))
 	.allRows()
 	.execute();
-db.updateMany(
-	users,
-	[
-		{ id: 1, name: 'Ada' },
-		{ id: 2, name: 'Alan' },
-	],
-	{ by: 'id' },
-).execute();
+db.update(posts)
+	.set((eb) => ({ views: eb.ref('posts.views').plus(1) })) // an increment
+	.where('posts.id', id)
+	.execute();
 ```
 
 - `set(values | (eb) => values)` takes columns of the update type, or expressions evaluating to it; read-only columns aren't offered. Calls **add up**: a column set again keeps its place and takes the new value (`setNodes` merges into a `Map` keyed by database name). An `undefined` value leaves its column out; if that leaves nothing, it throws (an update that sets nothing is almost always a bug).
 - `where(…)` or `allRows()` is required before `execute()` (type-checked; `allRows()` exists so updating every row is a deliberate act).
-- `updateMany(table, rows, { by })` updates many rows to different values in one statement ([COMPILER.md](COMPILER.md#update-and-updatemany)). Each row must have its `by` columns (checked at build time, with an error naming the missing ones) and may set any other writable columns.
+- Increments and the like are arithmetic on the column ([EXPRESSIONS.md](EXPRESSIONS.md#arithmetic)): `"posts"."views" + $1` is computed by the server from the current value, so concurrent increments don't lose updates.
+- `returning([...])` and `returningAll()` add to the `returning` list (the latter every column, listed, never `*`); a key returned twice is rejected, as in a select.
+
+## Bulk update: `setEach`
+
+"Update these N rows, each to its own values" is `setEach` on the regular update builder ([update-query-builder.ts](update-query-builder.ts)), added in #30 (it replaced `updateMany`):
+
+```ts
+await db
+	.update(products)
+	.setEach(
+		[
+			{ id: 1, price: '9.99', stock: 12 },
+			{ id: 2, price: '19.99' }, // leaves stock as it is
+		],
+		{ key: 'id' }, // or { key: ['tenantId', 'sku'] }
+	)
+	.expectRows(2)
+	.execute();
+```
+
+compiles to (real `toSQL()`):
+
+```sql
+update "products" set "price" = "row"."price",
+  "stock" = case when "row"."set:stock" then "row"."stock" else "products"."stock" end
+from unnest($1::integer[], $2::numeric[], $3::integer[], $4::boolean[]) as "row"("id", "price", "stock", "set:stock")
+where "products"."id" = "row"."id"
+-- params: [[1, 2], ['9.99', '19.99'], [12, null], [true, false]]
+-- paramCodecs: [int4[], numeric[], int4[], bool[]]
+```
+
+How it is built, step by step (`setEach` in [update-query-builder.ts](update-query-builder.ts)):
+
+1. **Checks** (`checkEachRows`), for what the types can't rule out: no rows; a row whose key is missing or null; two rows with the same key (Postgres would pick one of them at random; the error reports row indexes, never values); `as` equal to the table's name; a second `setEach`.
+2. **Rows as columns**: `rowsNode(table, rows, 'unnest')` aligns the rows on the union of their keys, key columns first. Each column becomes one array parameter, encoded with `arrayOf(column codec)` and its type pinned by the `$n::type[]` cast ([COMPILER.md](COMPILER.md#update-and-seteach)).
+3. **Columns some rows leave out** get a boolean **flag column** `set:<name>` (sent as `bool[]`, in binary) and the assignment `case when row."set:col" then row.col else table.col end`: "use the row's value if this row gave one, else keep the current value". So `undefined` means "keep" and `null` means "set to NULL", exactly as in `set()`. Columns every row sets are assigned directly, with no `case`.
+4. **The key match is the `where`**: one `table.key = row.key` per key column, added to the `WhereBuilder`. That is why `setEach` satisfies both `'set'` and `'where'` at the type level (`Exclude<M, UpdateNeeds>`); a later `.where(…)` adds conditions with `and`.
+5. **The rows are in scope** as `row` (or the `as` name): a `Table` named `row` over the same schema is added to `scope`, and `eb` is rebuilt over it. So `set`, `where` and `returning` can reference `row.price`; key columns are typed non-null, others `T | null` (a row may leave them out) (`SetEachRefs` in [TYPES.md](TYPES.md#seteach-rows-in-scope)).
+
+A `set` before `setEach` gives every row the same value; a `set` after it can replace a row's value with an expression of it: `.set((eb) => ({ stock: eb.fn.coalesce('row.stock', 'products.stock') }))`.
+
+Array-typed columns can't be sent through `unnest` (it would flatten them); such a `setEach` throws at compile time, as do expression values.
 
 ## Delete
 
@@ -255,6 +331,19 @@ db.deleteFrom(logs).allRows().execute();
 ```
 
 The same `where` / `allRows` rule as update.
+
+## Whole statements: `db.sql`
+
+```ts
+const { rowCount } = await db.sql`vacuum analyze posts`.execute();
+const n = await db.sql<{
+	n: string;
+}>`select count(*) as n from posts where author_id = ${id}`
+	.expectValue()
+	.execute();
+```
+
+`db.sql` (and `tx.sql`, on the transaction's connection) runs a whole statement written by hand ([sql.ts](sql.ts) `SqlQuery`). Interpolated values become parameters; expressions, tables, `sql.id(…)`, `sql.lit(…)` and `sql.join(…)` are written into the SQL. It has every result shape, `expectRows`, and works in `db.batch`. The row type `R` is a promise you make: nothing checks it. The `sql` fragment tag for use inside builder queries is in [EXPRESSIONS.md](EXPRESSIONS.md#raw-sql-fragments).
 
 ## Result shapes
 
@@ -376,14 +465,29 @@ Errors from the server are the driver's `PostgresError` classes (`UniqueViolatio
 | `toQuery()`     | builders, `Query` | the `Query` that `execute()` runs: the default shape (for `db.batch`)         |
 | `describe()`    | select builder    | the server's parameter and column types, without running                      |
 
-## Why it is built this way
+## Decisions
 
-- **One immutable state object per builder**: every method is a copy-with-one-change, easy to read and impossible to mutate by accident.
-- **Write builders refuse to run without their required clauses** (types, then compile-time checks): an `update` or `delete` of every row has to be written as `allRows()`.
-- **Shapes separate from the SQL**, and **names that say whether they throw**: see [above](#shapes-never-change-the-sql).
-- **`keepRows` instead of `limit`**: the client avoids decoding rows it won't use without changing what the server runs.
-- **No `orWhere`**: precedence is always explicit through `eb.or`.
-- **`set` merges, `values` replaces**: an update naturally accumulates assignments; inserting rows twice would be ambiguous.
+Why the builders work this way. Each links to its full entry (what it is, why, the alternatives, the cost, measured impact) in [DECISIONS.md](DECISIONS.md):
+
+- [Immutable builders](DECISIONS.md#immutable-builders): every method is a copy with one change, so a base query can be reused safely.
+- [What a builder still needs, in its type: `M` and `this` gating](DECISIONS.md#what-a-builder-still-needs-in-its-type-m-and-this-gating): an update or delete without `where` is a type error; every row has to be written as `allRows()`.
+- [The locking clause as a state machine: `L`](DECISIONS.md#the-locking-clause-as-a-state-machine-l): `of`, `skipLocked` and `noWait` only where SQL allows them.
+- [No `orWhere`: precedence is always explicit](DECISIONS.md#no-orwhere-precedence-is-always-explicit): `or` is written with `eb.or`, so its grouping is visible.
+- [`set` merges, `values` replaces](DECISIONS.md#set-merges-values-replaces): assignments accumulate; rows are stated in full.
+- [Lazy result shapes, and `execute()` as the one way to run](DECISIONS.md#lazy-result-shapes-and-execute-as-the-one-way-to-run): a query is a value until `execute()`, so many can go in one `db.batch`.
+- [Awaiting a builder rejects](DECISIONS.md#awaiting-a-builder-rejects): a forgotten `execute()` fails loudly instead of doing nothing.
+- [Throwing is in the name: the `take…` and `expect…` split](DECISIONS.md#throwing-is-in-the-name-the-take-and-expect-split): you can tell from the call whether it can throw on the number of rows.
+- [No implicit LIMIT in result shapes](DECISIONS.md#no-implicit-limit-in-result-shapes): the SQL you see is what runs, and locks cover exactly the rows returned.
+- [`keepRows` instead of `limit`](DECISIONS.md#keeprows-instead-of-limit): the client decodes only the rows a shape reads, without changing the SQL.
+- [A write's `execute()` with `returning` resolves to the rows](DECISIONS.md#a-writes-execute-with-returning-resolves-to-the-rows): like a select with no shape.
+- [`setEach`: one method for the source, the assignments and the key match](DECISIONS.md#seteach-one-method-for-the-source-the-assignments-and-the-key-match): a bulk update whose key match is generated, so it can be the required `where`.
+- [Rows that set different columns: flag columns and `case`](DECISIONS.md#rows-that-set-different-columns-flag-columns-and-case): `undefined` keeps a value, `null` sets NULL, in one statement.
+- [`setEach` rows are typed by the table, and duplicate keys are refused](DECISIONS.md#seteach-rows-are-typed-by-the-table-and-duplicate-keys-are-refused): no misspelled or read-only columns, no ambiguous updates.
+- [Outer joins make the joined side nullable: `NullableTable`](DECISIONS.md#outer-joins-make-the-joined-side-nullable-nullabletable): the row type says which columns can be NULL.
+- [A table joined twice, or a key selected twice, is refused](DECISIONS.md#a-table-joined-twice-or-a-key-selected-twice-is-refused): both silently corrupted results.
+- [`selectAll()` lists the columns, never `*`](DECISIONS.md#selectall-lists-the-columns-never-): each column keeps its key and codec.
+- [Ordering by a selected key uses the bare key](DECISIONS.md#ordering-by-a-selected-key-uses-the-bare-key): a dot always means a column.
+- [Raw SQL only through the `sql` template tag](DECISIONS.md#raw-sql-only-through-the-sql-template-tag): `db.sql` and fragments stay injection-safe.
 
 ## Glossary
 
