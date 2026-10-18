@@ -257,9 +257,30 @@ The driver's decisions are in [driver/DECISIONS.md](driver/DECISIONS.md), which 
 
 **Cost.** A `WeakMap` per table of its resolved columns (as many entries as columns used), the compiler's `WeakMap` of their SQL, and a map of up to 4,096 quoted names. A shared single-table expression builder is frozen, so a callback can't change it for other queries. Nodes must stay immutable: code that changed a shared node would change every query using it (nothing does; node types are `readonly`).
 
-**Measured.** In-process, a mock executor (build and compile only, Node 24): point lookup (`selectFrom(users).where(id).select([6 columns]).execute()`) 5.7 → 0.8 µs, single-row insert 1.6 → 1.3 µs, update by key 2.0 → 0.8 µs. Through a pool of 10 at 100 concurrent callers and 0 ms round trip, with call sites captured on failure and the driver's statement cache keyed by SQL ([driver/DECISIONS.md](driver/DECISIONS.md#statements-keyed-by-their-sql-with-the-declared-types-compared)), client CPU per point lookup went from 21.3 to 4.8 µs (`pool.query`: 4.4 µs) and throughput from 49k to 211k ops/s. The driver benchmark suite (#6), median of 5 interleaved runs:
+**Measured.** In-process, a mock executor (build and compile only, Node 24): point lookup (`selectFrom(users).where(id).select([6 columns]).execute()`) 5.7 → 0.8 µs, single-row insert 1.6 → 1.3 µs, update by key 2.0 → 0.8 µs. Through a pool of 10 at 100 concurrent callers and 0 ms round trip, with call sites captured on failure and the driver's statement cache keyed by SQL ([driver/DECISIONS.md](driver/DECISIONS.md#statements-keyed-by-their-sql-with-the-declared-types-compared)), client CPU per point lookup went from 21.3 to 4.8 µs (`pool.query`: 4.4 µs) and throughput from 49k to 211k ops/s (one process, the sources run directly). The driver benchmark suite (#6), with the built package, a fresh process per cell, before and after interleaved in one session, median of 5 runs:
 
-<!-- builder-cpu-ab -->
+| Query                 | Round trip | Callers | Before: ops/s (p50 ms) | After: ops/s (p50 ms) | Client CPU µs/op | `pool.query`: ops/s, CPU µs/op |
+| --------------------- | ---------- | ------- | ---------------------- | --------------------- | ---------------- | ------------------------------ |
+| point lookup          | 0 ms       | 1       | 20,227 (0.04)          | 29,466 (0.03)         | 37.8 → 20.1      | 33,654, 15.4                   |
+| point lookup          | 0 ms       | 100     | 51,077 (1.57)          | 186,582 (0.44)        | 21.3 → 6.0       | 233,004, 4.6                   |
+| point lookup          | 0 ms       | 1000    | 50,146 (17.82)         | 180,483 (4.54)        | 23.7 → 6.4       | 249,924, 4.3                   |
+| point lookup          | 5 ms       | 1       | 166 (6.00)             | 168 (5.96)            | 392.1 → 335.4    | 169, 281.8                     |
+| point lookup          | 5 ms       | 100     | 15,506 (6.47)          | 15,793 (6.35)         | 30.4 → 15.2      | 15,930, 9.0                    |
+| point lookup          | 5 ms       | 1000    | 46,268 (20.18)         | 133,222 (7.06)        | 24.9 → 6.9       | 148,808, 3.2                   |
+| insert one row        | 0 ms       | 1       | 23,979 (0.04)          | 29,441 (0.03)         | 28.6 → 20.9      | 34,505, 15.1                   |
+| insert one row        | 0 ms       | 100     | 81,066 (1.06)          | 159,774 (0.52)        | 13.3 → 6.8       | 175,881, 5.8                   |
+| insert one row        | 0 ms       | 1000    | 80,500 (11.04)         | 175,453 (4.95)        | 13.7 → 6.3       | 184,836, 5.6                   |
+| insert one row        | 5 ms       | 1       | 168 (5.94)             | 168 (5.94)            | 344.7 → 320.0    | 169, 266.3                     |
+| insert one row        | 5 ms       | 100     | 16,236 (6.08)          | 15,977 (6.27)         | 21.9 → 15.9      | 15,812, 8.1                    |
+| insert one row        | 5 ms       | 1000    | 80,346 (11.28)         | 132,493 (7.09)        | 13.8 → 6.4       | 143,059, 3.3                   |
+| update one row by key | 0 ms       | 1       | 22,367 (0.04)          | 28,945 (0.03)         | 29.4 → 18.6      | 31,745, 14.7                   |
+| update one row by key | 0 ms       | 100     | 78,128 (1.06)          | 152,170 (0.13)        | 13.9 → 7.2       | 156,053, 6.7                   |
+| update one row by key | 0 ms       | 1000    | 75,789 (11.04)         | 164,800 (4.05)        | 15.3 → 6.7       | 161,480, 6.4                   |
+| update one row by key | 5 ms       | 1       | 167 (5.97)             | 168 (5.94)            | 353.4 → 320.5    | 169, 257.4                     |
+| update one row by key | 5 ms       | 100     | 16,053 (6.15)          | 15,992 (6.22)         | 22.8 → 12.7      | 16,050, 8.2                    |
+| update one row by key | 5 ms       | 1000    | 79,059 (10.98)         | 126,976 (7.49)        | 14.5 → 5.2       | 133,682, 3.0                   |
+
+The driver suite on a 4-vCPU VM (client on 2 CPUs, PostgreSQL 18 on the other 2), Node 24, a pool of 10; `pool.query` runs the same statement written by hand (`pk`, `insert1`, `update`). At 0 ms with 100 or 1000 callers, the builder now reaches 72–100% of the driver's own throughput (point lookups 72–80%, writes 91–102%), against 20–50% before. At 5 ms with 100 callers, every configuration is bound by the round trip (100 callers per 6 ms), so throughput doesn't move, but CPU per query falls by a third to a half. With 1000 callers at 5 ms, the builder's CPU, not the round trip, was the limit before. With one caller, each query waits for its own round trip, so the CPU saved per query (38 → 20 µs for a point lookup) shows up as latency: 20k → 29k lookups/s at 0 ms.
 
 **Code.** `resolveColumn`, `expressionBuilder` in [expression-builder.ts](expression-builder.ts); `shareColumn`, `identifier` in [compile.ts](compile.ts); [test/builder-caches.test.ts](../test/builder-caches.test.ts).
 
