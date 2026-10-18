@@ -362,10 +362,10 @@ The keyset helpers (`iterateChunks`, `paginateByCursor`, `paginateByOffset`) are
 ## Timeouts and cancellation
 
 - **`signal`** (`RunOptions`): aborting it cancels the query: if it was already sent, the driver sends a **cancel request** to the server over a separate connection; if it was still waiting, it is dropped without contacting the server. Over a pool, the signal also aborts waiting for a connection.
-- **`timeout`** (`RunOptions`): a **server-side** `statement_timeout` for this query only. The driver applies it with `set_config('statement_timeout', $1, true)`, transaction-local, so it never leaks into later queries or other clients behind a pooler. Outside a transaction it wraps the query in `begin … commit`, all pipelined in one write. Over a pool, a query with a `timeout` takes a connection of its own: the driver chooses between this framing and the one for inside a transaction by the connection's last reported transaction status, which, on a shared connection, other callers' pipelined `begin`s change, and the setting could then silently not apply:
+- **`timeout`** (`RunOptions`): a **server-side** `statement_timeout` for this query only. The driver applies it with `set_config('statement_timeout', $1, true)`, transaction-local, so it never leaks into later queries or other clients behind a pooler. The setting, the query and a statement restoring the previous value share the query's Sync, so the timeout bounds this query alone, in a transaction or not, whatever else is pipelined on the connection:
 
 ```
-C> begin Sync  select set_config('statement_timeout', $1, true) Sync  <the query> Sync  commit Sync   (one write)
+C> <set statement_timeout = $1>  <the query>  <restore it>  Sync   (one write)
 ```
 
 A canceled query fails with `QueryCanceled` (`reason`: `'abort'`, `'timeout'`, `'statement_timeout'` or `'user'`). The mechanics are in [driver/CANCELLATION.md](driver/CANCELLATION.md).

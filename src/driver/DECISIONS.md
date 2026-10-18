@@ -961,13 +961,27 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 
 ### Server-side statement timeouts, transaction-local and pipelined
 
-**What it is.** A per-query `statementTimeout` is enforced by the server with `set_config('statement_timeout', $1, true)`: outside a transaction, `begin`, `set_config`, the query and `commit` are pipelined in one write ([CANCELLATION.md](CANCELLATION.md#statement-timeouts)).
+**What it is.** A per-query `statementTimeout` is enforced by the server with `set_config('statement_timeout', $1, true)` ([CANCELLATION.md](CANCELLATION.md#statement-timeouts)).
 
 **Why.** A client-side timer can only ask the server to stop; a server-side timeout stops the work even if the client is stuck or the network is down. Transaction-local, so it can't leak through poolers.
 
 **Alternatives.** pg's `query_timeout` doesn't cancel on the server.
 
 **Code.** [connection.ts](connection.ts) `#queryWithTimeout`.
+
+### A statement timeout is framed under the query's Sync, whatever the transaction status
+
+**What it is.** A timed query goes out as one `SyncGroupOp`: a statement setting `statement_timeout` (keeping the previous value in the transaction-local custom setting `quarry.statement_timeout`), the query, and the same statement with null, restoring it. Outside a transaction block the three share one implicit transaction, which ends the setting at the Sync; inside one, the restore ends it. The connection's transaction status isn't read ([CANCELLATION.md](CANCELLATION.md#statement-timeouts)).
+
+**Why.** The status is the last ReadyForQuery's, which says nothing about what is queued or in flight ahead. Choosing the framing from it (`begin … commit` with four Syncs when idle, an in-transaction variant otherwise) broke on pipelined connections: a timed query issued while another caller's transaction was open, with its `commit` queued ahead, ran unbounded (its `set_config` landed after that commit); one pipelined behind an unanswered `begin` committed that caller's transaction with its own `commit`; and in a transaction, the restore sent after the answer left the timeout on the statements pipelined behind. A pool reaches the first case with no misuse: a caller waiting for a pipeline slot is handed one mid-read, and the rest of that read can bring another timed query's `begin`. The pool's refusal to pipeline onto a connection reporting a transaction narrowed it but couldn't close it.
+
+**Alternatives.** Route timed queries to exclusive use (`acquire`, what [#37](https://github.com/shlokdesai33/quarry/pull/37) did in quarry's executor): it fixes the pool, not a connection pipelined by its owner (a `begin` and a timed query issued together), and costs each timed query a whole connection. Choose the framing when the query reaches the head of the queue: the status is still unknown while earlier queries are in flight, so it would have to wait for them, a round trip per timed query. `begin`/`set_config`/query/`commit` under one Sync: right outside a transaction, but inside one its `commit` would end the caller's transaction. Two statements for the set and the restore: once the query fails, the server skips the restore's Parse, while groups pipelined behind have already bound its name; one statement keeps its only Parse first in the group. Sending them unprepared avoids that too, but parsing them for every query cut timed throughput to about half of `main`'s.
+
+**Cost.** A custom placeholder setting, `quarry.statement_timeout`, exists in the session once a timed query ran (transaction-local, so `current_setting('quarry.statement_timeout', true)` is empty afterwards; not listed in `pg_settings`; harmless behind a pooler). A stale statement in a timed group isn't retried, since the statements after it were skipped (nor was it before, inside `begin … commit`). `vacuum` and `create index concurrently` with a timeout are refused as before ("cannot run inside a transaction block"). Relies on `statement_timeout` being re-armed for each Execute of a pipeline (PostgreSQL 13+).
+
+**Measured.** `pool.query('select $1::int')` from 200 callers on 4 connections, Node 24, PostgreSQL 18 on the same 4-core VM, median of 3 interleaved 2 s runs: every query timed 152,466 → 218,568/s (+43%); 1 in 10 timed 460,449 → 534,603/s (+16%; a timed query no longer makes its connection report a transaction, which stopped the pool pipelining onto it); untimed 551,240 → 546,982/s (unchanged path, within noise). At a simulated 5 ms round trip all three are bound by the callers (31,700–35,300/s either way). One Sync per timed query instead of four.
+
+**Code.** [connection.ts](connection.ts) `#queryWithTimeout`, `STATEMENT_TIMEOUT`; [ops.ts](ops.ts) `SyncGroupOp`.
 
 ### Every wait has a timeout
 

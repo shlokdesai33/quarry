@@ -350,7 +350,7 @@ S< ParseComplete BindComplete NoData CommandComplete(BEGIN)  ParseComplete … D
 
 **A batch.** `db.batch([q1, q2])` writes both queries in one go, each with its own Sync; with `{ transaction: true }`, BEGIN, both queries and COMMIT in one write. [EXECUTION.md](EXECUTION.md#batches).
 
-**A statement timeout.** `.execute({ timeout: '2s' })` outside a transaction pipelines four statements in one write: `begin`, `select set_config('statement_timeout', $1, true)`, the query, `commit`. [driver/CANCELLATION.md](driver/CANCELLATION.md).
+**A statement timeout.** `.execute({ timeout: '2s' })` sends three statements under one Sync, in one write: one setting `statement_timeout` with `set_config(…, true)`, the query, and one restoring the previous value. [driver/CANCELLATION.md](driver/CANCELLATION.md#statement-timeouts).
 
 **Concurrent driver queries.** Three `pool.query(…)` calls issued together on a pool of one connection go out in **one** write, three Bind/Execute/Sync groups back to back, and their replies come back in order. [driver/ARCHITECTURE.md](driver/ARCHITECTURE.md#pipelining). Builder queries take the same path, and once the pool is full, pipeline onto busy connections: [EXECUTION.md](EXECUTION.md#connections-shared-or-exclusive).
 

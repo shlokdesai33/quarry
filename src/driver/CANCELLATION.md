@@ -115,19 +115,42 @@ A cursor ([STREAMING.md](STREAMING.md#cursors)) spends most of its life **suspen
 <a id="statement-timeouts"></a>
 A client-side timeout can only ask the server to stop. A **server-side** timeout makes the server stop by itself: Postgres's `statement_timeout` setting cancels any statement that runs longer. The `statementTimeout` query option sets it for one query, with `set_config('statement_timeout', $1, true)`: a bound parameter, and **transaction-local** (the `true`), so the setting can't outlive the query or, behind a pooler, leak into another client's session.
 
-`#queryWithTimeout(sql, params, options, timeout)`:
-
-- **Outside a transaction**: wrap the query in its own, all four statements pipelined in one write (captured):
+`#queryWithTimeout(sql, params, options, timeout)` sends three statements under **one Sync**, as one `SyncGroupOp`, in one write:
 
 ```
-C> begin Sync  select set_config('statement_timeout', $1, true) as previous Sync  <query> Sync  commit Sync
+C> S($1 = '2000ms')  <query>  S($1 = null)  Sync
 ```
 
-The query's result is returned; if it failed, its error is thrown (before any other).
+`S` is one prepared statement:
 
-- **Inside a transaction**: read the current value and set the new one in one statement (`select current_setting('statement_timeout') as previous, set_config('statement_timeout', $1, true)`), pipelined with the query; afterwards, if still in the transaction, restore the previous value, without waiting.
+```sql
+select case when $1::text is null
+  then set_config('statement_timeout', current_setting('quarry.statement_timeout'), true)
+  else set_config('quarry.statement_timeout', current_setting('statement_timeout'), true)
+    || set_config('statement_timeout', $1, true)
+end
+```
+
+With a value, it keeps the current `statement_timeout` in a custom setting, `quarry.statement_timeout`, and sets the new one. With null, it puts the kept value back. Both settings are transaction-local, so the same three statements are right in both cases:
+
+- **Outside a transaction block**: statements under one Sync run in one implicit transaction, which ends at the Sync and takes both settings with it; the restore changes nothing.
+- **Inside one** (a `Transaction`, or `begin` sent by the caller): the restore ends the setting right after the query, so the transaction's later statements keep their own `statement_timeout` (a `set local` included). If the query fails, the server skips the restore and the transaction is failed anyway; rolling back (or to a savepoint) discards the setting.
+
+PostgreSQL re-arms `statement_timeout` for each Execute, from the value current when the statement starts, so the query, and only the query, runs under the new value.
+
+The query's result is returned, or its error is thrown. If `S` fails (an invalid interval, such as `'soon'`), the server skips the query, which rejects with that error. `signal` and `timeout` cancel the group, which hits the statement running ([above](#why-later-writes-are-held-back)); `onTiming` times the whole group.
 
 Numbers are milliseconds (`'2000ms'`); strings are any Postgres interval (`'2s'`, `'500ms'`).
+
+**Why one Sync group, independent of the transaction status.** The connection's transaction status is the one in the **last ReadyForQuery received**: it says how the last answered query left the connection, not how the queries still queued or in flight ahead of this one will leave it. Until #38 the framing was chosen from it (`begin`/`set_config`/query/`commit` with four Syncs when idle; set, query, then an asynchronous restore when in a transaction). On a pipelined connection, a pool's shared connection included, that was wrong three ways:
+
+- **Not applied.** In a transaction whose `commit` is already queued (another caller's transaction, or another timed query's framing), the in-transaction variant ran its `set_config(…, true)` after that commit, in an implicit transaction of its own, and the query ran unbounded. The pool doesn't pipeline onto a connection reporting a transaction, but a caller waiting for a pipeline slot is handed one mid-read and runs a microtask later, after the rest of that read (which can hold another timed query's `begin`) changed the status.
+- **Another caller's transaction committed.** Behind a `begin` not yet answered, the status still said idle: the timed query's own `begin` was ignored (a warning) and its `commit` committed the other caller's transaction, half done.
+- **Applied to the wrong statement.** In a transaction, the restore was sent only once the query's answer came back, so statements pipelined behind it ran under its timeout.
+
+In one Sync group nothing can come between the setting, the query and the restore, and the same statements are right in or out of a transaction block, so the status isn't read. Behind PgBouncer in transaction mode, the group ends with one Sync and ReadyForQuery, so the server connection stays linked for all three and is released after, as for any query.
+
+`S` is one statement for both ends because its Parse then comes first in the group, where nothing can make the server skip it. With two statements, a query that failed made the server skip the restore's Parse, while groups pipelined behind it had already bound that name (`26000 prepared statement does not exist`).
 
 ## `QueryCanceled` and its reason
 
@@ -148,6 +171,7 @@ Why cancellation works this way. Each links to its full entry (what it is, why, 
 - [Cancel only the query at the head, and hold back later writes](DECISIONS.md#cancel-only-the-query-at-the-head-and-hold-back-later-writes): the cancel can only hit its target, even with deep pipelines; repeated because Postgres ignores early cancels.
 - [Aborting a suspended cursor closes it instead of cancelling](DECISIONS.md#aborting-a-suspended-cursor-closes-it-instead-of-cancelling): between batches there is nothing to cancel.
 - [Server-side statement timeouts, transaction-local and pipelined](DECISIONS.md#server-side-statement-timeouts-transaction-local-and-pipelined): the server enforces them even if the client is stuck.
+- [A statement timeout is framed under the query's Sync, whatever the transaction status](DECISIONS.md#a-statement-timeout-is-framed-under-the-querys-sync-whatever-the-transaction-status): it bounds its own query alone, whatever else is pipelined.
 - [A statement timeout bounds the whole stream](DECISIONS.md#a-statement-timeout-bounds-the-whole-stream): for cursors.
 - [Every wait has a timeout](DECISIONS.md#every-wait-has-a-timeout): nothing waits forever by default.
 
