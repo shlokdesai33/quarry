@@ -249,7 +249,7 @@ async #run(signal, fn) {
 }
 ```
 
-Until #36, every operation took this path, so concurrent builder queries never pipelined: beyond `max`, each waited for a whole connection ([DECISIONS.md](DECISIONS.md#plain-queries-share-the-pools-pipelined-connections) has the measurements).
+Until #37, every operation took this path, so concurrent builder queries never pipelined: beyond `max`, each waited for a whole connection ([DECISIONS.md](DECISIONS.md#plain-queries-share-the-pools-pipelined-connections) has the measurements).
 
 Over a `PoolClient` or `Connection`, every operation uses that one connection, and concurrent queries on it are pipelined by the connection ([driver/ARCHITECTURE.md](driver/ARCHITECTURE.md#pipelining)).
 
