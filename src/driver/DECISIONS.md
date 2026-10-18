@@ -549,7 +549,7 @@ The adaptive depth sees the queueing in its latency ratio and stays at 100.
 
 ### Adaptive width: no more pipelined backends than the server runs at once
 
-**What it is.** The pool spreads `query()` over at most `limit` connections (its **width**), from `max` down to 1, and adapts it: it narrows when connections **stall** (a connection with queries in flight completes nothing while the rest of the pool completes everything in flight) and grows back when they don't. Queries beyond the width's pipelines wait in the shared FIFO for whichever connection frees a slot first ([POOL.md](POOL.md#adaptive-width)).
+**What it is.** The pool spreads `query()` (and so, since #37, builder queries and default `db.batch` calls) over at most `limit` connections (its **width**), from `max` down to 1, and adapts it: it narrows when connections **stall** (a connection with queries in flight completes nothing while the rest of the pool completes everything in flight) and grows back when they don't. Queries beyond the width's pipelines wait in the shared FIFO for whichever connection frees a slot first ([POOL.md](POOL.md#adaptive-width)).
 
 **Why: the CPU-saturated server.** After #25 made the client cheaper, the concurrency sweep put the server's CPUs at 100%, and p99 roughly doubled at 500–1000 callers (pool 10, 500 callers: 3.9 → 7.0 ms on Node; Bun 2.9 → 9.2 ms) while throughput rose. Tracing it on a 4-vCPU VM (PostgreSQL on 2 CPUs), pool 10 × 500 callers:
 
@@ -584,7 +584,26 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 - A workload whose stalls come from slow queries pays for a try now and then: usually two at start-up, then one per 1024 epochs. Fast and slow queries on shared connections can be bistable (slow queries starved, or fast ones stuck behind them), and a try can tip such a workload from one mode to the other for a while.
 - With `pipeline: n` the width stays at `max`.
 
-**Measured.** WIDTH_MEASURED
+**Measured.** 4-vCPU VM, client on 2 CPUs and PostgreSQL on the other 2, the benchmark suite's point lookups, median of 3 interleaved runs per cell, main → this change:
+
+| Runtime | Pool × callers | ops/s       | p99                | p99.9          |
+| ------- | -------------- | ----------- | ------------------ | -------------- |
+| Node    | 5 × 100        | 240k → 243k | 8.2 → **1.6 ms**   | 12.2 → 5.5 ms  |
+| Node    | 10 × 100       | 232k → 240k | 10.6 → **1.6 ms**  | 20.4 → 6.0 ms  |
+| Node    | 10 × 500       | 246k → 250k | 20.4 → **5.8 ms**  | 28.4 → 11.0 ms |
+| Node    | 10 × 1000      | 248k → 250k | 20.9 → **9.2 ms**  | 28.9 → 14.2 ms |
+| Node    | 50 × 500       | 234k → 237k | 56.3 → **7.9 ms**  | 112 → 25 ms    |
+| Node    | 50 × 1000      | 226k → 237k | 89.1 → **11.3 ms** | 118 → 62 ms    |
+| Bun     | 10 × 100       | 237k → 239k | 12.1 → **1.2 ms**  | 17.5 → 5.4 ms  |
+| Bun     | 10 × 500       | 248k → 251k | 22.7 → **4.3 ms**  | 32.4 → 7.8 ms  |
+| Bun     | 50 × 500       | 228k → 249k | 80.7 → **4.5 ms**  | 118 → 7.5 ms   |
+
+- Over all 96 cells (pools 1/5/10/50 × 1–1000 callers, 0 and 5 ms RTT, Node and Bun), the median throughput change was +0.2%. At 5 ms RTT, every cell was within ±2% except one pool-1 cell, and pools of 1 never narrow.
+- The worst cell was Bun pool 5 × 1000 at −5% (p99 14.9 → 7.6 ms). Cells at 1–10 callers moved ±7% between sweeps in both directions; a 9-run recheck put them within ±1%.
+- 50 concurrent inserts on pool 10: Node 166k → 179k/s, p99 4.7 → 2.4 ms; Bun 174k → 187k/s, p99 5.0 → 1.2 ms.
+- Mixed workload (10 connections; 100 lookup callers and 5 callers of 20 ms queries): 226–231k → 218–237k lookups/s, and the slow callers got 143–239 instead of 46–141 queries/s. With 5,000 lookup callers and 20 slow ones: 148–149k → 148–150k, the same p99.
+- Builder queries (through `pool.query` since #37) are client-bound on this VM (Node ~62k/s, Bun ~103k/s); they stay level, and the width doesn't engage while the server has room.
+- In about 1 run in 7 at pool 50 × 1000, the first narrowing is undone, and the pool stays wide for the rest of a 1-second run.
 
 **Code.** [pool.ts](pool.ts) `Width`, `#claimShared`, `#pickShared`, `#fillShared`, `#serveShared`, `#done`.
 
