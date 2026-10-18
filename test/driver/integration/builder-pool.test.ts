@@ -310,10 +310,12 @@ describe.skipIf(noPg)('builder queries on a pool', () => {
 			'fulfilled',
 			'rejected',
 		]);
-		const reason =
+		const reason: unknown =
 			failed.results[1]?.status === 'rejected' && failed.results[1].reason;
 		expect(reason).toBeInstanceOf(QueryCanceled);
-		expect((reason as QueryCanceled).reason).toBe('statement_timeout');
+		expect(reason instanceof QueryCanceled && reason.reason).toBe(
+			'statement_timeout',
+		);
 		// all in flight together on the one connection
 		expect(net.maxInFlight()).toBeGreaterThanOrEqual(7);
 		expect(withShared).toHaveBeenCalledTimes(2);

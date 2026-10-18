@@ -67,6 +67,8 @@ function batchedSockets(interval: number): { factory: SocketFactory } {
 	};
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 const targets: [string, () => ConnectionOptions][] = [
 	['directly', () => options()],
 ];
@@ -249,6 +251,73 @@ describe.skipIf(noPg).each(targets)('statementTimeout %s', (_name, target) => {
 		expect(
 			rest.map((r) => (r.status === 'fulfilled' ? r.value.rows : r.reason)),
 		).toEqual([[{ x: 1 }], [{ x: 2 }]]);
+	});
+
+	it('keeps a timed cursor inside a transaction pipelined ahead of it, without committing it', async () => {
+		await using conn = await open(target());
+		const rows: unknown[] = [];
+		const [, , read, after] = await Promise.all([
+			conn.query('begin'),
+			conn.query(`insert into ${name} values (2)`),
+			(async () => {
+				for await (const batch of conn.cursor(
+					'select generate_series(1, 5) as n',
+					[],
+					{ batchSize: 2, statementTimeout: '5s' },
+				))
+					rows.push(...batch);
+			})(),
+			conn.query<{ t: string }>(
+				"select current_setting('statement_timeout') as t",
+			),
+			conn.query('rollback'),
+		]);
+		expect(read).toBeUndefined();
+		expect(rows).toHaveLength(5);
+		expect(after.rows).toEqual([{ t: '0' }]);
+		expect(
+			(await conn.query(`select count(*)::int as n from ${name}`)).rows,
+		).toEqual([{ n: 0 }]);
+	});
+
+	it('bounds a timed cursor inside an explicit transaction, and restores the setting, read to the end or closed mid-batch', async () => {
+		await using conn = await open(target());
+		await conn.query('begin');
+		await conn.query("set local statement_timeout = '7s'");
+		let n = 0;
+		for await (const batch of conn.cursor('select generate_series(1, 5)', [], {
+			batchSize: 2,
+			statementTimeout: '1s',
+		}))
+			n += batch.length;
+		expect(n).toBe(5);
+		expect(await timeoutOf(conn)).toBe('7s');
+		const cursor = conn.cursor(
+			'select n, pg_sleep(0.05) from generate_series(1, 10) n',
+			[],
+			{ batchSize: 5, statementTimeout: '1s' },
+		);
+		const iterator = cursor[Symbol.asyncIterator]();
+		const first = iterator.next();
+		// closed while the server runs the first batch
+		await sleep(20);
+		await iterator.return?.();
+		await first.catch(() => {});
+		expect(await timeoutOf(conn)).toBe('7s');
+		expect(conn.transactionStatus).toBe('transaction');
+		const error = await rejection(
+			(async () => {
+				for await (const _ of conn.cursor(
+					'select n, pg_sleep(0.05) from generate_series(1, 100) n',
+					[],
+					{ batchSize: 5, statementTimeout: 120 },
+				));
+			})(),
+			QueryCanceled,
+		);
+		expect(error.reason).toBe('statement_timeout');
+		await conn.query('rollback');
+		expect(await timeoutOf(conn)).toBe('0');
 	});
 
 	it('is written with its query under one Sync', async () => {

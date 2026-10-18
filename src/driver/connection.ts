@@ -36,6 +36,7 @@ import {
 	Op,
 	QueryOp,
 	SimpleQueryOp,
+	STATEMENT_TIMEOUT,
 	SyncGroupOp,
 	closedError,
 	type Description,
@@ -170,18 +171,6 @@ type Listener<T> = (value: T) => void;
  */
 const FLUSH_BYTES = 65_536;
 
-/**
- * With $1, sets `statement_timeout` to it until the transaction ends,
- * keeping the value it replaces in a custom setting,
- * `quarry.statement_timeout` (transaction-local too; `||` evaluates its
- * left side first). With null, puts that value back.
- *
- * One statement for both, so a group's only Parse of it comes first,
- * where nothing can make the server skip it: groups pipelined behind
- * bind its name before it is answered.
- */
-const STATEMENT_TIMEOUT =
-	"select case when $1::text is null then set_config('statement_timeout', current_setting('quarry.statement_timeout'), true) else set_config('quarry.statement_timeout', current_setting('statement_timeout'), true) || set_config('statement_timeout', $1, true) end";
 const STATEMENT_TIMEOUT_OPTIONS = { paramTypes: [25] } as const;
 
 /**
@@ -1427,7 +1416,11 @@ export class Connection implements AsyncDisposable {
 			signal: options?.signal,
 			timeout: options?.timeout,
 			statementTimeout: options?.statementTimeout,
-			open: (portal: string, held: boolean) => {
+			open: (
+				portal: string,
+				held: boolean,
+				statementTimeout: string | undefined,
+			) => {
 				const op = new CursorOp(
 					sql,
 					params,
@@ -1437,6 +1430,7 @@ export class Connection implements AsyncDisposable {
 					batchSize,
 					portal,
 					held,
+					statementTimeout,
 				);
 				if (!this.#config.catalog.loaded) this.#loadTypesAfter(params, options);
 				return op;
@@ -1453,7 +1447,6 @@ export class Connection implements AsyncDisposable {
 			status: () => this.#status,
 			enqueue: (op, signal, timeout) => this.#enqueue(op, signal, timeout),
 			abort: (op, reason, cause) => this.#abort(op, reason, cause),
-			query: (sql, params) => this.#query(sql, params, undefined),
 			portal: () => `quarry_${++this.#portalCount}`,
 		});
 	}

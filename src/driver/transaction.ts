@@ -317,6 +317,17 @@ export class Session {
 		params?: readonly unknown[],
 		options?: TxCursorOptions,
 	): AsyncIterable<R[]> {
+		if (options?.['statementTimeout'] !== undefined) {
+			// it would run the cursor as one operation, with no queries between its batches
+			const refused = new DriverError(
+				'A cursor inside a transaction takes no statementTimeout, since other queries run between its batches: set statement_timeout with set_config(…, true)',
+			);
+			return {
+				[Symbol.asyncIterator]: () => ({
+					next: () => Promise.reject(refused),
+				}),
+			};
+		}
 		return this.#iterate(() => this.#conn.cursor<R>(sql, params, options));
 	}
 
