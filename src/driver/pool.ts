@@ -172,23 +172,33 @@ const WIDTH_BACKOFF = 64;
  *   queries behind it, so the epoch after next judges the change: unless
  *   stalls fell by a quarter (or below `STALLED_HIGH`) and the mean
  *   latency (queries in flight and queued over the completion rate,
- *   Little's law again: one clock read per epoch) didn't grow by more
- *   than `NARROWER_WORSE` times, the width goes back, and the next try
- *   waits twice as long (up to `WIDTH_BACKOFF` epochs). It goes back at
- *   once if, from 512 completions in, they come at under three fifths
- *   of the rate before (a clock read per 256 completions while judged);
+ *   Little's law again: one clock read per epoch) grew less than
+ *   `NARROWER_WORSE` times, the width goes back, and the next try waits
+ *   twice as long (up to `WIDTH_BACKOFF` epochs). It goes back at once
+ *   if, once it settled, completions come at under three fifths of the
+ *   rate before (a clock read per 256 completions while judged);
  * - below `STALLED_LOW`, while queries are pipelined or queued at the
  *   width, it grows by one. A growth that brings stalls back makes the
- *   next one wait twice as long.
+ *   next one wait twice as long; one that holds lets the next follow.
  *
  * So the pool settles at the widest the server runs without stalls.
  * Queries beyond the width's pipelines wait in the shared queue, in
  * order, for whichever connection frees a slot first. The epoch after a
- * change, or in which the pool ran out of queries, isn't judged.
+ * change, in which the pool ran out of queries, or in which a connection
+ * took queries for the first time, isn't judged.
  */
-class Width {
+/** What `Width` tracks of a connection. */
+export interface WidthSlot {
+	/** Queries in flight while lent for queries; -1 otherwise. */
+	readonly shared: number;
+	lastDone: number;
+}
+
+/** @internal Exported for tests. */
+export class Width {
 	limit: number;
 	readonly #max: number;
+	readonly #now: () => number;
 	#ticks = 0;
 	/** The completion count when the epoch began, and when it ends. */
 	#first = 0;
@@ -216,15 +226,17 @@ class Width {
 	#trialTick = 0;
 	#trialPace = 0;
 
-	constructor(max: number) {
+	constructor(max: number, now: () => number = () => performance.now()) {
 		this.limit = max;
 		this.#max = max;
+		this.#now = now;
 	}
 
 	/** A connection starts taking queries; `first` when no other has any. */
-	start(slot: Slot, first: boolean): void {
+	start(slot: WidthSlot, first: boolean): void {
+		// while the pool fills up, not every connection is busy yet: stalls would read low
+		if (first || slot.lastDone === 0) this.#settling = true;
 		slot.lastDone = this.#ticks;
-		if (first) this.#settling = true;
 	}
 
 	/** Queries are pipelined, or queued, because every connection the width allows is in use. */
@@ -238,11 +250,11 @@ class Width {
 	 * when the width grew.
 	 */
 	done(
-		slot: Slot,
+		slot: WidthSlot,
 		inFlight: number,
 		waiting: number,
 		shared: number,
-		slots: ReadonlyMap<unknown, Slot>,
+		slots: ReadonlyMap<unknown, WidthSlot>,
 	): boolean {
 		const tick = ++this.#ticks;
 		// its own completion is a tick of its time too
@@ -251,8 +263,12 @@ class Width {
 		slot.lastDone = tick;
 		this.#load += inFlight + waiting;
 		// a narrowing that slows completions down by two fifths is undone without waiting for its epochs
-		if (this.#from > 0 && (tick & 255) === 0 && tick - this.#trialTick >= 512) {
-			const now = performance.now();
+		if (
+			this.#from > 0 &&
+			(tick & 255) === 0 &&
+			tick - this.#trialTick >= WIDTH_EPOCH / 2
+		) {
+			const now = this.#now();
 			if (
 				(now - this.#trialStart) * 0.6 >
 				(tick - this.#trialTick) * this.#trialPace
@@ -296,7 +312,7 @@ class Width {
 	}
 
 	#adjust(shared: number): boolean {
-		const now = performance.now();
+		const now = this.#now();
 		const elapsed = now - this.#started;
 		// Little's law: mean queries in the pool over the completion rate
 		const latency = (this.#load / WIDTH_EPOCH) * (elapsed / WIDTH_EPOCH);
@@ -352,8 +368,8 @@ class Width {
 		}
 		if (stalled >= STALLED_LOW || !demand || this.limit >= this.#max)
 			return false;
-		// the last try held: try again sooner
-		if (this.#probing) this.#growBackoff = Math.max(1, this.#growBackoff >> 1);
+		// the last try held: the server has room again, so keep growing
+		if (this.#probing) this.#growBackoff = 1;
 		this.#probing = true;
 		this.#settling = true;
 		this.#epoch(now);

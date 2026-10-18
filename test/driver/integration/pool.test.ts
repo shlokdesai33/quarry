@@ -668,7 +668,7 @@ describe.skipIf(noPg)('pool', () => {
 		expect(net.maxInFlight()).toBe(100);
 	});
 
-	it('narrows to the connections the server runs at once, and widens back', async () => {
+	it('narrows to the connections the server runs at once', async () => {
 		// one CPU time-slicing every backend with replies waiting, 5 ms at a time
 		const net = timeSlicedSockets(1, 5);
 		await using p = pool({ max: 4, socket: net.factory });
@@ -687,40 +687,12 @@ describe.skipIf(noPg)('pool', () => {
 				return false;
 			};
 			// spread over every connection first, then down to one or two
+			// (widening back and slow queries: pool-width.test.ts)
 			expect(await until((n) => n === 4, 1)).toBe(true);
 			expect(await until((n) => n <= 2, 4)).toBe(true);
-			// a server with room again: back to all four
-			net.stop();
-			expect(await until((n) => n === 4, 4)).toBe(true);
 		} finally {
 			net.stop();
 			await load.stop();
-		}
-	});
-
-	it('keeps its width when slow queries, not the server, stall connections', async () => {
-		// no time-slicing: a connection stalls only behind a slow query
-		const net = timeSlicedSockets(Number.POSITIVE_INFINITY, 5);
-		await using p = pool({ max: 4, socket: net.factory });
-		let fast = 0;
-		const load = sustain(100, async () => {
-			await p.query('select 1');
-			fast++;
-		});
-		const slow = sustain(8, () => p.query('select pg_sleep(0.02)'));
-		try {
-			await sleep(1500);
-			// on all four most of the time: a narrowing tried now and then is undone
-			const seen: number[] = [];
-			const before = fast;
-			for (let i = 0; i < 20; i++) {
-				await sleep(50);
-				seen.push(net.sending(100));
-			}
-			expect(fast).toBeGreaterThan(before);
-			expect(seen.filter((n) => n === 4).length).toBeGreaterThanOrEqual(15);
-		} finally {
-			await Promise.all([load.stop(), slow.stop()]);
 		}
 	});
 
