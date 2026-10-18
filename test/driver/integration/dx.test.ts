@@ -524,7 +524,7 @@ describe.skipIf(noPg)('DX features against PostgreSQL', () => {
 					name: 'Ada',
 					email: 'ada@example.com',
 					passwordHash: 'hash-of-hunter2',
-					pin: '4242',
+					pin: 'pin-4242',
 				})
 				.returning(['accounts.email', 'accounts.passwordHash'])
 				.expectOne()
@@ -548,15 +548,15 @@ describe.skipIf(noPg)('DX features against PostgreSQL', () => {
 				.execute();
 			await db
 				.update(accounts)
-				.setEach([{ id: 1, pin: '1111' }], { key: ['id'] })
+				.setEach([{ id: 1, pin: 'pin-1111' }], { key: ['id'] })
 				.execute();
 			const shown = inspect(events, { depth: 5 });
 			for (const secret of [
 				'ada@example.com',
 				'hunter2',
 				'swordfish',
-				'4242',
-				'1111',
+				'pin-4242',
+				'pin-1111',
 			])
 				expect(shown).not.toContain(secret);
 			expect(events[0]?.params).toEqual([
@@ -569,7 +569,7 @@ describe.skipIf(noPg)('DX features against PostgreSQL', () => {
 				`select password_hash, pin from ${schema}.accounts`,
 			);
 			expect(rows).toEqual([
-				{ password_hash: 'hash-of-swordfish', pin: '1111' },
+				{ password_hash: 'hash-of-swordfish', pin: 'pin-1111' },
 			]);
 		});
 
@@ -768,6 +768,95 @@ describe.skipIf(noPg)('DX features against PostgreSQL', () => {
 				expect(shown).not.toContain(secret);
 			}
 			expect(events.map((e) => e.params)).toContainEqual(['[redacted]', 1]);
+		});
+	});
+
+	describe('on the pool’s shared and exclusive paths', () => {
+		/** Runs `fn` counting the connections the pool reserves: the exclusive path's. */
+		const reserving = async <T>(fn: () => Promise<T>) => {
+			const acquire = pool.acquire.bind(pool);
+			let reserved = 0;
+			pool.acquire = (acquireOptions) => {
+				reserved++;
+				return acquire(acquireOptions);
+			};
+			try {
+				const value = await fn();
+				return { value, reserved };
+			} finally {
+				pool.acquire = acquire;
+			}
+		};
+		const byEmail = () =>
+			db
+				.selectFrom(accounts)
+				.select(['accounts.id'])
+				.where('accounts.email', 'shared@example.com');
+
+		it('counts, reports and redacts queries and batches either way', async () => {
+			events.length = 0;
+			const { value: queries, reserved } = await reserving(() =>
+				db.budget({}, async (usage) => {
+					await byEmail().execute(); // shared
+					await byEmail().execute({ timeout: '5s' }); // exclusive
+					await db.batch([byEmail(), byEmail()]); // shared
+					await db.batch([byEmail()], { timeout: '5s' }); // exclusive
+					return usage.queries;
+				}),
+			);
+			expect(queries).toBe(5);
+			expect(reserved).toBe(2);
+			expect(events).toHaveLength(5);
+			for (const event of events) {
+				expect(event.params).toEqual(['[redacted]']);
+				expect(event.phases.acquireMs).toBeGreaterThanOrEqual(0);
+				expect(event.phases.acquireMs).toBeLessThanOrEqual(event.durationMs);
+			}
+			const refused = await reserving(() =>
+				rejection(
+					db.budget({ maxQueries: 1 }, async () => {
+						await byEmail().execute();
+						await db.batch([byEmail()]);
+					}),
+					QueryBudgetError,
+				),
+			);
+			expect(refused.value.query.params).toEqual(['[redacted]']);
+			expect(refused.reserved).toBe(0);
+		});
+
+		it('reports slow queries and redacts server errors either way', async () => {
+			slow.length = 0;
+			const napping = () => db.selectFrom(nap).select(['nap.done']);
+			const { reserved } = await reserving(async () => {
+				await napping().execute();
+				await napping().execute({ timeout: '5s' });
+				await db.batch([napping()]);
+			});
+			expect(reserved).toBe(1);
+			expect(slow).toHaveLength(3);
+			const duplicate = db.insertInto(accounts).values({
+				name: 'Twin',
+				email: 'ada@example.com',
+				passwordHash: 'hash-of-a-twin',
+			});
+			for (const run of [
+				() => duplicate.execute(),
+				() => duplicate.execute({ timeout: '5s' }),
+				() =>
+					db
+						.batch([duplicate])
+						.catch((e: BatchError) => Promise.reject(e.errors[0])),
+			]) {
+				const error = await rejection(run(), UniqueViolation);
+				expect(error.detail).toBe('Key (email)=([redacted]) already exists.');
+				expect(error.query?.params).toEqual([
+					'Twin',
+					'[redacted]',
+					'[redacted]',
+				]);
+				expect(inspect(error)).not.toContain('hash-of-a-twin');
+			}
 		});
 	});
 });
