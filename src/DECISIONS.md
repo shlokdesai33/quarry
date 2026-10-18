@@ -603,17 +603,35 @@ The mechanisms are in [PAGINATION.md](PAGINATION.md).
 
 **Code.** [executor.ts](executor.ts), [driver-executor.ts](driver-executor.ts).
 
-### Each operation borrows a connection
+### Plain queries share the pool's pipelined connections
 
-**What it is.** Over a pool, each `execute()` reserves a connection with `pool.acquire()` for its duration ([EXECUTION.md](EXECUTION.md#connections-what-a-query-borrows)).
+**What it is.** Over a pool, a builder query (`execute()`, and `db.sql` statements), `describe()` and a default `db.batch` run on the pool's shared connections: `pool.query`, `pool.describe`, and `pool.withShared` for a batch, which runs its statements together on one connection as one pipeline slot. What leaves state on a connection takes one of its own: transactions, `stream()`, atomic batches, a `timeout`, and `db.sql` statements whose first keyword changes session or transaction state (`begin`, `set`, `listen`, `create temp table`, …) ([EXECUTION.md](EXECUTION.md#connections-shared-or-exclusive)).
 
-**Why.** Simple and predictable: a query's timing (`acquireMs`, `queuedMs`, `execMs` in `onQuery`) is its own, and a failing query can't affect another caller's.
+**Why.** From the driver's integration (#3) until #36, every operation reserved a connection with `pool.acquire()`: beyond `max` concurrent queries, callers queued for a whole connection, so the builder got one query per connection per round trip, and none of the pool's pipelining. On the shared path, once the pool is full, queries pipeline onto busy connections, in a FIFO of pipeline slots, with each connection's depth adapting to the round trip, and connections are drained for callers who need one alone, so transactions and streams don't starve ([driver/DECISIONS.md](driver/DECISIONS.md#pipelining-onto-busy-connections-only-once-the-pool-is-full)). Nothing per query is lost: codecs, binary results once described, `keepRows`, tags, signals (a cancel only targets the query at the head of the connection), PgBouncer's unnamed statements and the stale-statement retry all live per query in the connection, and each query has its own Sync, so it fails alone.
 
-**Alternatives.** Route single queries through the pool's shared-connection pipelining ([driver/DECISIONS.md](driver/DECISIONS.md#pipelining-onto-busy-connections-only-once-the-pool-is-full)).
+**Alternatives.**
 
-**Cost.** Builder queries don't use the pool's pipelining onto busy connections: beyond the pool's `max`, concurrent queries wait for a free connection. What quarry sends together is still pipelined on the borrowed connection (a `db.batch`, a transaction's BEGIN with its first statement, a timeout's `set_config`). To send many independent queries in one round trip, use `db.batch`.
+- Keep a connection per operation (the previous design): a query's `queuedMs` was its own, at the cost of every builder query beyond `max` waiting a whole round trip per connection.
+- Send a batch's statements through `pool.query` one by one: on an idle pool they would spread over several connections, and the batch would no longer go out in one write on one connection.
+- Share queries with a `timeout` too: the driver frames a timeout by the connection's last reported transaction status (`begin`…`commit` when idle, a save-and-restore inside a transaction). On a shared connection, another caller's pipelined `begin` can make it pick the wrong one, and the setting silently doesn't apply. A connection of its own costs nothing extra: the four statements already go out in one write.
+- Refuse session statements in `db.sql` on a pool (postgres.js refuses `begin` outside `sql.begin`): it breaks code that worked, where giving them a connection of their own keeps their old behaviour and keeps other callers out of their state.
 
-**Code.** `#run` in [driver-executor.ts](driver-executor.ts).
+**Cost.** A slow query delays the queries pipelined behind it on its connection (head-of-line blocking, bounded by the pipeline depth), and `queuedMs` includes them. The session check is a heuristic on the first keyword: state a `select` sets (`set_config(…, false)`, `pg_advisory_lock`) isn't seen, and lands on an arbitrary connection, as before. One anchored regular expression test per query on a pool.
+
+**Measured.** 10 connections, point lookups by primary key through the builder (`selectFrom(users).where(id).select([6 columns]).execute()`), closed loop, median of 5 interleaved runs (the driver benchmark suite of #6, Node 24, a 4-core VM; the 5 ms round trip through Toxiproxy):
+
+| Round trip | Concurrent callers | Before: ops/s (p50) | After: ops/s (p50) |
+| ---------- | ------------------ | ------------------- | ------------------ |
+| 0 ms       | 100                | 37,300 (2.4 ms)     | 57,800 (1.4 ms)    |
+| 0 ms       | 500                | 37,800 (11.8 ms)    | 61,100 (6.8 ms)    |
+| 0 ms       | 1000               | 33,900 (28.8 ms)    | 55,300 (15.2 ms)   |
+| 5 ms       | 100                | 1,640 (60.7 ms)     | 15,900 (6.3 ms)    |
+| 5 ms       | 500                | 1,640 (303 ms)      | 58,200 (7.2 ms)    |
+| 5 ms       | 1000               | 1,620 (613 ms)      | 55,700 (17.2 ms)   |
+
+Before, throughput was capped at `max` lookups per round trip (10 per 6 ms at 5 ms). After, 100 callers at 5 ms match the driver's own `pool.query` (15,600 ops/s); beyond that, the builder's client CPU is the limit (about 19 µs per lookup, against about 4 µs for `pool.query`: building and rendering the query and capturing the call site), not the connections. Client CPU per lookup also drops at 0 ms (29 → 19 µs): no connection reserved and released per query.
+
+**Code.** `#shared`, `SESSION_STATEMENT` and `#run` in [driver-executor.ts](driver-executor.ts); `withShared` in [driver/pool.ts](driver/pool.ts); [test/driver/integration/builder-pool.test.ts](../test/driver/integration/builder-pool.test.ts).
 
 ### Errors carry the query (hidden) and your call site
 

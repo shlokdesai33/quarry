@@ -293,7 +293,7 @@ const user = await db
 3. **`.select([...])`** ([row.ts](row.ts) `selectionNodes`) turns each reference into a `SelectionNode`: the column's node, the key it gets in the row (`createdAt`), and the codec to read it with (`timestamptz`). The type parameter `O` becomes `{ id: number; name: string | null; createdAt: Date }`.
 4. **`.expectOne()`** compiles the tree right away ([compile.ts](compile.ts)) and wraps the result in a `Query<O>` together with a **shape**: how to read the rows (keep at most two; throw `NoRowError` for none and `TooManyRowsError` for several).
 5. **`.execute()`** ([query.ts](query.ts)) hands the compiled query to the executor, asking for only 2 rows to be kept and decoded.
-6. **`DriverExecutor.execute`** ([driver-executor.ts](driver-executor.ts)) borrows a connection from the pool, passes the SQL, parameters and codecs to `connection.query`, times the query for `onQuery`, and decorates errors.
+6. **`DriverExecutor.execute`** ([driver-executor.ts](driver-executor.ts)) passes the SQL, parameters and codecs to `pool.query`, which runs it on a shared connection, pipelined with other callers' queries once the pool is full; it times the query for `onQuery` and decorates errors.
 7. **The driver** ([driver/ARCHITECTURE.md](driver/ARCHITECTURE.md)) encodes the parameter, sends Parse/Describe/Bind/Execute/Sync, reads RowDescription and DataRow messages, decodes each column with the codec it was given, and resolves with `{ rows, rowCount, command }`.
 8. **The shape** reads the rows: one row, so it returns it, typed as `O`.
 
