@@ -139,8 +139,8 @@ const WIDTH_EPOCH = 4096;
 /** Above this share of stalled time, the width shrinks; below the other, it may grow. */
 const STALLED_HIGH = 0.25;
 const STALLED_LOW = 0.05;
-/** A narrower pool is kept unless queries then take this much longer on average. */
-const NARROWER_WORSE = 1.5;
+/** A narrower pool is kept unless queries then take this many times longer on average. */
+const NARROWER_WORSE = 2;
 /** The most epochs to wait before trying again after a change that didn't help. */
 const WIDTH_BACKOFF = 64;
 
@@ -172,10 +172,11 @@ const WIDTH_BACKOFF = 64;
  *   queries behind it, so the epoch after next judges the change: unless
  *   stalls fell by a quarter (or below `STALLED_HIGH`) and the mean
  *   latency (queries in flight and queued over the completion rate,
- *   Little's law again: one clock read per epoch) didn't rise by more
- *   than `NARROWER_WORSE`, the width goes back, and the next try waits
- *   twice as long (up to `WIDTH_BACKOFF` epochs). It goes back at once
- *   if completions slow down by two fifths meanwhile;
+ *   Little's law again: one clock read per epoch) didn't grow by more
+ *   than `NARROWER_WORSE` times, the width goes back, and the next try
+ *   waits twice as long (up to `WIDTH_BACKOFF` epochs). It goes back at
+ *   once if, from 512 completions in, they come at under three fifths
+ *   of the rate before (a clock read per 256 completions while judged);
  * - below `STALLED_LOW`, while queries are pipelined or queued at the
  *   width, it grows by one. A growth that brings stalls back makes the
  *   next one wait twice as long.
@@ -210,9 +211,10 @@ class Width {
 	#narrowBackoff = 4;
 	/** The previous epoch's stalled share, as narrowing takes two in a row. */
 	#lastStalled = 0;
-	/** When the narrowing being judged began, and how long its two epochs may take. */
+	/** When the narrowing being judged began (time and completion count), and the time per completion before it. */
 	#trialStart = 0;
-	#trialBudget = 0;
+	#trialTick = 0;
+	#trialPace = 0;
 
 	constructor(max: number) {
 		this.limit = max;
@@ -249,9 +251,13 @@ class Width {
 		slot.lastDone = tick;
 		this.#load += inFlight + waiting;
 		// a narrowing that slows completions down by two fifths is undone without waiting for its epochs
-		if (this.#from > 0 && (tick & 255) === 0) {
+		if (this.#from > 0 && (tick & 255) === 0 && tick - this.#trialTick >= 512) {
 			const now = performance.now();
-			if (now - this.#trialStart > this.#trialBudget) return this.#revert(now);
+			if (
+				(now - this.#trialStart) * 0.6 >
+				(tick - this.#trialTick) * this.#trialPace
+			)
+				return this.#revert(now);
 		}
 		if (tick < this.#end) return false;
 		// stalls still going on count too: a backend can be off its CPU for longer than an epoch
@@ -332,8 +338,8 @@ class Width {
 			this.#before = latency;
 			this.#stalledBefore = (stalled + lastStalled) / 2;
 			this.#trialStart = now;
-			// the settling half epoch and the judged one, at three fifths of this one's rate
-			this.#trialBudget = 2.5 * elapsed;
+			this.#trialTick = this.#ticks;
+			this.#trialPace = elapsed / WIDTH_EPOCH;
 			this.#settling = true;
 			this.#epoch(now);
 			this.limit = narrower;
