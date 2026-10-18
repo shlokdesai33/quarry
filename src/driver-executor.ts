@@ -133,6 +133,14 @@ const interval = (timeout: number | string) =>
 	typeof timeout === 'number' ? `${timeout}ms` : timeout;
 
 /**
+ * Hand-written statements (`db.sql`) that change the transaction or
+ * session state, by their first keyword. On a shared connection, queries
+ * other callers pipelined behind them would run in that state.
+ */
+const SESSION_STATEMENT =
+	/^\s*(?:begin|start|commit|end|rollback|abort|savepoint|release|prepare|set|reset|discard|listen|unlisten|declare|fetch|move|close|create\s+(?:temp|temporary|local\s+temp|local\s+temporary)\b)\b/i;
+
+/**
  * Runs quarry's queries on the driver: a pool, a reserved client, a single
  * connection, or a driver transaction. Decodes values to quarry's types,
  * reports `onQuery` events, and adds the query, tag and caller's stack to
@@ -164,7 +172,7 @@ export class DriverExecutor implements TransactionExecutor {
 	}
 
 	/** Looks up the types codecs name, once per pool; a failure leaves them to the driver. */
-	async #prepare(runner: Runner): Promise<void> {
+	async #prepare(runner: Runner | Pool): Promise<void> {
 		if (this.#ready || runner.loadTypes === undefined) return;
 		await runner.loadTypes();
 		this.#ready = true;
@@ -193,7 +201,29 @@ export class DriverExecutor implements TransactionExecutor {
 		return out;
 	}
 
-	/** Runs `fn` on a connection: borrowed from the pool, or the source itself. */
+	/**
+	 * The pool, when the operation can share its connections with other
+	 * callers' queries, pipelined: not with a `timeout` (set with
+	 * `set_config` in a transaction of its own, framed by the connection's
+	 * transaction status, which other callers' queries change), nor for a
+	 * statement that changes the session or transaction state.
+	 */
+	#shared(
+		timeout: number | string | undefined,
+		queries: CompiledQuery | readonly CompiledQuery[] | undefined,
+	): Pool | undefined {
+		const source = this.#source;
+		if (!(source instanceof Pool) || timeout !== undefined) return undefined;
+		if (queries === undefined) return source;
+		if ('sql' in queries) {
+			return SESSION_STATEMENT.test(queries.sql) ? undefined : source;
+		}
+		for (const query of queries)
+			if (SESSION_STATEMENT.test(query.sql)) return undefined;
+		return source;
+	}
+
+	/** Runs `fn` on a connection of its own: reserved from the pool, or the source itself. */
 	async #run<T>(
 		signal: AbortSignal | undefined,
 		fn: (runner: Runner) => Promise<T>,
@@ -270,18 +300,40 @@ export class DriverExecutor implements TransactionExecutor {
 		let acquired = start;
 		let timing: OpTiming | undefined;
 		try {
-			const result = await this.#run(options.signal, (runner) => {
-				if (observe) acquired = performance.now();
-				return runner.query<unknown>(
+			const pool = this.#shared(options.timeout, query);
+			let result: QueryResult<unknown>;
+			if (pool !== undefined) {
+				if (!this.#ready) await this.#prepare(pool);
+				// the pool picks the connection: the time before the query
+				// reached it is the wait for a connection or a pipeline slot
+				result = await pool.query<unknown>(
 					query.sql,
 					query.params,
 					this.#queryOptions(
 						options,
-						observe ? (t) => (timing = t) : undefined,
+						observe
+							? (t) => {
+									timing = t;
+									acquired = performance.now() - t.queuedMs - t.execMs;
+								}
+							: undefined,
 						query,
 					),
 				);
-			});
+			} else {
+				result = await this.#run(options.signal, (runner) => {
+					if (observe) acquired = performance.now();
+					return runner.query<unknown>(
+						query.sql,
+						query.params,
+						this.#queryOptions(
+							options,
+							observe ? (t) => (timing = t) : undefined,
+							query,
+						),
+					);
+				});
+			}
 			if (observe) {
 				this.#report(
 					'execute',
@@ -389,9 +441,16 @@ export class DriverExecutor implements TransactionExecutor {
 	async describe(query: CompiledQuery): Promise<QueryDescription> {
 		const callsite = this.#callsite();
 		try {
-			const description = await this.#run(undefined, (runner) =>
-				runner.describe(query.sql),
-			);
+			const pool = this.#shared(undefined, undefined);
+			let description: Description;
+			if (pool !== undefined) {
+				if (!this.#ready) await this.#prepare(pool);
+				description = await pool.describe(query.sql);
+			} else {
+				description = await this.#run(undefined, (runner) =>
+					runner.describe(query.sql),
+				);
+			}
 			return {
 				params: description.paramTypes,
 				columns: description.fields.map((field) => ({
@@ -500,6 +559,35 @@ export class DriverExecutor implements TransactionExecutor {
 			}
 			return settled;
 		};
+		/** Each query with its own Sync, all in one write. */
+		const independent = (runner: Pick<Runner, 'query'>) =>
+			settle(
+				batch.map(({ query, rowMode, keepRows }) =>
+					runner.query<unknown>(
+						query.sql,
+						query.params,
+						this.#queryOptions(
+							{ ...options, rowMode, keepRows },
+							undefined,
+							query,
+						),
+					),
+				),
+				false,
+			);
+		if (!inTransaction && transaction === undefined) {
+			const pool = this.#shared(timeout, queries);
+			if (pool !== undefined) {
+				if (!this.#ready) await this.#prepare(pool);
+				return pool.withShared(
+					(connection) => {
+						if (observe) acquired = performance.now();
+						return independent(connection);
+					},
+					{ signal },
+				);
+			}
+		}
 		return this.#run(signal, async (runner) => {
 			if (observe) acquired = performance.now();
 			if (inTransaction) {
@@ -507,22 +595,7 @@ export class DriverExecutor implements TransactionExecutor {
 					await settle(runner.queryGroup(statements, { signal }), true),
 				);
 			}
-			if (transaction === undefined) {
-				return settle(
-					batch.map(({ query, rowMode, keepRows }) =>
-						runner.query<unknown>(
-							query.sql,
-							query.params,
-							this.#queryOptions(
-								{ ...options, rowMode, keepRows },
-								undefined,
-								query,
-							),
-						),
-					),
-					false,
-				);
-			}
+			if (transaction === undefined) return independent(runner);
 			const { results, done } = Transaction.batch(runner, statements, {
 				...transaction,
 				...(timeout === undefined
