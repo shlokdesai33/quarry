@@ -170,6 +170,18 @@ type Listener<T> = (value: T) => void;
 const FLUSH_BYTES = 65_536;
 
 /**
+ * Sets `statement_timeout` to $1 until the transaction ends, keeping the
+ * value it replaces in a custom setting, `quarry.statement_timeout`
+ * (transaction-local too): the select list is evaluated in order.
+ */
+const SET_STATEMENT_TIMEOUT =
+	"select set_config('quarry.statement_timeout', current_setting('statement_timeout'), true), set_config('statement_timeout', $1, true)";
+/** Puts back the value `SET_STATEMENT_TIMEOUT` replaced. */
+const RESTORE_STATEMENT_TIMEOUT =
+	"select set_config('statement_timeout', current_setting('quarry.statement_timeout'), true)";
+const UNNAMED = { prepare: false } as const;
+
+/**
  * One session with the server. Queries can be issued concurrently: they
  * are pipelined, written together in one socket write per tick (in 64 KiB
  * chunks, pausing while the socket's buffer is full), and their results
@@ -1183,6 +1195,25 @@ export class Connection implements AsyncDisposable {
 		statements: readonly GroupStatement[],
 		{ signal }: { readonly signal?: AbortSignal | undefined } = {},
 	): Promise<QueryResult<unknown>>[] {
+		const results = this.#queryGroup(statements, signal);
+		if (this.#config.telemetry === undefined && !this.#config.captureStack)
+			return results;
+		return results.map((result, i) =>
+			this.#observe(
+				statements[i]?.sql ?? '',
+				statements[i]?.options?.tag,
+				() => result,
+				(r) => r.rowCount,
+			),
+		);
+	}
+
+	#queryGroup(
+		statements: readonly GroupStatement[],
+		signal: AbortSignal | undefined,
+		timeout?: number,
+		onTiming?: (timing: OpTiming) => void,
+	): Promise<QueryResult<unknown>>[] {
 		const ops: QueryOp[] = [];
 		let invalid: { error: unknown } | undefined;
 		const results = statements.map(
@@ -1224,67 +1255,59 @@ export class Connection implements AsyncDisposable {
 					);
 				}),
 		);
-		if (ops.length > 0) this.#enqueue(new SyncGroupOp(ops), signal);
+		if (ops.length > 0) {
+			const group = new SyncGroupOp(ops);
+			group.onTiming = onTiming;
+			this.#enqueue(group, signal, timeout);
+		}
 		if (!this.#config.catalog.loaded) {
 			for (const { params = [], options } of statements)
 				this.#loadTypesAfter(params, options);
 		}
-		if (this.#config.telemetry === undefined && !this.#config.captureStack)
-			return results;
-		return results.map((result, i) =>
-			this.#observe(
-				statements[i]?.sql ?? '',
-				statements[i]?.options?.tag,
-				() => result,
-				(r) => r.rowCount,
-			),
-		);
+		return results;
 	}
 
+	/**
+	 * The query between a statement setting `statement_timeout` and one
+	 * restoring it, all under one Sync. Outside a transaction block, the
+	 * three run in one implicit transaction, which ends the setting at the
+	 * Sync; inside one, the restore ends it. Either way it bounds the query
+	 * alone, whatever else is pipelined on the connection, so the framing
+	 * can't depend on the transaction status, which only says how the last
+	 * answered query left the connection.
+	 */
 	async #queryWithTimeout<R>(
 		sql: string,
 		params: readonly unknown[],
 		options: QueryOptions,
-		timeout: number | string,
+		statementTimeout: number | string,
 	): Promise<QueryResult<R>> {
-		const { statementTimeout: _, ...rest } = options;
-		const value = typeof timeout === 'number' ? `${timeout}ms` : timeout;
-		const set = "select set_config('statement_timeout', $1, true) as previous";
-		if (this.#status === 'I') {
-			// pipelined together, so they reach the server back to back
-			const settled = await Promise.allSettled([
-				this.#query('begin', [], undefined),
-				this.#query(set, [value], undefined),
-				this.#query<R>(sql, params, rest),
-				this.#query('commit', [], undefined),
-			]);
-			const result = settled[2];
-			if (result?.status === 'rejected') throw result.reason;
-			const failed = settled.find((s) => s.status === 'rejected');
-			if (failed?.status === 'rejected') throw failed.reason;
-			if (result?.status !== 'fulfilled')
-				throw new ConnectionError('Query did not run');
-			return result.value;
-		}
-		const previous = this.#query<{ previous: string }>(
-			"select current_setting('statement_timeout') as previous, set_config('statement_timeout', $1, true)",
-			[value],
-			undefined,
+		const { statementTimeout: _, signal, timeout, onTiming, ...rest } = options;
+		const interval =
+			typeof statementTimeout === 'number'
+				? `${statementTimeout}ms`
+				: statementTimeout;
+		const [set, query, restore] = this.#queryGroup(
+			// unnamed: once the query fails, the server skips the restore's
+			// Parse, while groups pipelined behind would Bind the name
+			[
+				{ sql: SET_STATEMENT_TIMEOUT, params: [interval], options: UNNAMED },
+				{ sql, params, options: rest },
+				{ sql: RESTORE_STATEMENT_TIMEOUT, options: UNNAMED },
+			],
+			signal,
+			timeout,
+			onTiming,
 		);
-		const [before, result] = await Promise.allSettled([
-			previous,
-			this.#query<R>(sql, params, rest),
-		]);
-		if (before.status === 'fulfilled' && this.#status === 'T') {
-			this.#query(
-				set,
-				[before.value.rows[0]?.previous ?? '0'],
-				undefined,
-			).catch(() => {});
-		}
-		if (result.status === 'rejected') throw result.reason;
-		if (before.status === 'rejected') throw before.reason;
-		return result.value;
+		// a failed set skips the query, which rejects with its error
+		set?.catch(() => {});
+		restore?.catch(() => {});
+		if (query === undefined || restore === undefined)
+			throw new ConnectionError('Query did not run');
+		const result = await query;
+		// outside a transaction block, a failed restore rolled the query back
+		await restore;
+		return asResult<R>(result);
 	}
 
 	/**
