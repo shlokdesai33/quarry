@@ -741,14 +741,14 @@ export class DriverExecutor implements TransactionExecutor {
 										}),
 							});
 							done.catch(() => {});
-							const settled = settle(await Promise.allSettled(results), true);
+							const outcomes = settle(await Promise.allSettled(results), true);
 							try {
 								await done;
 							} catch (error) {
 								decorate(error, undefined, callsite());
 								throw error;
 							}
-							return settled;
+							return outcomes;
 						});
 		} catch (error) {
 			if (budgets.length > 0)

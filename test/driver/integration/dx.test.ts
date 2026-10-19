@@ -357,6 +357,9 @@ describe.skipIf(noPg)('DX features against PostgreSQL', () => {
 			expect(error.usage.queries).toBe(3);
 			expect(error.query.params).toEqual([3]);
 			expect(error.stack).toContain('--- query issued at ---');
+			expect(
+				error.stack?.slice(error.stack.indexOf('--- query issued at ---')),
+			).toContain('dx.test.ts');
 			expect(events).toHaveLength(2);
 		});
 
@@ -376,6 +379,13 @@ describe.skipIf(noPg)('DX features against PostgreSQL', () => {
 				return [first, next];
 			});
 			expect(errors.map((e) => e.limit)).toEqual(['duration', 'duration']);
+			// captured lazily, once each had failed: the stack still reaches the caller
+			for (const error of errors) {
+				const site = error.stack?.slice(
+					error.stack.indexOf('--- query issued at ---'),
+				);
+				expect(site).toContain('dx.test.ts');
+			}
 			expect(errors[0]?.usage.durationMs).toBeGreaterThan(100);
 			// the slow query ran; the one after it was never sent
 			expect(events).toHaveLength(2);
@@ -850,6 +860,9 @@ describe.skipIf(noPg)('DX features against PostgreSQL', () => {
 			]) {
 				const error = await rejection(run(), UniqueViolation);
 				expect(error.detail).toBe('Key (email)=([redacted]) already exists.');
+				expect(
+					error.stack?.slice(error.stack.indexOf('--- query issued at ---')),
+				).toContain('dx.test.ts');
 				expect(error.query?.params).toEqual([
 					'Twin',
 					'[redacted]',

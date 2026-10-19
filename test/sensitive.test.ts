@@ -10,6 +10,7 @@ import { databaseWith } from '../src/database.js';
 import { defineTable } from '../src/define-table.js';
 import { DecodeError, UniqueViolation } from '../src/driver/errors.js';
 import { NoRowError } from '../src/executor.js';
+import { expressionBuilder } from '../src/expression-builder.js';
 import { insertInto } from '../src/insert-query-builder.js';
 import { redactDetail, redactError } from '../src/redact.js';
 import { selectFrom } from '../src/select-query-builder.js';
@@ -253,6 +254,50 @@ describe('sensitive() in everyday SQL', () => {
 		const other = new DecodeError('anything', 25, new Error('value: 1234'));
 		redactError(other, db.sql`select 1`.toSQL());
 		expect(other.cause).toBeInstanceOf(Error);
+	});
+});
+
+describe('sensitive() and the column nodes queries share', () => {
+	it('marks a sensitive column’s shared node once, and never changes a shared node', () => {
+		const eb = expressionBuilder(users);
+		const email = eb.ref('users.email')._quarry.node;
+		const name = eb.ref('users.name')._quarry.node;
+		expect(email).toEqual({
+			kind: 'reference',
+			table: 'users',
+			column: 'email',
+			sensitive: true,
+		});
+		expect(name).not.toHaveProperty('sensitive');
+		const before = structuredClone([email, name]);
+		const query = selectFrom(users)
+			.select(['users.email', 'users.name'])
+			.where('users.email', 'a@x')
+			.where((b) => b.fn.coalesce('users.name', b.val('n')).eq('m'))
+			.where((b) => sql<boolean>`${b.ref('users.email')} like ${'%'}`);
+		query.toSQL({ inline: true, pretty: true });
+		expect(redactedParams(query.toSQL())).toEqual([
+			'[redacted]',
+			'n',
+			'm',
+			'[redacted]',
+		]);
+		expect([email, name]).toEqual(before);
+		expect(expressionBuilder(users).ref('users.email')._quarry.node).toBe(
+			email,
+		);
+		// a table of the same name without the sensitive column has nodes of its own
+		const plainUsers = defineTable('users', {
+			columns: { id: integer().identity(), email: text() },
+		});
+		const plainEmail =
+			expressionBuilder(plainUsers).ref('users.email')._quarry.node;
+		expect(plainEmail).not.toHaveProperty('sensitive');
+		expect(
+			redactedParams(
+				selectFrom(plainUsers).where('users.email', 'a@x').toSQL(),
+			),
+		).toEqual(['a@x']);
 	});
 });
 
