@@ -596,6 +596,45 @@ export const SCENARIOS: Scenario[] = [
 		op: (d, i) => d.builderBatch!('batch', true, i),
 	},
 
+	// ------------------------------------------------------------ query-builder statements (quarry only; pk, insert1, update through `db`)
+	{
+		kind: 'ops',
+		id: 'db-pk',
+		group: 'builder',
+		title: 'builder: point lookup by primary key (selectAll().expectOne())',
+		rowsPerOp: 1,
+		needs: 'builderOp',
+		op: (d, i) => d.builderOp!('pk', i),
+		check: (r, i) => expect(Number((r as Row)['id']) === pkId(i), 'row by id'),
+	},
+	{
+		kind: 'ops',
+		id: 'db-pk-timed',
+		group: 'builder',
+		title:
+			"builder: point lookup with a statement timeout (execute({ timeout: '2s' }))",
+		rowsPerOp: 1,
+		needs: 'builderOp',
+		op: (d, i) => d.builderOp!('pk-timed', i),
+		check: (r, i) => expect(Number((r as Row)['id']) === pkId(i), 'row by id'),
+	},
+	{
+		kind: 'ops',
+		id: 'db-insert',
+		group: 'builder',
+		title: 'builder: insert one row',
+		needs: 'builderOp',
+		op: (d, i) => d.builderOp!('insert', i),
+	},
+	{
+		kind: 'ops',
+		id: 'db-update',
+		group: 'builder',
+		title: 'builder: update one row by primary key (score + 1)',
+		needs: 'builderOp',
+		op: (d, i) => d.builderOp!('update', i),
+	},
+
 	// ------------------------------------------------------------ errors
 	{
 		kind: 'ops',

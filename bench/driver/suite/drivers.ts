@@ -39,6 +39,15 @@ export interface Driver {
 		inTransaction: boolean,
 		i: number,
 	): Promise<unknown>;
+	/**
+	 * quarry's query builder only: the `pk`, `insert1` and `update`
+	 * scenarios' statements built and run through `db`; `pk-timed` adds a
+	 * server-side statement timeout (`execute({ timeout: '2s' })`).
+	 */
+	builderOp?(
+		op: 'pk' | 'pk-timed' | 'insert' | 'update',
+		i: number,
+	): Promise<unknown>;
 	/** COPY … FROM STDIN with pre-encoded text chunks. */
 	copyFrom?(sql: string, chunks: readonly string[]): Promise<void>;
 	/** Cursor streaming: calls `onBatch` per batch, awaiting it (backpressure). */
@@ -108,7 +117,7 @@ export const DRIVERS: Record<
 	'quarry-db': {
 		runtimes: ['node'],
 		describe:
-			"quarry's query builder (`database()` from the built `dist/index.js`) on its default driver pool, for the `db.batch` scenarios only.",
+			"quarry's query builder (`database()` from the built `dist/index.js`) on its default driver pool, for the builder scenarios only (`db.batch`, and builder lookups, inserts and updates under concurrency).",
 		make: (o) => quarryDb(o),
 	},
 	'quarry-lossless': {
@@ -322,6 +331,9 @@ async function quarryDb(o: DriverOptions): Promise<Driver> {
 		for (const x of qs) out.push(await x.execute());
 		return out;
 	};
+	const created = new Date('2024-01-01T00:00:00Z');
+	const lookup = (id: number) =>
+		db.selectFrom(users).where('bench_users.id', id).selectAll().expectOne();
 	return {
 		name: 'quarry-db',
 		query: () =>
@@ -334,6 +346,27 @@ async function quarryDb(o: DriverOptions): Promise<Driver> {
 				: mode === 'batch'
 					? db.batch(statements(db, i), { transaction: true })
 					: db.transaction((tx: any) => run(tx, mode, i)),
+		builderOp: (op, i) => {
+			switch (op) {
+				case 'pk':
+					return lookup(((i * 7919) % 1_000_000) + 1).execute();
+				case 'pk-timed':
+					return lookup(((i * 7919) % 1_000_000) + 1).execute({
+						timeout: '2s',
+					});
+				case 'insert':
+					return db
+						.insertInto(writes)
+						.values({ name: `n${i}`, score: i / 2, created })
+						.execute();
+				case 'update':
+					return db
+						.update(upd)
+						.set((eb: any) => ({ score: eb.ref('bench_upd.score').plus(1) }))
+						.where('bench_upd.id', ((i * 7919) % 100_000) + 1)
+						.execute();
+			}
+		},
 		end: () => db.close(),
 	};
 }

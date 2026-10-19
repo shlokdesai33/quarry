@@ -204,6 +204,7 @@ function get(
 const LABEL: Record<string, string> = {
 	quarry: 'quarry',
 	'quarry-candidate': 'quarry (candidate)',
+	'quarry-db': 'quarry builder',
 	'quarry-lossless': 'quarry (lossless)',
 	'quarry-noprep': 'quarry (prepare: false)',
 	'quarry-nopipe': 'quarry (pipeline: false)',
@@ -1116,6 +1117,67 @@ for (const runtime of RUNTIMES) {
 	);
 	if (t) out.push(`## db.batch\n\n${t}`);
 	summary['batch'] = series;
+}
+
+// ------------------------------------------------------------ builder under concurrency
+{
+	const ops: [string, string, string | undefined][] = [
+		['lookup', 'db-pk', 'pk'],
+		['lookup, statement timeout', 'db-pk-timed', undefined],
+		['insert', 'db-insert', 'insert1'],
+		['update', 'db-update', 'update'],
+	];
+	const drivers = ['quarry-db', 'quarry', 'pg', 'postgres.js'];
+	const callers = [1, 100, 500, 1000];
+	const cell = (
+		driver: string,
+		builder: string,
+		plain: string | undefined,
+		rtt: number,
+		concurrency: number,
+	) => {
+		const scenario = driver === 'quarry-db' ? builder : plain;
+		return scenario === undefined
+			? undefined
+			: get('builder', 'node', driver, scenario, { rtt, concurrency });
+	};
+	const series: Record<string, Record<string, Record<string, unknown>>> = {};
+	for (const [, builder, plain] of ops)
+		for (const driver of drivers)
+			for (const rtt of [0, 5])
+				for (const c of callers) {
+					const a = cell(driver, builder, plain, rtt, c);
+					if (a)
+						((series[builder] ??= {})[driver] ??= {})[`${rtt}/${c}`] = {
+							throughput: a.m['throughput'],
+							p99: a.m['p99'],
+						};
+				}
+	const sections: string[] = [];
+	for (const rtt of [0, 5])
+		for (const [name, m, fmt, lower] of [
+			['operations/s', 'throughput', fmtRate, false],
+			['p99 latency', 'p99', fmtTime, true],
+		] as const) {
+			const t = table(
+				`Node, pool 10, ${rtt} ms RTT: ${name} (\`quarry-db\` is the builder; the others run the same SQL through the driver)`,
+				'Statement, callers',
+				ops.flatMap(([op, builder, plain]) =>
+					callers.map((c) => ({
+						label: `${op}, ${c}`,
+						pick: (d: string) => metric(m)(cell(d, builder, plain, rtt, c)),
+					})),
+				),
+				drivers,
+				fmt,
+				lower,
+				true,
+			);
+			if (t) sections.push(t);
+		}
+	if (sections.length)
+		out.push(`## Query builder under concurrency\n\n${sections.join('\n')}`);
+	summary['builder'] = series;
 }
 
 // ------------------------------------------------------------ RTT sweep

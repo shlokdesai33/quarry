@@ -53,6 +53,7 @@ const PHASES = list('phases') ?? [
 	'pipeline',
 	'rtt',
 	'batch',
+	'builder',
 	'bouncer',
 	'reconnect',
 ];
@@ -178,7 +179,12 @@ function matrix(phase: string): Cell[] {
 		const core = CORE[runtime] ?? [];
 		if (phase === 'main' || phase === 'verify') {
 			for (const s of SCENARIOS) {
-				if (s.id === 'reconnect' || s.group === 'batches') continue;
+				if (
+					s.id === 'reconnect' ||
+					s.group === 'batches' ||
+					s.group === 'builder'
+				)
+					continue;
 				if (phase === 'verify' && (s.kind !== 'ops' || !s.verify)) continue;
 				for (const driver of core)
 					add({
@@ -317,6 +323,32 @@ function matrix(phase: string): Cell[] {
 						max: 10,
 						durationMs: rtt >= 5 ? 2000 : 1000,
 					});
+		}
+		// quarry's query builder under concurrency, with the same statements
+		// through the drivers for reference
+		if (phase === 'builder' && runtime === 'node') {
+			const plan: [string, string[]][] = [
+				['quarry-db', ['db-pk', 'db-pk-timed', 'db-insert', 'db-update']],
+				...['quarry', 'pg', 'postgres.js'].map((d): [string, string[]] => [
+					d,
+					['pk', 'insert1', 'update'],
+				]),
+			];
+			for (const rtt of [0, 5])
+				for (const [driver, scenarios] of plan)
+					for (const scenario of scenarios)
+						for (const concurrency of [1, 100, 500, 1000])
+							add({
+								phase,
+								runtime,
+								driver,
+								scenario,
+								via: 'toxiproxy',
+								rtt,
+								max: 10,
+								concurrency,
+								durationMs: rtt >= 5 ? 2000 : 1000,
+							});
 		}
 		if (phase === 'reconnect') {
 			const drivers =
@@ -573,7 +605,13 @@ async function main() {
 				}
 			};
 			// the simulated RTT and server restarts are global
-			const parallel = ['reconnect', 'rtt', 'pipeline', 'batch'].includes(phase)
+			const parallel = [
+				'reconnect',
+				'rtt',
+				'pipeline',
+				'batch',
+				'builder',
+			].includes(phase)
 				? 1
 				: PARALLEL;
 			await Promise.all(Array.from({ length: parallel }, worker));
