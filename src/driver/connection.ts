@@ -1088,11 +1088,7 @@ export class Connection implements AsyncDisposable {
 		options: QueryOptions | undefined,
 		onDone: () => void,
 	): Promise<QueryResult<R>> {
-		if (
-			this.#config.telemetry === undefined &&
-			!this.#config.captureStack &&
-			options?.statementTimeout === undefined
-		)
+		if (this.#config.telemetry === undefined && !this.#config.captureStack)
 			return this.#query<R>(sql, params ?? [], options, onDone);
 		const result = this.query<R>(sql, params, options);
 		result.then(onDone, onDone);
@@ -1145,6 +1141,7 @@ export class Connection implements AsyncDisposable {
 				params,
 				options,
 				options.statementTimeout,
+				onDone,
 			);
 		}
 		// one shared executor: one closing over this query would cost a
@@ -1202,11 +1199,20 @@ export class Connection implements AsyncDisposable {
 		);
 	}
 
+	/**
+	 * `queryGroup`, with the group's client `timeout`, `onTiming` and
+	 * `onDone`. `whole`: a statement that can't be sent fails the whole
+	 * group, sending none of it.
+	 */
 	#queryGroup(
 		statements: readonly GroupStatement[],
 		signal: AbortSignal | undefined,
-		timeout?: number,
-		onTiming?: (timing: OpTiming) => void,
+		group?: {
+			readonly timeout?: number | undefined;
+			readonly onTiming?: ((timing: OpTiming) => void) | undefined;
+			readonly onDone?: (() => void) | undefined;
+			readonly whole?: boolean;
+		},
 	): Promise<QueryResult<unknown>>[] {
 		const ops: QueryOp[] = [];
 		let invalid: { error: unknown } | undefined;
@@ -1249,11 +1255,20 @@ export class Connection implements AsyncDisposable {
 					);
 				}),
 		);
-		if (ops.length > 0) {
-			const group = new SyncGroupOp(ops);
-			group.onTiming = onTiming;
-			this.#enqueue(group, signal, timeout);
+		if (invalid !== undefined && group?.whole === true) {
+			const error =
+				invalid.error instanceof Error
+					? invalid.error
+					: new DriverError(String(invalid.error));
+			for (const op of ops) op.fail(error);
+			ops.length = 0;
 		}
+		if (ops.length > 0) {
+			const op = new SyncGroupOp(ops);
+			op.onTiming = group?.onTiming;
+			op.onDone = group?.onDone;
+			this.#enqueue(op, signal, group?.timeout);
+		} else group?.onDone?.();
 		if (!this.#config.catalog.loaded) {
 			for (const { params = [], options } of statements)
 				this.#loadTypesAfter(params, options);
@@ -1275,6 +1290,7 @@ export class Connection implements AsyncDisposable {
 		params: readonly unknown[],
 		options: QueryOptions,
 		statementTimeout: number | string,
+		onDone: (() => void) | undefined,
 	): Promise<QueryResult<R>> {
 		const { statementTimeout: _, signal, timeout, onTiming, ...rest } = options;
 		const interval =
@@ -1296,8 +1312,8 @@ export class Connection implements AsyncDisposable {
 				},
 			],
 			signal,
-			timeout,
-			onTiming,
+			// whole: a query that can't be sent mustn't leave the setting behind, in a transaction
+			{ timeout, onTiming, onDone, whole: true },
 		);
 		// a failed set skips the query, which rejects with its error
 		set?.catch(() => {});

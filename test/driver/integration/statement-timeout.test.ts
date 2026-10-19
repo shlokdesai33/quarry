@@ -17,6 +17,7 @@ import {
 	rejection,
 	slowSockets,
 	table,
+	timeSlicedSockets,
 } from './helpers.js';
 
 /**
@@ -320,6 +321,32 @@ describe.skipIf(noPg).each(targets)('statementTimeout %s', (_name, target) => {
 		expect(await timeoutOf(conn)).toBe('0');
 	});
 
+	it("sends nothing when its query can't be sent, so a transaction keeps its own setting", async () => {
+		await using conn = await open(target());
+		await conn.transaction(async (tx) => {
+			await tx.query("set local statement_timeout = '7s'");
+			await expect(
+				tx.query('select $1::int', [undefined], { statementTimeout: 50 }),
+			).rejects.toThrow(/undefined/);
+			expect(await timeoutOf(tx)).toBe('7s');
+		});
+	});
+
+	it.runIf(_name === 'directly')(
+		'prepares the statement setting and restoring the timeout once per connection',
+		async () => {
+			await using conn = await open(target());
+			for (let i = 0; i < 3; i++)
+				await conn.query('select $1::int as x', [i], {
+					statementTimeout: '1s',
+				});
+			const { rows } = await conn.query<{ n: number }>(
+				"select count(*)::int as n from pg_prepared_statements where statement like 'select case when $1::text is null%'",
+			);
+			expect(rows).toEqual([{ n: 1 }]);
+		},
+	);
+
 	it('is written with its query under one Sync', async () => {
 		const net = recordingSockets();
 		await using conn = await open({ ...target(), socket: net.factory });
@@ -362,5 +389,41 @@ describe.skipIf(noPg).each(targets)('statementTimeout %s', (_name, target) => {
 		expect(timings).toHaveLength(1);
 		expect(await timeoutOf(conn)).toBe('0');
 		expect(conn.transactionStatus).toBe('idle');
+	});
+});
+
+describe.skipIf(noPg)('statementTimeout and the adaptive pool width', () => {
+	it('narrows under timed queries as under untimed ones', async () => {
+		// one CPU time-slicing every backend with replies waiting (see pool.test.ts)
+		const net = timeSlicedSockets(1, 5);
+		await using pool = createPool({
+			...options(),
+			max: 4,
+			socket: net.factory,
+		});
+		const state = { running: true };
+		const load = Promise.all(
+			Array.from({ length: 200 }, async () => {
+				while (state.running)
+					await pool.query('select 1', [], { statementTimeout: '5s' });
+			}),
+		);
+		try {
+			let wide = false;
+			let streak = 0;
+			for (let i = 0; i < 200 && streak < 4; i++) {
+				await sleep(50);
+				const sending = net.sending(100);
+				if (sending === 4) wide = true;
+				streak = wide && sending <= 2 ? streak + 1 : 0;
+			}
+			expect(wide).toBe(true);
+			expect(streak).toBe(4);
+		} finally {
+			net.stop();
+			state.running = false;
+			await load;
+		}
+		expect(await timeoutOf(pool)).toBe('0');
 	});
 });
