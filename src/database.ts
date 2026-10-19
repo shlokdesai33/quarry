@@ -1,4 +1,5 @@
 import { type BatchResults, batchWith } from './batch.js';
+import type { BudgetUsage, QueryBudget } from './budget.js';
 import {
 	type DeleteQueryBuilder,
 	deleteFromWith,
@@ -151,6 +152,28 @@ export interface Database extends AsyncDisposable {
 		options?: TransactionOptions,
 	): Promise<T>;
 
+	/**
+	 * Runs `fn` with a budget for the queries this database runs on its
+	 * behalf, wherever they are issued from: anything awaited inside `fn`,
+	 * tracked with `AsyncLocalStorage`. Going over throws `QueryBudgetError`
+	 * (a query over `maxQueries` is refused before it is sent; the one that
+	 * takes the total over `maxDurationMs` throws once it has run), unless
+	 * `onExceeded` is given, which is called once instead. `usage` is live.
+	 * Budgets nest: a query counts against every budget it runs in.
+	 *
+	 * @example
+	 * const page = await db.budget(
+	 *   { maxQueries: 50, maxDurationMs: 1000, onExceeded: (usage) => log.warn(req.url, usage) },
+	 *   () => renderPage(req),
+	 * );
+	 * @example
+	 * await db.budget({ maxQueries: 3 }, () => loadDashboard(db)); // throws on the fourth query
+	 */
+	budget<T>(
+		limits: QueryBudget,
+		fn: (usage: BudgetUsage) => Promise<T>,
+	): Promise<T>;
+
 	/** Closes the connection pool, if this database opened it. */
 	close(): Promise<void>;
 }
@@ -229,5 +252,6 @@ function queries(
 		batch: (list, options) => batchWith(executor, list, options),
 		transaction: (fn, options) =>
 			executor.transaction((tx) => fn(transactionWith(tx)), options),
+		budget: (limits, fn) => executor.budget(limits, fn),
 	};
 }

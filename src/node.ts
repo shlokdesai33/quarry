@@ -26,6 +26,8 @@ export type ReferenceNode = {
 	readonly kind: 'reference';
 	readonly table: string;
 	readonly column: string;
+	/** Set for a `sensitive()` column: values compared with it are redacted. */
+	readonly sensitive?: true;
 };
 
 /**
@@ -40,6 +42,8 @@ export type ValueNode = {
 	 * its JavaScript type and the server infers its type.
 	 */
 	readonly codec?: Codec | undefined;
+	/** Bound against a `sensitive()` column: shown as `'[redacted]'`. */
+	readonly sensitive?: true;
 };
 
 /**
@@ -127,6 +131,8 @@ export type RawNode = {
 	readonly kind: 'raw';
 	readonly fragments: readonly string[];
 	readonly nodes: readonly OperationNode[];
+	/** The table a `sql` template interpolated, written as its fragment: for `sensitive()` columns. */
+	readonly table?: TableNode | undefined;
 };
 
 /**
@@ -136,6 +142,8 @@ export type RawNode = {
 export type TableNode = {
 	readonly name: string;
 	readonly alias: string | undefined;
+	/** The database names of its `sensitive()` columns, when it has any. */
+	readonly sensitive?: readonly string[];
 };
 
 /** An entry of a select list, keyed in the result row by `alias`. */

@@ -68,6 +68,7 @@ const user = await db
   - [Running queries](#running-queries)
   - [Batches](#batches)
   - [Transactions with the query builder](#transactions-with-the-query-builder)
+  - [Slow queries and query budgets](#slow-queries-and-query-budgets)
   - [Handling errors](#handling-errors)
   - [Schema verification](#schema-verification)
 - [Development](#development)
@@ -1072,6 +1073,10 @@ const point = defineType({
 
 `db.verify` checks a `defineType` column against its type's name, or the domain it is declared with.
 
+### Sensitive columns
+
+`text().sensitive()` marks a column whose values are secret: every value bound against it, or written beside it (in arithmetic, a function, a `case`, a `sql` fragment, `setEach` rows), shows as `'[redacted]'` in `onQuery`/`slowQuery` events, errors' `query` and details, and `toSQL({ inline })`; a decode error on it loses its cause. What is sent is unchanged. In `db.sql`, interpolating a table with sensitive columns redacts the statement's values, and `sql.sensitive(value)` marks any other value.
+
 ### Inferring row types
 
 ```ts
@@ -1125,6 +1130,7 @@ const db = database(
 | Option      | Default          | Description                                                                                                                                                     |
 | ----------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `onQuery`   |                  | Called once per query when it settles, with its SQL, parameters, tag, command, row count, error, and timings (`acquireMs`, `queuedMs`, `execMs`, `durationMs`). |
+| `slowQuery` |                  | `{ thresholdMs, onSlow }`: `onSlow` gets the event of every query that took at least `thresholdMs`.                                                             |
 | `callsites` | `true`           | Append the stack of the code awaiting a failed query to its error (captured when it fails).                                                                     |
 | `codecs`    | quarry's codecs  | Codecs for result columns no query types (raw SQL, expressions of unknown type). Columns always use their own codec, so their types hold.                       |
 | `catalog`   | `true`           | Look up the types codecs name (enums, pgvector, custom types and their arrays) in `pg_type` once per pool, before the first query.                              |
@@ -1763,6 +1769,8 @@ const { sql, params } = query.toSQL();
 const { params: paramTypes, columns } = await query.describe(); // types as the server sees them
 ```
 
+`toSQL({ inline: true, pretty: true })` (on builders, shaped queries, batch items and `db.sql` statements) writes each value as a literal of its codec's type (`'12.50'::numeric`; sensitive ones as `'[redacted]'`) and lays the SQL out over lines. It's for reading and logs: never run inlined SQL built from untrusted input. Without options, `toSQL()` is exactly what `execute()` sends; no result shape changes it.
+
 **Tagging.** `.tag('posts.feed')` labels a query for `onQuery` events and OpenTelemetry spans (`db.query.summary`). The tag never appears in the SQL, so it doesn't fragment the statement cache.
 
 **Building without a database.** `selectFrom`, `insertInto`, `update` and `deleteFrom` are also exported on their own. Queries built that way can be inspected, composed, and run by a database's `batch`; `execute()` works only on queries started from `database(...)`.
@@ -1835,6 +1843,22 @@ const orderId = await db.transaction(
 | `tx.setLocal(name, value)` | Sets a run-time parameter until the transaction ends, with a bound value (e.g. `app.tenant_id` for row-level security). |
 
 The options are the driver's [transaction options](#transactions): `isolation`, `readOnly`, `deferrable`, `retries`, `settings`, `timeout` and `durable`. With `retries`, the callback may run more than once, so keep side effects in `afterCommit`.
+
+## Slow queries and query budgets
+
+```ts
+const db = database(url, {
+	slowQuery: { thresholdMs: 200, onSlow: (e) => log.warn(e) },
+});
+await db.budget({ maxQueries: 10 }, () => loadDashboard(db)); // QueryBudgetError on the 11th query
+await db.budget(
+	{ maxDurationMs: 1000, onExceeded: (usage) => log.warn(usage) },
+	() => renderPage(req),
+);
+```
+
+- A budget counts this database's queries wherever `fn` issues them (transactions, streams, batches, `db.sql`), through `AsyncLocalStorage`; budgets nest.
+- Over `maxQueries`, a query (or a whole batch) is refused before it's sent. Over `maxDurationMs`, the query that went over has run and throws; a batch's round trip counts once. With `onExceeded`, nothing throws: it's called once.
 
 ## Handling errors
 

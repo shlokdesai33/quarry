@@ -38,6 +38,7 @@ import {
 	type ValueArgs,
 } from './shape.js';
 import type { AnyTable } from './table.js';
+import { toSQL as renderSQL, type ToSQLOptions } from './to-sql.js';
 import { codeType, renderType } from './verify/sql-type.js';
 
 /** The columns of the table `T`, by the keys they are declared under. */
@@ -90,11 +91,16 @@ export function columnOf(
 	return { column, name: column._quarry.columnName ?? key };
 }
 
-/** A value written to `column`: an expression as is, a value encoded by the column's codec. */
+/**
+ * A value written to `column`: an expression as is, a value encoded by the
+ * column's codec, and redacted for a `sensitive()` column.
+ */
 function valueNode(column: AnyColumn, value: unknown): OperationNode {
-	return Expression.is(value)
-		? value._quarry.node
-		: { kind: 'value', value, codec: column._quarry.dataType.codec };
+	if (Expression.is(value)) return value._quarry.node;
+	const { codec } = column._quarry.dataType;
+	return column._quarry.sensitive
+		? { kind: 'value', value, codec, sensitive: true }
+		: { kind: 'value', value, codec };
 }
 
 /**
@@ -188,7 +194,14 @@ export function excluded<T extends AnyTable>(table: T): Excluded<T> {
 	for (const key of Object.keys(table.schema.columns)) {
 		const { column, name } = columnOf(table, key);
 		row[key] = typedExpression(
-			{ kind: 'reference', table: 'excluded', column: name },
+			column._quarry.sensitive
+				? {
+						kind: 'reference',
+						table: 'excluded',
+						column: name,
+						sensitive: true,
+					}
+				: { kind: 'reference', table: 'excluded', column: name },
 			column._quarry.dataType,
 		);
 	}
@@ -455,9 +468,19 @@ export abstract class WriteQueryBuilder<O, M extends string> {
 		return writeOutput<O>(this.#executor, this.toNode()).execute(options);
 	}
 
-	/** The SQL and parameters `execute()` sends. */
-	toSQL(): CompiledQuery {
-		return compile(this.toNode());
+	/**
+	 * The SQL and parameters `execute()` sends, without running it; the
+	 * result shapes don't change them. With `inline`, each value is written
+	 * into the SQL as a Postgres literal of its type, rendered by its codec,
+	 * ready to paste into psql (values of `sensitive()` columns show as
+	 * `'[redacted]'`); it is for reading and logs, never for running SQL
+	 * built from untrusted input. `pretty` lays the SQL out over lines.
+	 *
+	 * @example q.toSQL() // { sql: '… where "users"."id" = $1', params: [42] }
+	 * @example console.log(q.toSQL({ inline: true, pretty: true }).sql)
+	 */
+	toSQL(options?: ToSQLOptions): CompiledQuery {
+		return renderSQL(this.toNode(), options);
 	}
 
 	/** The query `execute()` runs, for `db.batch`; one that still needs clauses has none. */

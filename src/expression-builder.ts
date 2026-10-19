@@ -154,11 +154,11 @@ function resolveColumn(
 	if (!Object.hasOwn(table.schema.columns, key)) return undefined;
 	const column = table.schema.columns[key];
 	if (column === undefined) return undefined;
-	const node: ReferenceNode = {
-		kind: 'reference',
-		table: table.name,
-		column: column._quarry.columnName ?? key,
-	};
+	const name = column._quarry.columnName ?? key;
+	// shared and never changed, so a sensitive column's is made sensitive here
+	const node: ReferenceNode = column._quarry.sensitive
+		? { kind: 'reference', table: table.name, column: name, sensitive: true }
+		: { kind: 'reference', table: table.name, column: name };
 	nameReference(node, `${table.name}.${key}`);
 	const { dataType } = column._quarry;
 	const selection: SelectionNode = {

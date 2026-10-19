@@ -32,6 +32,10 @@ export class IntegerColumn<D extends DataType, S, I = S, U = I>
 		return new IntegerColumn<D, S, I, U>({ ...this._quarry, columnName });
 	}
 
+	override sensitive() {
+		return new IntegerColumn<D, S, I, U>({ ...this._quarry, sensitive: true });
+	}
+
 	override typed<X extends S, Y extends I, Z extends U>() {
 		return new IntegerColumn<D, X, Y, Z>(this._quarry);
 	}

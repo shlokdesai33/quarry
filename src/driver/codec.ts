@@ -218,6 +218,18 @@ function arrayText(
 	return `${out}}`;
 }
 
+/**
+ * A non-null value as the server reads it in text, by `codec`: what
+ * `encode` sends for a text codec, an array's literal, and bytes as their
+ * hex escape. For writing a parameter into SQL text.
+ */
+export function codecText(codec: Codec, value: unknown): string {
+	if (codec.element !== undefined && Array.isArray(value))
+		return arrayText(value, codec.element, codec.delimiter ?? ',');
+	const encoded = codec.encode(value);
+	return typeof encoded === 'string' ? encoded : hexOf(encoded);
+}
+
 /** The binary decoder of `element`'s arrays, if it has one. */
 function arrayBinary(element: Codec): BinaryParser | undefined {
 	if (element.decodeBinary === undefined) return undefined;
