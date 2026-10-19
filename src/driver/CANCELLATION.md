@@ -138,7 +138,7 @@ With a value, it keeps the current `statement_timeout` in a custom setting, `qua
 
 PostgreSQL re-arms `statement_timeout` for each Execute, from the value current when the statement starts, so the query, and only the query, runs under the new value.
 
-The query's result is returned, or its error is thrown. If `S` fails (an invalid interval, such as `'soon'`), the server skips the query, which rejects with that error. `signal` and `timeout` cancel the group, which hits the statement running ([above](#why-later-writes-are-held-back)); `onTiming` times the whole group.
+The query's result is returned, or its error is thrown. If `S` fails (an invalid interval, such as `'soon'`), the server skips the query, which rejects with that error. A query that can't be sent (an `undefined` parameter) fails before any of the group is written, so `S` is never sent alone, which inside a transaction would have left the setting on its later statements. Both uses of `S` declare their parameter as `text` (OID 25), so the statement cache finds one statement for them, keyed by its SQL, and the connection prepares it once. Over a pool the group is one operation: it frees its pipeline slot at its ReadyForQuery, before the caller's callbacks, as any query does, so the adaptive depth and [width](POOL.md#adaptive-width) count it as one completion. `signal` and `timeout` cancel the group, which hits the statement running ([above](#why-later-writes-are-held-back)); `onTiming` times the whole group.
 
 Numbers are milliseconds (`'2000ms'`); strings are any Postgres interval (`'2s'`, `'500ms'`).
 
