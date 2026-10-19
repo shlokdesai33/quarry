@@ -72,7 +72,10 @@ export interface DatabaseOptions {
 	readonly catalog?: boolean | undefined;
 	/** Called once per query with its SQL, tag, timings, row count and error. */
 	readonly onQuery?: ((event: QueryEvent) => void) | undefined;
-	/** Append the stack of the code that ran a query to its error (default true). */
+	/**
+	 * Append the stack of the code awaiting a failed query to its error,
+	 * captured when it fails (default true).
+	 */
 	readonly callsites?: boolean | undefined;
 	/** Use cached prepared statements (default: the connection's setting). */
 	readonly prepare?: boolean | undefined;
@@ -111,6 +114,22 @@ const executeResult = (result: QueryResult<unknown>): ExecuteResult => ({
 
 const CALLSITE = Symbol('quarry.callsite');
 
+/**
+ * The stack of the code awaiting a query, captured once the query has
+ * failed. It must be called in the executor method's own continuation (its
+ * `catch`, after an `await`), where the engine's async stack trace lists
+ * the async functions awaiting it, the caller's included: nothing is
+ * captured for queries that succeed. Every link up to the caller has to
+ * be an `await` for the chain to reach it. `undefined` with `callsites: false`.
+ */
+function issuedAt(options: DatabaseOptions): Error | undefined {
+	if (options.callsites === false) return undefined;
+	const site = new Error();
+	if (typeof Error.captureStackTrace === 'function')
+		Error.captureStackTrace(site, issuedAt);
+	return site;
+}
+
 /** Adds the query and its tag to a server error, and the caller's stack to any error. */
 function decorate(
 	error: unknown,
@@ -131,6 +150,14 @@ function decorate(
 
 const interval = (timeout: number | string) =>
 	typeof timeout === 'number' ? `${timeout}ms` : timeout;
+
+/**
+ * Hand-written statements (`db.sql`) that change the transaction or
+ * session state, by their first keyword. On a shared connection, queries
+ * other callers pipelined behind them would run in that state.
+ */
+const SESSION_STATEMENT =
+	/^\s*(?:begin|start|commit|end|rollback|abort|savepoint|release|prepare|set|reset|discard|listen|unlisten|declare|fetch|move|close|create\s+(?:temp|temporary|local\s+temp|local\s+temporary)\b)\b/i;
 
 /**
  * Runs quarry's queries on the driver: a pool, a reserved client, a single
@@ -164,7 +191,7 @@ export class DriverExecutor implements TransactionExecutor {
 	}
 
 	/** Looks up the types codecs name, once per pool; a failure leaves them to the driver. */
-	async #prepare(runner: Runner): Promise<void> {
+	async #prepare(runner: Runner | Pool): Promise<void> {
 		if (this.#ready || runner.loadTypes === undefined) return;
 		await runner.loadTypes();
 		this.#ready = true;
@@ -193,7 +220,27 @@ export class DriverExecutor implements TransactionExecutor {
 		return out;
 	}
 
-	/** Runs `fn` on a connection: borrowed from the pool, or the source itself. */
+	/**
+	 * The pool, when the operation can share its connections with other
+	 * callers' queries, pipelined: not for a statement that changes the
+	 * session or transaction state. A `timeout` shares too: the driver sends
+	 * it with its query under one Sync, bounding that query alone.
+	 */
+	#shared(
+		queries: CompiledQuery | readonly CompiledQuery[] | undefined,
+	): Pool | undefined {
+		const source = this.#source;
+		if (!(source instanceof Pool)) return undefined;
+		if (queries === undefined) return source;
+		if ('sql' in queries) {
+			return SESSION_STATEMENT.test(queries.sql) ? undefined : source;
+		}
+		for (const query of queries)
+			if (SESSION_STATEMENT.test(query.sql)) return undefined;
+		return source;
+	}
+
+	/** Runs `fn` on a connection of its own: reserved from the pool, or the source itself. */
 	async #run<T>(
 		signal: AbortSignal | undefined,
 		fn: (runner: Runner) => Promise<T>,
@@ -202,7 +249,8 @@ export class DriverExecutor implements TransactionExecutor {
 		if (!(source instanceof Pool)) {
 			const runner = source instanceof PoolClient ? source.connection : source;
 			await this.#prepare(runner);
-			return fn(runner);
+			// awaited, so a failure's call site traces back through it
+			return await fn(runner);
 		}
 		const client = await source.acquire(signal === undefined ? {} : { signal });
 		try {
@@ -256,6 +304,10 @@ export class DriverExecutor implements TransactionExecutor {
 		});
 	}
 
+	/**
+	 * The call site captured up front, for the operations that run once per
+	 * stream or description rather than per query.
+	 */
 	#callsite(): Error | undefined {
 		return this.#options.callsites === false ? undefined : new Error();
 	}
@@ -264,24 +316,45 @@ export class DriverExecutor implements TransactionExecutor {
 		query: CompiledQuery,
 		options: ExecuteOptions = {},
 	): Promise<ExecuteResult> {
-		const callsite = this.#callsite();
 		const observe = this.#options.onQuery !== undefined;
 		const start = observe ? performance.now() : 0;
 		let acquired = start;
 		let timing: OpTiming | undefined;
 		try {
-			const result = await this.#run(options.signal, (runner) => {
-				if (observe) acquired = performance.now();
-				return runner.query<unknown>(
+			const pool = this.#shared(query);
+			let result: QueryResult<unknown>;
+			if (pool !== undefined) {
+				if (!this.#ready) await this.#prepare(pool);
+				// the pool picks the connection: the time before the query
+				// reached it is the wait for a connection or a pipeline slot
+				result = await pool.query<unknown>(
 					query.sql,
 					query.params,
 					this.#queryOptions(
 						options,
-						observe ? (t) => (timing = t) : undefined,
+						observe
+							? (t) => {
+									timing = t;
+									acquired = performance.now() - t.queuedMs - t.execMs;
+								}
+							: undefined,
 						query,
 					),
 				);
-			});
+			} else {
+				result = await this.#run(options.signal, (runner) => {
+					if (observe) acquired = performance.now();
+					return runner.query<unknown>(
+						query.sql,
+						query.params,
+						this.#queryOptions(
+							options,
+							observe ? (t) => (timing = t) : undefined,
+							query,
+						),
+					);
+				});
+			}
 			if (observe) {
 				this.#report(
 					'execute',
@@ -299,7 +372,7 @@ export class DriverExecutor implements TransactionExecutor {
 				command: result.command,
 			};
 		} catch (error) {
-			decorate(error, query, callsite);
+			decorate(error, query, issuedAt(this.#options));
 			if (observe)
 				this.#report(
 					'execute',
@@ -316,9 +389,12 @@ export class DriverExecutor implements TransactionExecutor {
 	}
 
 	/**
-	 * Reads the result in batches through a cursor, on one connection held
-	 * for the whole iteration. A `timeout` outside a transaction opens one
-	 * on that connection, so the setting can't leak.
+	 * Reads the result in batches through a cursor. On a pool, the cursor
+	 * has a connection of its own, taken by the first batch and released
+	 * when the iteration ends however it ends; inside a transaction, other
+	 * queries of the transaction run between its batches. A `timeout`
+	 * outside a transaction runs the cursor in a transaction of its own,
+	 * so the setting can't leak.
 	 */
 	async *stream(
 		query: CompiledQuery,
@@ -326,38 +402,30 @@ export class DriverExecutor implements TransactionExecutor {
 	): AsyncGenerator<unknown[], void, undefined> {
 		const callsite = this.#callsite();
 		const start = performance.now();
+		let acquired = start;
 		let rows = 0;
+		let failure: unknown;
 		const source = this.#source;
 		let client: PoolClient | undefined;
-		let runner: Runner;
-		if (source instanceof Pool) {
-			client = await source.acquire(
-				options.signal === undefined ? {} : { signal: options.signal },
-			);
-			runner = client.connection;
-		} else {
-			runner = source instanceof PoolClient ? source.connection : source;
-		}
-		const acquired = performance.now();
-		let failure: unknown;
-		let opened = false;
 		try {
-			await this.#prepare(runner);
-			if (options.timeout !== undefined) {
-				if (runner.transactionStatus === 'idle') {
-					await runner.query('begin');
-					opened = true;
-				}
-				await runner.query("select set_config('statement_timeout', $1, true)", [
-					interval(options.timeout),
-				]);
+			if (options.timeout !== undefined && source instanceof Transaction) {
+				throw new DriverError(
+					'A stream inside a transaction takes no timeout: set statement_timeout with setLocal',
+				);
 			}
+			let runner: Runner;
+			if (source instanceof Pool) {
+				client = await source.acquire(
+					options.signal === undefined ? {} : { signal: options.signal },
+				);
+				runner = client.connection;
+			} else {
+				runner = source instanceof PoolClient ? source.connection : source;
+			}
+			acquired = performance.now();
+			await this.#prepare(runner);
 			const cursorOptions = {
-				...this.#queryOptions(
-					{ ...options, timeout: undefined },
-					undefined,
-					query,
-				),
+				...this.#queryOptions(options, undefined, query),
 				...(options.batchSize === undefined
 					? {}
 					: { batchSize: options.batchSize }),
@@ -370,14 +438,11 @@ export class DriverExecutor implements TransactionExecutor {
 				rows += batch.length;
 				yield batch;
 			}
-			if (opened) await runner.query('commit');
 		} catch (error) {
 			failure = error;
 			decorate(error, query, callsite);
 			throw error;
 		} finally {
-			if (opened && runner.transactionStatus !== 'idle')
-				await runner.query('rollback').catch(() => {});
 			client?.release();
 			if (this.#options.onQuery !== undefined) {
 				this.#report(
@@ -397,9 +462,16 @@ export class DriverExecutor implements TransactionExecutor {
 	async describe(query: CompiledQuery): Promise<QueryDescription> {
 		const callsite = this.#callsite();
 		try {
-			const description = await this.#run(undefined, (runner) =>
-				runner.describe(query.sql),
-			);
+			const pool = this.#shared(undefined);
+			let description: Description;
+			if (pool !== undefined) {
+				if (!this.#ready) await this.#prepare(pool);
+				description = await pool.describe(query.sql);
+			} else {
+				description = await this.#run(undefined, (runner) =>
+					runner.describe(query.sql),
+				);
+			}
 			return {
 				params: description.paramTypes,
 				columns: description.fields.map((field) => ({
@@ -442,7 +514,9 @@ export class DriverExecutor implements TransactionExecutor {
 				'A batch inside a transaction takes no timeout: set statement_timeout with setLocal',
 			);
 		}
-		const callsite = this.#callsite();
+		let site: Error | undefined;
+		/** Captured by the first failure; every caller of it runs in this method's chain of awaits. */
+		const callsite = () => (site ??= issuedAt(this.#options));
 		const observe = this.#options.onQuery !== undefined;
 		const start = observe ? performance.now() : 0;
 		let acquired = start;
@@ -453,16 +527,16 @@ export class DriverExecutor implements TransactionExecutor {
 			options: this.#queryOptions({ rowMode, keepRows }, undefined, query),
 		}));
 		/** Each query's outcome, reported to `onQuery`; `shared` when a failure skipped the rest with its error. */
-		const settle = async (
-			results: readonly Promise<QueryResult<unknown>>[],
+		const settle = (
+			settled: readonly PromiseSettledResult<QueryResult<unknown>>[],
 			shared: boolean,
 		) => {
-			const settled = await Promise.allSettled(results);
 			let decorated = false;
 			return queries.map((query, i) => {
 				const outcome = settled[i]!;
 				if (outcome.status === 'rejected') {
-					if (!shared || !decorated) decorate(outcome.reason, query, callsite);
+					if (!shared || !decorated)
+						decorate(outcome.reason, query, callsite());
 					decorated = true;
 					if (observe) {
 						this.#report(
@@ -503,34 +577,52 @@ export class DriverExecutor implements TransactionExecutor {
 			try {
 				verify?.(values);
 			} catch (error) {
-				decorate(error, undefined, callsite);
+				decorate(error, undefined, callsite());
 				throw error;
 			}
 			return settled;
 		};
-		return this.#run(signal, async (runner) => {
+		/** Each query with its own Sync, all in one write, settled. */
+		const independent = (runner: Pick<Runner, 'query'>) =>
+			Promise.allSettled(
+				batch.map(({ query, rowMode, keepRows }) =>
+					runner.query<unknown>(
+						query.sql,
+						query.params,
+						this.#queryOptions(
+							{ ...options, rowMode, keepRows },
+							undefined,
+							query,
+						),
+					),
+				),
+			);
+		if (!inTransaction && transaction === undefined) {
+			const pool = this.#shared(queries);
+			if (pool !== undefined) {
+				if (!this.#ready) await this.#prepare(pool);
+				const settled = await pool.withShared(
+					(connection) => {
+						if (observe) acquired = performance.now();
+						return independent(connection);
+					},
+					{ signal },
+				);
+				return settle(settled, false);
+			}
+		}
+		return await this.#run(signal, async (runner) => {
 			if (observe) acquired = performance.now();
 			if (inTransaction) {
 				return verified(
-					await settle(runner.queryGroup(statements, { signal }), true),
-				);
-			}
-			if (transaction === undefined) {
-				return settle(
-					batch.map(({ query, rowMode, keepRows }) =>
-						runner.query<unknown>(
-							query.sql,
-							query.params,
-							this.#queryOptions(
-								{ ...options, rowMode, keepRows },
-								undefined,
-								query,
-							),
-						),
+					settle(
+						await Promise.allSettled(runner.queryGroup(statements, { signal })),
+						true,
 					),
-					false,
 				);
 			}
+			if (transaction === undefined)
+				return settle(await independent(runner), false);
 			const { results, done } = Transaction.batch(runner, statements, {
 				...transaction,
 				...(timeout === undefined
@@ -550,11 +642,11 @@ export class DriverExecutor implements TransactionExecutor {
 						}),
 			});
 			done.catch(() => {});
-			const settled = await settle(results, true);
+			const settled = settle(await Promise.allSettled(results), true);
 			try {
 				await done;
 			} catch (error) {
-				decorate(error, undefined, callsite);
+				decorate(error, undefined, callsite());
 				throw error;
 			}
 			return settled;

@@ -21,6 +21,7 @@ export type { Notice, Notification } from './notice.js';
 export type { Description, OpTiming, QueryResult } from './ops.js';
 export type { Field } from './protocol/messages.js';
 export type { RowMode } from './rows.js';
+export type { RowStream } from './row-stream.js';
 export type {
 	DriverSocket,
 	SocketConnectOptions,

@@ -71,6 +71,7 @@ export {
 	UndefinedTable,
 	UniqueViolation,
 	type PoolOptions,
+	type RowStream,
 } from './driver/index.js';
 export type { DatabaseOptions, QueryEvent } from './driver-executor.js';
 export { violatedColumns } from './errors.js';
@@ -97,19 +98,45 @@ export {
 	type InsertQueryBuilder,
 	type OnConflictBuilder,
 } from './insert-query-builder.js';
+export {
+	InvalidCursorError,
+	type CursorPage,
+	type CursorPageOptions,
+	type KeyColumn,
+	type KeyColumns,
+	type KeyDirection,
+	type KeysetOptions,
+	type OffsetPage,
+	type OffsetPageOptions,
+} from './pagination.js';
 export type { AnyQuery, Query } from './query.js';
 export type { Range } from './range.js';
+export {
+	sql,
+	type Sql,
+	type SqlQuery,
+	type SqlResult,
+	type SqlTag,
+} from './sql.js';
+export type { CaseElse, CaseStart, CaseWhen } from './case.js';
 export {
 	fragment,
 	selectFrom,
 	type Fragment,
 	type LockState,
+	type JoinBuilder,
 	type SelectQueryBuilder,
 } from './select-query-builder.js';
-export type { AnyTable, Table } from './table.js';
+export type {
+	AnyTable,
+	NullableColumn,
+	NullableTable,
+	Table,
+} from './table.js';
 export {
 	update,
-	updateMany,
+	type SetEachOptions,
+	type SetEachRow,
 	type UpdateQueryBuilder,
 } from './update-query-builder.js';
 export type {

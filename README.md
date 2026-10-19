@@ -545,7 +545,7 @@ Text-like codecs (`text`, `varchar`, `char`, `name`, and `codecs.raw`) leave the
 
 **Binary arrays.** Arrays of `bool`, `int2`, `int4`, `int8`, `float8`, `timestamptz` (from `Date`s), `uuid`, `jsonb` and `bytea` are sent in binary by their `arrayOf` codec (and, without a codec, when `paramTypes` declares the array's type), which the server reads far more cheaply than a literal. An element that doesn't fit falls back to a literal. Text arrays go as literals of a type the server infers.
 
-The query builder gives every parameter its column's codec: multi-row inserts and `updateMany` send each column as `arrayOf` its codec, and `column = any($1)` the same.
+The query builder gives every parameter its column's codec: multi-row inserts and `setEach` updates send each column as `arrayOf` its codec, and `column = any($1)` the same.
 
 A query takes at most 65,535 parameters, the protocol's limit; more are refused before anything is sent. For more rows than that, use `unnest` with array parameters, or `COPY`.
 
@@ -673,7 +673,15 @@ for await (const chunk of pool.copyTo(
 }
 ```
 
-A paused consumer pauses the socket: the driver doesn't read ahead of what you've consumed, so memory stays flat however large the result.
+A cursor fetches a batch only when you ask for the next one, so a slow consumer holds one batch in memory however large the result; a paused COPY consumer pauses the socket the same way. Its columns come in the formats their codecs read, binary where they can, from the first run: a statement not yet cached is described first (one more round trip, once per statement and connection).
+
+- **Outside a transaction**, the portal lives in the implicit transaction of one protocol sync, so the cursor holds its connection until it is read to the end or closed, and other queries on that connection wait. `pool.cursor` and `pool.stream` take a connection of their own; on a single connection or a reserved client, don't run queries on the same connection inside the loop.
+- **Inside a transaction**, the cursor is a named portal read with one Execute and Sync per batch, so the transaction's other queries run between its batches, and several cursors can be read at once. The portal is closed when the iteration ends.
+- **Leaving early** (`break`, `return`, a throw, `return()`, or `await using` on a stream) closes the portal and frees the connection.
+- **`signal` and `timeout`** stop the whole cursor, whenever they fire. Between batches, the portal is closed without a cancel request and the next batch rejects with `AbortError`; while a batch runs, it is canceled (`QueryCanceled`, reason `'abort'` or `'timeout'`), which inside a transaction fails the transaction like any canceled statement.
+- **`statementTimeout`** bounds the cursor from its first batch to its last, your loop's time included. The driver sets it right before the cursor and restores it right after, under the cursor's Sync, so it can't leak; a transaction refuses it, since other queries run between batches: use `set_config` there.
+- **A stream is an async iterable**, so `Readable.from(stream)` and `ReadableStream.from(stream)` read it with backpressure and close it when destroyed or canceled.
+- **Long streams hold a snapshot.** An open cursor keeps its backend's `xmin`, which holds back vacuum, and outside a transaction it is never "idle in transaction", so `idle_in_transaction_session_timeout` doesn't end it; use `statementTimeout` to bound it.
 
 ## LISTEN and NOTIFY
 
@@ -791,6 +799,7 @@ await pool.end({ timeout: 5000 }); // fail whatever is still running after 5 s
 - **Prepared statements** work from PgBouncer 1.21 with `max_prepared_statements` set. PgBouncer 1.26+ without it is detected at login, and no statement is named. For older versions or other poolers without prepared-statement support, use `prepare: false`.
 - **Pipelined queries are sent unnamed.** PgBouncer rewrites the statement name in every named Bind, flushing what it holds and writing the new name separately, so each named query reaches the server in two writes instead of sharing one. Under load the single-threaded pooler is the bottleneck, and that costs it more than re-parsing costs the server. So a query pipelined with others on its connection is sent unnamed (Parse, Bind, Describe), still with its cached columns and binary formats; a query alone on its connection stays named. PgBouncer 1.26+ reports itself at login (`connection.capabilities.pgbouncer`); for 1.21–1.25, set `preparePipelined: false`.
 - **Stale statements.** Behind PgBouncer, which maps a new Parse of the same text back to the statement it already prepared, SQL that still comes back stale after a retry is no longer prepared on that connection.
+- **Cursors and streams** work in transaction mode without an explicit transaction: until the cursor ends, the server sends no ReadyForQuery, so PgBouncer keeps the server connection linked to it. Each open stream holds one server connection for its lifetime, so `default_pool_size` streams at once fill the pool; keep long streams on a pool sized for them. Statement mode can't run cursors.
 
 **Session state** (`SET`, `LISTEN`, temporary tables, session advisory locks) doesn't survive between transactions in transaction mode. The driver's own settings never rely on it: `statementTimeout`, transaction `settings` and `timeout` all go through `set_config(…, true)` inside a transaction.
 
@@ -1116,7 +1125,7 @@ const db = database(
 | Option      | Default          | Description                                                                                                                                                     |
 | ----------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `onQuery`   |                  | Called once per query when it settles, with its SQL, parameters, tag, command, row count, error, and timings (`acquireMs`, `queuedMs`, `execMs`, `durationMs`). |
-| `callsites` | `true`           | Append the stack of the code that ran a query to its error.                                                                                                     |
+| `callsites` | `true`           | Append the stack of the code awaiting a failed query to its error (captured when it fails).                                                                     |
 | `codecs`    | quarry's codecs  | Codecs for result columns no query types (raw SQL, expressions of unknown type). Columns always use their own codec, so their types hold.                       |
 | `catalog`   | `true`           | Look up the types codecs name (enums, pgvector, custom types and their arrays) in `pg_type` once per pool, before the first query.                              |
 | `prepare`   | the connection's | Use cached prepared statements.                                                                                                                                 |
@@ -1604,7 +1613,7 @@ await db
 }))
 ```
 
-**An update must say which rows it changes.** It can't run until it has a `where`, or an explicit `.allRows()`; `execute()` on an update without either is a compile error, not a production incident.
+**An update must say which rows it changes.** It can't run until it has a `where`, an explicit `.allRows()`, or a [`setEach`](#updating-many-rows-to-different-values) (whose key match is its `where`); `execute()` on an update without either is a compile error, not a production incident.
 
 ```ts
 await db.update(users).set({ verified: false }).allRows().execute();
@@ -1624,25 +1633,60 @@ await db
 
 ### Updating many rows to different values
 
-`updateMany` updates each row to its own values in one statement, matched by key:
+`setEach` updates each row to its own values in one statement, matched by key:
 
 ```ts
 await db
-	.updateMany(
-		products,
+	.update(products)
+	.setEach(
 		[
 			{ id: 1, price: '9.99', stock: 12 },
 			{ id: 2, price: '19.99', stock: 0 },
 		],
-		{ by: 'id' },
+		{ key: 'id' },
 	)
+	.expectRows(2) // RowCountError unless both rows were there
 	.execute();
-// update "products" set "price" = "quarry_rows"."price", "stock" = "quarry_rows"."stock"
-// from unnest($1::integer[], $2::numeric[], $3::integer[]) as "quarry_rows"("id", "price", "stock")
-// where "products"."id" = "quarry_rows"."id"
+// update "products" set "price" = "row"."price", "stock" = "row"."stock"
+// from unnest($1::integer[], $2::numeric[], $3::integer[]) as "row"("id", "price", "stock")
+// where "products"."id" = "row"."id"
 ```
 
-`by` is a column or a composite key (`{ by: ['tenantId', 'sku'] }`); every row must include it. Like multi-row inserts, it sends one array per column.
+`key` is a column or a composite key (`{ key: ['tenantId', 'sku'] }`); every row must include it, and no two rows can share one. The key match is the update's `where`, so it runs without another; `.where(...)` adds conditions to it. Like multi-row inserts, it sends one array per column, so the SQL is the same whatever the number of rows.
+
+**Rows can set different columns.** A column a row leaves out (or sets to `undefined`) keeps its value in that row; `null` sets it to null. Each such column is sent with a flag:
+
+```ts
+await db
+	.update(users)
+	.setEach(
+		[
+			{ id: 1, name: 'Ada' },
+			{ id: 2, email: 'alan@example.com' },
+		],
+		{ key: 'id' },
+	)
+	.execute();
+// update "users" set
+//   "name" = case when "row"."set:name" then "row"."name" else "users"."name" end,
+//   "email" = case when "row"."set:email" then "row"."email" else "users"."email" end
+// from unnest($1::integer[], $2::text[], $3::text[], $4::boolean[], $5::boolean[])
+//   as "row"("id", "name", "email", "set:name", "set:email")
+// where "users"."id" = "row"."id"
+```
+
+**The rows are in scope** as `row`, or the name given as `as`, in `set`, `where` and `returning`. A column a row may leave out is nullable there. A later `set` of a column replaces the rows' values with an expression:
+
+```ts
+// apply each edit only over an older version of its doc
+await db
+	.update(docs)
+	.setEach(edits, { key: 'id', as: 'edit' }) // { id, body, version }[]
+	.set((eb) => ({ editedAt: eb.fn.now() }))
+	.where((eb) => eb.ref('docs.version').lt(eb.ref('edit.version')))
+	.returning(['docs.id', 'edit.version'])
+	.execute();
+```
 
 ## Deleting
 
@@ -1675,16 +1719,42 @@ await query.execute({ signal: request.signal, timeout: '2s' });
 
 **Awaiting a builder is an error.** `await db.selectFrom(users)` throws a `TypeError` explaining that queries run with `execute()`. A forgotten `execute()` can't silently do nothing.
 
-**Streaming.** Large results stream through a cursor, a batch of rows per round trip:
+**Streaming.** `stream()` reads every row through a cursor, decoded as `execute()` decodes them, without holding the result in memory. It fetches `batchSize` rows (default 1000) at a time, each batch once the rows before it are taken, so a slow loop holds one batch. Nothing runs until the first row is asked for.
 
 ```ts
 for await (const event of db
 	.selectFrom(events)
-	.selectAll()
-	.stream({ batchSize: 1000 })) {
+	.select(['events.id', 'events.payload'])
+	.stream({ batchSize: 1000, signal: request.signal })) {
 	await handle(event);
+	if (done) break; // closes the cursor and frees its connection
 }
 ```
+
+- **On the pool**, a stream takes a connection of its own, and frees it when the loop ends however it ends: read to the end, `break`, `return`, a throw, or the `signal`. `await using rows = query.stream()` frees it when the block ends.
+- **Inside `db.transaction`**, other queries of the transaction run between the stream's batches, so the loop can read and write through `tx`:
+
+```ts
+await db.transaction(async (tx) => {
+	for await (const job of tx
+		.selectFrom(jobs)
+		.select(['jobs.id'])
+		.where('jobs.status', 'queued')
+		.forUpdate()
+		.stream()) {
+		await tx
+			.update(jobs)
+			.set({ status: 'done' })
+			.where('jobs.id', job.id)
+			.execute();
+	}
+});
+```
+
+- **`signal`** stops the stream whenever it fires: between batches the next pull rejects with `AbortError`, and a batch being read is canceled (`QueryCanceled`). **`timeout`** bounds the whole stream, the loop's time included; it can't be set inside a transaction (use `tx.setLocal('statement_timeout', …)`).
+- **Errors** in the middle of a stream (a division by zero at row 10,001, a value a codec rejects) reject the pull that reaches them, after the rows before them.
+- **Node and web streams**: a stream is an async iterable, so `Readable.from(query.stream())` and `ReadableStream.from(query.stream())` pull from it with backpressure, and close it when destroyed or canceled.
+- **Only every row streams.** The `take…` and `expect…` shapes read a whole result, so they have no `stream()`.
 
 **Inspecting.** Every builder can show its SQL without running it, and the database can describe it:
 
@@ -1695,7 +1765,7 @@ const { params: paramTypes, columns } = await query.describe(); // types as the 
 
 **Tagging.** `.tag('posts.feed')` labels a query for `onQuery` events and OpenTelemetry spans (`db.query.summary`). The tag never appears in the SQL, so it doesn't fragment the statement cache.
 
-**Building without a database.** `selectFrom`, `insertInto`, `update`, `updateMany` and `deleteFrom` are also exported on their own. Queries built that way can be inspected, composed, and run by a database's `batch`; `execute()` works only on queries started from `database(...)`.
+**Building without a database.** `selectFrom`, `insertInto`, `update` and `deleteFrom` are also exported on their own. Queries built that way can be inspected, composed, and run by a database's `batch`; `execute()` works only on queries started from `database(...)`.
 
 ```ts
 import { selectFrom } from 'quarry';
@@ -1771,7 +1841,7 @@ The options are the driver's [transaction options](#transactions): `isolation`, 
 Database errors are the driver's [error classes](#errors), re-exported from `quarry`. The query builder adds:
 
 - **The query and its tag** on every server error, so a log line says which query failed.
-- **Your stack.** With `callsites` (on by default), the error's stack includes the code that called `execute()`, not just the driver's socket handler.
+- **Your stack.** With `callsites` (on by default), the error's stack includes the code awaiting the query (`await q.execute()` and its callers), not just the driver's socket handler. It is captured when the query fails, so queries that succeed pay nothing for it.
 - **Shape errors**: `NoRowError` and `TooManyRowsError` (with `count`) from the `expect…` shapes, and `RowCountError` (with `expected` and `actual`) from `expectRows`. Each carries the `table` it read or wrote and, non-enumerably, the compiled `query`.
 
 `violatedColumns(error, table)` maps a constraint violation back to your column keys, which is the usual first step in turning a database error into a form error:

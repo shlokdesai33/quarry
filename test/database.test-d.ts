@@ -2,6 +2,7 @@ import { describe, expectTypeOf, it } from 'vitest';
 import { integer, text } from '../src/column-factories.js';
 import { databaseWith, type DatabaseTransaction } from '../src/database.js';
 import { defineTable } from '../src/define-table.js';
+import type { RowStream } from '../src/driver/row-stream.js';
 import type { QueryDescription } from '../src/executor.js';
 import type { NotExecuted, Query } from '../src/query.js';
 import { executorFrom, fakeExecutor } from './helpers/executor.js';
@@ -73,7 +74,7 @@ describe('running a query', () => {
 		expectTypeOf(query.execute()).toEqualTypeOf<Promise<Row[]>>();
 		expectTypeOf(query.expectOne().execute()).toEqualTypeOf<Promise<Row>>();
 		expectTypeOf(query.stream({ batchSize: 100 })).toEqualTypeOf<
-			AsyncGenerator<Row, void, undefined>
+			RowStream<Row>
 		>();
 		expectTypeOf(query.describe()).toEqualTypeOf<Promise<QueryDescription>>();
 		// @ts-expect-error unknown option

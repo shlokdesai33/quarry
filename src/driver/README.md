@@ -118,8 +118,9 @@ Canceled queries throw `QueryCanceled`, whose `reason` is `'abort'`, `'timeout'`
 ### Streaming, COPY, notifications
 
 ```ts
-for await (const batch of conn.cursor(sql, params, { batchSize: 1000 })) { … }
-for await (const row of pool.stream(sql, params)) { … }
+for await (const batch of conn.cursor(sql, params, { batchSize: 1000 })) { … } // a batch per pull, binary columns from the first run
+for await (const row of pool.stream(sql, params)) { … } // a connection of its own until the loop ends
+for await (const row of tx.stream(sql, params)) await tx.query(…); // inside a transaction, queries run between batches
 await conn.copyRows('copy items (id, name) from stdin', rows); // bulk insert: rows as value arrays, encoded like parameters
 await conn.copyFrom('copy items from stdin', asyncIterableOfChunks);
 for await (const chunk of conn.copyTo('copy items to stdout')) { … }

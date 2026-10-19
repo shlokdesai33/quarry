@@ -1,9 +1,12 @@
 import type {
+	AliasNode,
 	DeleteNode,
 	InsertNode,
+	JoinNode,
 	LockNode,
 	OnConflictNode,
 	OperationNode,
+	ReferenceNode,
 	RowsNode,
 	SelectionNode,
 	SelectNode,
@@ -180,8 +183,27 @@ function renderReturning(
 	returning: readonly SelectionNode[],
 	params: Params,
 ): string {
-	if (returning.length === 0) return '';
-	return ` returning ${returning.map((s) => `${render(s.expression, params)} as ${identifier(s.alias)}`).join(', ')}`;
+	return renderSelections(returning, ' returning ', params);
+}
+
+function renderSelection(selection: SelectionNode, params: Params): string {
+	return (
+		shared.get(selection) ??
+		`${render(selection.expression, params)} as ${identifier(selection.alias)}`
+	);
+}
+
+/** A select or returning list after `prefix`; nothing when it is empty. */
+function renderSelections(
+	list: readonly SelectionNode[],
+	prefix: string,
+	params: Params,
+): string {
+	if (list.length === 0) return '';
+	let sql = prefix + renderSelection(list[0]!, params);
+	for (let i = 1; i < list.length; i++)
+		sql += `, ${renderSelection(list[i]!, params)}`;
+	return sql;
 }
 
 function renderOnConflict(
@@ -232,45 +254,21 @@ function renderInsert(node: InsertNode, params: Params): string {
 	return sql + renderReturning(node.returning, params);
 }
 
-/** The alias `updateMany`'s rows are joined under. */
-const MANY = 'quarry_rows';
-
 function renderUpdate(node: UpdateNode, params: Params): string {
-	const target = identifier(node.table.alias ?? node.table.name);
-	const sets: string[] = [];
-	if (node.set.length > 0) sets.push(renderSets(node.set, params));
-	const where: string[] = [];
-	let from = '';
-	const { many } = node;
-	if (many !== undefined) {
-		if (!unnestable(many)) {
+	if (node.set.length === 0) throw new Error('An update needs columns to set');
+	let sql = `update ${renderTable(node.table)} set ${renderSets(node.set, params)}`;
+	const { from } = node;
+	if (from !== undefined) {
+		if (!unnestable(from.rows)) {
 			throw new Error(
-				'updateMany needs every row to set the same columns, each to a plain value',
+				'setEach sends its rows with unnest: every value must be a plain value, and array columns are not supported',
 			);
 		}
-		const updated = many.columns.filter((c) => !many.by.includes(c));
-		if (updated.length > 0) {
-			sets.push(
-				updated
-					.map((c) => `${identifier(c)} = ${identifier(MANY)}.${identifier(c)}`)
-					.join(', '),
-			);
-		}
-		from = ` from ${renderUnnest(many, params)} as ${identifier(MANY)}(${many.columns.map(identifier).join(', ')})`;
-		where.push(
-			...many.by.map(
-				(c) =>
-					`${target}.${identifier(c)} = ${identifier(MANY)}.${identifier(c)}`,
-			),
-		);
+		sql += ` from ${renderUnnest(from.rows, params)} as ${identifier(from.alias)}(${from.rows.columns.map(identifier).join(', ')})`;
 	}
-	if (sets.length === 0) throw new Error('An update needs columns to set');
-	if (node.where !== undefined) where.push(render(node.where, params));
-	else if (!node.allRows && many === undefined)
+	if (node.where !== undefined) sql += ` where ${render(node.where, params)}`;
+	else if (!node.allRows)
 		throw new Error('An update needs where() or allRows()');
-	let sql = `update ${renderTable(node.table)} set ${sets.join(', ')}${from}`;
-	if (where.length > 0)
-		sql += ` where ${where.length === 1 ? where[0] : where.map((w) => `(${w})`).join(' and ')}`;
 	return sql + renderReturning(node.returning, params);
 }
 
@@ -282,10 +280,34 @@ function renderDelete(node: DeleteNode, params: Params): string {
 	return sql + renderReturning(node.returning, params);
 }
 
+/**
+ * The SQL of the nodes the builders make once per table and column and
+ * share across queries (see `resolveColumn`). Nodes are immutable, so a
+ * column is quoted once rather than in every query. Only shared nodes are
+ * kept: adding the nodes each query makes would cost more than it saves.
+ */
+const shared = new WeakMap<ReferenceNode | SelectionNode, string>();
+
+/** Renders a column's shared reference and selection nodes once, for every query that uses them. */
+export function shareColumn(
+	reference: ReferenceNode,
+	selection: SelectionNode,
+): void {
+	const sql = `${identifier(reference.table)}.${identifier(reference.column)}`;
+	shared.set(reference, sql);
+	shared.set(selection, `${sql} as ${identifier(selection.alias)}`);
+}
+
+function renderReference(node: ReferenceNode): string {
+	return (
+		shared.get(node) ?? `${identifier(node.table)}.${identifier(node.column)}`
+	);
+}
+
 function render(node: OperationNode, params: Params): string {
 	switch (node.kind) {
 		case 'reference':
-			return `${identifier(node.table)}.${identifier(node.column)}`;
+			return renderReference(node);
 		case 'value':
 			return param(params, node.value, node.codec);
 		case 'value_list':
@@ -302,8 +324,19 @@ function render(node: OperationNode, params: Params): string {
 			return renderLogical(node.operands, 'or', 'false', params);
 		case 'not':
 			return `not (${render(node.operand, params)})`;
-		case 'function':
-			return `${node.name}(${node.args.map((arg) => render(arg, params)).join(', ')})`;
+		case 'function': {
+			const args = node.args.map((arg) => render(arg, params)).join(', ');
+			return `${node.name}(${node.distinct === true ? `distinct ${args}` : args})`;
+		}
+		case 'case': {
+			let sql = 'case';
+			for (const branch of node.branches) {
+				sql += ` when ${render(branch.when, params)} then ${render(branch.result, params)}`;
+			}
+			if (node.otherwise !== undefined)
+				sql += ` else ${render(node.otherwise, params)}`;
+			return `${sql} end`;
+		}
 		case 'raw':
 			return node.nodes.reduce(
 				(sql, embedded, i) =>
@@ -315,22 +348,57 @@ function render(node: OperationNode, params: Params): string {
 	}
 }
 
+/** A `group by`, `order by` or `distinct on` key: an expression, or a selected column by its alias. */
+function renderKey(node: OperationNode | AliasNode, params: Params): string {
+	return node.kind === 'alias' ? identifier(node.alias) : render(node, params);
+}
+
+function renderKeys(
+	keys: readonly (OperationNode | AliasNode)[],
+	params: Params,
+): string {
+	return keys.map((key) => renderKey(key, params)).join(', ');
+}
+
+function renderJoin(join: JoinNode, params: Params): string {
+	const table = renderTable(join.table);
+	if (join.kind === 'cross') return ` cross join ${table}`;
+	if (join.on === undefined)
+		throw new Error(`A ${join.kind} join needs an on() condition`);
+	return ` ${join.kind} join ${table} on ${render(join.on, params)}`;
+}
+
 function renderSelect(node: SelectNode, params: Params): string {
-	const selections = node.selections.map(
-		(selection) =>
-			`${render(selection.expression, params)} as ${identifier(selection.alias)}`,
-	);
-	let sql =
-		selections.length === 0 ? 'select' : `select ${selections.join(', ')}`;
+	let sql = 'select';
+	if (node.distinct === true) sql += ' distinct';
+	else if (node.distinct !== undefined)
+		sql += ` distinct on (${renderKeys(node.distinct, params)})`;
+	sql += renderSelections(node.selections, ' ', params);
 	sql += ` from ${renderTable(node.from)}`;
-	for (const join of node.joins) {
-		sql += ` inner join ${renderTable(join.table)} on ${render(join.on, params)}`;
-	}
+	for (const join of node.joins) sql += renderJoin(join, params);
 	if (node.where !== undefined) {
 		sql += ` where ${render(node.where, params)}`;
 	}
+	if (node.groupBy !== undefined && node.groupBy.length > 0) {
+		sql += ` group by ${renderKeys(node.groupBy, params)}`;
+	}
+	if (node.having !== undefined) {
+		sql += ` having ${render(node.having, params)}`;
+	}
+	if (node.orderBy !== undefined && node.orderBy.length > 0) {
+		const keys = node.orderBy.map((key) => {
+			let rendered = renderKey(key.expression, params);
+			if (key.direction !== undefined) rendered += ` ${key.direction}`;
+			if (key.nulls !== undefined) rendered += ` nulls ${key.nulls}`;
+			return rendered;
+		});
+		sql += ` order by ${keys.join(', ')}`;
+	}
 	if (node.limit !== undefined) {
 		sql += ` limit ${param(params, node.limit)}`;
+	}
+	if (node.offset !== undefined) {
+		sql += ` offset ${param(params, node.offset)}`;
 	}
 	if (node.locks.length > 0) {
 		if (node.selections.some((s) => hasAggregate(s.expression))) {
@@ -351,7 +419,17 @@ function renderLock(lock: LockNode): string {
 }
 
 /** The aggregate functions `eb.fn` builds. */
-const aggregates = new Set(['count', 'min', 'max']);
+const aggregates = new Set([
+	'count',
+	'min',
+	'max',
+	'sum',
+	'avg',
+	'array_agg',
+	'string_agg',
+	'bool_and',
+	'bool_or',
+]);
 
 /** Whether `node` calls an aggregate of its own query, not of a subquery's. */
 function hasAggregate(node: OperationNode): boolean {
@@ -367,6 +445,13 @@ function hasAggregate(node: OperationNode): boolean {
 			return hasAggregate(node.operand);
 		case 'value_list':
 			return node.values.some(hasAggregate);
+		case 'case':
+			return (
+				node.branches.some(
+					(branch) => hasAggregate(branch.when) || hasAggregate(branch.result),
+				) ||
+				(node.otherwise !== undefined && hasAggregate(node.otherwise))
+			);
 		case 'raw':
 			return node.nodes.some(hasAggregate);
 		default:
@@ -380,19 +465,23 @@ function renderTable(table: TableNode): string {
 		: `${identifier(table.name)} as ${identifier(table.alias)}`;
 }
 
-/** Nested comparisons are parenthesised so postgres precedence cannot regroup them. */
+/**
+ * Operands that are operations themselves (comparisons, arithmetic, `not`)
+ * are parenthesised, so postgres precedence cannot regroup them: `not` binds
+ * looser than `is`, so `not (a) is null` would read as `not ((a) is null)`.
+ */
 function renderOperand(node: OperationNode, params: Params): string {
 	const sql = render(node, params);
-	return rendersAsBinary(node) ? `(${sql})` : sql;
+	return rendersAsOperation(node) ? `(${sql})` : sql;
 }
 
 /** A single-operand `and` / `or` renders as its operand, unparenthesised. */
-function rendersAsBinary(node: OperationNode): boolean {
+function rendersAsOperation(node: OperationNode): boolean {
 	if (node.kind === 'and' || node.kind === 'or') {
 		const [only, ...rest] = node.operands;
-		return only !== undefined && rest.length === 0 && rendersAsBinary(only);
+		return only !== undefined && rest.length === 0 && rendersAsOperation(only);
 	}
-	return node.kind === 'binary';
+	return node.kind === 'binary' || node.kind === 'not';
 }
 
 function renderLogical(
@@ -408,8 +497,22 @@ function renderLogical(
 	return `(${rendered.join(` ${operator} `)})`;
 }
 
-function identifier(name: string): string {
-	return `"${name.replaceAll('"', '""')}"`;
+/**
+ * Quoted identifiers, by name: table, column and alias names repeat in
+ * every query. Cleared when full, so names made at run time can't grow it
+ * without bound.
+ */
+const identifiers = new Map<string, string>();
+
+/** `name` as a quoted identifier. */
+export function identifier(name: string): string {
+	let quoted = identifiers.get(name);
+	if (quoted === undefined) {
+		quoted = `"${name.replaceAll('"', '""')}"`;
+		if (identifiers.size >= 4096) identifiers.clear();
+		identifiers.set(name, quoted);
+	}
+	return quoted;
 }
 
 /**

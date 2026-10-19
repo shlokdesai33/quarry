@@ -1,0 +1,288 @@
+# Transactions, savepoints and batches
+
+[transaction.ts](transaction.ts). This guide explains what transactions are, how the driver runs one (`Transaction.run`), how it saves round trips without changing what runs (the `Session`), savepoints, retries, settings and timeouts, the one-round-trip batch (`Transaction.batch`), and the cases where things go wrong.
+
+The query builder's side is in [../EXECUTION.md](../EXECUTION.md#transactions).
+
+## Contents
+
+- [What a transaction is](#what-a-transaction-is)
+- [The API](#the-api)
+- [`Transaction.run`, step by step](#transactionrun-step-by-step)
+- [BEGIN shares the first statement's Sync](#begin-shares-the-first-statements-sync)
+- [The `Session`](#the-session)
+- [Savepoints](#savepoints)
+- [Retries](#retries)
+- [Settings, `setLocal` and the transaction timeout](#settings-setlocal-and-the-transaction-timeout)
+- [A COMMIT that rolled back](#commit-that-rolled-back)
+- [`afterCommit` and `afterRollback`](#aftercommit-and-afterrollback)
+- [Batches in one round trip](#batches-in-one-round-trip)
+- [What goes wrong, and what you see](#what-goes-wrong-and-what-you-see)
+- [Decisions](#decisions)
+- [Glossary](#glossary)
+
+## What a transaction is
+
+A **transaction** is a group of statements that the database treats as one unit:
+
+- **All or nothing**: `commit` makes every change visible at once; `rollback` (or an error) discards them all. A money transfer never leaves the debit without the credit.
+- **Isolation**: while it runs, other sessions don't see its uncommitted changes, and (depending on the **isolation level**) it sees a consistent view of the data.
+
+Statements outside an explicit transaction each run in their own (**autocommit**).
+
+Isolation levels, weakest to strongest (Postgres treats `read uncommitted` as `read committed`):
+
+| Level                      | Each statement sees                                         | Can fail with                                  |
+| -------------------------- | ----------------------------------------------------------- | ---------------------------------------------- |
+| `read committed` (default) | data committed before **the statement** began               | (no serialization errors)                      |
+| `repeatable read`          | data committed before **the transaction's first statement** | serialization failure on conflicting writes    |
+| `serializable`             | as if transactions ran one after another                    | serialization failure on any dangerous overlap |
+
+A **serialization failure** (SQLSTATE `40001`) or a **deadlock** (`40P01`, two transactions each waiting for the other's lock) means "this transaction lost a race; running it again will likely succeed". Hence [retries](#retries).
+
+`read only` forbids writes; `deferrable` (with `serializable read only`) waits for a safe snapshot so the transaction can't fail with a serialization error.
+
+## The API
+
+```ts
+await pool.transaction(async (tx) => {
+	await tx.query('insert into orders …', [...]);
+	await tx.transaction(async (sp) => { … });          // a savepoint
+	tx.afterCommit(() => queue.publish('order.created'));
+}, { isolation: 'serializable', retries: 3, settings: { 'app.tenant_id': tenant }, timeout: '10s' });
+```
+
+`Pool.transaction` reserves a connection for the callback (`#with`), `Connection.transaction` and `PoolClient.transaction` use theirs; all call `Transaction.run(connection, fn, options)`.
+
+`TransactionOptions`: `isolation`, `readOnly`, `deferrable`, `retries`, `retryDelay(attempt)`, `settings`, `timeout`, `durable`.
+
+## `Transaction.run`, step by step
+
+```ts
+static async run(conn, fn, options = {}) {
+	const opening = openingStatements(conn, options); // BEGIN …, select set_config(…)
+	running.add(conn);
+	try {
+		for (let attempt = 0; ; attempt++) {
+			const session = new Session(conn, opening);
+			const tx = new Transaction(session, 0);
+			let result;
+			try {
+				result = await fn(tx);
+				tx.#finished = true;
+				const commit = await session.query('commit');
+				if (commit.command === 'ROLLBACK') throw new TransactionRolledBack();
+			} catch (caught) {
+				tx.#finished = true;
+				const failure = await session.end(); // did BEGIN itself fail?
+				const error = failure === undefined ? caught : failure.error;
+				if (conn.transactionStatus !== 'idle') await conn.query('rollback').catch(() => {});
+				runCallbacks(tx.#afterRollback);
+				if (error instanceof PostgresError && error.isRetryable && attempt < retries) {
+					await sleep(retryDelay(attempt + 1));
+					continue;
+				}
+				throw error;
+			}
+			runCallbacks(tx.#afterCommit);
+			return result;
+		}
+	} finally {
+		running.delete(conn);
+	}
+}
+```
+
+1. **`openingStatements`** validates the options (a known isolation level) and that the connection isn't already in a transaction (`transactionStatus`, or the `running` set for one whose BEGIN hasn't been sent yet), then builds: `begin [isolation level …] [read only|read write] [deferrable|not deferrable]`, and, if there are settings or a timeout, `select set_config($1, $2, true), …`. Both are sent **unprepared**: they run once per transaction and can't go stale.
+2. Each **attempt** gets a fresh `Session` and `Transaction`, and calls `fn(tx)`.
+3. `fn` resolved: send `commit`. If the server answers `ROLLBACK`, throw `TransactionRolledBack` ([below](#commit-that-rolled-back)).
+4. `fn` threw (or commit failed): find the real error (BEGIN's, if BEGIN failed and `fn`'s statements were therefore skipped), roll back if still in a transaction, run `afterRollback` callbacks, retry if retryable and attempts remain, else rethrow.
+5. Success: run `afterCommit` callbacks, return `fn`'s result.
+
+A `Transaction` must not be used after its callback settles (`#finished`): its methods reject with "This transaction has already finished".
+
+## BEGIN shares the first statement's Sync
+
+A naive transaction costs one round trip more than its statements: `begin` → wait → first statement → wait → … → `commit` → wait. The driver sends `begin` **together with the first statement, under one Sync**. Captured:
+
+```
+C> Parse("", "begin") Bind Describe(P) Execute   Parse("q2", "select …") Describe(S) Bind(q2) Execute   Sync
+S< ParseComplete BindComplete NoData CommandComplete(BEGIN)   ParseComplete … DataRow CommandComplete(SELECT 1)   ReadyForQuery(T)
+C> Bind(q2) Execute Sync                         (the second statement)
+S< BindComplete DataRow CommandComplete(SELECT 1) ReadyForQuery(T)
+C> Parse("q3", "commit") Describe(S) Bind(q3) Execute Sync
+S< … CommandComplete(COMMIT) ReadyForQuery(I)
+```
+
+With settings (`isolation: 'serializable', settings: { 'app.tenant': '7' }`), BEGIN, the `set_config` and the first statement share the Sync:
+
+```
+C> Parse("", "begin isolation level serializable") … Execute   Parse("", "select set_config($1, $2, true)") … Execute   Bind(q2) Execute   Sync
+```
+
+Why **one Sync**? If BEGIN fails (an invalid option, a connection-level problem), the server skips everything until Sync: the first statement does **not** run, and certainly not outside the transaction, which is what could happen with separate Syncs. The statement then rejects with BEGIN's error. (The callback has already started by then, since the first statement is what triggers sending BEGIN.)
+
+## The `Session`
+
+`Session` wraps the connection for one transaction attempt and implements the round-trip savings without changing what runs.
+
+```ts
+class Session {
+	#opening: GroupStatement[] | undefined; // BEGIN + settings, until sent
+	#beginning = false; // BEGIN in flight
+	#waiting: Waiter[] | undefined; // sends waiting for BEGIN's outcome
+	#opened: Promise<void> | undefined; // settles when BEGIN's outcome is known
+	#failure: { error } | undefined; // why the transaction never began
+	#deferred: Promise<unknown> | undefined; // a statement sent without waiting (release savepoint)
+}
+```
+
+- **`query(sql, …)`** while BEGIN is unsent: if the query's options don't need a Sync of its own (`signal`, `timeout`, `statementTimeout`, `onTiming` do), send it with BEGIN through `#begin([statement])`, which calls `connection.queryGroup([...opening, statement])` ([ARCHITECTURE.md](ARCHITECTURE.md#part-5-operations), `SyncGroupOp`). Otherwise send BEGIN alone first.
+- **`#send(fn)`** for everything else: if BEGIN is still unsent, send it; if it failed, reject with its error; if it's in flight, queue `fn` until its outcome (`#waiting`, run by `#began`). So statements issued before BEGIN's answer arrive in order after it, and fail with BEGIN's error if it failed.
+- **`transactionStatus`** reports `transaction` from the start, even before BEGIN was sent or answered, so code inside the callback sees what it expects.
+- **`queryGroup(statements)`**: several statements under one Sync, sharing BEGIN's if unsent.
+- **`cursor`, `stream`, `copyTo`** (`#iterate`) wait for BEGIN (and any deferred statement) before starting, since they hold the connection exclusively.
+- **`sendDeferred(sql)`**: send without waiting for the answer; the **next** statement's result waits for it first, and reports its error instead if it failed (`#send` chains on `#deferred`).
+- **`end()`**: drops BEGIN if it was never sent (a callback that ran no statement costs no round trip at all, and COMMIT then does nothing), waits for BEGIN's outcome, and returns its failure.
+
+## Savepoints
+
+A **savepoint** is a named point inside a transaction that you can roll back to without abandoning the whole transaction. `tx.transaction(fn)` runs `fn` in one:
+
+```ts
+async transaction(fn, options = {}) {
+	if (options.durable) throw new DriverError('A durable transaction cannot run inside another transaction');
+	// isolation, readOnly, deferrable, retries: only on the outermost transaction
+	const name = `quarry_sp_${this.#depth + 1}_${++this.#savepoints}`;
+	await this.#conn.query(`savepoint ${name}`);
+	const inner = new Transaction(this.#conn, this.#depth + 1);
+	try {
+		if (options.settings) await this.#conn.query(settingsQuery(options.settings)…);
+		const result = await fn(inner);
+		if (this.#conn.transactionStatus === 'failed') await this.#conn.query(`release savepoint ${name}`); // fails, like a throw
+		else this.#conn.sendDeferred(`release savepoint ${name}`);
+		inner.#finished = true;
+		this.#afterCommit.push(...inner.#afterCommit);
+		this.#afterRollback.push(...inner.#afterRollback);
+		return result;
+	} catch (error) {
+		inner.#finished = true;
+		if (this.#conn.transactionStatus !== 'idle')
+			await Promise.all([query(`rollback to savepoint ${name}`), query(`release savepoint ${name}`)]);
+		runCallbacks(inner.#afterRollback);
+		throw error;
+	}
+}
+```
+
+- Names are unique per depth and sequence (`quarry_sp_1_1`, `quarry_sp_1_2`, `quarry_sp_2_1`), generated by the driver, so they're safe to interpolate.
+- **Success**: `release savepoint` is **deferred**: sent without waiting; if it fails, the next statement (or the COMMIT) reports the error. Saves a round trip per savepoint.
+- **The callback resolved but swallowed a database error** (the transaction is `failed`): release is awaited and fails, so the savepoint behaves as if `fn` had thrown.
+- **Error**: roll back to the savepoint and release it (pipelined together), run the savepoint's `afterRollback` callbacks, rethrow. The outer transaction can continue.
+- The inner transaction's `afterCommit` callbacks move up to the outer one: they run when the **outermost** transaction commits. If the outer one later rolls back, they're dropped.
+- As the first statement of a transaction, `savepoint` shares BEGIN's Sync like any statement (captured: `Parse("", "begin") … Parse("q4", "savepoint quarry_sp_1_1") … Sync`).
+
+## Retries
+
+`retries: n` re-runs the whole callback up to n times when the transaction fails with `isRetryable` errors (`SerializationFailure` 40001, `DeadlockDetected` 40P01), after `retryDelay(attempt)` milliseconds; the default is jittered exponential backoff: `min(1000, 10 × 2^attempt) × (0.5 … 1.5)`. Jitter spreads retries of conflicting transactions apart, so they don't collide again.
+
+Because the callback runs again, it must be safe to re-run: no side effects outside the database. Put those in `afterCommit`, which only runs for the attempt that committed.
+
+Retries are opt-in (default 0): a retry is only correct when you know the callback can be repeated.
+
+## Settings, `setLocal` and the transaction timeout
+
+- **`settings: { name: value }`** applies run-time parameters for this transaction only: `select set_config($1, $2, true), set_config($3, $4, true)`, sent with BEGIN. Names and values are **bound parameters**, never interpolated (names are also checked against `^[A-Za-z_][\w$]*(\.[A-Za-z_][\w$]*)*$`). The third argument `true` makes them **transaction-local**: they end with the transaction, so behind a pooler they can't leak into another client's session. Typical use: row-level security (`'app.tenant_id': id`).
+- **`tx.setLocal(name, value)`**: the same, later in the transaction.
+- **`timeout`**: becomes the `transaction_timeout` setting (PostgreSQL 17+): if the transaction runs longer, the **server** ends the session, and the call fails with `TransactionTimeout` (25P04). The connection is closed by the server; the pool replaces it.
+- Savepoints accept `settings` too (applied after the savepoint, so rolling back to it undoes them).
+
+## A COMMIT that rolled back
+
+<a id="commit-that-rolled-back"></a>
+If a statement inside the transaction failed and your code caught the error and carried on, the transaction is in the **failed** state: Postgres refuses further statements, and a `commit` is answered with the command tag `ROLLBACK`, not an error. Many drivers report that as success. `Transaction.run` checks `commit.command === 'ROLLBACK'` and throws `TransactionRolledBack`: nothing was committed, and your code must not think otherwise.
+
+## `afterCommit` and `afterRollback`
+
+- `afterCommit(fn)`: runs once the outermost transaction commits; dropped if it (or the savepoint it was registered in) rolls back, or the attempt is retried.
+- `afterRollback(fn)`: runs if this transaction or savepoint rolls back.
+
+`runCallbacks` calls each one and reports errors (and rejected promises) by rethrowing them in a microtask, never by throwing: by then the transaction's outcome is decided, and a failing callback must not turn a successful commit into a rejected call.
+
+## Batches in one round trip
+
+<a id="batches-in-one-round-trip"></a>
+`Transaction.batch(conn, statements, options)` (used by quarry's `db.batch(…, { transaction: true })`) runs a **fixed list** of statements as one transaction in one round trip:
+
+```ts
+const opening = openingStatements(conn, options);
+const all = conn.queryGroup([...opening, ...statements], { signal }); // BEGIN + settings + statements, one Sync
+const results = all.slice(opening.length);
+const pipelined =
+	verify === undefined && !signal?.aborted ? conn.query('commit') : undefined; // COMMIT, own Sync
+const done = (async () => {
+	rows = await Promise.all(all);
+	verify?.(rows); // failure → rollback
+	const commit = await (pipelined ?? conn.query('commit'));
+	if (commit.command === 'ROLLBACK') throw new TransactionRolledBack();
+	return rows;
+})();
+return { results, done };
+```
+
+Captured (two queries):
+
+```
+C> begin … Execute  Bind(q1) Execute  Bind(q1) Execute  Sync  Parse("q2", "commit") … Execute Sync   (one write)
+S< … BEGIN … SELECT 1 … SELECT 1 … ReadyForQuery(T)
+S< … COMMIT … ReadyForQuery(I)
+```
+
+- Under one Sync, the first failure makes the server skip the rest, so the remaining statements reject with that error, and COMMIT (outside the failed segment) is answered `ROLLBACK` → `TransactionRolledBack`.
+- If BEGIN failed, nothing ran, and COMMIT, outside any transaction, does nothing (Postgres answers with a warning).
+- **`verify`**: when results must be checked before committing (quarry's `expect…` shapes), COMMIT isn't pipelined: `done` waits for the results, calls `verify`, and only then sends COMMIT, a second round trip. Throwing in `verify` rolls back.
+- Without `verify`, COMMIT is sent before any result is read: a result the client can't **decode** fails the batch, but its transaction has committed. (Decoding happens after the server's work; it can't be part of the server's decision.)
+- `finally`: if the connection is still in a transaction, roll back.
+
+## What goes wrong, and what you see
+
+| Situation                                            | What happens                                                                                                 |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| A statement fails                                    | its promise rejects; the transaction is failed; `fn` usually throws; rollback; the error is rethrown         |
+| `fn` catches a statement's error and returns         | COMMIT answers ROLLBACK → `TransactionRolledBack`                                                            |
+| BEGIN fails                                          | the first statement is skipped and rejects with BEGIN's error; `run` reports BEGIN's error                   |
+| `fn` throws a non-database error                     | rollback; rethrown                                                                                           |
+| Serialization failure / deadlock with `retries`      | rollback, backoff, `fn` runs again                                                                           |
+| Transaction exceeds `timeout`                        | the server ends the session: `TransactionTimeout`; the connection is gone                                    |
+| Connection lost mid-transaction                      | statements reject with `ConnectionError`; nothing committed (the server rolls back an abandoned transaction) |
+| `transaction()` while already in one                 | "The connection is already in a transaction; use tx.transaction() to nest" (or the durable message)          |
+| A `PoolClient` released while still in a transaction | the pool destroys the connection ([POOL.md](POOL.md#releasing-and-giving-back))                              |
+| Using `tx` after the callback settled                | "This transaction has already finished"                                                                      |
+
+## Decisions
+
+Why transactions work this way. Each links to its full entry (what it is, why, the alternatives, the cost, measured impact) in [DECISIONS.md](DECISIONS.md):
+
+- [BEGIN shares the first statement's Sync](DECISIONS.md#begin-shares-the-first-statements-sync): one round trip saved per transaction, and a failed BEGIN can never let a statement run outside it.
+- [Deferred savepoint RELEASE](DECISIONS.md#deferred-savepoint-release): one round trip saved per savepoint; errors still surface.
+- [Detect a COMMIT that rolled back](DECISIONS.md#detect-a-commit-that-rolled-back): a swallowed error can't pass for a commit.
+- [Retries opt-in, re-running the whole callback](DECISIONS.md#retries-opt-in-re-running-the-whole-callback): partial replays are never right.
+- [Settings with `set_config(…, true)`](DECISIONS.md#settings-with-set_config-true): bound values, transaction-local, pooler-safe.
+- [`afterCommit` callbacks that can't change the outcome](DECISIONS.md#aftercommit-callbacks-that-cant-change-the-outcome): side effects only for the committed attempt.
+- [`db.batch` framing: one write, with COMMIT pipelined unless results are checked](DECISIONS.md#dbbatch-framing-one-write-with-commit-pipelined-unless-results-are-checked): many statements, atomically, in one round trip.
+
+## Glossary
+
+**Autocommit**: a statement outside an explicit transaction runs and commits on its own.
+
+**Deadlock**: two transactions each waiting for a lock the other holds; Postgres aborts one.
+
+**Isolation level**: how much a transaction sees of concurrent ones.
+
+**Savepoint**: a named point inside a transaction to roll back to.
+
+**Serialization failure**: a `repeatable read` or `serializable` transaction losing a conflict; retrying usually succeeds.
+
+**`set_config(name, value, is_local)`**: sets a run-time parameter; `is_local = true` limits it to the current transaction.
+
+**`transaction_timeout`**: a PostgreSQL 17+ setting that ends sessions whose transaction runs too long.

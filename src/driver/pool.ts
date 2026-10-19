@@ -5,6 +5,7 @@ import {
 } from './config.js';
 import { openConnection, preloadSockets } from './connect.js';
 import type { Connection, CursorOptions, QueryOptions } from './connection.js';
+import { RowStream } from './row-stream.js';
 import { AbortError, ConnectionError, DriverError } from './errors.js';
 import type { Notification } from './notice.js';
 import type { Description, QueryResult } from './ops.js';
@@ -78,6 +79,10 @@ interface Slot {
 	idleSince: number;
 	/** Its adaptive pipeline depth, once a query was timed on it. */
 	depth: Depth | undefined;
+	/** The pool's completion count at its last completion, or when it started taking queries. */
+	lastDone: number;
+	/** Taking no new queries since the width narrowed; idle once its queries finish. */
+	retiring: boolean;
 	/** End an untimed query's turn on the connection; made once per connection, not per query. */
 	readonly settled: () => void;
 	readonly fulfilled: (value: unknown) => unknown;
@@ -128,6 +133,280 @@ class Depth {
 			this.limit = Math.min(PIPELINE_CEILING, Math.ceil(this.limit * 1.5));
 		else if (ratio > 3)
 			this.limit = Math.max(PIPELINE_FLOOR, Math.floor(this.limit * 0.75));
+	}
+}
+
+/** Completions per adjustment of the adaptive width. */
+const WIDTH_EPOCH = 4096;
+/** Above this share of stalled time, the width shrinks; below the other, it may grow. */
+const STALLED_HIGH = 0.25;
+const STALLED_LOW = 0.05;
+/** A narrower pool is kept unless queries then take this many times longer on average. */
+const NARROWER_WORSE = 2;
+/**
+ * The most epochs to wait before trying again after a change that didn't
+ * help: a growth (doubling the wait each time), or a narrowing
+ * (quadrupling it: a narrowing tried behind slow queries disturbs the
+ * pool for a while, so trying again soon costs more than it can win).
+ */
+const GROW_BACKOFF = 64;
+const NARROW_BACKOFF = 1024;
+
+/**
+ * How many connections `query` spreads its queries across: up to `max`,
+ * fewer when the server can't run that many at once.
+ *
+ * A pipelined connection always has work queued, so its backend never
+ * sleeps: with more such backends than the server has CPUs, the
+ * scheduler time-slices them, and a backend that loses its CPU holds
+ * every query pipelined on it for a whole slice (milliseconds, more with
+ * more backends) while the others carry on. Throughput doesn't improve
+ * (the CPUs were already busy) but the tail does: those queries wait
+ * many times the average.
+ *
+ * The pool sees that as stalls: a connection completing nothing while the
+ * rest of the pool completes everything in flight. Counted in
+ * completions rather than time, it needs no clock, ignores client pauses
+ * (GC stops every connection at once), and doesn't fire on a round trip,
+ * which by Little's law takes about one turnover. With W such backends
+ * sharing C CPUs, each is descheduled about 1 − C/W of the time, so the
+ * stalled share of connections' time also tells how many the server
+ * runs at once: W × (1 − stalled). Each epoch of `WIDTH_EPOCH`
+ * completions:
+ *
+ * - above `STALLED_HIGH` two epochs in a row, the width narrows to that
+ *   estimate (not below 2 in one step). A slow query stalls its
+ *   connection too, and there fewer connections would only queue more
+ *   queries behind it, so the epoch after next judges the change: unless
+ *   stalls fell by a quarter (or below `STALLED_HIGH`) and the mean
+ *   latency (queries in flight and queued over the completion rate,
+ *   Little's law again: one clock read per epoch) grew less than
+ *   `NARROWER_WORSE` times, the width goes back, and the next try waits
+ *   four times as long (up to `NARROW_BACKOFF` epochs). It goes back at once
+ *   if, once it settled, completions come at under three fifths of the
+ *   rate before (a clock read per 256 completions while judged): under
+ *   CPU contention the CPUs stay busy, so that only happens behind slow
+ *   queries, and the next try waits `NARROW_BACKOFF` epochs;
+ * - below `STALLED_LOW`, while queries are pipelined or queued at the
+ *   width, it grows by one. A growth that brings stalls back makes the
+ *   next one wait twice as long (up to `GROW_BACKOFF`); one that holds halves the wait.
+ *
+ * So the pool settles at the widest the server runs without stalls.
+ * Queries beyond the width's pipelines wait in the shared queue, in
+ * order, for whichever connection frees a slot first. The epoch after a
+ * change, in which the pool ran out of queries, or in which a connection
+ * took queries for the first time, isn't judged.
+ */
+/** What `Width` tracks of a connection. */
+export interface WidthSlot {
+	/** Queries in flight while lent for queries; -1 otherwise. */
+	readonly shared: number;
+	/** Being dropped after a narrowing: not counted. */
+	readonly retiring?: boolean;
+	lastDone: number;
+}
+
+/** @internal Exported for tests. */
+export class Width {
+	limit: number;
+	readonly #max: number;
+	readonly #now: () => number;
+	#ticks = 0;
+	/** The completion count when the epoch began, and when it ends. */
+	#first = 0;
+	#end = WIDTH_EPOCH;
+	#started = 0;
+	#gaps = 0;
+	#stalled = 0;
+	/** Queries in flight or queued, summed over the epoch's completions. */
+	#load = 0;
+	#demand = false;
+	#settling = true;
+	/** The width before the narrowing being judged (0: none), and its stalls and mean latency. */
+	#from = 0;
+	#before = 0;
+	#stalledBefore = 0;
+	#growHoldoff = 0;
+	#growBackoff = 1;
+	#probing = false;
+	#narrowHoldoff = 0;
+	#narrowBackoff = 4;
+	/** The previous epoch's stalled share, as narrowing takes two in a row. */
+	#lastStalled = 0;
+	/** When the narrowing being judged settled (time and completion count), and the time per completion before it. */
+	#trialStart = 0;
+	#trialTick = 0;
+	#trialPace = 0;
+
+	constructor(max: number, now: () => number = () => performance.now()) {
+		this.limit = max;
+		this.#max = max;
+		this.#now = now;
+	}
+
+	/** A connection starts taking queries; `first` when no other has any. */
+	start(slot: WidthSlot, first: boolean): void {
+		// while the pool fills up, not every connection is busy yet: stalls would read low
+		if (first || slot.lastDone === 0) this.#settling = true;
+		slot.lastDone = this.#ticks;
+	}
+
+	/** Whether a connection has completed nothing while the rest of the pool completed everything in flight. */
+	stalls(slot: WidthSlot, inFlight: number): boolean {
+		return slot.shared > 0 && slot.lastDone < this.stalledBefore(inFlight);
+	}
+
+	/** A connection with queries in flight whose last completion came before this count stalls. */
+	stalledBefore(inFlight: number): number {
+		return this.#ticks - inFlight - 16;
+	}
+
+	/** Queries are pipelined, or queued, because every connection the width allows is in use. */
+	demand(): void {
+		this.#demand = true;
+	}
+
+	/**
+	 * Records a completion on `slot`, with `inFlight` queries still in
+	 * flight on `shared` of the pool's `slots` and `waiting` queued; true
+	 * when the width grew.
+	 */
+	done(
+		slot: WidthSlot,
+		inFlight: number,
+		waiting: number,
+		shared: number,
+		slots: ReadonlyMap<unknown, WidthSlot>,
+	): boolean {
+		const tick = ++this.#ticks;
+		if (slot.retiring !== true) {
+			// its own completion is a tick of its time too
+			this.#gaps++;
+			this.#gap(tick - slot.lastDone - 1, inFlight);
+		}
+		slot.lastDone = tick;
+		this.#load += inFlight + waiting;
+		// a narrowing that slows completions down by two fifths is undone without waiting for its epochs
+		if (
+			this.#from > 0 &&
+			!this.#settling &&
+			(tick & 255) === 0 &&
+			tick - this.#trialTick >= 1024
+		) {
+			const now = this.#now();
+			if (
+				(now - this.#trialStart) * 0.6 >
+				(tick - this.#trialTick) * this.#trialPace
+			)
+				return this.#revert(now, true);
+		}
+		if (tick < this.#end) return false;
+		// stalls still going on count too: a backend can be off its CPU for longer than an epoch
+		for (const other of slots.values())
+			if (other.shared > 0 && other.retiring !== true)
+				this.#gap(tick - other.lastDone, inFlight);
+		return this.#adjust(shared);
+	}
+
+	/** Counts the part of a connection's gap between completions that falls in this epoch, as stalled if it is longer than a turnover. */
+	#gap(gap: number, inFlight: number): void {
+		const counted = Math.min(gap, this.#ticks - 1 - this.#first);
+		this.#gaps += counted;
+		if (gap > inFlight + 16) this.#stalled += counted;
+	}
+
+	/** Starts a new epoch: a half one while a change settles, as it only has to let dropped connections finish. */
+	#epoch(now: number): void {
+		this.#first = this.#ticks;
+		this.#end = this.#ticks + (this.#settling ? WIDTH_EPOCH / 2 : WIDTH_EPOCH);
+		this.#started = now;
+		this.#gaps = 0;
+		this.#stalled = 0;
+		this.#load = 0;
+		this.#demand = false;
+	}
+
+	/** Goes back to the width before a narrowing that didn't help; the next try waits four times as long, or the longest if it slowed completions down. */
+	#revert(now: number, slower = false): true {
+		this.limit = this.#from;
+		this.#from = 0;
+		// slowing completions down is what narrowing behind slow queries does, never under CPU contention
+		this.#narrowBackoff = slower
+			? NARROW_BACKOFF
+			: Math.min(NARROW_BACKOFF, this.#narrowBackoff * 4);
+		this.#narrowHoldoff = this.#narrowBackoff;
+		this.#settling = true;
+		this.#epoch(now);
+		return true;
+	}
+
+	#adjust(shared: number): boolean {
+		const now = this.#now();
+		const elapsed = now - this.#started;
+		// Little's law: mean queries in the pool over the completion rate
+		const latency = (this.#load / WIDTH_EPOCH) * (elapsed / WIDTH_EPOCH);
+		const stalled = this.#gaps > 0 ? this.#stalled / this.#gaps : 0;
+		const demand = this.#demand;
+		if (this.#settling) {
+			this.#settling = false;
+			this.#epoch(now);
+			// a narrowing's pace is judged from here: dropped connections compete for the CPUs until they finish
+			this.#trialStart = now;
+			this.#trialTick = this.#ticks;
+			return false;
+		}
+		this.#epoch(now);
+		const lastStalled = this.#lastStalled;
+		this.#lastStalled = stalled;
+		if (this.#from > 0) {
+			if (
+				stalled >= Math.max(STALLED_HIGH, this.#stalledBefore * 0.75) ||
+				latency > this.#before * NARROWER_WORSE
+			)
+				return this.#revert(now);
+			this.#from = 0;
+			this.#narrowBackoff = Math.max(4, this.#narrowBackoff >> 1);
+		}
+		if (stalled > STALLED_HIGH) {
+			if (this.#narrowHoldoff > 0) {
+				this.#narrowHoldoff--;
+				return false;
+			}
+			if (lastStalled <= STALLED_HIGH) return false;
+			const width = Math.min(this.limit, shared);
+			const runs = Math.round(width * (1 - (stalled + lastStalled) / 2));
+			// one step at a time below 2: a single connection is the costliest guess
+			const narrower = Math.min(width - 1, width > 2 ? Math.max(2, runs) : 1);
+			if (narrower < 1) return false;
+			if (this.#probing)
+				this.#growBackoff = Math.min(GROW_BACKOFF, this.#growBackoff * 2);
+			this.#probing = false;
+			this.#growHoldoff = this.#growBackoff;
+			this.#from = this.limit;
+			this.#before = latency;
+			this.#stalledBefore = (stalled + lastStalled) / 2;
+			this.#trialStart = now;
+			this.#trialTick = this.#ticks;
+			this.#trialPace = elapsed / WIDTH_EPOCH;
+			this.#settling = true;
+			this.#epoch(now);
+			this.limit = narrower;
+			return false;
+		}
+		if (this.#narrowHoldoff > 0) this.#narrowHoldoff--;
+		if (this.#growHoldoff > 0) {
+			this.#growHoldoff--;
+			return false;
+		}
+		if (stalled >= STALLED_LOW || !demand || this.limit >= this.#max)
+			return false;
+		// the last try held: try again sooner
+		if (this.#probing) this.#growBackoff = Math.max(1, this.#growBackoff >> 1);
+		this.#probing = true;
+		this.#settling = true;
+		this.#epoch(now);
+		this.limit++;
+		return true;
 	}
 }
 
@@ -182,7 +461,7 @@ export class PoolClient implements AsyncDisposable {
 		sql: string,
 		params?: readonly unknown[],
 		options?: CursorOptions,
-	): AsyncIterable<R> {
+	): RowStream<R> {
 		return this.connection.stream<R>(sql, params, options);
 	}
 
@@ -239,6 +518,14 @@ export class Pool implements AsyncDisposable {
 	/** Whether each connection's depth adapts (`pipeline` wasn't given). */
 	readonly #adaptive: boolean;
 	#timed = 0;
+	/** How many connections queries spread across, when adaptive. */
+	readonly #width: Width | undefined;
+	/** Connections lent out for queries. */
+	#sharedSlots = 0;
+	/** Of those, the ones taking no new queries since the width narrowed (`retiring`). */
+	#retiring = 0;
+	/** Queries in flight on them. */
+	#inFlight = 0;
 	/**
 	 * Every open connection's bookkeeping. Kept in fields rather than in
 	 * sets of busy or shared connections: adding and deleting a connection
@@ -279,6 +566,8 @@ export class Pool implements AsyncDisposable {
 		this.#pipeline = o.pipeline === false ? 0 : (o.pipeline ?? PIPELINE_FLOOR);
 		this.#adaptive = o.pipeline === undefined;
 		if (this.#max < 1) throw new DriverError('max must be at least 1');
+		this.#width =
+			this.#adaptive && this.#max > 1 ? new Width(this.#max) : undefined;
 		this.#fillMin();
 		// in the background: no cost to createPool, a faster first query
 		unref(setTimeout(() => preloadSockets(this.#config), 0));
@@ -340,6 +629,8 @@ export class Pool implements AsyncDisposable {
 						: Number.POSITIVE_INFINITY,
 				idleSince: 0,
 				depth: undefined,
+				lastDone: 0,
+				retiring: false,
 				settled: () => this.#done(slot, -1),
 				fulfilled: (value) => {
 					this.#done(slot, -1);
@@ -364,7 +655,7 @@ export class Pool implements AsyncDisposable {
 		const index = this.#idle.indexOf(slot);
 		if (index >= 0) this.#idle.splice(index, 1);
 		this.#unlend(slot);
-		slot.shared = -1;
+		this.#unshare(slot);
 		this.#draining.delete(slot);
 		this.#serveWaiters();
 		this.#rebalance();
@@ -405,9 +696,13 @@ export class Pool implements AsyncDisposable {
 			this.#rebalance();
 			return;
 		}
-		if (this.#sharedWaiters.length > 0 && this.#shareable(slot)) {
+		if (
+			this.#sharedWaiters.length > 0 &&
+			this.#taking() < this.#widthLimit() &&
+			this.#shareable(slot)
+		) {
 			this.#lend(slot);
-			slot.shared = 0;
+			this.#share(slot);
 			// share the queue with connections still opening, so a burst spreads out
 			this.#fillShared(
 				slot,
@@ -491,10 +786,28 @@ export class Pool implements AsyncDisposable {
 		for (const resolve of this.#drainWaiters.splice(0)) resolve();
 	}
 
+	/** How many connections the pool may lend for queries at once. */
+	#widthLimit(): number {
+		return this.#width?.limit ?? this.#max;
+	}
+
+	/** Connections lent for queries that take new ones. */
+	#taking(): number {
+		return this.#sharedSlots - this.#retiring;
+	}
+
+	/** Queued queries a new connection would serve: none once the width is reached. */
+	#sharedWanted(): number {
+		return Math.min(
+			this.#sharedWaiters.length,
+			Math.max(0, this.#widthLimit() - this.#taking()),
+		);
+	}
+
 	/** Opens connections for waiters while there is room. */
 	#serveWaiters(): void {
 		while (
-			this.#waiters.length + this.#sharedWaiters.length > this.#opening &&
+			this.#waiters.length + this.#sharedWanted() > this.#opening &&
 			this.#total() < this.#max
 		) {
 			this.#open().then(
@@ -535,7 +848,7 @@ export class Pool implements AsyncDisposable {
 
 	/** Gives free pipeline slots on a shared connection to queued queries, up to `limit` in flight. */
 	#fillShared(slot: Slot, limit = Number.POSITIVE_INFINITY): void {
-		if (this.#sharedWaiters.length === 0) return;
+		if (this.#sharedWaiters.length === 0 || slot.retiring) return;
 		const cap = Math.min(limit, this.#depth(slot));
 		while (
 			slot.shared < cap &&
@@ -546,9 +859,85 @@ export class Pool implements AsyncDisposable {
 			const waiter = this.#sharedWaiters.shift();
 			if (waiter === undefined) break;
 			waiter.cleanup();
-			slot.shared = Math.max(0, slot.shared) + 1;
+			this.#claim(slot);
 			waiter.resolve(slot.connection);
 		}
+	}
+
+	/** Lends an idle connection for queries, unless it is already. */
+	#share(slot: Slot): void {
+		if (slot.shared >= 0) return;
+		slot.shared = 0;
+		this.#width?.start(slot, this.#sharedSlots === 0);
+		this.#sharedSlots++;
+	}
+
+	/** Counts one more query in flight on a connection lent for queries. */
+	#claim(slot: Slot): void {
+		this.#share(slot);
+		slot.shared++;
+		this.#inFlight++;
+	}
+
+	/** The connection is no longer lent for queries. */
+	#unshare(slot: Slot): void {
+		if (slot.shared < 0) return;
+		this.#inFlight -= slot.shared;
+		this.#sharedSlots--;
+		if (slot.retiring) {
+			slot.retiring = false;
+			this.#retiring--;
+		}
+		slot.shared = -1;
+	}
+
+	/**
+	 * After the width narrowed: picks connections to take no new queries
+	 * until it holds, stalled ones first, then the least loaded (the
+	 * quickest to finish). The others keep pipelining meanwhile.
+	 */
+	#retire(): void {
+		const width = this.#widthLimit();
+		while (this.#taking() > width) {
+			let pick: Slot | undefined;
+			let pickStalled = false;
+			for (const slot of this.#slots.values()) {
+				if (slot.shared < 0 || slot.retiring) continue;
+				const stalled = this.#width?.stalls(slot, this.#inFlight) === true;
+				if (
+					pick === undefined ||
+					(stalled && !pickStalled) ||
+					(stalled === pickStalled && slot.shared < pick.shared)
+				) {
+					pick = slot;
+					pickStalled = stalled;
+				}
+			}
+			if (pick === undefined) return;
+			pick.retiring = true;
+			this.#retiring++;
+		}
+	}
+
+	/** The width grew: every connection lent for queries takes them again. */
+	#unretire(): void {
+		if (this.#retiring === 0) return;
+		for (const slot of this.#slots.values()) slot.retiring = false;
+		this.#retiring = 0;
+	}
+
+	/** Lends idle connections to queued queries while the width allows more, then opens what's still needed. */
+	#serveShared(): void {
+		while (
+			this.#sharedWaiters.length > 0 &&
+			this.#taking() < this.#widthLimit()
+		) {
+			const slot = this.#takeIdle();
+			if (slot === undefined) break;
+			this.#share(slot);
+			this.#fillShared(slot);
+		}
+		this.#serveWaiters();
 	}
 
 	/**
@@ -740,31 +1129,48 @@ export class Pool implements AsyncDisposable {
 	 * least loaded, once the pool is full and no query is queued ahead.
 	 */
 	#pickShared(): Slot | undefined {
+		const width = this.#widthLimit();
 		if (
 			this.#pipeline <= 1 ||
-			this.#idle.length > 0 ||
 			this.#sharedWaiters.length > 0 ||
-			this.#total() < this.#max
+			(this.#taking() < width &&
+				(this.#idle.length > 0 || this.#total() < this.#max))
 		) {
 			return undefined;
 		}
 		let best: Slot | undefined;
 		let fewest = Number.POSITIVE_INFINITY;
+		// a stalled connection (behind a slow query, or a backend off its CPU) only if every one is
+		let stalled: Slot | undefined;
+		let fewestStalled = Number.POSITIVE_INFINITY;
+		const stalledBefore =
+			this.#width?.stalledBefore(this.#inFlight) ?? Number.NEGATIVE_INFINITY;
 		for (const slot of this.#slots.values()) {
 			const count = slot.shared;
+			if (count < 0) continue;
+			const fresh = count === 0 || slot.lastDone >= stalledBefore;
+			// the cheap checks first: this runs per connection per query
 			if (
-				count >= 0 &&
-				count < fewest &&
-				// below the floor, without a lookup: this runs per connection per query
+				fresh ? count >= fewest : best !== undefined || count >= fewestStalled
+			)
+				continue;
+			if (
+				// below the floor, without a lookup
 				(count < this.#pipeline || count < this.#depth(slot)) &&
 				!this.#draining.has(slot) &&
+				!slot.retiring &&
 				this.#shareable(slot)
 			) {
-				best = slot;
-				fewest = count;
+				if (fresh) {
+					best = slot;
+					fewest = count;
+				} else {
+					stalled = slot;
+					fewestStalled = count;
+				}
 			}
 		}
-		return best;
+		return best ?? stalled;
 	}
 
 	/**
@@ -775,8 +1181,13 @@ export class Pool implements AsyncDisposable {
 	#claimShared(signal: AbortSignal | undefined): Slot | undefined {
 		if (this.#pipeline <= 1 || signal?.aborted || this.#ended) return undefined;
 		// claimed before any await, so queries issued in the same tick see it
-		const slot = this.#takeIdle() ?? this.#pickShared();
-		if (slot !== undefined) slot.shared = Math.max(0, slot.shared) + 1;
+		const slot =
+			this.#taking() < this.#widthLimit()
+				? (this.#takeIdle() ?? this.#pickShared())
+				: this.#pickShared();
+		if (slot === undefined) return undefined;
+		this.#claim(slot);
+		if (slot.shared > 1) this.#width?.demand();
 		return slot;
 	}
 
@@ -843,6 +1254,7 @@ export class Pool implements AsyncDisposable {
 	): Promise<T> {
 		// a slot handed over by #fillShared is already counted
 		const waiting = this.#wait(this.#sharedWaiters, signal);
+		this.#width?.demand();
 		this.#serveWaiters();
 		const connection = await waiting;
 		const slot = this.#slots.get(connection);
@@ -860,13 +1272,38 @@ export class Pool implements AsyncDisposable {
 
 	/** Frees a query's slot: straight to the next queued query, or back to the pool when the last one ends. */
 	#done(slot: Slot, started: number): void {
-		slot.shared = slot.shared > 0 ? slot.shared - 1 : 0;
+		let wider = false;
+		if (slot.shared > 0) {
+			slot.shared--;
+			this.#inFlight--;
+			const width = this.#width;
+			if (width !== undefined) {
+				const before = width.limit;
+				wider = width.done(
+					slot,
+					this.#inFlight,
+					this.#sharedWaiters.length,
+					this.#taking(),
+					this.#slots,
+				);
+				if (wider) this.#unretire();
+				else if (width.limit < before) this.#retire();
+			}
+		}
 		if (started >= 0) this.#sample(slot, performance.now() - started);
 		this.#fillShared(slot);
-		if (slot.shared > 0) return;
-		slot.shared = -1;
-		this.#draining.delete(slot);
-		this.#releaseSlot(slot, false);
+		if (slot.shared <= 0) {
+			this.#unshare(slot);
+			this.#draining.delete(slot);
+			this.#releaseSlot(slot, false);
+		}
+		// fewer connections than the width allows (it grew, or one left), and queries waiting
+		if (
+			(wider || slot.shared < 0) &&
+			this.#sharedWaiters.length > 0 &&
+			this.#taking() < this.#widthLimit()
+		)
+			this.#serveShared();
 	}
 
 	query<R = Record<string, unknown>>(
@@ -935,6 +1372,20 @@ export class Pool implements AsyncDisposable {
 		);
 	}
 
+	/**
+	 * @internal Runs `fn` on a shareable connection as one query of its
+	 * pipeline, like `query`: how quarry sends a batch's independent
+	 * statements together on one connection without reserving it. `fn` must
+	 * only issue queries, all before its promise settles, and leave no
+	 * session or transaction state behind.
+	 */
+	withShared<T>(
+		fn: (connection: Connection) => Promise<T>,
+		options?: { signal?: AbortSignal | undefined },
+	): Promise<T> {
+		return this.#withShared(options?.signal, fn);
+	}
+
 	/** Runs `fn` in a transaction on one connection; see `Connection.transaction`. */
 	transaction<T>(
 		fn: (tx: Transaction) => Promise<T>,
@@ -945,7 +1396,11 @@ export class Pool implements AsyncDisposable {
 		);
 	}
 
-	/** Streams batches on a connection held for the whole iteration. */
+	/**
+	 * Streams batches on a connection of its own, taken by the first batch
+	 * and held until the iteration ends: read to the end, broken out of, or
+	 * failed.
+	 */
 	async *cursor<R = Record<string, unknown>>(
 		sql: string,
 		params?: readonly unknown[],
@@ -959,13 +1414,13 @@ export class Pool implements AsyncDisposable {
 		}
 	}
 
-	async *stream<R = Record<string, unknown>>(
+	/** Like `cursor`, one row at a time. */
+	stream<R = Record<string, unknown>>(
 		sql: string,
 		params?: readonly unknown[],
 		options?: CursorOptions,
-	): AsyncGenerator<R, void, undefined> {
-		for await (const batch of this.cursor<R>(sql, params, options))
-			yield* batch;
+	): RowStream<R> {
+		return new RowStream(this.cursor<R>(sql, params, options));
 	}
 
 	copyFrom(

@@ -1,4 +1,6 @@
 /* oxlint-disable no-await-in-loop -- tests run their steps in order */
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Connection } from '../../../src/driver/connection.js';
 import {
@@ -22,6 +24,10 @@ import { oids } from '../../../src/driver/types.js';
 /** Every value as the server's text. */
 const rawCodecs = createCodecRegistry([], null);
 import { meteredSockets, noPg, open, rejection, table } from './helpers.js';
+
+setFlagsFromString('--expose-gc');
+// oxlint-disable-next-line typescript/no-unsafe-type-assertion
+const gc = runInNewContext('gc') as () => void;
 
 describe.skipIf(noPg)('queries', () => {
 	let conn: Connection;
@@ -663,5 +669,15 @@ describe.skipIf(noPg)('queries', () => {
 		await closing;
 		expect(c.closed).toBe(true);
 		await expect(c.query('select 1')).rejects.toBeInstanceOf(ConnectionError);
+	});
+
+	it("doesn't keep a result alive once the caller drops it", async () => {
+		const rows = new WeakRef(
+			(await conn.query('select g from generate_series(1, 1000) g')).rows,
+		);
+		// a WeakRef's target is kept until the current job ends
+		await new Promise((r) => setTimeout(r, 0));
+		gc();
+		expect(rows.deref()).toBeUndefined();
 	});
 });

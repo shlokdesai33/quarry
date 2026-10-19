@@ -222,6 +222,7 @@ describe('comparisons', () => {
 	});
 
 	it('needs an array of known SQL type to compare a parameter with', () => {
+		// @ts-expect-error values have no SQL type to encode the parameter by
 		expect(() => eb.val('admin').eq(eb.fn.any(['admin']))).toThrow(
 			'any() or all() of an array column or expression',
 		);
@@ -406,10 +407,14 @@ describe('value encoding', () => {
 		expect(
 			wire(eb.fn.concat(eb.val(january, codecs.tstzrange)).isNotNull()),
 		).toMatchObject({ params: [literal], types: [oids.tstzrange] });
+		// postgres can't infer a parameter of `concat(variadic any)`
 		expect(wire(eb.fn.concat(eb.val('a')).isNotNull())).toMatchObject({
 			params: ['a'],
-			types: [],
+			types: [oids.text],
 		});
+		expect(
+			wire(eb.fn.concat(eb.val(1), eb.val(1.5)).isNotNull()),
+		).toMatchObject({ params: ['1', '1.5'], types: [oids.int4, oids.float8] });
 	});
 
 	it('does not encode expressions', () => {

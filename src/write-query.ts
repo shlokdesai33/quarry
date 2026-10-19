@@ -1,4 +1,5 @@
 import type { AnyColumn } from './column/any-column.js';
+import type { DataType } from './data-type/data-type.js';
 import { compile, type CompiledQuery } from './compile.js';
 import {
 	type Executor,
@@ -37,7 +38,6 @@ import {
 	type ValueArgs,
 } from './shape.js';
 import type { AnyTable } from './table.js';
-import type { Prettify } from './types.js';
 import { codeType, renderType } from './verify/sql-type.js';
 
 /** The columns of the table `T`, by the keys they are declared under. */
@@ -71,19 +71,6 @@ export type Excluded<T extends AnyTable> = {
 		Columns<T>[K]['_quarry']['dataType']
 	>;
 };
-
-/**
- * A row of an `updateMany`: the `by` columns, which match it to the table's
- * row, and any of the columns an update can set.
- */
-export type UpdateManyRow<
-	T extends AnyTable,
-	B extends ColumnKey<T>,
-> = Prettify<
-	{ readonly [K in B]: NonNullable<Columns<T>[K]['$select']> } & {
-		readonly [K in Exclude<UpdateKey<T>, B>]?: Columns<T>[K]['$update'];
-	}
->;
 
 /** What a write query without `returning` resolves to. */
 export interface WriteResult {
@@ -120,13 +107,27 @@ export function setNodes(
 	set: readonly SetNode[],
 	values: object,
 ): SetNode[] {
-	const merged = new Map(set.map((node) => [node.column, node.value]));
-	for (const [key, value] of Object.entries(values)) {
+	const nodes = [...set];
+	const entries = Object.entries(values);
+	// a short list is searched; a long one indexed
+	const index =
+		set.length + entries.length > 32
+			? new Map(set.map((node, i) => [node.column, i]))
+			: undefined;
+	for (const [key, value] of entries) {
 		if (value === undefined) continue;
 		const { column, name } = columnOf(table, key);
-		merged.set(name, valueNode(column, value));
+		const node = { column: name, value: valueNode(column, value) };
+		const at =
+			index === undefined
+				? nodes.findIndex((existing) => existing.column === name)
+				: (index.get(name) ?? -1);
+		if (at >= 0) nodes[at] = node;
+		else {
+			index?.set(name, nodes.length);
+			nodes.push(node);
+		}
 	}
-	const nodes = [...merged].map(([column, value]) => ({ column, value }));
 	if (nodes.length === 0) {
 		throw new Error(
 			`The update of "${table.name}" sets no columns: an undefined value leaves its column out, and every value given was undefined (or none was given)`,
@@ -144,34 +145,41 @@ export function rowsNode(
 	rows: readonly object[],
 	strategy: RowsNode['strategy'],
 ): RowsNode {
+	const entries = rows.map((row) => Object.entries(row));
 	const keys: string[] = [];
-	for (const row of rows) {
-		for (const [key, value] of Object.entries(row)) {
+	for (const list of entries) {
+		for (const [key, value] of list) {
 			if (value !== undefined && !keys.includes(key)) keys.push(key);
 		}
 	}
-	const columns = keys.map((key) => columnOf(table, key));
+	const columns = keys.map((key) => columnOf(table, key).column);
 	return {
-		columns: columns.map(({ name }) => name),
-		types: columns.map(({ column }) =>
-			renderType({
-				...codeType(column._quarry.dataType),
-				modifiers: undefined,
-			}),
-		),
-		codecs: columns.map(({ column }) => column._quarry.dataType.codec),
-		rows: rows.map((row) => {
-			const values = new Map(Object.entries(row));
-			return keys.map((key, i) => {
-				const value = values.get(key);
-				const target = columns[i];
-				return value === undefined || target === undefined
-					? undefined
-					: valueNode(target.column, value);
-			});
+		columns: keys.map((key) => columnOf(table, key).name),
+		types: columns.map((column) => castType(column._quarry.dataType)),
+		codecs: columns.map((column) => column._quarry.dataType.codec),
+		rows: entries.map((list) => {
+			const cells: (OperationNode | undefined)[] = keys.map(() => undefined);
+			for (const [key, value] of list) {
+				if (value === undefined) continue;
+				const i = keys.indexOf(key);
+				cells[i] = valueNode(columns[i]!, value);
+			}
+			return cells;
 		}),
 		strategy,
 	};
+}
+
+/** Each data type's SQL type without modifiers, as `unnest` casts its arrays to. */
+const castTypes = new WeakMap<DataType, string>();
+
+function castType(dataType: DataType): string {
+	let type = castTypes.get(dataType);
+	if (type === undefined) {
+		type = renderType({ ...codeType(dataType), modifiers: undefined });
+		castTypes.set(dataType, type);
+	}
+	return type;
 }
 
 /** The `excluded` row of an upsert into `table`. */

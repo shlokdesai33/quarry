@@ -25,6 +25,7 @@ import {
 	roundTripSockets,
 	slowSockets,
 	table,
+	timeSlicedSockets,
 } from './helpers.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -33,6 +34,21 @@ const waited = async (work: () => Promise<unknown>) => {
 	const started = performance.now();
 	await work();
 	return performance.now() - started;
+};
+/** Runs `op` in a loop on `callers` callers until stopped. */
+const sustain = (callers: number, op: () => Promise<unknown>) => {
+	const state = { running: true };
+	const all = Promise.all(
+		Array.from({ length: callers }, async () => {
+			while (state.running) await op();
+		}),
+	);
+	return {
+		stop: () => {
+			state.running = false;
+			return all;
+		},
+	};
 };
 /** Releases the savepoint from inside it, so the driver's own release fails. */
 const releaseInside = (tx: Transaction) =>
@@ -650,6 +666,52 @@ describe.skipIf(noPg)('pool', () => {
 			}),
 		);
 		expect(net.maxInFlight()).toBe(100);
+	});
+
+	it('narrows to the connections the server runs at once', async () => {
+		// one CPU time-slicing every backend with replies waiting, 5 ms at a time
+		const net = timeSlicedSockets(1, 5);
+		await using p = pool({ max: 4, socket: net.factory });
+		const load = sustain(200, () => p.query('select 1'));
+		try {
+			// how many connections took queries, over windows of 100 ms, `times` in a row
+			const until = async (
+				done: (sending: number) => boolean,
+				times: number,
+			) => {
+				for (let i = 0, streak = 0; i < 200; i++) {
+					await sleep(50);
+					streak = done(net.sending(100)) ? streak + 1 : 0;
+					if (streak === times) return true;
+				}
+				return false;
+			};
+			// spread over every connection first, then down to one or two
+			// (widening back and slow queries: pool-width.test.ts)
+			expect(await until((n) => n === 4, 1)).toBe(true);
+			expect(await until((n) => n <= 2, 4)).toBe(true);
+		} finally {
+			net.stop();
+			await load.stop();
+		}
+	});
+
+	it('spreads over every connection with a fixed depth', async () => {
+		const net = timeSlicedSockets(1, 5);
+		await using p = pool({ max: 4, pipeline: 100, socket: net.factory });
+		const load = sustain(200, () => p.query('select 1'));
+		try {
+			await sleep(1000);
+			const seen: number[] = [];
+			for (let i = 0; i < 10; i++) {
+				await sleep(50);
+				seen.push(net.sending(100));
+			}
+			expect(seen.every((n) => n === 4)).toBe(true);
+		} finally {
+			net.stop();
+			await load.stop();
+		}
 	});
 
 	it('hands connections to transactions, clients and cursors under sustained load', async () => {

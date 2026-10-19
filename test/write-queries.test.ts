@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { integer, jsonb, text, timestamptz } from '../src/column-factories.js';
+import {
+	array,
+	integer,
+	jsonb,
+	text,
+	timestamptz,
+} from '../src/column-factories.js';
 import { compile } from '../src/compile.js';
 import { arrayOf, declareParamType } from '../src/driver/codec.js';
 import { codecs } from '../src/driver/codecs.js';
@@ -13,9 +19,11 @@ import {
 import { executorFrom, fakeExecutor } from './helpers/executor.js';
 import { defineTable } from '../src/define-table.js';
 import { deleteFrom } from '../src/delete-query-builder.js';
+import { expressionBuilder } from '../src/expression-builder.js';
 import { insertInto } from '../src/insert-query-builder.js';
 import type { OperationNode } from '../src/node.js';
-import { update, updateMany } from '../src/update-query-builder.js';
+import { sql as rawSql } from '../src/sql.js';
+import { update } from '../src/update-query-builder.js';
 
 const users = defineTable('users', {
 	columns: {
@@ -240,39 +248,151 @@ describe('update', () => {
 	});
 });
 
-describe('updateMany', () => {
-	it('records the rows and the `by` columns by database name', () => {
-		const { many, set } = updateMany(
-			users,
-			[
-				{ id: 1, name: 'Ada' },
-				{ id: 2, createdAt: new Date(0) },
-			],
-			{ by: 'id' },
-		).toNode();
-		expect(set).toEqual([]);
-		expect(many).toEqual({
-			by: ['id'],
-			columns: ['id', 'name', 'created_at'],
-			types: ['integer', 'text', 'timestamptz'],
-			codecs: [codecs.int4, codecs.text, codecs.timestamptz],
-			rows: [
-				[value(1, codecs.int4), value('Ada', codecs.text), undefined],
+const target = (column: string) => ({
+	kind: 'reference',
+	table: 'users',
+	column,
+});
+const row = (column: string) => ({ kind: 'reference', table: 'row', column });
+
+describe('update().setEach', () => {
+	it('records the rows, key columns first, and matches them by key', () => {
+		const node = update(users)
+			.setEach(
 				[
-					value(2, codecs.int4),
-					undefined,
-					value(new Date(0), codecs.timestamptz),
+					{ name: 'Ada', id: 1 },
+					{ id: 2, name: null },
 				],
+				{ key: 'id' },
+			)
+			.toNode();
+		expect(node.from).toEqual({
+			alias: 'row',
+			rows: {
+				columns: ['id', 'name'],
+				types: ['integer', 'text'],
+				codecs: [codecs.int4, codecs.text],
+				rows: [
+					[value(1, codecs.int4), value('Ada', codecs.text)],
+					[value(2, codecs.int4), value(null, codecs.text)],
+				],
+				strategy: 'unnest',
+			},
+		});
+		expect(node.set).toEqual([{ column: 'name', value: row('name') }]);
+		expect(node.where).toEqual({
+			kind: 'binary',
+			left: target('id'),
+			operator: '=',
+			right: row('id'),
+		});
+		expect(node.allRows).toBe(false);
+	});
+
+	it('keeps a column a row leaves out, with a flag per such column', () => {
+		const { from, set } = update(users)
+			.setEach(
+				[
+					{ id: 1, name: 'Ada', email: 'ada@example.com' },
+					{ id: 2, createdAt: new Date(0), email: 'alan@example.com' },
+				],
+				{ key: 'id' },
+			)
+			.toNode();
+		expect(from?.rows.columns).toEqual([
+			'id',
+			'name',
+			'email',
+			'created_at',
+			'set:name',
+			'set:created_at',
+		]);
+		expect(from?.rows.types).toEqual([
+			'integer',
+			'text',
+			'text',
+			'timestamptz',
+			'boolean',
+			'boolean',
+		]);
+		expect(from?.rows.rows).toEqual([
+			[
+				value(1, codecs.int4),
+				value('Ada', codecs.text),
+				value('ada@example.com', codecs.text),
+				value(null, codecs.timestamptz),
+				value(true, codecs.bool),
+				value(false, codecs.bool),
 			],
-			strategy: 'unnest',
+			[
+				value(2, codecs.int4),
+				value(null, codecs.text),
+				value('alan@example.com', codecs.text),
+				value(new Date(0), codecs.timestamptz),
+				value(false, codecs.bool),
+				value(true, codecs.bool),
+			],
+		]);
+		expect(set.map(({ column }) => column)).toEqual([
+			'name',
+			'email',
+			'created_at',
+		]);
+		expect(set[1]?.value).toEqual(row('email'));
+		expect(set[0]?.value).toEqual({
+			kind: 'case',
+			branches: [{ when: row('set:name'), result: row('name') }],
+			otherwise: target('name'),
 		});
 	});
 
-	it('rejects a row without its `by` columns', () => {
-		const untyped = [users, [{ name: 'Ada' }], { by: 'id' }];
-		expect(() => Reflect.apply(updateMany, undefined, untyped)).toThrow(
+	it('takes a later set over a row value, and a set before it under it', () => {
+		const { set } = update(users)
+			.set({ name: 'kept?', email: 'everyone@example.com' })
+			.setEach([{ id: 1, name: 'Ada' }], { key: 'id' })
+			.set((eb) => ({ name: eb.fn.lower('row.name') }))
+			.toNode();
+		expect(set).toEqual([
+			{
+				column: 'name',
+				value: { kind: 'function', name: 'lower', args: [row('name')] },
+			},
+			{ column: 'email', value: value('everyone@example.com', codecs.text) },
+		]);
+	});
+
+	it('rejects what the types can’t rule out', () => {
+		const query = update(users);
+		const each = (rows: unknown, options: unknown) => () =>
+			Reflect.apply(query.setEach.bind(query), undefined, [rows, options]);
+		expect(each([{ name: 'Ada' }], { key: 'id' })).toThrow('missing "id"');
+		expect(each([{ id: null, name: 'Ada' }], { key: 'id' })).toThrow(
 			'missing "id"',
 		);
+		expect(each([], { key: 'id' })).toThrow('at least one row');
+		expect(
+			each(
+				[
+					{ id: 1, name: 'Ada' },
+					{ id: 1, name: 'Alan' },
+				],
+				{ key: 'id' },
+			),
+		).toThrow('Rows 0 and 1 of setEach have the same key (id)');
+		expect(each([{ id: 1, name: 'Ada' }], { key: 'id', as: 'users' })).toThrow(
+			'pass another `as`',
+		);
+		expect(each([{ id: 1 }], { key: 'nope' })).toThrow('Unknown column "nope"');
+		const once = update(users).setEach([{ id: 1, name: 'A' }], { key: 'id' });
+		expect(() => once.setEach([{ id: 2, name: 'B' }], { key: 'id' })).toThrow(
+			'one setEach',
+		);
+	});
+
+	it('leaves the builder it was called on unchanged', () => {
+		const query = update(users).set({ name: 'Ada' });
+		query.setEach([{ id: 1, email: 'a' }], { key: 'id' });
+		expect(query.toNode()).toMatchObject({ from: undefined, where: undefined });
 	});
 });
 
@@ -376,7 +496,7 @@ describe('compiling write queries', () => {
 		);
 	});
 
-	it('renders updates, updateMany and deletes', () => {
+	it('renders updates and deletes', () => {
 		expect(
 			plain(
 				compile(
@@ -394,31 +514,6 @@ describe('compiling write queries', () => {
 		expect(
 			compile(update(users).set({ name: null }).allRows().toNode()).sql,
 		).toBe('update "users" set "name" = $1');
-		const many = compile(
-			updateMany(
-				users,
-				[
-					{ id: 1, name: 'A' },
-					{ id: 2, name: 'B' },
-				],
-				{ by: 'id' },
-			).toNode(),
-		);
-		expect(plain(many)).toEqual({
-			sql: 'update "users" set "name" = "quarry_rows"."name" from unnest($1::integer[], $2::text[]) as "quarry_rows"("id", "name") where "users"."id" = "quarry_rows"."id"',
-			params: [
-				[1, 2],
-				['A', 'B'],
-			],
-		});
-		expect(codecNames(many).params).toEqual(['int4[]', 'text[]']);
-		expect(() =>
-			compile(
-				updateMany(users, [{ id: 1, name: 'A' }, { id: 2 }], {
-					by: 'id',
-				}).toNode(),
-			),
-		).toThrow(/every row to set the same columns/);
 		expect(
 			compile(
 				deleteFrom(users)
@@ -431,6 +526,178 @@ describe('compiling write queries', () => {
 		);
 		expect(compile(deleteFrom(users).allRows().toNode()).sql).toBe(
 			'delete from "users"',
+		);
+	});
+});
+
+describe('compiling setEach', () => {
+	const docs = defineTable('docs', {
+		columns: {
+			tenantId: integer().name('tenant_id'),
+			slug: text(),
+			body: text().nullable(),
+			tags: array(text()).default(),
+			version: integer(),
+		},
+	});
+
+	it('updates from unnest, one array per column, matched by key', () => {
+		const query = compile(
+			update(users)
+				.setEach(
+					[
+						{ id: 1, name: 'A' },
+						{ id: 2, name: 'B' },
+					],
+					{ key: 'id' },
+				)
+				.toNode(),
+		);
+		expect(plain(query)).toEqual({
+			sql: 'update "users" set "name" = "row"."name" from unnest($1::integer[], $2::text[]) as "row"("id", "name") where "users"."id" = "row"."id"',
+			params: [
+				[1, 2],
+				['A', 'B'],
+			],
+		});
+		expect(codecNames(query).params).toEqual(['int4[]', 'text[]']);
+	});
+
+	it('sets a column some rows leave out only in the rows that have it', () => {
+		const query = compile(
+			update(users)
+				.setEach(
+					[
+						{ id: 1, name: 'A' },
+						{ id: 2, email: 'b@example.com' },
+					],
+					{ key: 'id' },
+				)
+				.toNode(),
+		);
+		expect(plain(query)).toEqual({
+			sql: 'update "users" set "name" = case when "row"."set:name" then "row"."name" else "users"."name" end, "email" = case when "row"."set:email" then "row"."email" else "users"."email" end from unnest($1::integer[], $2::text[], $3::text[], $4::boolean[], $5::boolean[]) as "row"("id", "name", "email", "set:name", "set:email") where "users"."id" = "row"."id"',
+			params: [
+				[1, 2],
+				['A', null],
+				[null, 'b@example.com'],
+				[true, false],
+				[false, true],
+			],
+		});
+		expect(codecNames(query).params).toEqual([
+			'int4[]',
+			'text[]',
+			'text[]',
+			'bool[]',
+			'bool[]',
+		]);
+	});
+
+	it('matches a composite key, under another name, with more conditions, sets and returning', () => {
+		const query = compile(
+			update(docs)
+				.setEach(
+					[
+						{ tenantId: 1, slug: 'a', body: 'x', version: 2 },
+						{ tenantId: 1, slug: 'b', body: null, version: 5 },
+					],
+					{ key: ['tenantId', 'slug'], as: 'v' },
+				)
+				.set((eb) => ({
+					version: eb.fn.coalesce('v.version', 'docs.version'),
+				}))
+				.where((eb) => eb.ref('docs.version').lt(eb.ref('v.version')))
+				.returning(['docs.slug', 'v.body'])
+				.toNode(),
+		);
+		expect(plain(query)).toEqual({
+			sql: 'update "docs" set "body" = "v"."body", "version" = coalesce("v"."version", "docs"."version") from unnest($1::integer[], $2::text[], $3::text[], $4::integer[]) as "v"("tenant_id", "slug", "body", "version") where ("docs"."tenant_id" = "v"."tenant_id" and "docs"."slug" = "v"."slug" and "docs"."version" < "v"."version") returning "docs"."slug" as "slug", "v"."body" as "body"',
+			params: [
+				[1, 1],
+				['a', 'b'],
+				['x', null],
+				[2, 5],
+			],
+		});
+		expect(codecNames(query).results).toEqual(['text', 'text']);
+	});
+
+	it('takes returningAll, arithmetic, case and sql over the rows', () => {
+		const query = update(docs)
+			.setEach(
+				[
+					{ tenantId: 1, slug: 'a', version: 2 },
+					{ tenantId: 1, slug: 'b', version: 5 },
+				],
+				{ key: ['tenantId', 'slug'] },
+			)
+			.set((eb) => ({
+				version: eb
+					.case()
+					.when(eb.ref('row.version').gt(3), eb.ref('docs.version').plus(1))
+					.else(eb.fn.coalesce('row.version', eb.val(0)))
+					.end(),
+				body: rawSql<string>`upper(${eb.ref('row.slug')})`,
+			}))
+			.returningAll();
+		expect(query.toSQL().sql).toBe(
+			'update "docs" set "version" = case when "row"."version" > $1 then "docs"."version" + $2 else coalesce("row"."version", $3) end, "body" = upper("row"."slug") from unnest($4::integer[], $5::text[], $6::integer[]) as "row"("tenant_id", "slug", "version") where ("docs"."tenant_id" = "row"."tenant_id" and "docs"."slug" = "row"."slug") returning "docs"."tenant_id" as "tenantId", "docs"."slug" as "slug", "docs"."body" as "body", "docs"."tags" as "tags", "docs"."version" as "version"',
+		);
+	});
+
+	it('refuses what unnest can’t send: expressions and array columns', () => {
+		const expression = update(users).setEach(
+			// @ts-expect-error rows hold plain values
+			[{ id: 1, name: expressionBuilder(users).fn.lower('users.email') }],
+			{ key: 'id' },
+		);
+		expect(() => expression.toSQL()).toThrow(/plain value/);
+		const arrays = update(docs).setEach(
+			[{ tenantId: 1, slug: 'a', tags: ['x'] }],
+			{ key: ['tenantId', 'slug'] },
+		);
+		expect(() => arrays.toSQL()).toThrow(/array columns/);
+	});
+
+	it('needs a column to set besides the key', () => {
+		const keysOnly = update(users).setEach([{ id: 1 }], { key: 'id' });
+		expect(() => keysOnly.toSQL()).toThrow('An update needs columns to set');
+		expect(keysOnly.set({ name: 'Ada' }).toSQL().sql).toBe(
+			'update "users" set "name" = $1 from unnest($2::integer[]) as "row"("id") where "users"."id" = "row"."id"',
+		);
+	});
+
+	it('runs with the take and expect shapes, and in a batch', async () => {
+		const { executor, ran } = fakeExecutor([{ id: 1 }, { id: 2 }]);
+		const db = databaseWith(executor);
+		const rows = [
+			{ id: 1, name: 'A' },
+			{ id: 2, name: 'B' },
+		];
+		const query = db.update(users).setEach(rows, { key: 'id' });
+		expect(await query.execute()).toEqual({ rowCount: 2 });
+		expect(await query.expectRows(rows.length).execute()).toEqual({
+			rowCount: 2,
+		});
+		await expect(query.expectRows(3).execute()).rejects.toBeInstanceOf(
+			RowCountError,
+		);
+		expect(
+			await query.returning(['users.id']).expectNonEmpty().execute(),
+		).toEqual([{ id: 1 }, { id: 2 }]);
+		const [count, first] = await db.batch([
+			query,
+			query.returning(['row.name']).takeFirst(),
+		]);
+		expect(count).toEqual({ rowCount: 2 });
+		expect(first).toEqual({ id: 1 });
+		expect(new Set(ran.map((q) => q.sql.split(' from ')[1]))).toEqual(
+			new Set([
+				'unnest($1::integer[], $2::text[]) as "row"("id", "name") where "users"."id" = "row"."id"',
+				'unnest($1::integer[], $2::text[]) as "row"("id", "name") where "users"."id" = "row"."id" returning "users"."id" as "id"',
+				'unnest($1::integer[], $2::text[]) as "row"("id", "name") where "users"."id" = "row"."id" returning "row"."name" as "name"',
+			]),
 		);
 	});
 });

@@ -26,6 +26,7 @@ import {
 	ProtocolError,
 	postgresError,
 } from './errors.js';
+import { CursorIterator, type CursorHost } from './cursor.js';
 import { toNotice, type Notice, type Notification } from './notice.js';
 import {
 	CopyFromOp,
@@ -35,6 +36,7 @@ import {
 	Op,
 	QueryOp,
 	SimpleQueryOp,
+	STATEMENT_TIMEOUT,
 	SyncGroupOp,
 	closedError,
 	type Description,
@@ -49,7 +51,8 @@ import type { BackendMessage } from './protocol/messages.js';
 import { ChannelNames, decodeNotification, Reader } from './protocol/reader.js';
 import { Writer } from './protocol/writer.js';
 import { Queue } from './queue.js';
-import { asResult, asResultPromise, asRows, type RowMode } from './rows.js';
+import { RowStream } from './row-stream.js';
+import { asResult, asResultPromise, type RowMode } from './rows.js';
 import type { DriverSocket } from './socket.js';
 import { startQuerySpan } from './telemetry.js';
 import { Transaction, type TransactionOptions } from './transaction.js';
@@ -107,8 +110,9 @@ export interface QueryOptions {
 	/**
 	 * A server-side `statement_timeout` for this query only (milliseconds,
 	 * or a Postgres interval such as `'2s'`). Applied with
-	 * `set_config(…, true)`: outside a transaction the query is wrapped in
-	 * `begin … commit`; inside one, the previous value is restored after it.
+	 * `set_config(…, true)` just before the query and restored just after
+	 * it, all three under the query's Sync, so it bounds this query alone,
+	 * in a transaction or not, whatever else is pipelined.
 	 */
 	readonly statementTimeout?: number | string;
 	/** Receives where the query spent its time once it settles. */
@@ -140,9 +144,16 @@ export interface GroupStatement {
 		| undefined;
 }
 
-/** A cursor's options: a query's, without `keepRows` (a cursor reads every row it fetches). */
+/**
+ * A cursor's options: a query's, without `keepRows` (a cursor reads every
+ * row it fetches). `signal` and `timeout` stop the whole cursor, whenever
+ * they fire; `statementTimeout` bounds it from its first batch to its last,
+ * the consumer's time included, and is refused by a `Transaction` (on a
+ * plain connection it holds the connection between batches, as outside a
+ * transaction).
+ */
 export interface CursorOptions extends Omit<QueryOptions, 'keepRows'> {
-	/** Rows fetched per round trip (default 1000). */
+	/** Rows fetched per round trip (default 1000), each batch once the one before is taken. */
 	readonly batchSize?: number;
 }
 
@@ -161,6 +172,8 @@ type Listener<T> = (value: T) => void;
  * queries, so a long queue is encoded only as fast as the socket takes it.
  */
 const FLUSH_BYTES = 65_536;
+
+const STATEMENT_TIMEOUT_OPTIONS = { paramTypes: [25] } as const;
 
 /**
  * One session with the server. Queries can be issued concurrently: they
@@ -192,6 +205,8 @@ export class Connection implements AsyncDisposable {
 	/** Statement keys never prepared again on this connection (see `OpContext.unprepare`). */
 	readonly #unprepared = new Set<string>();
 	#statementCount = 0;
+	#portalCount = 0;
+	#cursorHost: CursorHost | undefined;
 	#statementUses = 0;
 	/** Which cached statements are written named: every one, those written alone, or none (see `OpContext.named`). */
 	#naming: 'always' | 'alone' | 'never' = 'always';
@@ -277,7 +292,8 @@ export class Connection implements AsyncDisposable {
 				(this.#naming === 'alone' &&
 					this.#queue.length === 1 &&
 					(this.#queue.at(0)?.prepares ?? 0) <= 1),
-			unprepare: (statement) => this.#unprepared.add(statement.key),
+			unprepare: (statement) =>
+				this.#unprepared.add(statementKey(statement.sql, statement.types)),
 			preparable: (sql, types) =>
 				this.#unprepared.size === 0 ||
 				!this.#unprepared.has(statementKey(sql, types)),
@@ -791,9 +807,24 @@ export class Connection implements AsyncDisposable {
 		return false;
 	}
 
+	/**
+	 * The cached statement for `sql` with the parameter types `types`, or a
+	 * new one. A statement is keyed by its SQL alone, and the types are
+	 * compared: a SQL string used again keeps its hash, where a key built
+	 * per query (types and SQL) would be hashed in full every time. The same
+	 * SQL with other types is keyed by both.
+	 */
 	#statement(sql: string, types: readonly number[], named: boolean): Statement {
-		const key = statementKey(sql, types);
-		const existing = this.#statements.get(key);
+		let key = sql;
+		let existing = this.#statements.get(sql);
+		if (existing === undefined || !sameTypes(existing.types, types)) {
+			const variant = variantKey(sql, types);
+			const found = this.#statements.get(variant);
+			if (existing !== undefined || found !== undefined) {
+				key = variant;
+				existing = found;
+			}
+		}
 		if (existing !== undefined) {
 			if (!named || existing.name !== '') {
 				// a use stamp instead of moving the entry to the Map's end: deleting
@@ -808,6 +839,9 @@ export class Connection implements AsyncDisposable {
 		const statement: Statement = {
 			name: named ? `q${++this.#statementCount}` : '',
 			key,
+			sql,
+			// a copy: `paramTypes` is the caller's array
+			types: [...types],
 			used: ++this.#statementUses,
 			unwritten: true,
 			parsed: false,
@@ -881,6 +915,7 @@ export class Connection implements AsyncDisposable {
 			return;
 		}
 		op.canceledBy = reason;
+		if (op.interrupt(reason, cause)) return;
 		// hold back later queries so the cancel can't hit one of them
 		this.#canceling ??= op;
 		this.#cancelAtHead();
@@ -1053,11 +1088,7 @@ export class Connection implements AsyncDisposable {
 		options: QueryOptions | undefined,
 		onDone: () => void,
 	): Promise<QueryResult<R>> {
-		if (
-			this.#config.telemetry === undefined &&
-			!this.#config.captureStack &&
-			options?.statementTimeout === undefined
-		)
+		if (this.#config.telemetry === undefined && !this.#config.captureStack)
 			return this.#query<R>(sql, params ?? [], options, onDone);
 		const result = this.query<R>(sql, params, options);
 		result.then(onDone, onDone);
@@ -1110,6 +1141,7 @@ export class Connection implements AsyncDisposable {
 				params,
 				options,
 				options.statementTimeout,
+				onDone,
 			);
 		}
 		// one shared executor: one closing over this query would cost a
@@ -1117,6 +1149,8 @@ export class Connection implements AsyncDisposable {
 		const promise = new Promise<QueryResult<unknown>>(capture);
 		const resolve = capturedResolve;
 		const reject = capturedReject;
+		capturedResolve = noop;
+		capturedReject = noop;
 		let op: QueryOp | undefined;
 		try {
 			const invalid = invalidSql(sql);
@@ -1151,6 +1185,34 @@ export class Connection implements AsyncDisposable {
 	queryGroup(
 		statements: readonly GroupStatement[],
 		{ signal }: { readonly signal?: AbortSignal | undefined } = {},
+	): Promise<QueryResult<unknown>>[] {
+		const results = this.#queryGroup(statements, signal);
+		if (this.#config.telemetry === undefined && !this.#config.captureStack)
+			return results;
+		return results.map((result, i) =>
+			this.#observe(
+				statements[i]?.sql ?? '',
+				statements[i]?.options?.tag,
+				() => result,
+				(r) => r.rowCount,
+			),
+		);
+	}
+
+	/**
+	 * `queryGroup`, with the group's client `timeout`, `onTiming` and
+	 * `onDone`. `whole`: a statement that can't be sent fails the whole
+	 * group, sending none of it.
+	 */
+	#queryGroup(
+		statements: readonly GroupStatement[],
+		signal: AbortSignal | undefined,
+		group?: {
+			readonly timeout?: number | undefined;
+			readonly onTiming?: ((timing: OpTiming) => void) | undefined;
+			readonly onDone?: (() => void) | undefined;
+			readonly whole?: boolean;
+		},
 	): Promise<QueryResult<unknown>>[] {
 		const ops: QueryOp[] = [];
 		let invalid: { error: unknown } | undefined;
@@ -1193,67 +1255,75 @@ export class Connection implements AsyncDisposable {
 					);
 				}),
 		);
-		if (ops.length > 0) this.#enqueue(new SyncGroupOp(ops), signal);
+		if (invalid !== undefined && group?.whole === true) {
+			const error =
+				invalid.error instanceof Error
+					? invalid.error
+					: new DriverError(String(invalid.error));
+			for (const op of ops) op.fail(error);
+			ops.length = 0;
+		}
+		if (ops.length > 0) {
+			const op = new SyncGroupOp(ops);
+			op.onTiming = group?.onTiming;
+			op.onDone = group?.onDone;
+			this.#enqueue(op, signal, group?.timeout);
+		} else group?.onDone?.();
 		if (!this.#config.catalog.loaded) {
 			for (const { params = [], options } of statements)
 				this.#loadTypesAfter(params, options);
 		}
-		if (this.#config.telemetry === undefined && !this.#config.captureStack)
-			return results;
-		return results.map((result, i) =>
-			this.#observe(
-				statements[i]?.sql ?? '',
-				statements[i]?.options?.tag,
-				() => result,
-				(r) => r.rowCount,
-			),
-		);
+		return results;
 	}
 
+	/**
+	 * The query between a statement setting `statement_timeout` and one
+	 * restoring it, all under one Sync. Outside a transaction block, the
+	 * three run in one implicit transaction, which ends the setting at the
+	 * Sync; inside one, the restore ends it. Either way it bounds the query
+	 * alone, whatever else is pipelined on the connection, so the framing
+	 * can't depend on the transaction status, which only says how the last
+	 * answered query left the connection.
+	 */
 	async #queryWithTimeout<R>(
 		sql: string,
 		params: readonly unknown[],
 		options: QueryOptions,
-		timeout: number | string,
+		statementTimeout: number | string,
+		onDone: (() => void) | undefined,
 	): Promise<QueryResult<R>> {
-		const { statementTimeout: _, ...rest } = options;
-		const value = typeof timeout === 'number' ? `${timeout}ms` : timeout;
-		const set = "select set_config('statement_timeout', $1, true) as previous";
-		if (this.#status === 'I') {
-			// pipelined together, so they reach the server back to back
-			const settled = await Promise.allSettled([
-				this.#query('begin', [], undefined),
-				this.#query(set, [value], undefined),
-				this.#query<R>(sql, params, rest),
-				this.#query('commit', [], undefined),
-			]);
-			const result = settled[2];
-			if (result?.status === 'rejected') throw result.reason;
-			const failed = settled.find((s) => s.status === 'rejected');
-			if (failed?.status === 'rejected') throw failed.reason;
-			if (result?.status !== 'fulfilled')
-				throw new ConnectionError('Query did not run');
-			return result.value;
-		}
-		const previous = this.#query<{ previous: string }>(
-			"select current_setting('statement_timeout') as previous, set_config('statement_timeout', $1, true)",
-			[value],
-			undefined,
+		const { statementTimeout: _, signal, timeout, onTiming, ...rest } = options;
+		const interval =
+			typeof statementTimeout === 'number'
+				? `${statementTimeout}ms`
+				: statementTimeout;
+		const [set, query, restore] = this.#queryGroup(
+			[
+				{
+					sql: STATEMENT_TIMEOUT,
+					params: [interval],
+					options: STATEMENT_TIMEOUT_OPTIONS,
+				},
+				{ sql, params, options: rest },
+				{
+					sql: STATEMENT_TIMEOUT,
+					params: [null],
+					options: STATEMENT_TIMEOUT_OPTIONS,
+				},
+			],
+			signal,
+			// whole: a query that can't be sent mustn't leave the setting behind, in a transaction
+			{ timeout, onTiming, onDone, whole: true },
 		);
-		const [before, result] = await Promise.allSettled([
-			previous,
-			this.#query<R>(sql, params, rest),
-		]);
-		if (before.status === 'fulfilled' && this.#status === 'T') {
-			this.#query(
-				set,
-				[before.value.rows[0]?.previous ?? '0'],
-				undefined,
-			).catch(() => {});
-		}
-		if (result.status === 'rejected') throw result.reason;
-		if (before.status === 'rejected') throw before.reason;
-		return result.value;
+		// a failed set skips the query, which rejects with its error
+		set?.catch(() => {});
+		restore?.catch(() => {});
+		if (query === undefined || restore === undefined)
+			throw new ConnectionError('Query did not run');
+		const result = await query;
+		// outside a transaction block, a failed restore rolled the query back
+		await restore;
+		return asResult<R>(result);
 	}
 
 	/**
@@ -1334,8 +1404,14 @@ export class Connection implements AsyncDisposable {
 
 	/**
 	 * Reads a query's rows in batches through a portal, so large results
-	 * never sit in memory at once. The connection runs nothing else until
-	 * the iteration ends; breaking out early closes the portal.
+	 * never sit in memory at once: each batch is fetched once the one
+	 * before it is taken. Its columns come in the formats their codecs read
+	 * (binary where they can), described first if not cached.
+	 *
+	 * Outside a transaction, the portal holds the connection until it is
+	 * read or closed: other queries on it wait. Inside one, other queries of
+	 * the transaction run between its batches. Breaking out early closes
+	 * the portal.
 	 */
 	cursor<R = Record<string, unknown>>(
 		sql: string,
@@ -1350,56 +1426,56 @@ export class Connection implements AsyncDisposable {
 				}),
 			};
 		}
-		return {
-			[Symbol.asyncIterator]: () => {
+		const batchSize = options?.batchSize ?? 1000;
+		const request = {
+			sql,
+			params,
+			batchSize,
+			signal: options?.signal,
+			timeout: options?.timeout,
+			statementTimeout: options?.statementTimeout,
+			open: (
+				portal: string,
+				held: boolean,
+				statementTimeout: string | undefined,
+			) => {
 				const op = new CursorOp(
 					sql,
 					params,
 					encodeParams(sql, params, options?.paramCodecs, options?.paramTypes),
 					this.#types(params, options),
 					this.#options(options),
-					options?.batchSize ?? 1000,
+					batchSize,
+					portal,
+					held,
+					statementTimeout,
 				);
-				let started = false;
-				let failed: Error | undefined;
-				const start = () => {
-					if (started) return;
-					started = true;
-					const original = op.fail.bind(op);
-					op.fail = (error: Error) => {
-						failed = error;
-						original(error);
-					};
-					this.#enqueue(op, options?.signal, options?.timeout);
-					if (!this.#config.catalog.loaded)
-						this.#loadTypesAfter(params, options);
-				};
-				return {
-					next: async (): Promise<IteratorResult<R[]>> => {
-						start();
-						if (failed && !op.written) throw failed;
-						const rows = await op.next();
-						return rows === undefined
-							? { done: true, value: undefined }
-							: { done: false, value: asRows<R>(rows) };
-					},
-					return: async (): Promise<IteratorResult<R[]>> => {
-						if (started) await op.close();
-						return { done: true, value: undefined };
-					},
-				};
+				if (!this.#config.catalog.loaded) this.#loadTypesAfter(params, options);
+				return op;
 			},
 		};
+		const iterate = (): AsyncIterator<R[]> =>
+			// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- rows are typed by the caller, as in `asRows`
+			new CursorIterator(this.#cursors(), request) as AsyncIterator<R[]>;
+		return { [Symbol.asyncIterator]: iterate };
+	}
+
+	#cursors(): CursorHost {
+		return (this.#cursorHost ??= {
+			status: () => this.#status,
+			enqueue: (op, signal, timeout) => this.#enqueue(op, signal, timeout),
+			abort: (op, reason, cause) => this.#abort(op, reason, cause),
+			portal: () => `quarry_${++this.#portalCount}`,
+		});
 	}
 
 	/** Like `cursor`, one row at a time. */
-	async *stream<R = Record<string, unknown>>(
+	stream<R = Record<string, unknown>>(
 		sql: string,
 		params: readonly unknown[] = [],
 		options?: CursorOptions,
-	): AsyncGenerator<R, void, undefined> {
-		for await (const batch of this.cursor<R>(sql, params, options))
-			yield* batch;
+	): RowStream<R> {
+		return new RowStream(this.cursor<R>(sql, params, options));
 	}
 
 	/**
@@ -1679,9 +1755,14 @@ function naming(
 	return (preparePipelined ?? names === 'kept') ? 'always' : 'alone';
 }
 
-/** The resolving functions of the latest promise `capture` executed for. */
-let capturedResolve: (result: QueryResult<unknown>) => void = () => {};
-let capturedReject: (error: unknown) => void = () => {};
+const noop = () => {};
+/**
+ * The resolving functions of the promise `capture` just executed for. Reset
+ * as soon as they're read: a resolving function keeps its promise, and so
+ * the settled result, reachable for as long as it is.
+ */
+let capturedResolve: (result: QueryResult<unknown>) => void = noop;
+let capturedReject: (error: unknown) => void = noop;
 const capture = (
 	resolve: (result: QueryResult<unknown>) => void,
 	reject: (error: unknown) => void,
@@ -1696,6 +1777,17 @@ const listRegistries = new WeakMap<readonly Codec[], CodecRegistry>();
 /** The statement cache's key: the SQL, prefixed with the parameter types declared. */
 function statementKey(sql: string, types: readonly number[]): string {
 	return types.length === 0 ? sql : `${types.join(',')}\0${sql}`;
+}
+
+/** The cache key of `sql` with types other than its first statement's: never a SQL text, which has no NUL. */
+function variantKey(sql: string, types: readonly number[]): string {
+	return `${types.join(',')}\0${sql}`;
+}
+
+function sameTypes(a: readonly number[], b: readonly number[]): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+	return true;
 }
 
 /** Why `sql` can't be sent, if it can't: Postgres takes text without NUL bytes. */

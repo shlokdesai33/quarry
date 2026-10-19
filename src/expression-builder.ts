@@ -1,12 +1,14 @@
+import { type CaseStart, caseOf } from './case.js';
 import type { AnyColumn } from './column/any-column.js';
 import { nameReference } from './comparison.js';
+import { shareColumn } from './compile.js';
 import type { DataType } from './data-type/data-type.js';
 import type { Codec } from './driver/codec.js';
 import type { Expression, TypedExpression } from './expression.js';
 import { param, predicate, typedExpression } from './expression-methods.js';
 import { type Functions, functions } from './functions.js';
 import { type JsonFunctions, jsonFunctions } from './json.js';
-import type { OperationNode, ReferenceNode } from './node.js';
+import type { OperationNode, ReferenceNode, SelectionNode } from './node.js';
 import type { AnyPredicate, Expr, Predicate, Value } from './operators.js';
 import type { NullOf, Ref, Refs, RefsOf } from './refs.js';
 import type { AnyTable } from './table.js';
@@ -91,6 +93,21 @@ export interface ExpressionBuilder<in out R extends Refs> {
 	readonly not: <E extends AnyPredicate>(
 		expression: E,
 	) => Predicate<NullOf<E['_quarry']['$type']>>;
+
+	/**
+	 * `case when … then … else … end`: the result of the first branch whose
+	 * condition holds. Its type is the union of the results, plus `null`
+	 * without an `else`.
+	 *
+	 * @example
+	 * eb.case()
+	 *   .when(eb.ref('orders.total').gte(1000), 'large')
+	 *   .when(eb.ref('orders.total').gte(100), 'medium')
+	 *   .else('small')
+	 *   .end()
+	 *   .as('size')
+	 */
+	readonly case: () => CaseStart;
 }
 
 /** `kind` of the operands, unwrapping those that are `kind` themselves. */
@@ -105,8 +122,68 @@ const junction =
 		});
 
 /**
+ * A column reference, resolved: its node, its column, what `ref` returns,
+ * and its entry in a select or returning list, keyed by the column's key.
+ */
+export interface ResolvedColumn {
+	readonly node: ReferenceNode;
+	readonly column: AnyColumn;
+	readonly expression: TypedExpression<unknown, DataType>;
+	readonly selection: SelectionNode;
+}
+
+/**
+ * Each table's resolved columns, by key. Nodes and expressions are
+ * immutable, so every query over the table shares them, and the compiler
+ * can cache what it renders for them.
+ */
+const resolvedColumns = new WeakMap<AnyTable, Map<string, ResolvedColumn>>();
+
+/** `table`'s column `key`, resolved once per table. */
+function resolveColumn(
+	table: AnyTable,
+	key: string,
+): ResolvedColumn | undefined {
+	let columns = resolvedColumns.get(table);
+	if (columns === undefined) {
+		columns = new Map();
+		resolvedColumns.set(table, columns);
+	}
+	let resolved = columns.get(key);
+	if (resolved !== undefined) return resolved;
+	if (!Object.hasOwn(table.schema.columns, key)) return undefined;
+	const column = table.schema.columns[key];
+	if (column === undefined) return undefined;
+	const node: ReferenceNode = {
+		kind: 'reference',
+		table: table.name,
+		column: column._quarry.columnName ?? key,
+	};
+	nameReference(node, `${table.name}.${key}`);
+	const { dataType } = column._quarry;
+	const selection: SelectionNode = {
+		expression: node,
+		alias: key,
+		codec: dataType.codec,
+	};
+	shareColumn(node, selection);
+	resolved = {
+		node,
+		column,
+		expression: typedExpression(node, dataType),
+		selection,
+	};
+	columns.set(key, resolved);
+	return resolved;
+}
+
+/** The expression builder of each single-table scope: it holds nothing per query. */
+const singleTable = new WeakMap<AnyTable, ExpressionBuilder<Refs>>();
+
+/**
  * Creates an expression builder with the given tables in scope. The
  * implementation only builds nodes; `ExpressionBuilder` supplies the types.
+ * A builder holds no state, so a single table's is made once and shared.
  *
  * @example
  * const eb = expressionBuilder(users, posts.as('p'));
@@ -115,27 +192,39 @@ const junction =
 export function expressionBuilder<const T extends readonly AnyTable[]>(
 	...tables: T
 ): ExpressionBuilder<RefsOf<T>> {
+	const [only] = tables;
+	if (only === undefined || tables.length > 1) return makeBuilder(tables);
+	let eb = singleTable.get(only);
+	if (eb === undefined) {
+		eb = Object.freeze(makeBuilder([only]));
+		singleTable.set(only, eb);
+	}
+	// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the builder of this very scope
+	return eb as unknown as ExpressionBuilder<RefsOf<T>>;
+}
+
+function makeBuilder<const T extends readonly AnyTable[]>(
+	tables: T,
+): ExpressionBuilder<RefsOf<T>> {
 	type R = RefsOf<T>;
 
-	const resolve = (
-		reference: string,
-	): { node: ReferenceNode; column: AnyColumn } => {
+	/** This scope's references, as written: `users.email`. */
+	const references = new Map<string, ResolvedColumn>();
+	const resolve = (reference: string): ResolvedColumn => {
+		let resolved = references.get(reference);
+		if (resolved !== undefined) return resolved;
 		const dot = reference.indexOf('.');
 		const tableName = reference.slice(0, dot);
-		const key = reference.slice(dot + 1);
-		const column = tables.find((table) => table.name === tableName)?.schema
-			.columns[key];
-		if (column === undefined) {
+		const table = tables.find((candidate) => candidate.name === tableName);
+		resolved =
+			table === undefined
+				? undefined
+				: resolveColumn(table, reference.slice(dot + 1));
+		if (resolved === undefined) {
 			throw new Error(`Unknown column reference "${reference}"`);
 		}
-		return {
-			node: {
-				kind: 'reference',
-				table: tableName,
-				column: column._quarry.columnName ?? key,
-			},
-			column,
-		};
+		references.set(reference, resolved);
+		return resolved;
 	};
 
 	const node = (arg: string | Expression<unknown>): OperationNode =>
@@ -148,12 +237,10 @@ export function expressionBuilder<const T extends readonly AnyTable[]>(
 			? resolve(arg).column._quarry.dataType
 			: arg._quarry.dataType;
 
-	return {
-		ref: (column: string) => {
-			const resolved = resolve(column);
-			nameReference(resolved.node, column);
-			return typedExpression(resolved.node, resolved.column._quarry.dataType);
-		},
+	const eb: ExpressionBuilder<R> & Resolver = {
+		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the signature supplies the type
+		ref: (column: string) => resolve(column).expression as never,
+		[RESOLVE]: resolve,
 		val: (value: unknown, codec?: Codec) => param(value, codec),
 		fn: functions<R>({ node, dataType }),
 		json: jsonFunctions<R>({ node }),
@@ -161,5 +248,26 @@ export function expressionBuilder<const T extends readonly AnyTable[]>(
 		or: junction('or'),
 		not: (expression: AnyPredicate) =>
 			predicate({ kind: 'not', operand: expression._quarry.node }),
+		case: caseOf,
 	};
+	return eb;
+}
+
+const RESOLVE = Symbol('quarry.resolve');
+
+/** How a builder made here resolves a reference; not part of `ExpressionBuilder`. */
+interface Resolver {
+	readonly [RESOLVE]: (reference: string) => ResolvedColumn;
+}
+
+/**
+ * Resolves `reference` in `eb`'s scope to the shared node, column,
+ * expression and selection. Throws as `ref` does.
+ */
+export function resolveReference<R extends Refs>(
+	eb: ExpressionBuilder<R>,
+	reference: string,
+): ResolvedColumn {
+	// eslint-disable-next-line typescript/no-unsafe-type-assertion -- every builder is made by makeBuilder
+	return (eb as unknown as Resolver)[RESOLVE](reference);
 }

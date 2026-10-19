@@ -23,7 +23,6 @@ import type { Expr } from '../src/operators.js';
 import {
 	type UpdateQueryBuilder,
 	update,
-	updateMany,
 } from '../src/update-query-builder.js';
 import type { WriteResult } from '../src/write-query.js';
 
@@ -295,38 +294,168 @@ describe('update', () => {
 	});
 });
 
-describe('updateMany', () => {
-	it('takes rows with the `by` columns and any columns to set', () => {
-		const query = updateMany(
-			docs,
+describe('update().setEach', () => {
+	const db = databaseWith(fakeExecutor().executor);
+
+	it('runs as is: the key match is its `where`', () => {
+		const query = update(docs).setEach(
 			[
 				{ id: 1, body: 'a' },
 				{ id: 2, version: 3 },
 			],
-			{ by: 'id' },
+			{ key: 'id' },
 		);
-		expectTypeOf(query).toEqualTypeOf<
-			UpdateQueryBuilder<typeof docs, undefined, never>
-		>();
+		expectTypeOf(query.$missing).toEqualTypeOf<never>();
 		expectTypeOf(query.execute()).toEqualTypeOf<Promise<WriteResult>>();
-
-		updateMany(docs, [{ tenantId: 1, slug: 'a', body: 'b' }], {
-			by: ['tenantId', 'slug'],
-		});
+		expectTypeOf(query.expectRows(2)).toEqualTypeOf<Query<WriteResult>>();
+		expectTypeOf(query.toQuery()).toEqualTypeOf<Query<WriteResult>>();
+		// branded: the plain check rejects a rest tuple of `{ id: number }`
+		expectTypeOf(
+			query.returning(['docs.id']).expectNonEmpty(),
+		).branded.toEqualTypeOf<Query<[{ id: number }, ...{ id: number }[]]>>();
+		expectTypeOf(
+			query.returning(['docs.id']).takeFirst().execute(),
+		).toEqualTypeOf<Promise<{ id: number } | undefined>>();
+		// @ts-expect-error a plain `set` still needs a `where`
+		void update(docs).set({ body: 'a' }).execute();
 	});
 
-	it('rejects rows without the `by` columns, or with wrong values', () => {
-		// @ts-expect-error a row lacks its `by` column
-		updateMany(docs, [{ id: 1, body: 'a' }, { body: 'b' }], { by: 'id' });
-		const composite = { by: ['tenantId', 'slug'] } as const;
-		// @ts-expect-error a row lacks one of its `by` columns
-		updateMany(docs, [{ tenantId: 1, body: 'b' }], composite);
+	it('types each row: its key, and any of the columns an update can set', () => {
+		update(docs).setEach(
+			[
+				{ id: 1, body: 'a', settings: { theme: 'dark' } },
+				{ id: 2, version: 3 },
+				{ id: 3 },
+			],
+			{ key: 'id' },
+		);
+		update(users).setEach([{ id: 1, name: null, role: 'admin' }], {
+			key: 'id',
+		});
+		update(docs).setEach([{ tenantId: 1, slug: 'a', body: 'b' }], {
+			key: ['tenantId', 'slug'],
+		});
+		update(docs).setEach([{ slug: 'a', version: 1 }], { key: 'slug' });
+
+		// @ts-expect-error a row lacks its key
+		update(docs).setEach([{ id: 1, body: 'a' }, { body: 'b' }], { key: 'id' });
+		update(docs).setEach(
+			// @ts-expect-error a row lacks one of its key columns
+			[{ tenantId: 1, body: 'b' }],
+			{ key: ['tenantId', 'slug'] },
+		);
+		// @ts-expect-error a key is never null
+		update(users).setEach([{ id: null, name: 'a' }], { key: 'id' });
 		// @ts-expect-error wrong value type
-		updateMany(docs, [{ id: 1, body: 2 }], { by: 'id' });
-		// @ts-expect-error an identity is only a `by` column, never set
-		updateMany(docs, [{ slug: 'a', id: 1 }], { by: 'slug' });
+		update(docs).setEach([{ id: 1, body: 2 }], { key: 'id' });
+		// @ts-expect-error a non-null column takes no null
+		update(docs).setEach([{ id: 1, body: null }], { key: 'id' });
+		// @ts-expect-error not one of the role's values
+		update(users).setEach([{ id: 1, role: 'owner' }], { key: 'id' });
+		// @ts-expect-error an identity is only a key column, never set
+		update(docs).setEach([{ slug: 'a', id: 1 }], { key: 'slug' });
+		// @ts-expect-error nor is a generated column
+		update(users).setEach([{ id: 1, search: 'x' }], { key: 'id' });
+		// @ts-expect-error not a column
+		update(users).setEach([{ id: 1, nickname: 'x' }], { key: 'id' });
 		// @ts-expect-error not a column: reported on the rows, which then need every column
-		updateMany(docs, [{ id: 1 }], { by: 'nope' });
+		update(docs).setEach([{ id: 1 }], { key: 'nope' });
+		// @ts-expect-error a key needs a column
+		update(docs).setEach([{ id: 1 }], { key: [] });
+	});
+
+	it('takes the rows’ type from a variable, with columns set in some rows only', () => {
+		type Patch = { id: number; body?: string; version?: number };
+		const patches: Patch[] = [{ id: 1, body: 'a' }, { id: 2 }];
+		void db.update(docs).setEach(patches, { key: 'id' }).execute();
+		const loose: { id?: number; body?: string }[] = [];
+		// @ts-expect-error a row's key may be missing
+		update(docs).setEach(loose, { key: 'id' });
+	});
+
+	it('puts the rows in scope, a column a row may leave out as nullable', () => {
+		const query = update(docs)
+			.setEach([{ id: 1, body: 'a' }], { key: 'id' })
+			.set((eb) => ({
+				version: eb.fn.coalesce('row.version', 'docs.version'),
+			}))
+			.where((eb) => eb.ref('docs.version').lt(eb.ref('row.id')))
+			.returning(['docs.slug', 'row.id', 'row.body']);
+		expectTypeOf(query.expectOne()).toEqualTypeOf<
+			Query<{ slug: string; id: number; body: string | null }>
+		>();
+
+		update(docs)
+			.setEach([{ id: 1, body: 'a' }], { key: 'id' })
+			// @ts-expect-error a row may leave the body out: it is nullable
+			.set((eb) => ({ body: eb.ref('row.body') }));
+		update(users)
+			.setEach([{ id: 1, name: 'a' }], { key: 'id' })
+			// @ts-expect-error only the key and the columns an update sets are in the rows
+			.returning(['row.search']);
+		// @ts-expect-error the rows are only in scope after setEach
+		update(docs).set((eb) => ({ body: eb.ref('row.body') }));
+	});
+
+	it('works with returningAll and arithmetic over the rows', () => {
+		const query = update(docs)
+			.setEach([{ id: 1, version: 2 }], { key: 'id' })
+			.set((eb) => ({
+				version: eb
+					.ref('docs.version')
+					.plus(eb.fn.coalesce('row.version', eb.val(0))),
+			}))
+			.returningAll();
+		expectTypeOf(query.takeFirst()).toEqualTypeOf<
+			Query<
+				| {
+						id: number;
+						tenantId: number;
+						slug: string;
+						body: string;
+						version: number;
+						settings: { theme: string };
+				  }
+				| undefined
+			>
+		>();
+		update(docs)
+			.setEach([{ id: 1, version: 2 }], { key: 'id' })
+			// @ts-expect-error a row may leave the version out: the sum is nullable
+			.set((eb) => ({
+				version: eb.ref('docs.version').plus(eb.ref('row.version')),
+			}));
+	});
+
+	it('names the rows with `as`', () => {
+		const query = update(docs)
+			.setEach([{ tenantId: 1, slug: 'a', body: 'x' }], {
+				key: ['tenantId', 'slug'],
+				as: 'v',
+			})
+			.returning(['v.tenantId', 'v.slug']);
+		expectTypeOf(query.expectFirst()).toEqualTypeOf<
+			Query<{ tenantId: number; slug: string }>
+		>();
+		update(docs)
+			.setEach([{ id: 1, body: 'x' }], { key: 'id', as: 'v' })
+			// @ts-expect-error the rows are `v`, not `row`
+			.returning(['row.id']);
+	});
+
+	it('runs in a batch', async () => {
+		const [counted, first] = await db.batch([
+			db.update(docs).setEach([{ id: 1, body: 'a' }], { key: 'id' }),
+			db
+				.update(docs)
+				.setEach([{ id: 2, version: 3 }], { key: 'id' })
+				.returning(['docs.id', 'row.version'])
+				.takeFirst(),
+		]);
+		expectTypeOf(counted).toEqualTypeOf<WriteResult>();
+		expectTypeOf(first).toEqualTypeOf<
+			{ id: number; version: number | null } | undefined
+		>();
 	});
 });
 
@@ -374,8 +503,5 @@ describe('database', () => {
 		expectTypeOf(db.deleteFrom(users)).toEqualTypeOf<
 			DeleteQueryBuilder<typeof users, undefined, 'where'>
 		>();
-		expectTypeOf(
-			db.updateMany(docs, [{ id: 1, body: 'a' }], { by: 'id' }),
-		).toEqualTypeOf<UpdateQueryBuilder<typeof docs, undefined, never>>();
 	});
 });

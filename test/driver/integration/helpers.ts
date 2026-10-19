@@ -270,6 +270,113 @@ export function slowSockets(delay: number): {
 	};
 }
 
+/** A connection of `timeSlicedSockets`, as the simulated server sees it. */
+interface Backend {
+	held: Uint8Array[];
+	/** When its oldest held reply arrived. */
+	heldSince: number;
+	deliver: (data: Uint8Array) => void;
+	lastWrite: number;
+}
+
+/** Delivers a backend's held replies. */
+function flush(backend: Backend): void {
+	for (const data of backend.held.splice(0)) backend.deliver(data);
+}
+
+/**
+ * A socket factory that makes the server look like one with `cpus` CPUs
+ * time-slicing its backends: a connection's replies are delivered only
+ * while it holds one of the CPUs, which rotate every `slice` milliseconds
+ * among the connections with replies waiting. Also records when each
+ * connection last sent something.
+ */
+export function timeSlicedSockets(
+	cpus: number,
+	slice: number,
+): {
+	factory: SocketFactory;
+	/** How many connections sent something in the last `ms` milliseconds. */
+	sending(ms: number): number;
+	/** Stops time-slicing: every connection gets a CPU of its own. */
+	stop(): void;
+} {
+	const backends: Backend[] = [];
+	let running = new Set<Backend>();
+	// the ones waiting longest run next
+	const schedule = () => {
+		running = new Set(
+			backends
+				.filter((b) => b.held.length > 0)
+				.toSorted((a, b) => a.heldSince - b.heldSince)
+				.slice(0, cpus),
+		);
+		for (const backend of running) flush(backend);
+	};
+	const timer = setInterval(schedule, slice);
+	const factory: SocketFactory = {
+		async connect(o) {
+			const socket = await nodeSockets.connect(o);
+			const backend: Backend = {
+				held: [],
+				heldSince: 0,
+				deliver: () => {},
+				lastWrite: 0,
+			};
+			const wrapped: DriverSocket = {
+				get encrypted() {
+					return socket.encrypted;
+				},
+				write: (data) => {
+					backend.lastWrite = performance.now();
+					return socket.write(data);
+				},
+				startTls: (t) => socket.startTls(t),
+				peerCertificate: () => socket.peerCertificate(),
+				pause: () => socket.pause(),
+				resume: () => socket.resume(),
+				end: () => socket.end(),
+				destroy: () => socket.destroy(),
+				onData: (h) => {
+					backend.deliver = h;
+					socket.onData((data) => {
+						if (running.size < cpus) running.add(backend);
+						if (running.has(backend)) h(data);
+						else {
+							if (backend.held.length === 0)
+								backend.heldSince = performance.now();
+							backend.held.push(data.slice());
+						}
+					});
+				},
+				onClose: (h) =>
+					socket.onClose(() => {
+						flush(backend);
+						backends.splice(backends.indexOf(backend), 1);
+						running.delete(backend);
+						h();
+					}),
+				onError: (h) => socket.onError(h),
+				onDrain: (h) => socket.onDrain(h),
+			};
+			backends.push(backend);
+			return wrapped;
+		},
+	};
+	return {
+		factory,
+		sending: (ms) => {
+			const since = performance.now() - ms;
+			return backends.filter((b) => b.lastWrite >= since).length;
+		},
+		stop: () => {
+			clearInterval(timer);
+			cpus = Number.POSITIVE_INFINITY;
+			for (const backend of backends) flush(backend);
+		},
+	};
+}
+
 /** A fresh table name, so tests don't collide. */
 let tableCount = 0;
 export const table = (prefix = 't') =>

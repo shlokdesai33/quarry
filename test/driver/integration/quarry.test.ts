@@ -264,13 +264,13 @@ describe.skipIf(noPg || !pg?.extensions.includes('vector'))(
 			expect(updated).toEqual({ visits: '42' });
 			expect(
 				await db
-					.updateMany(
-						users,
+					.update(users)
+					.setEach(
 						[
 							{ id: 2, firstName: 'Bea' },
 							{ id: 3, firstName: 'Cyd' },
 						],
-						{ by: 'id' },
+						{ key: 'id' },
 					)
 					.returning(['users.firstName'])
 					.execute(),
