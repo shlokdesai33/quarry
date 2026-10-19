@@ -480,7 +480,7 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
 
 ### Pipelining onto busy connections, only once the pool is full
 
-**What it is.** `pool.query()` takes an idle connection if there is one; once every connection is busy and the pool is at `max`, it pipelines the query onto the **least-loaded** connection already running queries; beyond that, it waits for a **pipeline slot** ([POOL.md](POOL.md#pipelining-onto-busy-connections)).
+**What it is.** `pool.query()` takes an idle connection if there is one; once every connection is busy and the pool is at `max` (or at its [adaptive width](#adaptive-width-no-more-pipelined-backends-than-the-server-runs-at-once)), it pipelines the query onto the **least-loaded** connection already running queries; beyond that, it waits for a **pipeline slot** ([POOL.md](POOL.md#pipelining-onto-busy-connections)).
 
 **Why.** A pool without pipelining caps throughput at `max` queries per round trip; opening more connections costs server processes. Sharing busy connections gets far more throughput from the same connections. Before the pool is full, a fresh connection is better than sharing.
 
@@ -546,6 +546,66 @@ The adaptive depth sees the queueing in its latency ratio and stays at 100.
 **Measured.** One connection, 100 callers: 1 ms RTT 24,507 → 42,425/s (postgres.js 32,063), 20 ms 2,317 → 4,701/s. One connection, 1000 callers: 5 ms 7,757 → 126,551/s (postgres.js 7,939). No measurable change at 0 ms (median +0.8% over 24 cells; an A/A control differed by up to 4%) ([#15](https://github.com/shlokdesai33/quarry/pull/15)).
 
 **Code.** [pool.ts](pool.ts) `Depth`, `#timing`, `#sample`.
+
+### Adaptive width: no more pipelined backends than the server runs at once
+
+**What it is.** The pool spreads `query()` (and so, since #37, builder queries and default `db.batch` calls) over at most `limit` connections (its **width**), from `max` down to 1, and adapts it: it narrows when connections **stall** (a connection with queries in flight completes nothing while the rest of the pool completes everything in flight) and grows back when they don't. Queries beyond the width's pipelines wait in the shared FIFO for whichever connection frees a slot first ([POOL.md](POOL.md#adaptive-width)).
+
+**Why: the CPU-saturated server.** After #25 made the client cheaper, the concurrency sweep put the server's CPUs at 100%, and p99 roughly doubled at 500–1000 callers (pool 10, 500 callers: 3.9 → 7.0 ms on Node; Bun 2.9 → 9.2 ms) while throughput rose. Tracing it on a 4-vCPU VM (PostgreSQL on 2 CPUs), pool 10 × 500 callers:
+
+- p50 0.5 ms, p99 20 ms; almost all of it between writing a query and its result (pool queue wait p99 5 µs);
+- each connection had queries in flight but received nothing for 83% of the time, in gaps of 1–40 ms; the ten backends spent ~9.5 s per second waiting for a CPU (`/proc/<pid>/schedstat`), a pool of 2 ~8 ms;
+- the client read 1.0 result per read and wrote 1.0 query per write: under load there was no batching left to tune.
+
+A pipelined connection always has input waiting, so its backend never sleeps. With more such backends than CPUs, the kernel time-slices them, and every query pipelined on a descheduled backend waits for whole slices while the running ones serve their callers in microseconds; least-loaded assignment even sends each caller's next query back to the backend that just answered. The tail grows with the number of backends: pool 50 × 500 had p50 0.09 ms and p99 56 ms. Fewer connections did better on both counts: a pool of 2 gave 227k/s at p99 4.4 ms, against pool 10's 206k/s at 20 ms. pg has no such tail (its backends sleep after every query) but runs at 50k/s. The adaptive depth (above) and the FIFO (#12) weren't the cause: depth stayed at its floor of 100, nobody queued, and fixed depths of 16 or 50 had the same tail.
+
+**How it decides.**
+
+- **Stalls without a clock.** A completion counter, and each connection's count at its own last completion: a gap longer than one turnover of the pool (everything in flight) is a stall. A network round trip takes about one turnover (Little's law), and a GC pause stops every connection at once, so neither counts. Each epoch of 4096 completions sums stalled and total connection time, including stalls still open at its end.
+- **Narrowing.** With W pipelined backends on C CPUs, each is off its CPU about 1 − C/W of the time, so W × (1 − stalled) estimates C. Above 25% stalled two epochs in a row, the width drops to that (not below 2 in one step). The connections to drop (stalled ones first) take no new queries and go idle once theirs finish; the others keep pipelining.
+- **Picking.** Among connections with room, the least loaded one that isn't stalled: a query sent to a stalled connection waits with it.
+- **Judged, because slow queries stall too.** A connection behind a 20 ms query also stalls, and there fewer connections would only queue more lookups behind it. A narrowing is kept only if stalls then fell by a quarter (or below 25%) and the mean latency (in flight plus queued, over the completion rate) didn't double; otherwise the next try waits four times as long (4 to 1024 epochs). It is undone at once if, once it settled, completions come at under three fifths of the rate before: under CPU contention the CPUs stay busy whatever the width, so that only happens behind slow queries, and the next try waits the full 1024 epochs.
+- **Growing.** Below 5% stalled, with queries pipelined or queued at the width, +1; a growth that brings stalls back doubles the wait before the next; one that holds halves it.
+- **Not judged:** the epoch after a change, one in which the pool ran out of queries, and one in which a connection took queries for the first time. While a pool of 50 fills up, not every connection is busy, stalls read low (50–60% instead of 96%), and the first narrowing would aim at 20 connections instead of 2.
+
+**Alternatives.**
+
+- **A latency target for the depth** (cap each connection's depth so queries finish within k × the fastest): moves queries into the FIFO but keeps every backend busy. Depth 4 on pool 10 × 500 gave p99 7.5 ms but 147k/s, against the default's 197k; depth 8, 8.6 ms at 171k/s.
+- **Batch refills** (a shared connection takes queued queries only once it has drained, so its backend sleeps between batches): pool 10 × 500 216k/s at p99 6.9 ms, but about a quarter slower at pool 10 × 100 and pool 50 × 500, and stop-and-wait on a single connection at any RTT.
+- **Adaptive write coalescing**: nothing to coalesce; under load each read carried one result.
+- **A fixed smaller `max`**: the right width depends on the server's free CPUs, which the client can't know and which change with other clients.
+- **Narrowing on stalls alone**: 20 callers of `pg_sleep(0.02)` beside 5,000 lookups stall every connection; the first version shrank the pool to one connection and fell from 155k to 14k lookups/s. Hence the judging.
+
+**Cost.**
+
+- A few integer operations per completion and, per epoch, one `performance.now()` and a scan of the slots.
+- Under a CPU-saturated server the median rises (queries wait their turn in the FIFO instead of a lucky few cycling on a running backend), while p99 and p99.9 fall.
+- At 1000 callers, a wider stalling pool can squeeze a few percent more throughput out of the server (main on the VM above: 235k/s at pool 2, 255k at pool 5, at p99 7.8 against 11.7 ms); the width takes the tail.
+- A workload whose stalls come from slow queries pays for a try now and then: usually two at start-up, then one per 1024 epochs. Fast and slow queries on shared connections can be bistable (slow queries starved, or fast ones stuck behind them), and a try can tip such a workload from one mode to the other for a while.
+- With `pipeline: n` the width stays at `max`.
+
+**Measured.** 4-vCPU VM, client on 2 CPUs and PostgreSQL on the other 2, the benchmark suite's point lookups, median of 3 interleaved runs per cell, main → this change:
+
+| Runtime | Pool × callers | ops/s       | p99                | p99.9          |
+| ------- | -------------- | ----------- | ------------------ | -------------- |
+| Node    | 5 × 100        | 240k → 243k | 8.2 → **1.6 ms**   | 12.2 → 5.5 ms  |
+| Node    | 10 × 100       | 232k → 240k | 10.6 → **1.6 ms**  | 20.4 → 6.0 ms  |
+| Node    | 10 × 500       | 246k → 250k | 20.4 → **5.8 ms**  | 28.4 → 11.0 ms |
+| Node    | 10 × 1000      | 248k → 250k | 20.9 → **9.2 ms**  | 28.9 → 14.2 ms |
+| Node    | 50 × 500       | 234k → 237k | 56.3 → **7.9 ms**  | 112 → 25 ms    |
+| Node    | 50 × 1000      | 226k → 237k | 89.1 → **11.3 ms** | 118 → 62 ms    |
+| Bun     | 10 × 100       | 237k → 239k | 12.1 → **1.2 ms**  | 17.5 → 5.4 ms  |
+| Bun     | 10 × 500       | 248k → 251k | 22.7 → **4.3 ms**  | 32.4 → 7.8 ms  |
+| Bun     | 50 × 500       | 228k → 249k | 80.7 → **4.5 ms**  | 118 → 7.5 ms   |
+
+- Over all 96 cells (pools 1/5/10/50 × 1–1000 callers, 0 and 5 ms RTT, Node and Bun), the median throughput change was +0.2%. At 5 ms RTT, every cell was within ±2% except one pool-1 cell, and pools of 1 never narrow.
+- The worst cell was Bun pool 5 × 1000 at −5% (p99 14.9 → 7.6 ms). Cells at 1–10 callers moved ±7% between sweeps in both directions; a 9-run recheck put them within ±1%.
+- 50 concurrent inserts on pool 10: Node 166k → 179k/s, p99 4.7 → 2.4 ms; Bun 174k → 187k/s, p99 5.0 → 1.2 ms.
+- Mixed workload (10 connections; 100 lookup callers and 5 callers of 20 ms queries): 226–231k → 218–237k lookups/s, and the slow callers got 143–239 instead of 46–141 queries/s. With 5,000 lookup callers and 20 slow ones: 148–149k → 148–150k, the same p99.
+- Builder queries (through `pool.query` since #37) are client-bound on this VM (Node ~62k/s, Bun ~103k/s); they stay level, and the width doesn't engage while the server has room.
+- In about 1 run in 7 at pool 50 × 1000, the first narrowing is undone, and the pool stays wide for the rest of a 1-second run.
+
+**Code.** [pool.ts](pool.ts) `Width`, `#claimShared`, `#pickShared`, `#fillShared`, `#serveShared`, `#done`.
 
 ### Pool policies: LIFO idle, jittered lifetime, safe release, fail fast
 
