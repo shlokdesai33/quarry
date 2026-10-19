@@ -825,7 +825,7 @@ const pool = createPool({
 | ---------------------------------------------- | ----------: | -------: | --------: | ----------: |
 | Fetch 100,000 rows                             | **27.8 ms** |   120 ms |    146 ms |     91.9 ms |
 | Fetch 1,000,000 rows                           |  **389 ms** | 1,242 ms |  1,482 ms |    1,044 ms |
-| Stream 1,000,000 rows (cursor)                 |  **304 ms** | 1,267 ms |           |    1,053 ms |
+| Stream 1,000,000 rows (cursor)                 |  **304 ms** | 1,267 ms |       n/a |    1,053 ms |
 | Wide rows: 1,000 × 100 columns                 | **3.48 ms** | 14.37 ms |  21.27 ms |    14.11 ms |
 | Arrays: 1,000 rows of `int4[100]` + `text[20]` | **3.23 ms** | 22.10 ms |  26.07 ms |     8.39 ms |
 | 10 × 1 MB `bytea`                              | **3.45 ms** | 16.96 ms |  31.64 ms |    16.50 ms |
