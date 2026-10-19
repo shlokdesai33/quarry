@@ -113,6 +113,24 @@ batch = [s for s, v in S["scenarios"].items() if v["group"] == "batches"]
 if batch:
     out.append(table("quarry's query builder, 3 statements per operation (ops/s)", [(TITLE[s], s) for s in batch], [0, 5], lambda s, rtt: val(get("batch", "node", "quarry-db", s, via="toxiproxy", rtt=rtt), "throughput"), r, False, label=lambda d: f"RTT {d} ms", bold=False))
 
+B_OPS = [("lookup", "db-pk", "pk"), ("lookup, timeout", "db-pk-timed", None), ("insert", "db-insert", "insert1"), ("update", "db-update", "update")]
+B_D = ["quarry-db", "quarry", "pg", "postgres.js"]
+
+
+def builder_cell(rtt, metric):
+    def cell(k, d):
+        builder, plain, c = k
+        s = builder if d == "quarry-db" else plain
+        return None if s is None else val(get("builder", "node", d, s, via="toxiproxy", conc=c, rtt=rtt), metric)
+    return cell
+
+
+if any(c["phase"] == "builder" for c in S["cells"]):
+    for rtt in [0, 5]:
+        rows = [(f"{n}, {c}", (b, p, c)) for n, b, p in B_OPS for c in [1, 100, 500, 1000]]
+        out.append(table(f"Query builder against the driver, pool 10, {rtt} ms RTT (ops/s)", rows, B_D, builder_cell(rtt, "throughput"), r, False, head="Statement, callers"))
+        out.append(table(f"Query builder against the driver, pool 10, {rtt} ms RTT (p99)", rows, B_D, builder_cell(rtt, "p99"), t, True, head="Statement, callers"))
+
 W = ["insert1", "insert1-c50", "insert-multi100", "bulk-unnest", "bulk-copy", "update", "upsert", "delete", "tx-empty", "tx-insert", "savepoints"]
 out.append(table("Writes and transactions, Node 24 (operations/s)", [(TITLE[s], s) for s in W], NODE, main_cell("node", "throughput"), r, False))
 print("\n".join(out))

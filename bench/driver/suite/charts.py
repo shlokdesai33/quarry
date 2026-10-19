@@ -30,6 +30,7 @@ SHORT = {
 COLORS = {
     "quarry": "#d62728",
     "quarry-candidate": "#ff9f9a",
+    "quarry-db": "#bcbd22",
     "quarry-lossless": "#ff9896",
     "quarry-noprep": "#e377c2",
     "quarry-nopipe": "#8c564b",
@@ -231,6 +232,33 @@ if pipe:
     ax.set_title("quarry: 1 connection, 100 concurrent callers")
     ax.legend()
     save(fig, "pipeline-depth.png")
+
+# 5b. query builder against the driver, under concurrency
+if any(c["phase"] == "builder" and c["runs"] for c in cells):
+    fig, axes = plt.subplots(2, 3, figsize=(15, 7.5))
+    for row, rtt in enumerate([0, 5]):
+        for col, (name, builder, plain) in enumerate([("point lookup", "db-pk", "pk"), ("insert one row", "db-insert", "insert1"), ("update one row", "db-update", "update")]):
+            ax = axes[row][col]
+            series = [("quarry-db", builder, "-")] + [(d, plain, "-") for d in ["quarry", "pg", "postgres.js"]]
+            if builder == "db-pk":
+                series.insert(1, ("quarry-db", "db-pk-timed", "--"))
+            for d, scen, ls in series:
+                xs, ys = [], []
+                for c in [1, 100, 500, 1000]:
+                    v = val(find("builder", "node", d, scen, max=10, rtt=rtt, concurrency=c), "throughput")
+                    if v:
+                        xs.append(c)
+                        ys.append(v)
+                lab = labels.get(d, d) + (" (statement timeout)" if scen == "db-pk-timed" else "")
+                ax.plot(xs, ys, marker="o", ms=3, ls=ls, label=lab, color=COLORS.get(d))
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.set_xlabel("concurrent callers")
+            ax.set_ylabel("operations/s (log)")
+            ax.set_title(f"{name}, {rtt} ms RTT, pool 10")
+    axes[0][0].legend(fontsize=7)
+    fig.suptitle("Node 24: quarry's query builder against the same SQL through the drivers")
+    save(fig, "builder-concurrency.png")
 
 # 6. large-result throughput (rows/s), per runtime
 LARGE = ["fetch1k", "fetch100k", "fetch1m", "stream1m", "wide", "arrays"]
