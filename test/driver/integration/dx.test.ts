@@ -26,6 +26,7 @@ import {
 	DecodeError,
 	NotNullViolation,
 	PostgresError,
+	QueryCanceled,
 	UniqueViolation,
 } from '../../../src/driver/errors.js';
 import { createPool, type Pool } from '../../../src/driver/pool.js';
@@ -803,20 +804,35 @@ describe.skipIf(noPg)('DX features against PostgreSQL', () => {
 				.select(['accounts.id'])
 				.where('accounts.email', 'shared@example.com');
 
-		it('counts, reports and redacts queries and batches either way', async () => {
+		it('counts, reports and redacts queries and batches either way, timed ones included', async () => {
 			events.length = 0;
-			const { value: queries, reserved } = await reserving(() =>
+			const shared = await reserving(() =>
 				db.budget({}, async (usage) => {
-					await byEmail().execute(); // shared
-					await byEmail().execute({ timeout: '5s' }); // exclusive
-					await db.batch([byEmail(), byEmail()]); // shared
-					await db.batch([byEmail()], { timeout: '5s' }); // exclusive
+					await byEmail().execute();
+					await byEmail().execute({ timeout: '5s' });
+					await db.batch([byEmail(), byEmail()]);
+					await db.batch([byEmail()], { timeout: '5s' });
 					return usage.queries;
 				}),
 			);
-			expect(queries).toBe(5);
-			expect(reserved).toBe(2);
-			expect(events).toHaveLength(5);
+			// since #38, a timeout shares the pool too
+			expect(shared).toEqual({ value: 5, reserved: 0 });
+			const exclusive = await reserving(() =>
+				db.budget({}, async (usage) => {
+					await db.batch([byEmail()], { transaction: true });
+					await db.transaction((tx) =>
+						tx
+							.selectFrom(accounts)
+							.select(['accounts.id'])
+							.where('accounts.email', 'shared@example.com')
+							.execute(),
+					);
+					return usage.queries;
+				}),
+			);
+			// the atomic batch reserves a connection; the transaction takes its own
+			expect(exclusive).toEqual({ value: 2, reserved: 1 });
+			expect(events).toHaveLength(7);
 			for (const event of events) {
 				expect(event.params).toEqual(['[redacted]']);
 				expect(event.phases.acquireMs).toBeGreaterThanOrEqual(0);
@@ -835,6 +851,43 @@ describe.skipIf(noPg)('DX features against PostgreSQL', () => {
 			expect(refused.reserved).toBe(0);
 		});
 
+		it('bounds a timed query on the shared path, and counts, reports and redacts it', async () => {
+			events.length = 0;
+			const { value, reserved } = await reserving(() =>
+				db.budget({}, async (usage) => {
+					const error = await rejection(
+						db.sql`select pg_sleep(0.5) where ${sqlTag.sensitive('timed-secret')}::text is not null`.execute(
+							{ timeout: '50ms' },
+						),
+						QueryCanceled,
+					);
+					return { error, queries: usage.queries };
+				}),
+			);
+			expect(reserved).toBe(0);
+			expect(value.queries).toBe(1);
+			expect(value.error.query?.params).toEqual(['[redacted]']);
+			expect(
+				value.error.stack?.slice(
+					value.error.stack.indexOf('--- query issued at ---'),
+				),
+			).toContain('dx.test.ts');
+			expect(events).toHaveLength(1);
+			expect(events[0]?.params).toEqual(['[redacted]']);
+			expect(events[0]?.error).toBe(value.error);
+			expect(inspect([value.error, events], { depth: 6 })).not.toContain(
+				'timed-secret',
+			);
+			// the connection it ran on is still usable, at the default timeout
+			expect(
+				await db.sql<{
+					ms: string;
+				}>`select current_setting('statement_timeout') as ms`
+					.expectValue()
+					.execute(),
+			).toBe('0');
+		});
+
 		it('reports slow queries and redacts server errors either way', async () => {
 			slow.length = 0;
 			const napping = () => db.selectFrom(nap).select(['nap.done']);
@@ -842,9 +895,10 @@ describe.skipIf(noPg)('DX features against PostgreSQL', () => {
 				await napping().execute();
 				await napping().execute({ timeout: '5s' });
 				await db.batch([napping()]);
+				await db.batch([napping()], { transaction: true });
 			});
 			expect(reserved).toBe(1);
-			expect(slow).toHaveLength(3);
+			expect(slow).toHaveLength(4);
 			const duplicate = db.insertInto(accounts).values({
 				name: 'Twin',
 				email: 'ada@example.com',
@@ -857,12 +911,14 @@ describe.skipIf(noPg)('DX features against PostgreSQL', () => {
 					db
 						.batch([duplicate])
 						.catch((e: BatchError) => Promise.reject(e.errors[0])),
+				() => db.batch([duplicate], { transaction: true }),
 			]) {
 				const error = await rejection(run(), UniqueViolation);
 				expect(error.detail).toBe('Key (email)=([redacted]) already exists.');
+				// the deepest paths reach the test's helper within the default 10 frames
 				expect(
 					error.stack?.slice(error.stack.indexOf('--- query issued at ---')),
-				).toContain('dx.test.ts');
+				).toMatch(/dx\.test\.ts|helpers\.ts/);
 				expect(error.query?.params).toEqual([
 					'Twin',
 					'[redacted]',
