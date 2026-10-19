@@ -214,7 +214,7 @@ innerJoin<J extends AnyTable>(table: J): JoinBuilder<T, J, O, L> { … }
 
 `innerJoin(users)` doesn't add `users` to the scope of the builder you called it on; it returns a `JoinBuilder` whose `on` callback already sees `[...T, J]` (so the condition can reference the joined table), and whose result is a `SelectQueryBuilder<[...T, J], …>`. Before the join, `'users.email'` is not a `Ref` of the scope, so using it is a type error.
 
-At run time the same happens with real tables: `expressionBuilder(...tables)` ([expression-builder.ts](expression-builder.ts)) resolves `'users.email'` by finding the table named `users` in its list, and throws `Unknown column reference` if it can't (only reachable by casting around the types). The `WhereBuilder` is **rescoped** to the new tables after a join (`where.rescope(…)`) so conditions added later can reference them.
+At run time the same happens with real tables: `expressionBuilder(...tables)` ([expression-builder.ts](expression-builder.ts)) resolves `'users.email'` by finding the table named `users` in its list (each column once per table, then shared: [EXPRESSIONS.md](EXPRESSIONS.md#references-ebref)), and throws `Unknown column reference` if it can't (only reachable by casting around the types). The `WhereBuilder` is **rescoped** to the new tables after a join (`where.rescope(…)`) so conditions added later can reference them.
 
 ### Operands: a reference or a typed expression
 

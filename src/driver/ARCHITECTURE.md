@@ -388,7 +388,9 @@ If a codec throws while decoding a value, the generated decoder wraps it in a `D
 ```ts
 interface Statement {
 	readonly name: string; // 'q7', or '' for SQL only ever sent unnamed (its columns are still cached)
-	readonly key: string; // the SQL, prefixed with the declared parameter types
+	readonly key: string; // its key in the cache: the SQL, or types and SQL (below)
+	readonly sql: string;
+	readonly types: readonly number[]; // the declared parameter types
 	used: number; // last lookup, on the connection's counter
 	unwritten: boolean; // created, its Parse not yet written
 	parsed: boolean; // ParseComplete arrived
@@ -398,12 +400,13 @@ interface Statement {
 }
 ```
 
-The **key** is `types.join(',') + '\0' + sql` (just `sql` when no type is declared): the same SQL with different declared parameter types is a different server-side statement.
+The same SQL with different declared parameter types is a different server-side statement. The **key** is the SQL itself for the first statement of a SQL text, whose `types` are compared on each lookup; the same SQL with other types is keyed `types.join(',') + '\0' + sql`, which no SQL text can equal (SQL has no NUL). A SQL string used again keeps its hash, so a hit costs a `Map` lookup and a short array comparison; a key built per query would be hashed in full every time (about 450 ns for a builder point lookup's 200 characters).
 
 ### Lookup and eviction
 
 `Connection.#statement(sql, types, named)`:
 
+- Look up the SQL; if it isn't there, or its statement declares other types, look up the types-and-SQL key.
 - Found: stamp `used` with `++#statementUses` and return it. (A use stamp rather than moving the entry to the end of the `Map`: deleting and re-adding a key on every hit makes the `Map` rehash, garbage that adds up to GC pauses on small queries.)
 - Not found: create it with the next name. If the cache is full (`statementCacheSize`, default 100), evict the entry with the lowest `used` and write a **Close** for its server-side statement **before** the new Parse, in the same buffer (the op ignores the CloseComplete).
 

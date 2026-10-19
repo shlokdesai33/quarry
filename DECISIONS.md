@@ -64,6 +64,7 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 
 - [A node tree, and one compiler](src/DECISIONS.md#a-node-tree-and-one-compiler)
 - [References resolved before compiling](src/DECISIONS.md#references-resolved-before-compiling)
+- [Columns resolved and quoted once per table](src/DECISIONS.md#columns-resolved-and-quoted-once-per-table) (measured)
 - [Every identifier quoted](src/DECISIONS.md#every-identifier-quoted)
 - [Parameters everywhere, literals only where Postgres refuses a parameter](src/DECISIONS.md#parameters-everywhere-literals-only-where-postgres-refuses-a-parameter)
 - [Parameters numbered in text order, and `in` as `= any($1)`](src/DECISIONS.md#parameters-numbered-in-text-order-and-in-as--any1)
@@ -111,7 +112,7 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 
 - [One small `Executor` interface between the builder and the driver](src/DECISIONS.md#one-small-executor-interface-between-the-builder-and-the-driver)
 - [Plain queries share the pool's pipelined connections](src/DECISIONS.md#plain-queries-share-the-pools-pipelined-connections)
-- [Errors carry the query (hidden) and your call site](src/DECISIONS.md#errors-carry-the-query-hidden-and-your-call-site)
+- [Errors carry the query (hidden) and the code awaiting it](src/DECISIONS.md#errors-carry-the-query-hidden-and-the-code-awaiting-it) (measured)
 - [Nested `durable` transactions throw](src/DECISIONS.md#nested-durable-transactions-throw)
 
 ### Type-level tricks
@@ -155,6 +156,7 @@ Full entries: [src/driver/DECISIONS.md](src/driver/DECISIONS.md).
 
 - [Prepared statements by default, named per connection](src/driver/DECISIONS.md#prepared-statements-by-default-named-per-connection) (measured)
 - [A bounded LRU cache with use stamps](src/driver/DECISIONS.md#a-bounded-lru-cache-with-use-stamps) (measured)
+- [Statements keyed by their SQL, with the declared types compared](src/driver/DECISIONS.md#statements-keyed-by-their-sql-with-the-declared-types-compared) (measured)
 - [Retry a stale statement once, unprepared](src/driver/DECISIONS.md#retry-a-stale-statement-once-unprepared)
 - [Unnamed statements for pipelined queries behind PgBouncer](src/driver/DECISIONS.md#unnamed-statements-for-pipelined-queries-behind-pgbouncer) (measured)
 - [Detect poolers at login rather than configure them](src/driver/DECISIONS.md#detect-poolers-at-login-rather-than-configure-them)

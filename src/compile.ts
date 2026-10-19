@@ -6,6 +6,7 @@ import type {
 	LockNode,
 	OnConflictNode,
 	OperationNode,
+	ReferenceNode,
 	RowsNode,
 	SelectionNode,
 	SelectNode,
@@ -182,8 +183,27 @@ function renderReturning(
 	returning: readonly SelectionNode[],
 	params: Params,
 ): string {
-	if (returning.length === 0) return '';
-	return ` returning ${returning.map((s) => `${render(s.expression, params)} as ${identifier(s.alias)}`).join(', ')}`;
+	return renderSelections(returning, ' returning ', params);
+}
+
+function renderSelection(selection: SelectionNode, params: Params): string {
+	return (
+		shared.get(selection) ??
+		`${render(selection.expression, params)} as ${identifier(selection.alias)}`
+	);
+}
+
+/** A select or returning list after `prefix`; nothing when it is empty. */
+function renderSelections(
+	list: readonly SelectionNode[],
+	prefix: string,
+	params: Params,
+): string {
+	if (list.length === 0) return '';
+	let sql = prefix + renderSelection(list[0]!, params);
+	for (let i = 1; i < list.length; i++)
+		sql += `, ${renderSelection(list[i]!, params)}`;
+	return sql;
 }
 
 function renderOnConflict(
@@ -260,10 +280,34 @@ function renderDelete(node: DeleteNode, params: Params): string {
 	return sql + renderReturning(node.returning, params);
 }
 
+/**
+ * The SQL of the nodes the builders make once per table and column and
+ * share across queries (see `resolveColumn`). Nodes are immutable, so a
+ * column is quoted once rather than in every query. Only shared nodes are
+ * kept: adding the nodes each query makes would cost more than it saves.
+ */
+const shared = new WeakMap<ReferenceNode | SelectionNode, string>();
+
+/** Renders a column's shared reference and selection nodes once, for every query that uses them. */
+export function shareColumn(
+	reference: ReferenceNode,
+	selection: SelectionNode,
+): void {
+	const sql = `${identifier(reference.table)}.${identifier(reference.column)}`;
+	shared.set(reference, sql);
+	shared.set(selection, `${sql} as ${identifier(selection.alias)}`);
+}
+
+function renderReference(node: ReferenceNode): string {
+	return (
+		shared.get(node) ?? `${identifier(node.table)}.${identifier(node.column)}`
+	);
+}
+
 function render(node: OperationNode, params: Params): string {
 	switch (node.kind) {
 		case 'reference':
-			return `${identifier(node.table)}.${identifier(node.column)}`;
+			return renderReference(node);
 		case 'value':
 			return param(params, node.value, node.codec);
 		case 'value_list':
@@ -329,11 +373,7 @@ function renderSelect(node: SelectNode, params: Params): string {
 	if (node.distinct === true) sql += ' distinct';
 	else if (node.distinct !== undefined)
 		sql += ` distinct on (${renderKeys(node.distinct, params)})`;
-	const selections = node.selections.map(
-		(selection) =>
-			`${render(selection.expression, params)} as ${identifier(selection.alias)}`,
-	);
-	if (selections.length > 0) sql += ` ${selections.join(', ')}`;
+	sql += renderSelections(node.selections, ' ', params);
 	sql += ` from ${renderTable(node.from)}`;
 	for (const join of node.joins) sql += renderJoin(join, params);
 	if (node.where !== undefined) {
@@ -457,9 +497,22 @@ function renderLogical(
 	return `(${rendered.join(` ${operator} `)})`;
 }
 
+/**
+ * Quoted identifiers, by name: table, column and alias names repeat in
+ * every query. Cleared when full, so names made at run time can't grow it
+ * without bound.
+ */
+const identifiers = new Map<string, string>();
+
 /** `name` as a quoted identifier. */
 export function identifier(name: string): string {
-	return `"${name.replaceAll('"', '""')}"`;
+	let quoted = identifiers.get(name);
+	if (quoted === undefined) {
+		quoted = `"${name.replaceAll('"', '""')}"`;
+		if (identifiers.size >= 4096) identifiers.clear();
+		identifiers.set(name, quoted);
+	}
+	return quoted;
 }
 
 /**

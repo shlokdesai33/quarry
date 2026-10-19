@@ -286,7 +286,8 @@ export class Connection implements AsyncDisposable {
 				(this.#naming === 'alone' &&
 					this.#queue.length === 1 &&
 					(this.#queue.at(0)?.prepares ?? 0) <= 1),
-			unprepare: (statement) => this.#unprepared.add(statement.key),
+			unprepare: (statement) =>
+				this.#unprepared.add(statementKey(statement.sql, statement.types)),
 			preparable: (sql, types) =>
 				this.#unprepared.size === 0 ||
 				!this.#unprepared.has(statementKey(sql, types)),
@@ -800,9 +801,24 @@ export class Connection implements AsyncDisposable {
 		return false;
 	}
 
+	/**
+	 * The cached statement for `sql` with the parameter types `types`, or a
+	 * new one. A statement is keyed by its SQL alone, and the types are
+	 * compared: a SQL string used again keeps its hash, where a key built
+	 * per query (types and SQL) would be hashed in full every time. The same
+	 * SQL with other types is keyed by both.
+	 */
 	#statement(sql: string, types: readonly number[], named: boolean): Statement {
-		const key = statementKey(sql, types);
-		const existing = this.#statements.get(key);
+		let key = sql;
+		let existing = this.#statements.get(sql);
+		if (existing === undefined || !sameTypes(existing.types, types)) {
+			const variant = variantKey(sql, types);
+			const found = this.#statements.get(variant);
+			if (existing !== undefined || found !== undefined) {
+				key = variant;
+				existing = found;
+			}
+		}
 		if (existing !== undefined) {
 			if (!named || existing.name !== '') {
 				// a use stamp instead of moving the entry to the Map's end: deleting
@@ -817,6 +833,9 @@ export class Connection implements AsyncDisposable {
 		const statement: Statement = {
 			name: named ? `q${++this.#statementCount}` : '',
 			key,
+			sql,
+			// a copy: `paramTypes` is the caller's array
+			types: [...types],
 			used: ++this.#statementUses,
 			unwritten: true,
 			parsed: false,
@@ -1715,6 +1734,17 @@ const listRegistries = new WeakMap<readonly Codec[], CodecRegistry>();
 /** The statement cache's key: the SQL, prefixed with the parameter types declared. */
 function statementKey(sql: string, types: readonly number[]): string {
 	return types.length === 0 ? sql : `${types.join(',')}\0${sql}`;
+}
+
+/** The cache key of `sql` with types other than its first statement's: never a SQL text, which has no NUL. */
+function variantKey(sql: string, types: readonly number[]): string {
+	return `${types.join(',')}\0${sql}`;
+}
+
+function sameTypes(a: readonly number[], b: readonly number[]): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+	return true;
 }
 
 /** Why `sql` can't be sent, if it can't: Postgres takes text without NUL bytes. */

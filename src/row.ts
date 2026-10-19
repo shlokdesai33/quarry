@@ -5,7 +5,10 @@ import {
 	type AliasedExpression,
 	type Expression,
 } from './expression.js';
-import type { ExpressionBuilder } from './expression-builder.js';
+import {
+	resolveReference,
+	type ExpressionBuilder,
+} from './expression-builder.js';
 import type { SelectionNode } from './node.js';
 import type { Ref, Refs } from './refs.js';
 import type { AnyTable } from './table.js';
@@ -111,15 +114,28 @@ export function checkUniqueKeys(
 	existing: readonly SelectionNode[],
 	added: readonly SelectionNode[],
 ): void {
-	const keys = new Set(existing.map((selection) => selection.alias));
-	for (const { alias } of added) {
-		if (keys.has(alias)) {
-			throw new Error(
-				`select each key once: "${alias}" is already in the row; rename one with .as()`,
-			);
+	// a select list is short: comparing each pair allocates nothing
+	if (existing.length + added.length > 32) {
+		const keys = new Set(existing.map((selection) => selection.alias));
+		for (const { alias } of added) {
+			if (keys.has(alias)) throw repeatedKey(alias);
+			keys.add(alias);
 		}
-		keys.add(alias);
+		return;
 	}
+	for (let i = 0; i < added.length; i++) {
+		const { alias } = added[i]!;
+		for (const selection of existing)
+			if (selection.alias === alias) throw repeatedKey(alias);
+		for (let j = 0; j < i; j++)
+			if (added[j]!.alias === alias) throw repeatedKey(alias);
+	}
+}
+
+function repeatedKey(alias: string): Error {
+	return new Error(
+		`select each key once: "${alias}" is already in the row; rename one with .as()`,
+	);
 }
 
 /** `existing` with `added` after it, checked by `checkUniqueKeys`. */
@@ -145,14 +161,8 @@ export function selectionNodes<R extends Refs>(
 	selections: readonly Selection<R>[],
 ): SelectionNode[] {
 	return selections.map((selection): SelectionNode => {
-		if (typeof selection === 'string') {
-			const ref = eb.ref(selection);
-			return {
-				expression: ref._quarry.node,
-				alias: selection.slice(selection.indexOf('.') + 1),
-				codec: ref._quarry.dataType.codec,
-			};
-		}
+		if (typeof selection === 'string')
+			return resolveReference(eb, selection).selection;
 		return {
 			expression: selection.expression._quarry.node,
 			alias: selection.alias,

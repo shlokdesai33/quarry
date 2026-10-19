@@ -1125,7 +1125,7 @@ const db = database(
 | Option      | Default          | Description                                                                                                                                                     |
 | ----------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `onQuery`   |                  | Called once per query when it settles, with its SQL, parameters, tag, command, row count, error, and timings (`acquireMs`, `queuedMs`, `execMs`, `durationMs`). |
-| `callsites` | `true`           | Append the stack of the code that ran a query to its error.                                                                                                     |
+| `callsites` | `true`           | Append the stack of the code awaiting a failed query to its error (captured when it fails).                                                                     |
 | `codecs`    | quarry's codecs  | Codecs for result columns no query types (raw SQL, expressions of unknown type). Columns always use their own codec, so their types hold.                       |
 | `catalog`   | `true`           | Look up the types codecs name (enums, pgvector, custom types and their arrays) in `pg_type` once per pool, before the first query.                              |
 | `prepare`   | the connection's | Use cached prepared statements.                                                                                                                                 |
@@ -1841,7 +1841,7 @@ The options are the driver's [transaction options](#transactions): `isolation`, 
 Database errors are the driver's [error classes](#errors), re-exported from `quarry`. The query builder adds:
 
 - **The query and its tag** on every server error, so a log line says which query failed.
-- **Your stack.** With `callsites` (on by default), the error's stack includes the code that called `execute()`, not just the driver's socket handler.
+- **Your stack.** With `callsites` (on by default), the error's stack includes the code awaiting the query (`await q.execute()` and its callers), not just the driver's socket handler. It is captured when the query fails, so queries that succeed pay nothing for it.
 - **Shape errors**: `NoRowError` and `TooManyRowsError` (with `count`) from the `expect…` shapes, and `RowCountError` (with `expected` and `actual`) from `expectRows`. Each carries the `table` it read or wrote and, non-enumerably, the compiled `query`.
 
 `violatedColumns(error, table)` maps a constraint violation back to your column keys, which is the usual first step in turning a database error into a form error:

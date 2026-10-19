@@ -162,7 +162,9 @@ describe.skipIf(noPg)('builder queries on a pool', () => {
 		expect(error.code).toBe('22012');
 		expect(error.query?.tag).toBe('divide');
 		expect(error.stack).toContain('query issued at');
-		expect(error.stack).toContain('builder-pool.test.ts');
+		// the call site is the code awaiting the query when it failed: here
+		// `rejection`, which this test awaits only later (call-sites.test.ts)
+		expect(error.stack).toContain('helpers.ts');
 		expect(net.maxInFlight()).toBeGreaterThan(20);
 		const lookups = events.filter((e) => e.tag === 'lookup');
 		expect(lookups).toHaveLength(20);

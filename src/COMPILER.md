@@ -21,6 +21,7 @@ Background: builders produce nodes ([QUERIES.md](QUERIES.md)); expressions produ
 - [Result codecs](#result-codecs)
 - [Errors the compiler raises](#errors-the-compiler-raises)
 - [`toSQL()` and when compiling happens](#tosql-and-when-compiling-happens)
+- [What is rendered once](#what-is-rendered-once)
 - [Decisions](#decisions)
 - [Glossary](#glossary)
 
@@ -108,7 +109,13 @@ Values are passed through **as given**. The compiler never encodes them: the dri
 
 ```ts
 function identifier(name: string): string {
-	return `"${name.replaceAll('"', '""')}"`;
+	let quoted = identifiers.get(name); // memoised, bounded: see below
+	if (quoted === undefined) {
+		quoted = `"${name.replaceAll('"', '""')}"`;
+		if (identifiers.size >= 4096) identifiers.clear();
+		identifiers.set(name, quoted);
+	}
+	return quoted;
 }
 ```
 
@@ -341,6 +348,18 @@ These are plain `Error`s: they are programming mistakes, not database errors.
 
 Every builder and `Query` has `toSQL()`, which returns the same `CompiledQuery` that `execute()` sends. On a builder it compiles on each call. A **result shape** (`takeFirst()`, `expectOne()`, …, and `toQuery()`) compiles once, when the shape is applied, and the `Query` holds the result; `execute()` doesn't compile again. So a compile error surfaces when the shape is applied (or at `execute()` for a builder without a shape), not at the earlier builder calls.
 
+## What is rendered once
+
+A query is built and compiled from scratch each time it runs, but most of its SQL is the same every time: the quoted table and column names. Three caches keep that work out of the per-query path:
+
+- **Shared column nodes.** `resolveColumn` ([expression-builder.ts](expression-builder.ts)) resolves each table's column once, into one `ReferenceNode`, one typed expression (what `eb.ref` returns) and one `SelectionNode` (what `select(['users.email'])` adds), kept per table object in a `WeakMap`. Every query over the table reuses them; nodes are immutable, so sharing is safe. A table of the same name (another `defineTable`, or `users.as('u')`) is another object, with its own nodes. `nameReference`, which records how a reference was written for the `undefined`-comparison error, now runs once per column instead of adding a `WeakMap` entry per reference per query.
+- **Their SQL.** `shareColumn` renders a column's reference (`"users"."email"`) and selection (`"users"."email" as "email"`) when the column is first resolved, into the compiler's `shared` map; `render` and `renderSelection` look nodes up there before rendering them. Only these shared nodes go in: adding the nodes each query makes (values, comparisons, `.as()` selections) would cost a `WeakMap` entry per query, more than rendering them.
+- **Quoted identifiers.** `identifier` memoises in a `Map`, cleared when it reaches 4,096 names, so aliases made at run time can't grow it without bound.
+
+The builders also reuse a single table's expression builder (`expressionBuilder(users)` is made once and frozen; a scope of several tables is made per call), and the predicate `DataType`. Together with call sites captured only on failure ([EXECUTION.md](EXECUTION.md#errors)), a point lookup's build and compile went from 5.7 to 0.8 µs (in-process, mock executor), and its client CPU through the pool from 21 to under 5 µs ([DECISIONS.md](DECISIONS.md#columns-resolved-and-quoted-once-per-table)).
+
+**Not cached: whole compiled queries.** A cache of SQL and parameter plans keyed by query shape was considered. Its key has to be computed from the query's own nodes, which are new on every call (the builder makes a fresh tree each time), so building the key is a walk of the same tree that rendering from cached fragments already is: it saves nothing measurable, and adds invalidation rules. What a reused SQL string would have saved in the driver (hashing the statement cache's key) is saved there instead: the cache is keyed by the SQL alone ([driver/DECISIONS.md](driver/DECISIONS.md#statements-keyed-by-their-sql-with-the-declared-types-compared)).
+
 ## Decisions
 
 Why the compiler works this way. Each links to its full entry (what it is, why, the alternatives, the cost, measured impact) in [DECISIONS.md](DECISIONS.md):
@@ -348,6 +367,7 @@ Why the compiler works this way. Each links to its full entry (what it is, why, 
 - [A node tree, and one compiler](DECISIONS.md#a-node-tree-and-one-compiler): quoting, numbering and parenthesising are written once; builders only produce data.
 - [References resolved before compiling](DECISIONS.md#references-resolved-before-compiling): `compile` needs no schema and can't get a name wrong.
 - [Every identifier quoted](DECISIONS.md#every-identifier-quoted): no reserved-word list, and case is preserved.
+- [Columns resolved and quoted once per table](DECISIONS.md#columns-resolved-and-quoted-once-per-table): shared, immutable column nodes whose SQL is rendered once; no whole-query cache.
 - [Parameters everywhere, literals only where Postgres refuses a parameter](DECISIONS.md#parameters-everywhere-literals-only-where-postgres-refuses-a-parameter): injection-safe and cache-friendly, with checked exceptions.
 - [Parameters numbered in text order, and `in` as `= any($1)`](DECISIONS.md#parameters-numbered-in-text-order-and-in-as--any1): identical queries give identical SQL, so the statement cache gets hits.
 - [Every operation operand bracketed](DECISIONS.md#every-operation-operand-bracketed): no precedence table to get wrong.

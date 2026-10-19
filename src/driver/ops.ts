@@ -29,7 +29,11 @@ import type { RowDecoder, RowMode } from './rows.js';
 export interface Statement {
 	/** The server-side name; '' for SQL only ever sent unnamed, whose columns are still cached. */
 	readonly name: string;
+	/** Its key in the connection's cache: the SQL, or with other types than the SQL's first statement, types and SQL. */
 	readonly key: string;
+	readonly sql: string;
+	/** The declared parameter types (OIDs; 0 for none). */
+	readonly types: readonly number[];
 	/** When the statement was last looked up, on the connection's counter: the cache evicts the lowest. */
 	used: number;
 	/** Created, and its Parse not yet written: the operation that finds it so writes it. */

@@ -243,6 +243,47 @@ The driver's decisions are in [driver/DECISIONS.md](driver/DECISIONS.md), which 
 
 **Code.** `resolve` in [expression-builder.ts](expression-builder.ts).
 
+### Columns resolved and quoted once per table
+
+**What it is.** Each table's column is resolved once into a shared, immutable reference node, typed expression and selection node, and the compiler renders their SQL (`"users"."email"`, `"users"."email" as "email"`) once, when the column is first resolved. A single table's expression builder is made once. Quoted identifiers are memoised in a bounded map. There is no cache of whole compiled queries ([COMPILER.md](COMPILER.md#what-is-rendered-once)).
+
+**Why.** Once #37 let builder queries pipeline, the builder became client-CPU bound: about 19 µs per point lookup against 4.4 µs for the driver's own `pool.query`. Its profile had a quarter of the time in capturing the call site ([above](#errors-carry-the-query-hidden-and-the-code-awaiting-it)), 15% in quoting names, and more in making an expression builder per query (with its `fn` and `json` closures), a `WeakMap` entry per column reference per query (for the `undefined`-comparison error), a `Set` per `select`, and the garbage collection all of that caused. A query's names are the same every time it runs; only its values change.
+
+**Alternatives.**
+
+- A cache of SQL and parameter plans keyed by the query's shape: the key has to be computed from the query's nodes, which the builder makes anew on every call, so building it walks the same tree that rendering from cached fragments walks. It saves nothing measurable, and adds invalidation rules.
+- Cache rendered SQL for every node: nodes made per query (values, comparisons, `.as()` selections) would each add a `WeakMap` entry per query, which costs more than rendering them. Only the shared column nodes are kept.
+- Reuse builder state between chained calls (mutable builders): builders are immutable by design ([Immutable builders](#immutable-builders)); the copy per chained call measured about 70 ns of a point lookup's 800 ns build.
+
+**Cost.** A `WeakMap` per table of its resolved columns (as many entries as columns used), the compiler's `WeakMap` of their SQL, and a map of up to 4,096 quoted names. A shared single-table expression builder is frozen, so a callback can't change it for other queries. Nodes must stay immutable: code that changed a shared node would change every query using it (nothing does; node types are `readonly`).
+
+**Measured.** In-process, a mock executor (build and compile only, Node 24): point lookup (`selectFrom(users).where(id).select([6 columns]).execute()`) 5.7 → 0.8 µs, single-row insert 1.6 → 1.3 µs, update by key 2.0 → 0.8 µs. Through a pool of 10 at 100 concurrent callers and 0 ms round trip, with call sites captured on failure and the driver's statement cache keyed by SQL ([driver/DECISIONS.md](driver/DECISIONS.md#statements-keyed-by-their-sql-with-the-declared-types-compared)), client CPU per point lookup went from 21.3 to 4.8 µs (`pool.query`: 4.4 µs) and throughput from 49k to 211k ops/s (one process, the sources run directly). The driver benchmark suite (#6), with the built package, a fresh process per cell, before and after interleaved in one session, median of 5 runs:
+
+| Query                 | Round trip | Callers | Before: ops/s (p50 ms) | After: ops/s (p50 ms) | Client CPU µs/op | `pool.query`: ops/s, CPU µs/op |
+| --------------------- | ---------- | ------- | ---------------------- | --------------------- | ---------------- | ------------------------------ |
+| point lookup          | 0 ms       | 1       | 20,227 (0.04)          | 29,466 (0.03)         | 37.8 → 20.1      | 33,654, 15.4                   |
+| point lookup          | 0 ms       | 100     | 51,077 (1.57)          | 186,582 (0.44)        | 21.3 → 6.0       | 233,004, 4.6                   |
+| point lookup          | 0 ms       | 1000    | 50,146 (17.82)         | 180,483 (4.54)        | 23.7 → 6.4       | 249,924, 4.3                   |
+| point lookup          | 5 ms       | 1       | 166 (6.00)             | 168 (5.96)            | 392.1 → 335.4    | 169, 281.8                     |
+| point lookup          | 5 ms       | 100     | 15,506 (6.47)          | 15,793 (6.35)         | 30.4 → 15.2      | 15,930, 9.0                    |
+| point lookup          | 5 ms       | 1000    | 46,268 (20.18)         | 133,222 (7.06)        | 24.9 → 6.9       | 148,808, 3.2                   |
+| insert one row        | 0 ms       | 1       | 23,979 (0.04)          | 29,441 (0.03)         | 28.6 → 20.9      | 34,505, 15.1                   |
+| insert one row        | 0 ms       | 100     | 81,066 (1.06)          | 159,774 (0.52)        | 13.3 → 6.8       | 175,881, 5.8                   |
+| insert one row        | 0 ms       | 1000    | 80,500 (11.04)         | 175,453 (4.95)        | 13.7 → 6.3       | 184,836, 5.6                   |
+| insert one row        | 5 ms       | 1       | 168 (5.94)             | 168 (5.94)            | 344.7 → 320.0    | 169, 266.3                     |
+| insert one row        | 5 ms       | 100     | 16,236 (6.08)          | 15,977 (6.27)         | 21.9 → 15.9      | 15,812, 8.1                    |
+| insert one row        | 5 ms       | 1000    | 80,346 (11.28)         | 132,493 (7.09)        | 13.8 → 6.4       | 143,059, 3.3                   |
+| update one row by key | 0 ms       | 1       | 22,367 (0.04)          | 28,945 (0.03)         | 29.4 → 18.6      | 31,745, 14.7                   |
+| update one row by key | 0 ms       | 100     | 78,128 (1.06)          | 152,170 (0.13)        | 13.9 → 7.2       | 156,053, 6.7                   |
+| update one row by key | 0 ms       | 1000    | 75,789 (11.04)         | 164,800 (4.05)        | 15.3 → 6.7       | 161,480, 6.4                   |
+| update one row by key | 5 ms       | 1       | 167 (5.97)             | 168 (5.94)            | 353.4 → 320.5    | 169, 257.4                     |
+| update one row by key | 5 ms       | 100     | 16,053 (6.15)          | 15,992 (6.22)         | 22.8 → 12.7      | 16,050, 8.2                    |
+| update one row by key | 5 ms       | 1000    | 79,059 (10.98)         | 126,976 (7.49)        | 14.5 → 5.2       | 133,682, 3.0                   |
+
+The driver suite on a 4-vCPU VM (client on 2 CPUs, PostgreSQL 18 on the other 2), Node 24, a pool of 10; `pool.query` runs the same statement written by hand (`pk`, `insert1`, `update`). At 0 ms with 100 or 1000 callers, the builder now reaches 72–100% of the driver's own throughput (point lookups 72–80%, writes 91–102%), against 20–50% before. At 5 ms with 100 callers, every configuration is bound by the round trip (100 callers per 6 ms), so throughput doesn't move, but CPU per query falls by a third to a half. With 1000 callers at 5 ms, the builder's CPU, not the round trip, was the limit before. With one caller, each query waits for its own round trip, so the CPU saved per query (38 → 20 µs for a point lookup) shows up as latency: 20k → 29k lookups/s at 0 ms.
+
+**Code.** `resolveColumn`, `expressionBuilder` in [expression-builder.ts](expression-builder.ts); `shareColumn`, `identifier` in [compile.ts](compile.ts); [test/builder-caches.test.ts](../test/builder-caches.test.ts).
+
 ### Every identifier quoted
 
 **What it is.** Table and column names are always written in double quotes (`"users"."createdAt"`).
@@ -629,21 +670,28 @@ The mechanisms are in [PAGINATION.md](PAGINATION.md).
 | 5 ms       | 500                | 1,640 (303 ms)      | 58,200 (7.2 ms)    |
 | 5 ms       | 1000               | 1,620 (613 ms)      | 55,700 (17.2 ms)   |
 
-Before, throughput was capped at `max` lookups per round trip (10 per 6 ms at 5 ms). After, 100 callers at 5 ms match the driver's own `pool.query` (15,600 ops/s); beyond that, the builder's client CPU is the limit (about 19 µs per lookup, against about 4 µs for `pool.query`: building and rendering the query and capturing the call site), not the connections. Client CPU per lookup also drops at 0 ms (29 → 19 µs): no connection reserved and released per query.
+Before, throughput was capped at `max` lookups per round trip (10 per 6 ms at 5 ms). After, 100 callers at 5 ms match the driver's own `pool.query` (15,600 ops/s); beyond that, the builder's client CPU is the limit (about 19 µs per lookup, against about 4 µs for `pool.query`: building and rendering the query and capturing the call site), not the connections. That overhead was cut afterwards ([Columns resolved and quoted once per table](#columns-resolved-and-quoted-once-per-table)). Client CPU per lookup also drops at 0 ms (29 → 19 µs): no connection reserved and released per query.
 
 **Code.** `#shared`, `SESSION_STATEMENT` and `#run` in [driver-executor.ts](driver-executor.ts); `withShared` in [driver/pool.ts](driver/pool.ts); [test/driver/integration/builder-pool.test.ts](../test/driver/integration/builder-pool.test.ts).
 
-### Errors carry the query (hidden) and your call site
+### Errors carry the query (hidden) and the code awaiting it
 
-**What it is.** A failing query's error gets `query` (SQL and parameters) as a **non-enumerable** property and your code's stack appended (`--- query issued at ---`), from an `Error` created when the query was issued. Row-count errors name the table (`The query on "users" returned no row…`) ([EXECUTION.md](EXECUTION.md#errors)).
+**What it is.** A failing query's error gets `query` (SQL and parameters) as a **non-enumerable** property and your code's stack appended (`--- query issued at ---`). The stack is captured **when the query fails**, in the executor's `catch`, where the engine's async stack trace lists the async functions awaiting the query, yours included. Row-count errors name the table (`The query on "users" returned no row…`) ([EXECUTION.md](EXECUTION.md#errors)).
 
-**Why.** The driver's own stack ends in socket code, which says nothing about which line of yours ran the query. The parameters are there for debugging but don't print with `console.log(err)` or `JSON.stringify(err)`, so they can't leak into logs by accident (before #8, row-count errors exposed them).
+**Why.** The driver's own stack ends in socket code, which says nothing about which line of yours ran the query. The parameters are there for debugging but don't print with `console.log(err)` or `JSON.stringify(err)`, so they can't leak into logs by accident (before #8, row-count errors exposed them). Capturing on failure costs a query that succeeds nothing: from #3 until this change, `execute` and `batch` ran `new Error()` for every query, which on V8 costs about 2 µs however few frames it keeps (`Error.stackTraceLimit = 1` is no cheaper; only 0 frames is), a quarter of a pipelined point lookup's client CPU in #37's profile.
 
-**Alternatives.** Async stack traces only (they don't cross the driver's queue). Always print the query (leaks values).
+**Alternatives.**
 
-**Cost.** One `new Error()` per query to capture the stack; V8 only formats it if the stack is read. `callsites: false` turns it off.
+- A stack captured when the query is issued (the previous design): it also names a synchronous wrapper between the awaiting code and `execute()`, and the line that issued a query awaited later. About 2 µs per query on V8 (0.3 µs on Bun).
+- A shallower stack captured up front (`Error.captureStackTrace` with a small `stackTraceLimit`): measured, the fixed cost of walking the stack dominates, so it saves almost nothing.
+- Capturing only for slow queries, or when `onQuery` asks: errors are what call sites are for, and a failing query is rarely slow.
+- The driver error's own async stack: it is created in the socket's data handler, so it has no frames of yours. The stack has to be captured in the executor's continuation.
 
-**Code.** `decorate`, `#callsite` in [driver-executor.ts](driver-executor.ts); [call-site.ts](call-site.ts).
+**Cost.** What the stack lists depends on who awaits the query when it fails. Awaited right away (`await q.execute()`, `Promise.all`), it lists your function and its awaiting callers, more than before, since those that resumed after their own `await` were missing from a stack taken at issue time. A synchronous function that returns `q.execute()` to an async caller isn't listed (its caller is). A query started now and awaited later lists the code awaiting it when it failed, which may be none of yours. Every link from the executor up has to be an `await` for the chain to reach the caller, so `batch` settles its outcomes in its own continuation and `#run` awaits its callback. `stream` and `describe` still capture up front, once per stream or description. `callsites: false` turns it off.
+
+**Measured.** See [below](#columns-resolved-and-quoted-once-per-table): with the builder's caches, a point lookup's client CPU through a pool went from 21 to under 5 µs.
+
+**Code.** `issuedAt`, `decorate`, `#callsite` in [driver-executor.ts](driver-executor.ts); [test/driver/integration/call-sites.test.ts](../test/driver/integration/call-sites.test.ts).
 
 ### Nested `durable` transactions throw
 
