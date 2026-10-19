@@ -10,6 +10,7 @@ import { compile } from '../src/compile.js';
 import { databaseWith } from '../src/database.js';
 import { defineTable } from '../src/define-table.js';
 import { dec, inc } from '../src/increment.js';
+import { expressionBuilder } from '../src/expression-builder.js';
 import { insertInto } from '../src/insert-query-builder.js';
 import { update } from '../src/update-query-builder.js';
 import { fakeExecutor } from './helpers/executor.js';
@@ -322,5 +323,46 @@ describe('running an increment', () => {
 		expect(ran[0]?.sql).toBe(
 			'update "posts" set "views" = "views" + $1 where "posts"."id" = $2 returning "posts"."views" as "views"',
 		);
+	});
+});
+
+describe('the column nodes queries share', () => {
+	it('are left as they are by inc and dec, in set, upserts and setEach', () => {
+		const eb = expressionBuilder(posts);
+		const shared = [
+			eb.ref('posts.views')._quarry.node,
+			eb.ref('posts.likes')._quarry.node,
+			eb.ref('posts.balance')._quarry.node,
+		];
+		const before = structuredClone(shared);
+		update(posts)
+			.set((b) => ({ likes: inc(b.ref('posts.views')), views: inc(1) }))
+			.where('posts.id', 1)
+			.returning(['posts.views', 'posts.likes'])
+			.toSQL();
+		update(posts)
+			.set({ views: inc(1, { coalesce: true }) })
+			.setEach([{ id: 1, balance: dec('2') }], { key: 'id' })
+			.set({ likes: inc(2) })
+			.toSQL();
+		insertInto(posts)
+			.values({
+				key: 'k',
+				views: 0,
+				likes: null,
+				visits: '0',
+				balance: '0',
+				score: null,
+				title: 't',
+			})
+			.onConflict('key')
+			.doUpdate((excluded) => ({ views: inc(excluded.views) }))
+			.toSQL();
+		expect(shared).toEqual(before);
+		// the same objects keep rendering as plain references
+		expect(eb.ref('posts.views')._quarry.node).toBe(shared[0]);
+		expect(
+			update(posts).set({ title: 'x' }).where('posts.id', 1).toSQL().sql,
+		).toBe('update "posts" set "title" = $1 where "posts"."id" = $2');
 	});
 });
