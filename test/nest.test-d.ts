@@ -162,3 +162,9 @@ describe('nest', () => {
 		>();
 	});
 });
+
+describe('NullableColumn', () => {
+	it('still takes the table itself where its nullable type is in scope', () => {
+		left.forUpdate().of(bookings);
+	});
+});

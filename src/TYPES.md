@@ -432,7 +432,7 @@ type NullableTable<X> =
 
 `leftJoin(posts)` puts `NullableTable<typeof posts>` into the scope tuple; `rightJoin` turns the earlier tables into `NullableTables<T>` (a mapped tuple type) **and** the row already selected into `NullableRow<O>` (every key `| null`); `fullJoin` does both. Since only `$select` changes, comparisons on an outer table still take the column's values and its codec still decodes it: nullability is a property of the row, not of the SQL type. The run-time table object is the same; the cast in each join method is the type-level change only.
 
-`$inner` is optional, so a table is still assignable to its nullable type (`selectAll(posts)` on a left-joined `posts`). It lets `nest` tell an outer table from the others (`'$inner' extends keyof C`) and read each column as the table reads it in a row it has, unwrapped through every outer join.
+`$inner` is optional, so a table is still assignable to its nullable type (`forUpdate().of(posts)` on a left-joined `posts`). It lets `nest` tell an outer table from the others (`'$inner' extends keyof C`) and read each column as the table reads it in a row it has, unwrapped through every outer join.
 
 ### `nest`: an object per table
 
