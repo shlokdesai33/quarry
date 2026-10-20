@@ -78,16 +78,32 @@ export interface WriteResult {
 	readonly rowCount: number;
 }
 
+/** A column of a table: the column declared under a key, and its name in the database. */
+interface ColumnOf {
+	readonly column: AnyColumn;
+	readonly name: string;
+}
+
+/** Each table's columns by key, looked up once per table: only keys that name a column are kept. */
+const columnsOf = new WeakMap<AnyTable, Map<string, ColumnOf>>();
+
 /** The column declared under `key`, and its name in the database. */
-export function columnOf(
-	table: AnyTable,
-	key: string,
-): { readonly column: AnyColumn; readonly name: string } {
-	const column = table.schema.columns[key];
-	if (column === undefined) {
-		throw new Error(`Unknown column "${key}" in table "${table.name}"`);
+export function columnOf(table: AnyTable, key: string): ColumnOf {
+	let columns = columnsOf.get(table);
+	if (columns === undefined) {
+		columns = new Map();
+		columnsOf.set(table, columns);
 	}
-	return { column, name: column._quarry.columnName ?? key };
+	let found = columns.get(key);
+	if (found === undefined) {
+		const column = table.schema.columns[key];
+		if (column === undefined) {
+			throw new Error(`Unknown column "${key}" in table "${table.name}"`);
+		}
+		found = { column, name: column._quarry.columnName ?? key };
+		columns.set(key, found);
+	}
+	return found;
 }
 
 /** A value written to `column`: an expression as is, a value encoded by the column's codec. */
@@ -108,19 +124,25 @@ export function setNodes(
 	values: object,
 ): SetNode[] {
 	const nodes = [...set];
-	const entries = Object.entries(values);
+	const keys = Object.keys(values);
+	// read once each, before any is written, as Object.entries reads them
+	const given: unknown[] = [];
+	// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the values are a record of columns
+	for (const key of keys) given.push((values as Record<string, unknown>)[key]);
 	// a short list is searched; a long one indexed
 	const index =
-		set.length + entries.length > 32
+		set.length + keys.length > 32
 			? new Map(set.map((node, i) => [node.column, i]))
 			: undefined;
-	for (const [key, value] of entries) {
+	for (let k = 0; k < keys.length; k++) {
+		const value = given[k];
 		if (value === undefined) continue;
-		const { column, name } = columnOf(table, key);
+		// oxlint-disable-next-line typescript/no-non-null-assertion -- within bounds
+		const { column, name } = columnOf(table, keys[k]!);
 		const node = { column: name, value: valueNode(column, value) };
 		const at =
 			index === undefined
-				? nodes.findIndex((existing) => existing.column === name)
+				? indexOfColumn(nodes, name)
 				: (index.get(name) ?? -1);
 		if (at >= 0) nodes[at] = node;
 		else {
@@ -136,6 +158,12 @@ export function setNodes(
 	return nodes;
 }
 
+function indexOfColumn(nodes: readonly SetNode[], name: string): number {
+	for (let i = 0; i < nodes.length; i++)
+		if (nodes[i]?.column === name) return i;
+	return -1;
+}
+
 /**
  * Rows of values, aligned on the columns any of them has, in the order they
  * first appear; a column a row lacks is its `default`.
@@ -145,27 +173,47 @@ export function rowsNode(
 	rows: readonly object[],
 	strategy: RowsNode['strategy'],
 ): RowsNode {
-	const entries = rows.map((row) => Object.entries(row));
+	// each row's own enumerable keys and values, read once, as Object.entries reads them
+	const rowKeys: string[][] = [];
+	const rowValues: unknown[][] = [];
 	const keys: string[] = [];
-	for (const list of entries) {
-		for (const [key, value] of list) {
+	for (const row of rows) {
+		const own = Object.keys(row);
+		const values: unknown[] = [];
+		for (const key of own) {
+			// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- a row is a record of its columns
+			const value = (row as Record<string, unknown>)[key];
+			values.push(value);
 			if (value !== undefined && !keys.includes(key)) keys.push(key);
 		}
+		rowKeys.push(own);
+		rowValues.push(values);
 	}
-	const columns = keys.map((key) => columnOf(table, key).column);
+	const resolved = keys.map((key) => columnOf(table, key));
+	const cells: (OperationNode | undefined)[][] = [];
+	for (let r = 0; r < rowKeys.length; r++) {
+		// oxlint-disable-next-line typescript/no-non-null-assertion -- within bounds
+		const own = rowKeys[r]!;
+		// oxlint-disable-next-line typescript/no-non-null-assertion -- within bounds
+		const values = rowValues[r]!;
+		const row: (OperationNode | undefined)[] = [];
+		for (let i = 0; i < keys.length; i++) row.push(undefined);
+		for (let j = 0; j < own.length; j++) {
+			const value = values[j];
+			if (value === undefined) continue;
+			// oxlint-disable-next-line typescript/no-non-null-assertion -- within bounds
+			const key = own[j]!;
+			const i = keys[j] === key ? j : keys.indexOf(key);
+			// oxlint-disable-next-line typescript/no-non-null-assertion -- every defined key is in keys
+			row[i] = valueNode(resolved[i]!.column, value);
+		}
+		cells.push(row);
+	}
 	return {
-		columns: keys.map((key) => columnOf(table, key).name),
-		types: columns.map((column) => castType(column._quarry.dataType)),
-		codecs: columns.map((column) => column._quarry.dataType.codec),
-		rows: entries.map((list) => {
-			const cells: (OperationNode | undefined)[] = keys.map(() => undefined);
-			for (const [key, value] of list) {
-				if (value === undefined) continue;
-				const i = keys.indexOf(key);
-				cells[i] = valueNode(columns[i]!, value);
-			}
-			return cells;
-		}),
+		columns: resolved.map(({ name }) => name),
+		types: resolved.map(({ column }) => castType(column._quarry.dataType)),
+		codecs: resolved.map(({ column }) => column._quarry.dataType.codec),
+		rows: cells,
 		strategy,
 	};
 }
