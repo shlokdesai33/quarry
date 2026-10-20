@@ -526,7 +526,7 @@ export class SelectQueryBuilder<
 		AddRow<O, RowOf<RefsOf<T>, TableRefs<RefsOf<T>, N>>>,
 		L
 	> {
-		const tables = this.#state.tables.filter((t) => t.name === table);
+		const tables = tablesNamed(this.#state.tables, table);
 		if (tables.length === 0) {
 			throw new Error(`selectAll: "${table}" is not in the query`);
 		}
@@ -536,11 +536,12 @@ export class SelectQueryBuilder<
 			AddRow<O, RowOf<RefsOf<T>, TableRefs<RefsOf<T>, N>>>,
 			L
 		>(
-			this.#selecting(
-				tables.length === 1 && only !== undefined
-					? allSelections(only)
-					: tables.flatMap((t) => allSelections(t)),
-			),
+			tables.length === 1 &&
+				only !== undefined &&
+				this.#state.selections.length === 0
+				? // one table's columns, keyed by its column keys: unique
+					{ ...this.#state, selections: allSelections(only) }
+				: this.#selecting(tables.flatMap((t) => allSelections(t))),
 		);
 	}
 
@@ -1327,6 +1328,14 @@ export class SelectQueryBuilder<
 			shape,
 		);
 	}
+}
+
+/** The tables in scope named `name`. */
+function tablesNamed<T extends readonly AnyTable[]>(
+	tables: T,
+	name: string,
+): readonly T[number][] {
+	return tables.filter((t) => t.name === name);
 }
 
 /**
