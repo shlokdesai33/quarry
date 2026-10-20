@@ -89,15 +89,18 @@ describe('nest', () => {
 	});
 
 	it('throws for tables and columns not in the query', () => {
-		// oxlint-disable-next-line typescript/no-explicit-any -- what the types reject
-		const loose = left as any;
-		expect(() => loose.select(({ nest }: any) => [nest('posts')])).toThrow(
+		// @ts-expect-error not in the query
+		expect(() => left.select(({ nest }) => [nest('posts')])).toThrow(
 			'nest: "posts" is not in the query',
 		);
 		expect(() =>
-			loose.select(({ nest }: any) => [nest('bookings', ['email'])]),
+			// @ts-expect-error not a column of bookings
+			left.select(({ nest }) => [nest('bookings', ['email'])]),
 		).toThrow('nest: "bookings" has no column "email"');
-		expect(() => loose.select(({ nest }: any) => [nest('bookings', [])])).toThrow(
+		expect(() =>
+			// @ts-expect-error at least one column
+			left.select(({ nest }) => [nest('bookings', [])]),
+		).toThrow(
 			'nest: list at least one column of "bookings", or none for every column',
 		);
 		expect(() =>
@@ -110,10 +113,10 @@ describe('nest', () => {
 			left.select(({ nest }) => ['users.id', nest('bookings', ['id'])]),
 		).not.toThrow();
 		const nested = left.select(({ nest }) => [nest('bookings', ['id'])]);
-		// oxlint-disable-next-line typescript/no-explicit-any -- what the types reject
-		expect(() => (nested as any).select(({ nest }: any) => [nest('bookings')])).toThrow(
-			'select each key once: "bookings" is already in the row',
-		);
+		expect(() =>
+			// @ts-expect-error the key is taken
+			nested.select(({ nest }) => [nest('bookings')]),
+		).toThrow('select each key once: "bookings" is already in the row');
 	});
 
 	it("isn't a key to order or group by", () => {

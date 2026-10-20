@@ -260,12 +260,9 @@ describe('rowDecoder with nested objects', () => {
 	});
 
 	it('gives each row an object of its own', () => {
-		const a = decodeNested(['1', 't', int4(7), 'hi', 'ada']) as {
-			booking: object;
-		};
-		const b = decodeNested(['1', 't', int4(7), 'hi', 'ada']) as {
-			booking: object;
-		};
+		const a = Object(decodeNested(['1', 't', int4(7), 'hi', 'ada']));
+		const b = Object(decodeNested(['1', 't', int4(7), 'hi', 'ada']));
+		expect(a.booking).toEqual(b.booking);
 		expect(a.booking).not.toBe(b.booking);
 	});
 
@@ -321,8 +318,14 @@ describe('rowDecoder with nested objects', () => {
 			at,
 			shifted,
 		);
-		expect(Object.getOwnPropertyDescriptor(Object(row), '__proto__')?.value).toBe(0);
-		expect(row).toMatchObject({ id: 1, booking: { id: 7, note: 'hi' }, name: 'ada' });
+		expect(
+			Object.getOwnPropertyDescriptor(Object(row), '__proto__')?.value,
+		).toBe(0);
+		expect(row).toMatchObject({
+			id: 1,
+			booking: { id: 7, note: 'hi' },
+			name: 'ada',
+		});
 		expect(
 			decodeNested(['0', '1', 'f', null, null, 'ada'], 'array', at, shifted),
 		).toEqual([0, 1, null, 'ada']);

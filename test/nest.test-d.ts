@@ -55,7 +55,8 @@ describe('nest', () => {
 			selectFrom(users)
 				.innerJoin(bookings)
 				.on('bookings.userId', 'users.id')
-				.select(({ nest }) => [nest('users', ['id']), nest('bookings')]).$output,
+				.select(({ nest }) => [nest('users', ['id']), nest('bookings')])
+				.$output,
 		).toEqualTypeOf<{ users: { id: number }; bookings: Booking }>();
 		expectTypeOf(
 			left.select(({ nest }) => [nest('users')]).$output,
@@ -71,7 +72,10 @@ describe('nest', () => {
 				.on('bookings.userId', 'users.id')
 				.select(({ nest }) => [nest('users', ['id']), nest('bookings', ['id'])])
 				.$output,
-		).toEqualTypeOf<{ users: { id: number } | null; bookings: { id: number } }>();
+		).toEqualTypeOf<{
+			users: { id: number } | null;
+			bookings: { id: number };
+		}>();
 		expectTypeOf(
 			selectFrom(users)
 				.fullJoin(bookings)

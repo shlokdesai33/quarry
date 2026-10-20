@@ -64,7 +64,7 @@ type InnerColumn<C> =
 type NestedRow<X extends AnyTable, K extends ColumnKey<X>> =
 	IsOuter<X['schema']['columns'][K]> extends true
 		? { [C in K]: InnerColumn<X['schema']['columns'][C]>['$select'] } | null
-	: { [C in K]: InnerColumn<X['schema']['columns'][C]>['$select'] };
+		: { [C in K]: InnerColumn<X['schema']['columns'][C]>['$select'] };
 
 /**
  * Selects columns of the table that goes by `table` in the query (its

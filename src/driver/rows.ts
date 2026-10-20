@@ -73,7 +73,8 @@ function entriesOf(
 	const entries: Entry[] = [];
 	for (let i = 0; i < names.length; i++) {
 		const object = markers.get(i);
-		if (object !== undefined) entries.push({ key: object.key, column: i, object });
+		if (object !== undefined)
+			entries.push({ key: object.key, column: i, object });
 		else if (!inner.has(i))
 			entries.push({ key: names[i] ?? '', column: i, object: undefined });
 	}

@@ -23,9 +23,7 @@ export type Selection<R extends Refs> =
 	| AliasedExpression<unknown, string>;
 
 /** An entry of a select list: a selection, or a nested object (`nest`). */
-export type SelectItem<R extends Refs> =
-	| Selection<R>
-	| Nested<unknown, string>;
+export type SelectItem<R extends Refs> = Selection<R> | Nested<unknown, string>;
 
 /** The key a selection has in the result row. */
 export type KeyOf<S> = S extends `${string}.${infer C}`
