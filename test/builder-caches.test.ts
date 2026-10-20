@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { identifier } from '../src/compile.js';
+import { compile, identifier, isDataStatement } from '../src/compile.js';
 import { integer, text } from '../src/column-factories.js';
+import { databaseWith } from '../src/database.js';
 import { defineTable } from '../src/define-table.js';
-import { expressionBuilder } from '../src/expression-builder.js';
+import type { Executor } from '../src/executor.js';
+import { allSelections, expressionBuilder } from '../src/expression-builder.js';
 import { insertInto } from '../src/insert-query-builder.js';
 import { selectFrom } from '../src/select-query-builder.js';
+import { sql } from '../src/sql.js';
 import { update } from '../src/update-query-builder.js';
 
 const users = defineTable('users', {
@@ -135,5 +138,130 @@ describe('what the builders reuse across queries', () => {
 			sql: 'insert into "users" ("id", "first_name", "email") values ($1, $2, default), ($3, $4, $5), ($6, $7, default)',
 			params: [1, 'a', 2, 'b', 'x', 3, 'c'],
 		});
+	});
+
+	it('renders each shape right when shapes that share a start interleave', () => {
+		const shapes = [
+			(i: number) => selectFrom(users).where('users.id', i).selectAll(),
+			(i: number) =>
+				selectFrom(users).where('users.email', `e${i}`).selectAll(),
+			(i: number) =>
+				selectFrom(users).where('users.id', i).selectAll().limit(1),
+			(i: number) => selectFrom(users).selectAll().where('users.id', i),
+			(i: number) => selectFrom(legacyUsers).where('users.id', i).selectAll(),
+		];
+		const expected = [
+			'select "users"."id" as "id", "users"."first_name" as "firstName", "users"."email" as "email" from "users" where "users"."id" = $1',
+			'select "users"."id" as "id", "users"."first_name" as "firstName", "users"."email" as "email" from "users" where "users"."email" = $1',
+			'select "users"."id" as "id", "users"."first_name" as "firstName", "users"."email" as "email" from "users" where "users"."id" = $1 limit $2',
+			'select "users"."id" as "id", "users"."first_name" as "firstName", "users"."email" as "email" from "users" where "users"."id" = $1',
+			'select "users"."user_id" as "id", "users"."given_name" as "firstName" from "users" where "users"."user_id" = $1',
+		];
+		for (let round = 0; round < 3; round++) {
+			shapes.forEach((shape, i) => {
+				expect(shape(round).toSQL().sql).toBe(expected[i]);
+			});
+		}
+	});
+
+	it('writes out a query past the bounds of the rendered-SQL trie', () => {
+		const rows = Array.from({ length: 400 }, (_, i) => ({
+			id: i,
+			firstName: `n${i}`,
+			email: i % 2 === 0 ? missing : 'x',
+		}));
+		let n = 0;
+		const values = rows
+			.map(
+				(row) =>
+					`($${++n}, $${++n}, ${row.email === undefined ? 'default' : `$${++n}`})`,
+			)
+			.join(', ');
+		const insert = `insert into "users" ("id", "first_name", "email") values ${values}`;
+		const long = 'x'.repeat(5000);
+		const literal = `select "users"."id" as "id" from "users" where "users"."first_name" = '${long}' and "users"."id" = $1`;
+		for (let round = 0; round < 2; round++) {
+			expect(insertInto(users).values(rows).toSQL().sql).toBe(insert);
+			expect(
+				selectFrom(users)
+					.where((eb) =>
+						eb.and([
+							sql<boolean>`${eb.ref('users.firstName')} = ${sql.lit(long)}`,
+							eb.ref('users.id').eq(1),
+						]),
+					)
+					.select(['users.id'])
+					.toSQL().sql,
+			).toBe(literal.replace('where ', 'where (').concat(')'));
+		}
+	});
+
+	it('shares one frozen list of every column per table, still checking keys', () => {
+		expect(allSelections(users)).toBe(allSelections(users));
+		expect(Object.isFrozen(allSelections(users))).toBe(true);
+		expect(allSelections(users).map((s) => s.alias)).toEqual([
+			'id',
+			'firstName',
+			'email',
+		]);
+		const both = selectFrom(users)
+			.innerJoin(legacyUsers.as('legacy'))
+			.on('legacy.id', 'users.id')
+			.selectAll('legacy')
+			.toSQL();
+		expect(both.sql).toBe(
+			'select "legacy"."user_id" as "id", "legacy"."given_name" as "firstName" from "users" inner join "users" as "legacy" on "legacy"."user_id" = "users"."id"',
+		);
+		expect(
+			selectFrom(users)
+				.innerJoin(legacyUsers.as('legacy'))
+				.on('legacy.id', 'users.id')
+				.select(['users.email'])
+				.selectAll('legacy')
+				.toSQL().sql,
+		).toBe(
+			'select "users"."email" as "email", "legacy"."user_id" as "id", "legacy"."given_name" as "firstName" from "users" inner join "users" as "legacy" on "legacy"."user_id" = "users"."id"',
+		);
+		expect(() =>
+			selectFrom(users)
+				.select(['users.id'])
+				// @ts-expect-error -- id is already in the row
+				.selectAll(),
+		).toThrow('select each key once: "id" is already in the row');
+		expect(() =>
+			insertInto(users)
+				.values({ id: 1, firstName: 'a', email: null })
+				.returning(['users.email'])
+				// @ts-expect-error -- email is already in the row
+				.returningAll(),
+		).toThrow('select each key once: "email" is already in the row');
+		expect(
+			update(users).set({ id: 2 }).where('users.id', 1).returningAll().toSQL()
+				.sql,
+		).toBe(
+			'update "users" set "id" = $1 where "users"."id" = $2 returning "users"."id" as "id", "users"."first_name" as "firstName", "users"."email" as "email"',
+		);
+	});
+
+	it('marks what it compiles from a select or a write, not SQL written by hand', () => {
+		// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- never run
+		const db = databaseWith({} as Executor);
+		const select = selectFrom(users).where('users.id', 1).selectAll().toSQL();
+		expect(isDataStatement(select)).toBe(true);
+		expect(
+			isDataStatement(
+				insertInto(users)
+					.values({ id: 1, firstName: 'a', email: null })
+					.toSQL(),
+			),
+		).toBe(true);
+		expect(isDataStatement(db.sql`begin`.toSQL())).toBe(false);
+		expect(isDataStatement(db.sql`select 1`.toSQL())).toBe(false);
+		expect(isDataStatement({ ...select })).toBe(false);
+		expect(
+			isDataStatement(
+				compile({ kind: 'raw', fragments: ['set x = 1'], nodes: [] }),
+			),
+		).toBe(false);
 	});
 });
