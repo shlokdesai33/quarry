@@ -66,10 +66,11 @@ out = []
 seq = ["select1", "pk", "range100", "fetch1k", "insert1", "update", "tx-insert", "savepoints", "error"]
 out.append(table("Sequential latency (p50), Node 24", [(TITLE[s], s) for s in seq], NODE, main_cell("node", "p50"), t, True))
 big = ["fetch100k", "fetch1m", "wide", "large-bytea", "large-text", "large-jsonb", "arrays", "stream1m"]
-out.append(table("Large results (time per fetch), Node 24", [(TITLE[s], s) for s in big], NODE, main_cell("node", "p50"), t, True))
+out.append(table("Large results (time per fetch, p50), Node 24", [(TITLE[s], s) for s in big], NODE, main_cell("node", "p50"), t, True))
+out.append(table("Large results (time per fetch, mean), Node 24", [(TITLE[s], s) for s in big], NODE, main_cell("node", "mean"), t, True))
 
 bun_rows = [
-    ("point lookup (p50)", "pk", "p50", t), ("fetch 1k rows (fetches/s)", "fetch1k", "throughput", r), ("fetch 1M rows", "fetch1m", "p50", t),
+    ("point lookup (p50)", "pk", "p50", t), ("fetch 1k rows (fetches/s)", "fetch1k", "throughput", r), ("fetch 1M rows (p50)", "fetch1m", "p50", t), ("fetch 1M rows (mean)", "fetch1m", "mean", t),
     ("wide rows", "wide", "p50", t), ("arrays", "arrays", "p50", t), ("multi-row insert, 100 rows (ops/s)", "insert-multi100", "throughput", r),
     ("50 concurrent inserts, pool 10 (ops/s)", "insert1-c50", "throughput", r), ("begin; insert; commit (ops/s)", "tx-insert", "throughput", r),
     ("connect + select 1 + close", "connect-plain-trust", "p50", t),

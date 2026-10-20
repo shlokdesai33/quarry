@@ -551,6 +551,18 @@ for (const runtime of RUNTIMES) {
 			true,
 		),
 	);
+	// a large result's p50 moves with where GC pauses fall; the mean doesn't
+	out.push(
+		table(
+			`${RT[runtime]}: large results and bulk work, time per operation (mean)`,
+			'Scenario',
+			BIG.map((s) => ({ label: title(s), pick: mainPick(runtime, s, 'mean') })),
+			drivers,
+			fmtTime,
+			true,
+			true,
+		),
+	);
 	out.push(
 		table(
 			`${RT[runtime]}: rows per second (median)`,

@@ -227,10 +227,13 @@ async function runOps(
 				while ((done < min || performance.now() - start < ms) && seq < maxOps) {
 					const i = seq++;
 					const t = performance.now();
-					const r = await s.op(d, i, ctx);
+					let r: unknown = await s.op(d, i, ctx);
 					const took = performance.now() - t;
 					record?.(took);
 					s.check?.(r, i);
+					// a suspended async frame keeps its registers: without this, each
+					// result stays alive through the next operation
+					r = undefined;
 					done++;
 				}
 			}),
@@ -240,6 +243,9 @@ async function runOps(
 	// warm-up: JIT, prepared statements, every pool connection opened
 	await loopFor(warmupMs, warmupOps);
 	await freshGc();
+	// the forced GC also resets the heap's sizing: run the window from a heap
+	// that has just done this work, as it would be in a loop that's running
+	if (!equalWork) await loopFor(0, warmupOps);
 	let lat = new Float64Array(1 << 14);
 	let n = 0;
 	const record = (ms: number) => {
