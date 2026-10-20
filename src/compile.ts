@@ -15,6 +15,7 @@ import type {
 	UpdateNode,
 } from './node.js';
 import { arrayOf, declareParamType, type Codec } from './driver/codec.js';
+import type { NestedObject } from './driver/rows.js';
 
 export interface CompiledQuery {
 	readonly sql: string;
@@ -36,6 +37,12 @@ export interface CompiledQuery {
 	 * statement's columns are described.
 	 */
 	readonly resultCodecs?: readonly (Codec | null)[] | undefined;
+	/**
+	 * The result columns read into objects of the row (`nest`), each in
+	 * place of its marker column; absent when there are none. Like
+	 * `resultCodecs`, not an own property.
+	 */
+	readonly nested?: readonly NestedObject[] | undefined;
 	/** The query's label from `tag()`, if any. It is not part of `sql`. */
 	readonly tag?: string;
 }
@@ -90,7 +97,29 @@ export function compile(node: StatementNode): CompiledQuery {
 		tag,
 		params.typed ? params.codecs : undefined,
 		resultCodecs,
+		nestedObjects(selections),
 	);
+}
+
+/** The nested objects of a select list, by the positions of their entries; undefined when it has none. */
+function nestedObjects(
+	selections: readonly SelectionNode[],
+): NestedObject[] | undefined {
+	let objects:
+		| { key: string; marker: number; columns: [number, string][] }[]
+		| undefined;
+	for (let i = 0; i < selections.length; i++) {
+		const nest = selections[i]?.nest;
+		if (nest === undefined) continue;
+		objects ??= [];
+		if (nest.column === undefined)
+			objects.push({ key: nest.key, marker: i, columns: [] });
+		else
+			objects
+				.find((object) => object.key === nest.key)
+				?.columns.push([i, nest.column]);
+	}
+	return objects;
 }
 
 /**
@@ -103,6 +132,7 @@ class Compiled implements CompiledQuery {
 	declare readonly tag?: string;
 	readonly #paramCodecs: readonly (Codec | undefined)[] | undefined;
 	readonly #resultCodecs: readonly (Codec | null)[] | undefined;
+	readonly #nested: readonly NestedObject[] | undefined;
 
 	constructor(
 		sql: string,
@@ -110,12 +140,14 @@ class Compiled implements CompiledQuery {
 		tag: string | undefined,
 		paramCodecs: readonly (Codec | undefined)[] | undefined,
 		resultCodecs: readonly (Codec | null)[] | undefined,
+		nested: readonly NestedObject[] | undefined,
 	) {
 		this.sql = sql;
 		this.params = params;
 		if (tag !== undefined) Object.assign(this, { tag });
 		this.#paramCodecs = paramCodecs;
 		this.#resultCodecs = resultCodecs;
+		this.#nested = nested;
 	}
 
 	get paramCodecs(): readonly (Codec | undefined)[] | undefined {
@@ -124,6 +156,10 @@ class Compiled implements CompiledQuery {
 
 	get resultCodecs(): readonly (Codec | null)[] | undefined {
 		return this.#resultCodecs;
+	}
+
+	get nested(): readonly NestedObject[] | undefined {
+		return this.#nested;
 	}
 }
 

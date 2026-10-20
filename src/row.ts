@@ -1,4 +1,6 @@
+import { identifier } from './compile.js';
 import type { Codec } from './driver/codec.js';
+import { codecs } from './driver/codecs.js';
 import {
 	Param,
 	TypedExpression,
@@ -9,6 +11,7 @@ import {
 	resolveReference,
 	type ExpressionBuilder,
 } from './expression-builder.js';
+import { Nested } from './nest.js';
 import type { SelectionNode } from './node.js';
 import type { Ref, Refs } from './refs.js';
 import type { AnyTable } from './table.js';
@@ -19,12 +22,19 @@ export type Selection<R extends Refs> =
 	| Ref<R>
 	| AliasedExpression<unknown, string>;
 
+/** An entry of a select list: a selection, or a nested object (`nest`). */
+export type SelectItem<R extends Refs> =
+	| Selection<R>
+	| Nested<unknown, string>;
+
 /** The key a selection has in the result row. */
 export type KeyOf<S> = S extends `${string}.${infer C}`
 	? C
 	: S extends AliasedExpression<unknown, infer A>
 		? A
-		: never;
+		: S extends Nested<unknown, infer A>
+			? A
+			: never;
 
 /** The type a selection has in the result row. */
 export type ValueOf<R extends Refs, S> =
@@ -32,7 +42,9 @@ export type ValueOf<R extends Refs, S> =
 		? R[S]['$select']
 		: S extends AliasedExpression<infer T, string>
 			? T
-			: never;
+			: S extends Nested<infer T, string>
+				? T
+				: never;
 
 /** The row the selections `S` over the references `R` produce. */
 export type RowOf<R extends Refs, S> = {
@@ -158,17 +170,56 @@ export function allColumns(table: AnyTable): string[] {
  */
 export function selectionNodes<R extends Refs>(
 	eb: ExpressionBuilder<R>,
-	selections: readonly Selection<R>[],
+	selections: readonly SelectItem<R>[],
 ): SelectionNode[] {
-	return selections.map((selection): SelectionNode => {
+	const nodes: SelectionNode[] = [];
+	for (const selection of selections) {
 		if (typeof selection === 'string')
-			return resolveReference(eb, selection).selection;
-		return {
-			expression: selection.expression._quarry.node,
-			alias: selection.alias,
-			codec: codecOf(selection.expression),
-		};
-	});
+			nodes.push(resolveReference(eb, selection).selection);
+		else if (selection instanceof Nested)
+			nodes.push(...nestedNodes(eb, selection));
+		else
+			nodes.push({
+				expression: selection.expression._quarry.node,
+				alias: selection.alias,
+				codec: codecOf(selection.expression),
+			});
+	}
+	return nodes;
+}
+
+/**
+ * The entries of a nested object: its marker, `table.ctid is not null`,
+ * keyed by the object's key, then each column, keyed `key.column`. A
+ * table's `ctid` is never null in a row it has, so the marker tells a
+ * missing row from one whose columns are all null.
+ */
+function nestedNodes<R extends Refs>(
+	eb: ExpressionBuilder<R>,
+	{ alias, _quarry: { table, columns } }: Nested<unknown, string>,
+): SelectionNode[] {
+	const marker: SelectionNode = {
+		expression: {
+			kind: 'raw',
+			fragments: [`(${identifier(table)}.ctid is not null)`],
+			nodes: [],
+		},
+		alias,
+		codec: codecs.bool,
+		nest: { key: alias, column: undefined },
+	};
+	return [
+		marker,
+		...columns.map((column): SelectionNode => {
+			const { node, selection } = resolveReference(eb, `${table}.${column}`);
+			return {
+				expression: node,
+				alias: `${alias}.${column}`,
+				codec: selection.codec,
+				nest: { key: alias, column },
+			};
+		}),
+	];
 }
 
 /** The codec an expression's values are read with, when its SQL type is known. */

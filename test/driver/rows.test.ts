@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { DecodeError, ProtocolError } from '../../src/driver/errors.js';
+import {
+	DecodeError,
+	DriverError,
+	ProtocolError,
+} from '../../src/driver/errors.js';
 import type { Field } from '../../src/driver/protocol/messages.js';
 import { Writer } from '../../src/driver/protocol/writer.js';
 import { defineCodec } from '../../src/driver/codec.js';
@@ -9,7 +13,11 @@ import {
 	TypeCatalog,
 	type CodecRegistry,
 } from '../../src/driver/registry.js';
-import { rowDecoder as decoderOf } from '../../src/driver/rows.js';
+import {
+	checkNested,
+	rowDecoder as decoderOf,
+	type NestedObject,
+} from '../../src/driver/rows.js';
 import { oids } from '../../src/driver/types.js';
 
 /** A decoder reading each column with the registry's codec for its type. */
@@ -185,5 +193,151 @@ describe('rowDecoder', () => {
 		// the 10th value's length, past the end of the row
 		new DataView(bad.buffer).setInt32(bad.length - 5, 1000);
 		expect(() => decoder(bad, 0, bad.length)).toThrow(/Invalid value length/);
+	});
+});
+
+describe('rowDecoder with nested objects', () => {
+	const fields = [
+		field('id', oids.int4),
+		field('booking', oids.bool),
+		field('booking.id', oids.int4, 1),
+		field('booking.note', oids.text),
+		field('name', oids.text),
+	];
+	const nested: NestedObject[] = [
+		{
+			key: 'booking',
+			marker: 1,
+			columns: [
+				[2, 'id'],
+				[3, 'note'],
+			],
+		},
+	];
+
+	function decodeNested(
+		values: readonly (string | Uint8Array | null)[],
+		mode: 'object' | 'array' = 'object',
+		at: readonly Field[] = fields,
+		objects: readonly NestedObject[] = nested,
+	): unknown {
+		const body = payload(values);
+		return decoderOf(
+			at,
+			at.map((f) => defaultRegistry.codecFor(f.typeOid, new TypeCatalog())),
+			mode,
+			objects,
+		)(body, 0, body.length);
+	}
+
+	it('reads the columns into the object in place of its marker', () => {
+		const row = decodeNested(['1', 't', int4(7), 'hi', 'ada']);
+		expect(row).toEqual({ id: 1, booking: { id: 7, note: 'hi' }, name: 'ada' });
+		expect(Object.keys(Object(row))).toEqual(['id', 'booking', 'name']);
+		expect(decodeNested(['1', 't', int4(7), 'hi', 'ada'], 'array')).toEqual([
+			1,
+			{ id: 7, note: 'hi' },
+			'ada',
+		]);
+	});
+
+	it('is null where the marker is false or null, an object of nulls where it is true', () => {
+		expect(decodeNested(['1', 'f', null, null, 'ada'])).toEqual({
+			id: 1,
+			booking: null,
+			name: 'ada',
+		});
+		expect(decodeNested(['1', null, null, null, 'ada'])).toEqual({
+			id: 1,
+			booking: null,
+			name: 'ada',
+		});
+		expect(decodeNested(['1', 't', null, null, 'ada'])).toEqual({
+			id: 1,
+			booking: { id: null, note: null },
+			name: 'ada',
+		});
+	});
+
+	it('gives each row an object of its own', () => {
+		const a = decodeNested(['1', 't', int4(7), 'hi', 'ada']) as {
+			booking: object;
+		};
+		const b = decodeNested(['1', 't', int4(7), 'hi', 'ada']) as {
+			booking: object;
+		};
+		expect(a.booking).not.toBe(b.booking);
+	});
+
+	it('reads several objects, across generated functions', () => {
+		const wide = [
+			...Array.from({ length: 9 }, (_, i) => field(`c${i}`, oids.int4)),
+			field('a', oids.bool),
+			field('a.x', oids.int4),
+			field('b', oids.bool),
+			field('b.x', oids.int4),
+			field('b.y', oids.text),
+		];
+		const values = [
+			...Array.from({ length: 9 }, (_, i) => String(i)),
+			't',
+			'1',
+			'f',
+			null,
+			null,
+		];
+		const objects: NestedObject[] = [
+			{ key: 'a', marker: 9, columns: [[10, 'x']] },
+			{
+				key: 'b',
+				marker: 11,
+				columns: [
+					[12, 'x'],
+					[13, 'y'],
+				],
+			},
+		];
+		const row = decodeNested(values, 'object', wide, objects);
+		expect(row).toMatchObject({ c0: 0, c8: 8, a: { x: 1 }, b: null });
+		expect(Object.keys(Object(row))).toHaveLength(11);
+	});
+
+	it('nests without generated code', () => {
+		// a `__proto__` column takes the decoder without generated code
+		const at = [field('__proto__', oids.int4), ...fields];
+		const shifted: NestedObject[] = [
+			{
+				key: 'booking',
+				marker: 2,
+				columns: [
+					[3, 'id'],
+					[4, 'note'],
+				],
+			},
+		];
+		const row = decodeNested(
+			['0', '1', 't', int4(7), 'hi', 'ada'],
+			'object',
+			at,
+			shifted,
+		);
+		expect(Object.getOwnPropertyDescriptor(Object(row), '__proto__')?.value).toBe(0);
+		expect(row).toMatchObject({ id: 1, booking: { id: 7, note: 'hi' }, name: 'ada' });
+		expect(
+			decodeNested(['0', '1', 'f', null, null, 'ada'], 'array', at, shifted),
+		).toEqual([0, 1, null, 'ada']);
+	});
+
+	it('rejects columns before their marker, or in two objects', () => {
+		expect(() =>
+			checkNested([{ key: 'a', marker: 2, columns: [[1, 'x']] }]),
+		).toThrow(DriverError);
+		expect(() =>
+			checkNested([
+				{ key: 'a', marker: 0, columns: [[1, 'x']] },
+				{ key: 'b', marker: 2, columns: [[1, 'x']] },
+			]),
+		).toThrow(DriverError);
+		expect(() => checkNested(nested)).not.toThrow();
 	});
 });

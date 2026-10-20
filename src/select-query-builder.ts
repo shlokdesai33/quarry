@@ -24,6 +24,7 @@ import type {
 	SelectionNode,
 	TableNode,
 } from './node.js';
+import type { SelectBuilder } from './nest.js';
 import type { AnyPredicate, EqualsValue } from './operators.js';
 import {
 	checkSize,
@@ -48,7 +49,7 @@ import {
 	type AddRow,
 	checkUniqueKeys,
 	type RowOf,
-	type Selection,
+	type SelectItem,
 	selectionNodes,
 	type TableRefs,
 	type UniqueColumns,
@@ -489,19 +490,25 @@ export class SelectQueryBuilder<
 
 	/**
 	 * Adds to the select list. A column is keyed by its name, an expression
-	 * by its alias. Each key can be in the row once: selecting a second
-	 * column of the same name is a type error, which `.as()` resolves.
+	 * by its alias, and `nest`'s object of a table's columns by the table's
+	 * name. Each key can be in the row once: selecting a second column of
+	 * the same name is a type error, which `.as()` resolves.
 	 *
 	 * @example .select(['users.id', 'contacts.email'])
 	 * @example .select((eb) => [eb.fn.lower('users.email').as('email')])
 	 * @example .select((eb) => ['users.email', eb.ref('managers.email').as('managerEmail')])
+	 * @example .select(({ nest }) => ['users.id', nest('bookings', ['id', 'name'])])
 	 */
-	select<const S extends readonly Selection<RefsOf<T>>[]>(
-		selections: S | ((eb: ExpressionBuilder<RefsOf<T>>) => S),
+	select<const S extends readonly SelectItem<RefsOf<T>>[]>(
+		selections: S | ((eb: SelectBuilder<T>) => S),
 		..._unique: UniqueKeys<O, S>
 	): SelectQueryBuilder<T, AddRow<O, RowOf<RefsOf<T>, S[number]>>, L> {
 		const eb = expressionBuilder(...this.#state.tables);
-		const list = typeof selections === 'function' ? selections(eb) : selections;
+		const list =
+			typeof selections === 'function'
+				? // eslint-disable-next-line typescript/no-unsafe-type-assertion -- every builder has `nest`, typed for select lists only
+					selections(eb as unknown as SelectBuilder<T>)
+				: selections;
 		return new SelectQueryBuilder<T, AddRow<O, RowOf<RefsOf<T>, S[number]>>, L>(
 			this.#selecting(selectionNodes(eb, list)),
 		);
@@ -1252,9 +1259,15 @@ export class SelectQueryBuilder<
 			const item = typeof key === 'function' ? key(eb) : key;
 			if (typeof item !== 'string') return item._quarry.node;
 			if (item.includes('.')) return eb.ref(item)._quarry.node;
-			if (!this.#state.selections.some((s) => s.alias === item)) {
+			const selected = this.#state.selections.find((s) => s.alias === item);
+			if (selected === undefined) {
 				throw new Error(
 					`"${item}" is not a key of the row: select it first, or name a column as 'table.column'`,
+				);
+			}
+			if (selected.nest !== undefined) {
+				throw new Error(
+					`"${item}" is a nested object: name one of its columns as 'table.column'`,
 				);
 			}
 			return { kind: 'alias', alias: item };

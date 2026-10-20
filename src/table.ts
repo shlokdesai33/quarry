@@ -59,6 +59,12 @@ export interface NullableColumn<C extends AnyColumn> {
 	readonly $insert: C['$insert'];
 	readonly $update: C['$update'];
 	readonly _quarry: C['_quarry'];
+	/**
+	 * Phantom: the column itself, as it reads in a row its table has (see
+	 * `nest`). Never set; optional, so that the table itself is still
+	 * assignable to its nullable type.
+	 */
+	readonly $inner?: C;
 }
 
 /**
