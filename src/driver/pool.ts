@@ -184,7 +184,9 @@ const NARROW_BACKOFF = 1024;
  *   `NARROWER_WORSE` times, the width goes back, and the next try waits
  *   four times as long (up to `NARROW_BACKOFF` epochs). It goes back at once
  *   if, once it settled, completions come at under three fifths of the
- *   rate before (a clock read per 256 completions while judged): under
+ *   rate before, overall and in each of the last four windows of 256
+ *   completions (a clock read per window while judged), so a client pause
+ *   that slows one window doesn't undo it: under
  *   CPU contention the CPUs stay busy, so that only happens behind slow
  *   queries, and the next try waits `NARROW_BACKOFF` epochs;
  * - below `STALLED_LOW`, while queries are pipelined or queued at the
@@ -237,6 +239,10 @@ export class Width {
 	#trialStart = 0;
 	#trialTick = 0;
 	#trialPace = 0;
+	/** The last pace check (time and completion count), and how many in a row found completions slower. */
+	#checkTime = 0;
+	#checkTick = 0;
+	#slowChecks = 0;
 
 	constructor(max: number, now: () => number = () => performance.now()) {
 		this.limit = max;
@@ -287,16 +293,21 @@ export class Width {
 		slot.lastDone = tick;
 		this.#load += inFlight + waiting;
 		// a narrowing that slows completions down by two fifths is undone without waiting for its epochs
-		if (
-			this.#from > 0 &&
-			!this.#settling &&
-			(tick & 255) === 0 &&
-			tick - this.#trialTick >= 1024
-		) {
+		if (this.#from > 0 && !this.#settling && (tick & 255) === 0) {
 			const now = this.#now();
+			// in every window since the last check, not only overall: a client
+			// pause (GC, the process descheduled) slows the one it falls in
+			const slow =
+				(now - this.#checkTime) * 0.6 >
+				(tick - this.#checkTick) * this.#trialPace;
+			this.#checkTime = now;
+			this.#checkTick = tick;
+			this.#slowChecks = slow ? this.#slowChecks + 1 : 0;
 			if (
+				this.#slowChecks >= 4 &&
+				tick - this.#trialTick >= 1024 &&
 				(now - this.#trialStart) * 0.6 >
-				(tick - this.#trialTick) * this.#trialPace
+					(tick - this.#trialTick) * this.#trialPace
 			)
 				return this.#revert(now, true);
 		}
@@ -353,6 +364,9 @@ export class Width {
 			// a narrowing's pace is judged from here: dropped connections compete for the CPUs until they finish
 			this.#trialStart = now;
 			this.#trialTick = this.#ticks;
+			this.#checkTime = now;
+			this.#checkTick = this.#ticks;
+			this.#slowChecks = 0;
 			return false;
 		}
 		this.#epoch(now);
