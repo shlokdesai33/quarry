@@ -1,5 +1,6 @@
 import type { ExpressionBuilder } from './expression-builder.js';
 import type { RefsOf } from './refs.js';
+import type { Repeated } from './row.js';
 import type { AnyTable } from './table.js';
 
 /**
@@ -86,8 +87,21 @@ export interface Nest<T extends readonly AnyTable[]> {
 	>(
 		table: N,
 		columns: C,
+		..._once: ListedOnce<C>
 	): Nested<NestedRow<TableNamed<T, N>, C[number]>, N>;
 }
+
+/** Nothing when no column of `C` is listed twice; otherwise one more argument naming it, so the call fails. */
+type ListedOnce<C extends readonly string[]> = [Repeated<C, never>] extends [
+	never,
+]
+	? []
+	: [
+			listedTwice: `list each column once: "${Repeated<C, never> & string}" is listed twice`,
+		];
+
+/** The key a select-list entry `S` gives a `nest` object; never for any other entry. */
+export type NestedKey<S> = S extends Nested<unknown, infer A> ? A : never;
 
 /** The expression builder of a select list over the tables `T`: it also has `nest`. */
 export type SelectBuilder<T extends readonly AnyTable[]> = ExpressionBuilder<

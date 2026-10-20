@@ -454,7 +454,9 @@ type NestedRow<X extends AnyTable, K extends ColumnKey<X>> =
 		: { [C in K]: InnerColumn<X['schema']['columns'][C]>['$select'] };
 ```
 
-A table on the outer side of a join gives `{…} | null`, with its columns typed as the table's own, since the object exists only where the table has a row. The base table, an inner join and a cross join give `{…}`. A `rightJoin` after a `nest` makes the object nullable through `NullableRow<O>`, like any selected column. A `Nested<T, A>` is a select-list entry like an aliased expression: `KeyOf` gives its key `A` and `ValueOf` its type `T`. So `UniqueKeys` checks the object's key against the row, and never the columns inside it. `.as(B)` gives a `Nested<T, B>`.
+A table on the outer side of a join gives `{…} | null`, with its columns typed as the table's own, since the object exists only where the table has a row. The base table, an inner join and a cross join give `{…}`. A `rightJoin` after a `nest` makes the object nullable through `NullableRow<O>`, like any selected column. A `Nested<T, A>` is a select-list entry like an aliased expression: `KeyOf` gives its key `A` and `ValueOf` its type `T`. So `UniqueKeys` checks the object's key against the row, and never the columns inside it. `.as(B)` gives a `Nested<T, B>`. Listing a column twice is a type error through an impossible extra argument (`ListedOnce`, built on the same `Repeated` as `UniqueKeys`).
+
+An object's key holds no column, so it can't be ordered, grouped or keyset-paginated by. Nothing in `O` tells an object from a jsonb column, so the select builder keeps the object keys in a fourth type parameter, `K` (default `never`, read as `$nested`). `select` adds `NestedKey<S[number]>` to it, `when` and `pipe` add their piece's, and the joins carry it. `Key<R, O, K>` (`orderBy`, `groupBy`, `distinctOn`) and `KeyColumn<T, O, K>` (`iterateChunks`, `paginateByCursor`) exclude it. Measured: +0.8% instantiations on the existing type tests, with check time unchanged.
 
 ### `setEach`: rows in scope
 
@@ -576,7 +578,7 @@ So `.forUpdate().skipLocked().of(jobs)` is a type error (`of` must come right af
 
 ### The select row `O`
 
-`O` starts as `Record<never, never>` (an object with no keys) and grows with each `select`. A `Fragment<T>` is `SelectQueryBuilder<T, Record<never, never>>`: a builder over the given tables with nothing selected, which is what `fragment` and `when` callbacks receive.
+`O` starts as `Record<never, never>` (an object with no keys) and grows with each `select`; `K`, the keys of `O` that hold `nest`'s objects, grows with it ([above](#nest-an-object-per-table)). A `Fragment<T>` is `SelectQueryBuilder<T, Record<never, never>>`: a builder over the given tables with nothing selected, which is what `fragment` and `when` callbacks receive.
 
 ## Part 8: Tricks for better errors
 

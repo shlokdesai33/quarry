@@ -65,7 +65,7 @@ export type AddRow<O, A> = [keyof O] extends [never]
 type KeysOf<S extends readonly unknown[]> = { [I in keyof S]: KeyOf<S[I]> };
 
 /** The keys of the list `K` that repeat one before them or one in `Seen`. */
-type Repeated<K extends readonly unknown[], Seen> = K extends readonly [
+export type Repeated<K extends readonly unknown[], Seen> = K extends readonly [
 	infer H,
 	...infer Rest,
 ]

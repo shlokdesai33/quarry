@@ -104,6 +104,7 @@ describe('nest', () => {
 			'nest: list at least one column of "bookings", or none for every column',
 		);
 		expect(() =>
+			// @ts-expect-error listed twice
 			left.select(({ nest }) => [nest('bookings', ['id', 'id'])]),
 		).toThrow('nest: "id" is listed twice');
 	});
@@ -121,7 +122,12 @@ describe('nest', () => {
 
 	it("isn't a key to order or group by", () => {
 		const nested = left.select(({ nest }) => [nest('bookings', ['id'])]);
+		// @ts-expect-error a nested object's key
 		expect(() => nested.orderBy('bookings')).toThrow(
+			'"bookings" is a nested object: name one of its columns',
+		);
+		// @ts-expect-error a nested object's key
+		expect(() => nested.groupBy(['bookings'])).toThrow(
 			'"bookings" is a nested object: name one of its columns',
 		);
 		expect(nested.orderBy('bookings.id').toSQL().sql).toMatch(

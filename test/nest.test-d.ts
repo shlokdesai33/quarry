@@ -1,7 +1,7 @@
 import { describe, expectTypeOf, it } from 'vitest';
 import { integer, text, timestamptz } from '../src/column-factories.js';
 import { defineTable } from '../src/define-table.js';
-import { selectFrom } from '../src/select-query-builder.js';
+import { fragment, selectFrom } from '../src/select-query-builder.js';
 
 const users = defineTable('users', {
 	columns: {
@@ -150,6 +150,67 @@ describe('nest', () => {
 		left
 			.select(({ nest }) => [nest('bookings', ['id'])])
 			.select(({ nest }) => [nest('bookings', ['name']).as('again')]);
+	});
+
+	it('lists each column once', () => {
+		// @ts-expect-error -- listed twice
+		left.select(({ nest }) => [nest('bookings', ['id', 'name', 'id'])]);
+	});
+
+	it("isn't a key to order, group or distinct on, wherever it was selected", () => {
+		const nested = left.select(({ nest }) => [
+			'users.name',
+			nest('bookings', ['id']).as('booking'),
+		]);
+		// @ts-expect-error -- a nested object's key
+		nested.orderBy('booking');
+		// @ts-expect-error -- a nested object's key
+		nested.orderBy(() => 'booking');
+		// @ts-expect-error -- a nested object's key
+		nested.groupBy(['booking']);
+		// @ts-expect-error -- a nested object's key
+		nested.groupBy(() => ['booking']);
+		// @ts-expect-error -- a nested object's key
+		nested.distinctOn(['booking']);
+		// its columns and the row's other keys still are
+		nested
+			.groupBy(['name', 'bookings.id'])
+			.orderBy('name')
+			.orderBy('bookings.id')
+			.distinctOn(['name']);
+		// through a join, `when` and `pipe`
+		selectFrom(users)
+			.select(({ nest }) => [nest('users', ['id'])])
+			.leftJoin(bookings)
+			.on('bookings.userId', 'users.id')
+			// @ts-expect-error -- a nested object's key
+			.orderBy('users');
+		selectFrom(users)
+			.when(true, (qb) => qb.select(({ nest }) => [nest('users', ['id'])]))
+			// @ts-expect-error -- a nested object's key
+			.orderBy('users');
+		const nestUsers = fragment(users, (qb) =>
+			qb.select(({ nest }) => [nest('users', ['id'])]),
+		);
+		selectFrom(users)
+			.pipe(nestUsers)
+			// @ts-expect-error -- a nested object's key
+			.orderBy('users');
+	});
+
+	it("isn't a pagination key, even when a column has its name", () => {
+		const accounts = defineTable('accounts', {
+			columns: { id: integer().identity(), owner: integer() },
+		});
+		const query = selectFrom(accounts).select(({ nest }) => [
+			'accounts.id',
+			nest('accounts', ['owner']).as('owner'),
+		]);
+		query.iterateChunks(10, { by: 'accounts.id' });
+		// @ts-expect-error -- `owner` holds the object, not the column
+		query.iterateChunks(10, { by: 'accounts.owner' });
+		// @ts-expect-error -- `owner` holds the object, not the column
+		void query.paginateByCursor({ perPage: 10, by: 'accounts.owner' });
 	});
 
 	it('works with the result shapes', () => {
