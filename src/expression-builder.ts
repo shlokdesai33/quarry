@@ -192,9 +192,7 @@ export function allSelections(table: AnyTable): readonly SelectionNode[] {
 			Object.keys(table.schema.columns).map((key) => {
 				const resolved = resolveColumn(table, key);
 				if (resolved === undefined) {
-					throw new Error(
-						`Unknown column reference "${table.name}.${key}"`,
-					);
+					throw new Error(`Unknown column reference "${table.name}.${key}"`);
 				}
 				return resolved.selection;
 			}),

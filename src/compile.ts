@@ -204,10 +204,11 @@ class Prefix {
 
 /** The text of `prefix`, one flat string. */
 function spell(prefix: Prefix): string {
-	const pieces: string[] = [];
+	// oxlint-disable-next-line unicorn/no-new-array -- sized up front, filled from the end
+	const pieces = new Array<string>(prefix.depth);
 	for (let at = prefix; at.parent !== undefined; at = at.parent)
-		pieces.push(at.piece);
-	return pieces.reverse().join('');
+		pieces[at.depth - 1] = at.piece;
+	return pieces.join('');
 }
 
 /**
@@ -489,10 +490,7 @@ function renderRow(row: RowsNode['rows'][number], out: Output): void {
 	write(out, ')');
 }
 
-function renderCell(
-	cell: RowsNode['rows'][number][number],
-	out: Output,
-): void {
+function renderCell(cell: RowsNode['rows'][number][number], out: Output): void {
 	if (cell === undefined) write(out, 'default');
 	else render(cell, out);
 }
