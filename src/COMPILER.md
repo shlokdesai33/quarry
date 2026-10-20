@@ -65,27 +65,30 @@ So `console.log(query.toSQL())`, `JSON.stringify`, and `expect(compiled).toEqual
 ## The parameter list
 
 ```ts
-interface Params {
+interface Output {
+	at: Prefix | undefined; // where the SQL so far ends in the trie (see What is rendered once)
+	text: string; // the SQL, once it is written out instead
 	values: unknown[];
 	codecs: (Codec | undefined)[];
 	typed: boolean;
 }
 
-function param(params: Params, value: unknown, codec?: Codec): string {
-	params.values.push(value);
-	params.codecs.push(codec);
-	if (codec !== undefined) params.typed = true;
-	return `$${params.values.length}`;
+function param(out: Output, value: unknown, codec?: Codec): void {
+	out.values.push(value);
+	out.codecs.push(codec);
+	if (codec !== undefined) out.typed = true;
+	const n = out.values.length;
+	write(out, (placeholders[n] ??= `$${n}`));
 }
 ```
 
-Rendering is a single left-to-right walk, so parameters are numbered **in the order they appear in the SQL text**. A value node renders as its placeholder and records its value and codec at the same index. `paramCodecs` is only returned when at least one parameter has a codec (`typed`); a query whose parameters are all untyped has none.
+Rendering is a single left-to-right walk that writes the SQL piece by piece (`write(out, piece)`), so parameters are numbered **in the order they appear in the SQL text**. A value node writes its placeholder and records its value and codec at the same index. `paramCodecs` is only returned when at least one parameter has a codec (`typed`); a query whose parameters are all untyped has none.
 
 Values are passed through **as given**. The compiler never encodes them: the driver encodes each one with its codec ([driver/CODECS.md](driver/CODECS.md)).
 
 ## Rendering expressions: `render()`
 
-`render(node, params)` is a `switch` over the node kinds:
+`render(node, out)` is a `switch` over the node kinds, each writing its SQL into `out`:
 
 | Node         | Renders as                                                      | Example                                               |
 | ------------ | --------------------------------------------------------------- | ----------------------------------------------------- |
@@ -314,14 +317,14 @@ Insert, update and delete can return rows. `renderReturning` renders the `return
 
 ## Result codecs
 
-After rendering, `compile` collects the codec of each select-list (or `returning`) entry into `resultCodecs`, by position:
+After rendering, `compile` collects the codec of each select-list (or `returning`) entry into `resultCodecs`, by position (`resultCodecsOf`); a frozen list's are collected once ([below](#what-is-rendered-once)):
 
 ```ts
 for (let i = 0; i < selections.length; i++) {
 	const codec = selections[i]?.codec;
 	if (codec === undefined) continue;
-	resultCodecs ??= selections.map(() => null);
-	resultCodecs[i] = codec;
+	codecs ??= selections.map(() => null);
+	codecs[i] = codec;
 }
 ```
 
@@ -350,15 +353,17 @@ Every builder and `Query` has `toSQL()`, which returns the same `CompiledQuery` 
 
 ## What is rendered once
 
-A query is built and compiled from scratch each time it runs, but most of its SQL is the same every time: the quoted table and column names. Three caches keep that work out of the per-query path:
+A query is built and compiled from scratch each time it runs, but most of its SQL is the same every time: the quoted table and column names, and for a query of the same shape, the whole text. These caches keep that work out of the per-query path:
 
 - **Shared column nodes.** `resolveColumn` ([expression-builder.ts](expression-builder.ts)) resolves each table's column once, into one `ReferenceNode`, one typed expression (what `eb.ref` returns) and one `SelectionNode` (what `select(['users.email'])` adds), kept per table object in a `WeakMap`. Every query over the table reuses them; nodes are immutable, so sharing is safe. A table of the same name (another `defineTable`, or `users.as('u')`) is another object, with its own nodes. `nameReference`, which records how a reference was written for the `undefined`-comparison error, now runs once per column instead of adding a `WeakMap` entry per reference per query.
 - **Their SQL.** `shareColumn` renders a column's reference (`"users"."email"`) and selection (`"users"."email" as "email"`) when the column is first resolved, into the compiler's `shared` map; `render` and `renderSelection` look nodes up there before rendering them. Only these shared nodes go in: adding the nodes each query makes (values, comparisons, `.as()` selections) would cost a `WeakMap` entry per query, more than rendering them.
 - **Quoted identifiers.** `identifier` memoises in a `Map`, cleared when it reaches 4,096 names, so aliases made at run time can't grow it without bound.
+- **Every column of a table.** `allSelections(table)` ([expression-builder.ts](expression-builder.ts)) is the frozen list of a table's shared selection nodes that `selectAll` and `returningAll` add, made once per table object. The compiler renders a frozen list once (`sharedList`): its SQL (`"users"."id" as "id", "users"."email" as "email", …`) as one piece, and its result codecs as one frozen array, the same array for every query, so the driver's plan lookup compares it by identity.
+- **The whole SQL text, by its pieces.** `write` doesn't concatenate: it walks a trie (`Prefix`) keyed by the pieces the SQL is written from, such as `'select'`, a shared column's SQL, `' from '`, a quoted name, `' = '` and `'$1'`. Each step is a check against the child taken last (the same piece object, when the shape repeats), or a `Map` lookup. The node a query ends on holds its SQL, made once (`spell`) as one flat string. So a query of a shape rendered before gets **the same string object**, whose hash V8 has kept: the driver's statement cache, keyed by the SQL, finds its entry without flattening, hashing and comparing the text ([driver/DECISIONS.md](driver/DECISIONS.md#statements-keyed-by-their-sql-with-the-declared-types-compared)). The same text from two different sequences of pieces is two strings with equal content, which is still correct, just not free. Bounds: a query goes no deeper than 1,024 pieces, or past a piece longer than 4,096 characters (a long multi-row insert, a big literal). The rest of its SQL is then concatenated as before. The trie starts over once it holds 16,384 prefixes or about a million characters, so shapes made at run time can't grow it without bound.
 
-The builders also reuse a single table's expression builder (`expressionBuilder(users)` is made once and frozen; a scope of several tables is made per call), and the predicate `DataType`. Together with call sites captured only on failure ([EXECUTION.md](EXECUTION.md#errors)), a point lookup's build and compile went from 5.7 to 0.8 µs (in-process, mock executor), and its client CPU through the pool from 21 to under 5 µs ([DECISIONS.md](DECISIONS.md#columns-resolved-and-quoted-once-per-table)).
+The builders also reuse a single table's expression builder (`expressionBuilder(users)` is made once and frozen; a scope of several tables is made per call), and the predicate `DataType`. Together with call sites captured only on failure ([EXECUTION.md](EXECUTION.md#errors)), a point lookup's build and compile went from 5.7 to 0.8 µs (#39), then to 0.5 µs with `selectAll`'s shared list and the trie (in-process, mock executor). Its client CPU through the pool fell from 21 to 6.3 µs, then to 3.2–3.4 µs against `pool.query`'s 2.3 ([DECISIONS.md](DECISIONS.md#sql-rendered-through-a-trie-of-its-pieces)).
 
-**Not cached: whole compiled queries.** A cache of SQL and parameter plans keyed by query shape was considered. Its key has to be computed from the query's own nodes, which are new on every call (the builder makes a fresh tree each time), so building the key is a walk of the same tree that rendering from cached fragments already is: it saves nothing measurable, and adds invalidation rules. What a reused SQL string would have saved in the driver (hashing the statement cache's key) is saved there instead: the cache is keyed by the SQL alone ([driver/DECISIONS.md](driver/DECISIONS.md#statements-keyed-by-their-sql-with-the-declared-types-compared)).
+**Why not a cache of whole compiled queries.** A cache keyed by query shape needs a key computed from the query's nodes, which are new on every call, so building that key costs a walk of the same tree that rendering already is. #39 measured no gain and kept rendering. The trie is that walk: rendering _is_ the lookup, so the key costs nothing extra, and nothing needs invalidating, because the text a path spells can't change. It only reuses the SQL string. Parameters and their codecs are still collected per query, from the values.
 
 ## Decisions
 
@@ -367,7 +372,8 @@ Why the compiler works this way. Each links to its full entry (what it is, why, 
 - [A node tree, and one compiler](DECISIONS.md#a-node-tree-and-one-compiler): quoting, numbering and parenthesising are written once; builders only produce data.
 - [References resolved before compiling](DECISIONS.md#references-resolved-before-compiling): `compile` needs no schema and can't get a name wrong.
 - [Every identifier quoted](DECISIONS.md#every-identifier-quoted): no reserved-word list, and case is preserved.
-- [Columns resolved and quoted once per table](DECISIONS.md#columns-resolved-and-quoted-once-per-table): shared, immutable column nodes whose SQL is rendered once; no whole-query cache.
+- [Columns resolved and quoted once per table](DECISIONS.md#columns-resolved-and-quoted-once-per-table): shared, immutable column nodes whose SQL is rendered once.
+- [SQL rendered through a trie of its pieces](DECISIONS.md#sql-rendered-through-a-trie-of-its-pieces): a query of a shape rendered before gets the same SQL string, so the driver's statement cache finds it by identity.
 - [Parameters everywhere, literals only where Postgres refuses a parameter](DECISIONS.md#parameters-everywhere-literals-only-where-postgres-refuses-a-parameter): injection-safe and cache-friendly, with checked exceptions.
 - [Parameters numbered in text order, and `in` as `= any($1)`](DECISIONS.md#parameters-numbered-in-text-order-and-in-as--any1): identical queries give identical SQL, so the statement cache gets hits.
 - [Every operation operand bracketed](DECISIONS.md#every-operation-operand-bracketed): no precedence table to get wrong.
@@ -388,6 +394,8 @@ Why the compiler works this way. Each links to its full entry (what it is, why, 
 **Literal**: a value written directly into SQL text (`'theme'`, `true`).
 
 **Placeholder**: `$1`, `$2`, …: where a parameter goes in the SQL text.
+
+**Trie**: a tree of prefixes, each child one piece longer than its parent; rendering follows it piece by piece, so equal sequences of pieces end on the same node.
 
 **Upsert**: an insert that does something else (nothing, or an update) when the row conflicts with an existing one on a unique key.
 

@@ -90,7 +90,9 @@ export class Query<T> {
 		return read(
 			await executor.execute(
 				query,
-				rows === undefined ? options : { ...options, ...rows },
+				rows === undefined || options === undefined
+					? (rows ?? options)
+					: { ...options, ...rows },
 			),
 		);
 	}

@@ -2,6 +2,7 @@ import type { AnyColumn } from './column/any-column.js';
 import { codecs } from './driver/codecs.js';
 import type { Executor } from './executor.js';
 import {
+	allSelections,
 	type ExpressionBuilder,
 	expressionBuilder,
 } from './expression-builder.js';
@@ -16,7 +17,6 @@ import type {
 import type { Ref, Refs, RefsOf } from './refs.js';
 import {
 	type AddRow,
-	allColumns,
 	returningNodes,
 	type RowOf,
 	type Selection,
@@ -372,12 +372,11 @@ export class UpdateQueryBuilder<
 		M,
 		R
 	> {
-		const eb = expressionBuilder(this.#state.table);
 		return new UpdateQueryBuilder({
 			...this.#state,
 			returning: returningNodes(
 				this.#state.returning,
-				selectionNodes(eb, allColumns(this.#state.table)),
+				allSelections(this.#state.table),
 			),
 		});
 	}

@@ -93,32 +93,53 @@ export const failure = <E extends Error>(
 	error: E,
 ): Error => (err === undefined ? error : err(error));
 
-/** Every row. */
-export const allRows = <O>(): Shape<O[]> => ({
-	read: rowsOf<O>,
-	checked: false,
-});
+/**
+ * `shape`, typed for the rows `R`: a shape reads whatever rows it is given,
+ * so one made once serves every query.
+ */
+// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the select or returning list supplies the row type
+const typed = <R>(shape: Shape<unknown>): Shape<R> => shape as Shape<R>;
 
-/** The first row, if any. */
-export const takeFirst = <O>(): Shape<O | undefined> => ({
-	read: (input) => rowsOf<O>(input)[0],
+/** The shape `make` makes without an `err`, made once; one with an `err`, made per call. */
+function shared<E extends Error>(
+	make: (err: ErrorFor<E> | undefined) => Shape<unknown>,
+): <R>(err: ErrorFor<E> | undefined) => Shape<R> {
+	const plain = make(undefined);
+	return <R>(err: ErrorFor<E> | undefined) =>
+		typed<R>(err === undefined ? plain : make(err));
+}
+
+const ALL_ROWS: Shape<unknown> = { read: rowsOf, checked: false };
+
+/** Every row. */
+export const allRows = <O>(): Shape<O[]> => typed<O[]>(ALL_ROWS);
+
+const TAKE_FIRST: Shape<unknown> = {
+	read: (input) => rowsOf(input)[0],
 	checked: false,
 	rows: firstRow,
-});
+};
 
-/** The first column of the first row, if any. */
-export const takeValue = <V>(): Shape<V | undefined> => ({
-	read: (input) => rowsOf<readonly [V]>(input)[0]?.[0],
+/** The first row, if any. */
+export const takeFirst = <O>(): Shape<O | undefined> =>
+	typed<O | undefined>(TAKE_FIRST);
+
+const TAKE_VALUE: Shape<unknown> = {
+	read: (input) => rowsOf<readonly [unknown]>(input)[0]?.[0],
 	checked: false,
 	rows: firstValueRows,
-});
+};
+
+/** The first column of the first row, if any. */
+export const takeValue = <V>(): Shape<V | undefined> =>
+	typed<V | undefined>(TAKE_VALUE);
 
 /** Every row, of which there must be one or more. */
-export const expectNonEmpty = <O>(
+export const expectNonEmpty: <O>(
 	err: ErrorFor<NoRowError> | undefined,
-): Shape<[O, ...O[]]> => ({
+) => Shape<[O, ...O[]]> = shared((err) => ({
 	read: (input) => {
-		const rows = rowsOf<O>(input);
+		const rows = rowsOf(input);
 		if (isNonEmpty(rows)) return rows;
 		throw failure(
 			err,
@@ -126,14 +147,14 @@ export const expectNonEmpty = <O>(
 		);
 	},
 	checked: true,
-});
+}));
 
 /** The first row, of which there must be one. */
-export const expectFirst = <O>(
+export const expectFirst: <O>(
 	err: ErrorFor<NoRowError> | undefined,
-): Shape<O> => ({
+) => Shape<O> = shared((err) => ({
 	read: (input) => {
-		const [row] = rowsOf<O>(input);
+		const [row] = rowsOf(input);
 		if (row !== undefined) return row;
 		throw failure(
 			err,
@@ -142,14 +163,14 @@ export const expectFirst = <O>(
 	},
 	checked: true,
 	rows: firstRow,
-});
+}));
 
 /** The one row: there must be exactly one. */
-export const expectOne = <O>(
+export const expectOne: <O>(
 	err: ErrorFor<NoRowError | TooManyRowsError> | undefined,
-): Shape<O> => ({
+) => Shape<O> = shared((err) => ({
 	read: (input) => {
-		const [row] = rowsOf<O>(input);
+		const [row] = rowsOf(input);
 		if (row === undefined) {
 			throw failure(err, new NoRowError(input.query, input.table));
 		}
@@ -168,12 +189,12 @@ export const expectOne = <O>(
 	},
 	checked: true,
 	rows: twoRows,
-});
+}));
 
 /** The row, if any: there must not be several. */
-export const expectAtMostOne = <O>(
+export const expectAtMostOne: <O>(
 	err: ErrorFor<TooManyRowsError> | undefined,
-): Shape<O | undefined> => ({
+) => Shape<O | undefined> = shared((err) => ({
 	read: (input) => {
 		if (input.count > 1) {
 			throw failure(
@@ -181,18 +202,18 @@ export const expectAtMostOne = <O>(
 				new TooManyRowsError(input.query, input.table, input.count),
 			);
 		}
-		return rowsOf<O>(input)[0];
+		return rowsOf(input)[0];
 	},
 	checked: true,
 	rows: twoRows,
-});
+}));
 
 /** The first column of the first row, of which there must be one. */
-export const expectValue = <V>(
+export const expectValue: <V>(
 	err: ErrorFor<NoRowError> | undefined,
-): Shape<V> => ({
+) => Shape<V> = shared((err) => ({
 	read: (input) => {
-		const [row] = rowsOf<readonly [V]>(input);
+		const [row] = rowsOf<readonly [unknown]>(input);
 		if (row !== undefined) return row[0];
 		throw failure(
 			err,
@@ -201,7 +222,7 @@ export const expectValue = <V>(
 	},
 	checked: true,
 	rows: firstValueRows,
-});
+}));
 
 /** The `err` argument of `expectValue`, among the arguments `ValueArgs` allows. */
 export function errorArg<E extends Error>(
