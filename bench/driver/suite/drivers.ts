@@ -333,7 +333,11 @@ async function quarryDb(o: DriverOptions): Promise<Driver> {
 	};
 	const created = new Date('2024-01-01T00:00:00Z');
 	const lookup = (id: number) =>
-		db.selectFrom(users).where('bench_users.id', id).selectAll().expectOne();
+		db
+			.selectFrom(users)
+			.where('bench_users.id', id)
+			.selectAll('bench_users')
+			.expectOne();
 	return {
 		name: 'quarry-db',
 		query: () =>
