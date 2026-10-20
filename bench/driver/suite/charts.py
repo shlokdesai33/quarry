@@ -366,13 +366,17 @@ print("\n".join(written))
 # 13. optional A/B: a candidate build's raw results (QUARRY_DIST) against the baseline, for quarry's concurrency sweep
 if len(sys.argv) > 4:
     def load(path):
+        # throughput by (phase, pool, callers, pipeline, rtt); p99 (ms) under ("p99", runtime, pool, callers)
         rows = {}
         for line in open(path):
             r = json.loads(line)
             c = r["cell"]
-            if "throughput" not in r["result"] or c["driver"] != "quarry" or c["runtime"] != "node" or c["scenario"] != "pk":
+            if "throughput" not in r["result"] or c["driver"] != "quarry" or c["scenario"] != "pk" or c.get("memOps") is not None:
                 continue
-            rows.setdefault((c["phase"], c["max"], c.get("concurrency"), c.get("pipeline"), c.get("rtt")), []).append(r["result"]["throughput"])
+            if c["phase"] == "conc":
+                rows.setdefault(("p99", c["runtime"], c["max"], c.get("concurrency")), []).append(r["result"]["lat"]["p99"])
+            if c["runtime"] == "node":
+                rows.setdefault((c["phase"], c["max"], c.get("concurrency"), c.get("pipeline"), c.get("rtt")), []).append(r["result"]["throughput"])
         return {k: sorted(v)[len(v) // 2] for k, v in rows.items()}
     def load_md(path):
         # the same points from a tables.md (a results snapshot), when the raw results are gone
@@ -397,7 +401,8 @@ if len(sys.argv) > 4:
                 pass
         return rows
     base, cand = [(load_md if path.endswith(".md") else load)(path) for path in sys.argv[3:5]]
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.2))
+    p99 = any(k[0] == "p99" for k in cand)
+    fig, axes = plt.subplots(1, 3 if p99 else 2, figsize=(19 if p99 else 13, 4.2))
     for pool, color in zip([1, 5, 10], ["#1f77b4", "#2ca02c", "#d62728"]):
         xs = [1, 10, 50, 100, 500, 1000]
         axes[0].plot(xs, [base.get(("conc", pool, c, None, None)) for c in xs], color=color, ls="--", marker="o", ms=3, label=f"pool {pool}, before")
@@ -417,5 +422,17 @@ if len(sys.argv) > 4:
     axes[1].set_ylabel("point lookups/s (log)")
     axes[1].set_title("1 connection, 100 callers: baseline (dashed) vs candidate run (solid)")
     axes[1].legend(fontsize=7)
+    if p99:
+        xs = [10, 50, 100, 500, 1000]
+        for runtime, color in [("node", "#d62728"), ("bun", "#ff7f0e")]:
+            for pool, ms in [(10, "o"), (50, "s")]:
+                axes[2].plot(xs, [base.get(("p99", runtime, pool, c)) for c in xs], color=color, ls="--", marker=ms, ms=3, label=f"{RT[runtime]}, pool {pool}, before")
+                axes[2].plot(xs, [cand.get(("p99", runtime, pool, c)) for c in xs], color=color, marker=ms, ms=3, label=f"{RT[runtime]}, pool {pool}, after")
+        axes[2].set_xscale("log")
+        axes[2].set_yscale("log")
+        axes[2].set_xlabel("concurrent callers")
+        axes[2].set_ylabel("p99 latency (ms, log)")
+        axes[2].set_title("point lookup p99: baseline (dashed) vs candidate run (solid)")
+        axes[2].legend(fontsize=6)
     save(fig, "pool-fix-ab.png")
     print(written[-1])
