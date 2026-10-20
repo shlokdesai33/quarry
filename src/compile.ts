@@ -90,7 +90,21 @@ export function compile(node: StatementNode): CompiledQuery {
 		tag,
 		params.typed ? params.codecs : undefined,
 		resultCodecs,
+		node.kind === 'select' ||
+			node.kind === 'insert' ||
+			node.kind === 'update' ||
+			node.kind === 'delete',
 	);
+}
+
+/**
+ * Whether `query` was compiled here from a select, insert, update or
+ * delete: a statement that leaves no session or transaction state behind.
+ * False for SQL written by hand (`db.sql`) and for queries made elsewhere,
+ * a copy of a compiled one included.
+ */
+export function isDataStatement(query: CompiledQuery): boolean {
+	return Compiled.isDataStatement(query);
 }
 
 /**
@@ -103,6 +117,7 @@ class Compiled implements CompiledQuery {
 	declare readonly tag?: string;
 	readonly #paramCodecs: readonly (Codec | undefined)[] | undefined;
 	readonly #resultCodecs: readonly (Codec | null)[] | undefined;
+	readonly #data: boolean;
 
 	constructor(
 		sql: string,
@@ -110,12 +125,18 @@ class Compiled implements CompiledQuery {
 		tag: string | undefined,
 		paramCodecs: readonly (Codec | undefined)[] | undefined,
 		resultCodecs: readonly (Codec | null)[] | undefined,
+		data: boolean,
 	) {
 		this.sql = sql;
 		this.params = params;
 		if (tag !== undefined) Object.assign(this, { tag });
 		this.#paramCodecs = paramCodecs;
 		this.#resultCodecs = resultCodecs;
+		this.#data = data;
+	}
+
+	static isDataStatement(query: CompiledQuery): boolean {
+		return #data in query && query.#data;
 	}
 
 	get paramCodecs(): readonly (Codec | undefined)[] | undefined {
