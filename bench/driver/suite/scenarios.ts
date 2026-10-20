@@ -601,7 +601,8 @@ export const SCENARIOS: Scenario[] = [
 		kind: 'ops',
 		id: 'db-pk',
 		group: 'builder',
-		title: 'builder: point lookup by primary key (selectAll().expectOne())',
+		title:
+			"builder: point lookup by primary key (selectAll('bench_users').expectOne())",
 		rowsPerOp: 1,
 		needs: 'builderOp',
 		op: (d, i) => d.builderOp!('pk', i),
