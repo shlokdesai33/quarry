@@ -65,6 +65,7 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 - [A node tree, and one compiler](src/DECISIONS.md#a-node-tree-and-one-compiler)
 - [References resolved before compiling](src/DECISIONS.md#references-resolved-before-compiling)
 - [Columns resolved and quoted once per table](src/DECISIONS.md#columns-resolved-and-quoted-once-per-table) (measured)
+- [SQL rendered through a trie of its pieces](src/DECISIONS.md#sql-rendered-through-a-trie-of-its-pieces) (measured)
 - [Every identifier quoted](src/DECISIONS.md#every-identifier-quoted)
 - [Parameters everywhere, literals only where Postgres refuses a parameter](src/DECISIONS.md#parameters-everywhere-literals-only-where-postgres-refuses-a-parameter)
 - [Parameters numbered in text order, and `in` as `= any($1)`](src/DECISIONS.md#parameters-numbered-in-text-order-and-in-as--any1)
