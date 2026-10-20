@@ -5,7 +5,7 @@ This guide covers the four builders (select, insert, update, delete), what each 
 - Files: [select-query-builder.ts](select-query-builder.ts), [insert-query-builder.ts](insert-query-builder.ts), [update-query-builder.ts](update-query-builder.ts), [delete-query-builder.ts](delete-query-builder.ts), [write-query.ts](write-query.ts), [row.ts](row.ts), [shape.ts](shape.ts), [query.ts](query.ts), [executor.ts](executor.ts) (the error classes), [errors.ts](errors.ts).
 - The type-level side of these builders (how the row type grows, how a builder knows it still needs a `where`) is in [TYPES.md](TYPES.md). The SQL they produce is in [COMPILER.md](COMPILER.md). Running them is in [EXECUTION.md](EXECUTION.md).
 
-The builders on `main` cover everyday SQL: inner, outer and cross joins, `distinct`/`distinct on`, `group by`/`having`, `order by`, `limit`/`offset`, row locks, `case`, arithmetic, aggregates and raw `sql` fragments, plus keyset pagination ([PAGINATION.md](PAGINATION.md)) and streaming. Subqueries, CTEs, set operations and `insert … select` are still only in the [public README](../README.md#part-ii-the-query-builder)'s intended surface.
+The builders on `main` cover everyday SQL: inner, outer and cross joins, `distinct`/`distinct on`, `group by`/`having`, `order by`, `limit`/`offset`, row locks, `case`, arithmetic, aggregates and raw `sql` fragments, plus keyset pagination ([PAGINATION.md](PAGINATION.md)) and streaming. Subqueries, CTEs, set operations and `insert … select` are not built yet.
 
 ## Contents
 
