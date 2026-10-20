@@ -109,6 +109,7 @@ export {
 	type OffsetPage,
 	type OffsetPageOptions,
 } from './pagination.js';
+export type { Nest, Nested, SelectBuilder } from './nest.js';
 export type { AnyQuery, Query } from './query.js';
 export type { Range } from './range.js';
 export {

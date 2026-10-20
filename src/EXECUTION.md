@@ -192,6 +192,7 @@ async execute(query, options = {}) {
 | shape's `rowMode` (default `'object'`)     | `rowMode`                        |
 | shape's `keepRows`                         | `keepRows`                       |
 | `query.paramCodecs` / `query.resultCodecs` | `paramCodecs` / `resultCodecs`   |
+| `query.nested` (`nest`)                    | `nested`                         |
 | `DatabaseOptions.prepare`                  | `prepare`                        |
 | `RunOptions.signal`                        | `signal`                         |
 | `RunOptions.timeout`                       | `statementTimeout` (server-side) |

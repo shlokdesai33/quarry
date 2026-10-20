@@ -97,6 +97,7 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 - [A table joined twice, or a key selected twice, is refused](src/DECISIONS.md#a-table-joined-twice-or-a-key-selected-twice-is-refused)
 - [`selectAll()` lists the columns, never `*`](src/DECISIONS.md#selectall-lists-the-columns-never-)
 - [Ordering by a selected key uses the bare key](src/DECISIONS.md#ordering-by-a-selected-key-uses-the-bare-key)
+- [`nest` marks a joined row with `ctid`](src/DECISIONS.md#nest-marks-a-joined-row-with-ctid)
 
 ### Pagination
 

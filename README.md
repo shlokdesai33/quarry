@@ -256,6 +256,18 @@ const rows = await db
 
 `innerJoin`, `leftJoin`, `rightJoin`, `fullJoin` and `crossJoin`. `on` takes two columns of comparable types (the joined table's first) or any `where` form. Outer joins make the columns of the optional side nullable.
 
+`nest` selects a table's columns as one object of the row, keyed by the name the table goes by in the query. On the optional side of an outer join the whole object is `null` when there was no matching row, even if the matched row's columns are all null. Leave out the column list to take every column; rename the object with `.as()`.
+
+```ts
+// { id: number; posts: { id: string; title: string } | null }[]
+const rows = await db
+	.selectFrom(users)
+	.leftJoin(posts)
+	.on('posts.authorId', 'users.id')
+	.select(({ nest }) => ['users.id', nest('posts', ['id', 'title'])])
+	.execute();
+```
+
 ### Ordering, limit and distinct
 
 ```ts

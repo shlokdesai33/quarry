@@ -125,6 +125,30 @@ Every join goes through `#joined(table)`: it refuses a table whose name is alrea
 - **Each key can be in the row once.** Selecting a second `id` is a type error (`UniqueKeys`, an impossible extra argument naming the duplicate) and a build-time error (`checkUniqueKeys`); `.as('managerId')` resolves it. Before #32, two `id`s were both rendered and the driver's object row silently kept the last.
 - **`selectAll` lists the columns**, never `select *`: each column keeps its TypeScript key (`createdAt` from `created_at`) and its codec, and the SQL doesn't change meaning if the table gains a column.
 
+### `nest`: a table's columns as one object
+
+```ts
+.select(({ nest }) => ['users.id', nest('bookings', ['id', 'name'])]) // { id: number; bookings: { id: number; name: string } | null }
+.select(({ nest }) => [nest('bookings')])                              // every column of bookings
+.select(({ nest }) => [nest('managers', ['name']).as('manager')])      // an aliased table, renamed in the row
+```
+
+`nest` is a member of the `eb` a `select` callback gets (`SelectBuilder<T>` in [nest.ts](nest.ts); every builder has it at run time, but only the select list's type shows it). It takes the name a table goes by in the query (its alias, or its name), and optionally a non-empty list of that table's column keys (all of them otherwise), and returns a `Nested` entry keyed by the table's name; `.as()` re-keys it.
+
+`selectionNodes` expands a `Nested` into flat entries, so every column is still selected under its own codec, in binary where it can be, with no `json_build_object`:
+
+```sql
+select "users"."id" as "id",
+       ("bookings".ctid is not null) as "bookings",   -- the marker
+       "bookings"."id" as "bookings.id", "bookings"."name" as "bookings.name"
+from "users" left join "bookings" on …
+```
+
+Each entry carries `nest: { key, column }` on its `SelectionNode`. From those, `compile` builds `CompiledQuery.nested` (a getter, like `resultCodecs`): per object, the position of its marker and of each column. The executor passes it to the driver as the query's `nested` option, and the generated row decoder writes the object directly: the marker's slot starts as `null`, a `true` marker stores a fresh `{ id: null, name: null }`, and each non-NULL column is stored into it. There is no second pass over the rows. That works for every shape (`execute`, `take…`, `expect…`, including `takeValue` on `array` rows), `stream`, `db.batch` and the pagination methods.
+
+- **The marker is always `table.ctid is not null`**, never a join column: every row of a real table has a non-null `ctid`, so the marker is false exactly when an outer join found no row, whatever the table's columns hold ([DECISIONS.md](DECISIONS.md#nest-marks-a-joined-row-with-ctid)). Because of that, the table must be a real table (not a view).
+- **Its key is a top-level key**: it is checked against the row like any column (`UniqueKeys`, `checkUniqueKeys`). Its columns live in their own object, so `users.id` and a nested `bookings.id` don't clash. The marker's key isn't something `orderBy` or `groupBy` can use; they take the object's columns as `'bookings.id'`.
+
 ### `distinct`, `distinctOn`, `groupBy`, `orderBy`, `limit`, `offset`
 
 ```ts
@@ -486,6 +510,7 @@ Why the builders work this way. Each links to its full entry (what it is, why, t
 - [Outer joins make the joined side nullable: `NullableTable`](DECISIONS.md#outer-joins-make-the-joined-side-nullable-nullabletable): the row type says which columns can be NULL.
 - [A table joined twice, or a key selected twice, is refused](DECISIONS.md#a-table-joined-twice-or-a-key-selected-twice-is-refused): both silently corrupted results.
 - [`selectAll()` lists the columns, never `*`](DECISIONS.md#selectall-lists-the-columns-never-): each column keeps its key and codec.
+- [`nest` marks a joined row with `ctid`](DECISIONS.md#nest-marks-a-joined-row-with-ctid): flat columns plus one marker, so a missing row is `null` and a row of nulls is an object.
 - [Ordering by a selected key uses the bare key](DECISIONS.md#ordering-by-a-selected-key-uses-the-bare-key): a dot always means a column.
 - [Raw SQL only through the `sql` template tag](DECISIONS.md#raw-sql-only-through-the-sql-template-tag): `db.sql` and fragments stay injection-safe.
 

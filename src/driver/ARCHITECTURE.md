@@ -375,6 +375,11 @@ flowchart TD
 <a id="keeprows"></a>
 `dataRow` returns early once `rows.length >= keepRows`, so the rows after it are **not decoded**: the bytes are skipped. The query still runs to completion and the command tag still counts every row. quarry's `takeFirst()` (`keepRows: 1`) and `expectOne()` (`keepRows: 2`) use it. A row not kept is never decoded, so a decode error in it goes unnoticed (documented on the option).
 
+### Nested objects
+
+<a id="nested-objects"></a>
+With a query's `nested` option (quarry's `nest`), the generated decoder writes some columns into an object of the row instead of the row itself. The object takes the place of its marker column. The row literal starts it as `null`; a `true` marker stores a fresh literal of nulls (`{ "id": null, "name": null }`), and each of the object's non-NULL columns is stored into it (`row["bookings"]["id"] = …`). A missing row (marker false, every column NULL) allocates nothing. The marker must come before its columns (`checkNested`). The decoder is cached on the plan per row mode and nesting, and without generated code the same layout is built from the values array.
+
 ### Decode errors
 
 If a codec throws while decoding a value, the generated decoder wraps it in a `DecodeError` naming the column and type OID (never the value, which could be sensitive). The op records it, drops its rows, ignores the rest of the rows, and rejects with it at ReadyForQuery. The connection stays usable: the protocol is intact, only that query's values were unreadable.
