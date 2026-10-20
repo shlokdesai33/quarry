@@ -107,21 +107,27 @@ describe('the select list', () => {
 		);
 	});
 
-	it('selects every column, of one table or all', () => {
-		expect(selectFrom(posts).selectAll().toSQL().sql).toBe(
+	it('selects every column of a table, by the name it goes by', () => {
+		expect(selectFrom(posts).selectAll('posts').toSQL().sql).toBe(
 			'select "posts"."id" as "id", "posts"."author_id" as "authorId", "posts"."title" as "title" from "posts"',
 		);
 		const joined = selectFrom(users)
 			.innerJoin(posts)
 			.on('posts.authorId', 'users.id');
-		expect(joined.selectAll(posts).toSQL().sql).toMatch(
+		expect(joined.selectAll('posts').toSQL().sql).toMatch(
 			/^select "posts"\."id" as "id", "posts"\."author_id" as "authorId", "posts"\."title" as "title" from/,
 		);
-		expect(joined.selectAll('posts').toSQL().sql).toBe(
-			joined.selectAll(posts).toSQL().sql,
+		expect(selectFrom(posts.as('p')).selectAll('p').toSQL().sql).toBe(
+			'select "p"."id" as "id", "p"."author_id" as "authorId", "p"."title" as "title" from "posts" as "p"',
 		);
-		// @ts-expect-error both tables have an `id`
-		expect(() => joined.selectAll()).toThrow('"id" is already in the row');
+		expect(() =>
+			// @ts-expect-error both tables have an `id`
+			joined.selectAll('users').selectAll('posts'),
+		).toThrow('"id" is already in the row');
+		// @ts-expect-error the table name is required
+		expect(() => joined.selectAll()).toThrow('"undefined" is not in the query');
+		// @ts-expect-error not a table object
+		expect(() => joined.selectAll(posts)).toThrow('is not in the query');
 	});
 
 	it('reads each selected expression with its type’s codec', () => {

@@ -42,6 +42,8 @@ export type ConditionArgs<R extends Refs> =
 	| readonly [group: Group<R>]
 	| readonly [predicate: AnyPredicate];
 
+const NO_CONDITIONS: readonly OperationNode[] = Object.freeze([]);
+
 /**
  * Collects the conditions of a `where` clause over the references in scope
  * `R`, joined by `and`. Any other combination is one condition built with
@@ -55,7 +57,7 @@ export class WhereBuilder<R extends Refs> {
 
 	constructor(
 		eb: ExpressionBuilder<R>,
-		conditions: readonly OperationNode[] = [],
+		conditions: readonly OperationNode[] = NO_CONDITIONS,
 	) {
 		this.#eb = eb;
 		this.#conditions = conditions;
@@ -76,10 +78,10 @@ export class WhereBuilder<R extends Refs> {
 
 	/** The conditions as one node, `undefined` when there are none. */
 	toNode(): OperationNode | undefined {
-		const [only, ...rest] = this.#conditions;
-		return rest.length === 0
-			? only
-			: { kind: 'and', operands: this.#conditions };
+		const conditions = this.#conditions;
+		return conditions.length <= 1
+			? conditions[0]
+			: { kind: 'and', operands: conditions };
 	}
 
 	#nodeOf(args: ConditionArgs<R>): OperationNode {

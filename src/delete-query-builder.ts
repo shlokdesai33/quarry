@@ -1,5 +1,6 @@
 import type { Executor } from './executor.js';
 import {
+	allSelections,
 	type ExpressionBuilder,
 	expressionBuilder,
 } from './expression-builder.js';
@@ -7,7 +8,6 @@ import type { DeleteNode, SelectionNode } from './node.js';
 import type { Ref, RefsOf } from './refs.js';
 import {
 	type AddRow,
-	allColumns,
 	returningNodes,
 	type RowOf,
 	type Selection,
@@ -132,12 +132,11 @@ export class DeleteQueryBuilder<
 	returningAll(
 		..._unique: UniqueColumns<O, Ref<RefsOf<[T]>>>
 	): DeleteQueryBuilder<T, AddRow<O, RowOf<RefsOf<[T]>, Ref<RefsOf<[T]>>>>, M> {
-		const eb = expressionBuilder(this.#state.table);
 		return new DeleteQueryBuilder({
 			...this.#state,
 			returning: returningNodes(
 				this.#state.returning,
-				selectionNodes(eb, allColumns(this.#state.table)),
+				allSelections(this.#state.table),
 			),
 		});
 	}

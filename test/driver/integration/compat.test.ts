@@ -166,9 +166,11 @@ describe.skipIf(noPg)('lost connections, as node-postgres tests them', () => {
 		const conn = await open();
 		await using admin = await open();
 		const running = conn.query('select pg_sleep(5)');
+		// handled from the start: its error can come before the terminate's reply
+		const failed = rejection(running, PostgresError);
 		await new Promise((resolve) => setTimeout(resolve, 100));
 		await admin.query('select pg_terminate_backend($1)', [conn.processId]);
-		const error = await rejection(running, PostgresError);
+		const error = await failed;
 		expect(error.code).toBe('57P01');
 		expect(conn.closed).toBe(true);
 		await expect(conn.query('select 1')).rejects.toThrow(/closed/);
@@ -181,9 +183,10 @@ describe.skipIf(noPg)('lost connections, as node-postgres tests them', () => {
 			await pool.query<{ pid: number }>('select pg_backend_pid() as pid')
 		).rows[0]?.pid;
 		const running = pool.query('select pg_sleep(5)');
+		const failed = expect(running).rejects.toBeInstanceOf(PostgresError);
 		await new Promise((resolve) => setTimeout(resolve, 100));
 		await admin.query('select pg_terminate_backend($1)', [pid]);
-		await expect(running).rejects.toBeInstanceOf(PostgresError);
+		await failed;
 		const { rows } = await pool.query<{ pid: number }>(
 			'select pg_backend_pid() as pid',
 		);

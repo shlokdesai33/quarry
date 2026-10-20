@@ -65,6 +65,7 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 - [A node tree, and one compiler](src/DECISIONS.md#a-node-tree-and-one-compiler)
 - [References resolved before compiling](src/DECISIONS.md#references-resolved-before-compiling)
 - [Columns resolved and quoted once per table](src/DECISIONS.md#columns-resolved-and-quoted-once-per-table) (measured)
+- [SQL rendered through a trie of its pieces](src/DECISIONS.md#sql-rendered-through-a-trie-of-its-pieces) (measured)
 - [Every identifier quoted](src/DECISIONS.md#every-identifier-quoted)
 - [Parameters everywhere, literals only where Postgres refuses a parameter](src/DECISIONS.md#parameters-everywhere-literals-only-where-postgres-refuses-a-parameter)
 - [Parameters numbered in text order, and `in` as `= any($1)`](src/DECISIONS.md#parameters-numbered-in-text-order-and-in-as--any1)
@@ -95,7 +96,8 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 
 - [Outer joins make the joined side nullable: `NullableTable`](src/DECISIONS.md#outer-joins-make-the-joined-side-nullable-nullabletable)
 - [A table joined twice, or a key selected twice, is refused](src/DECISIONS.md#a-table-joined-twice-or-a-key-selected-twice-is-refused)
-- [`selectAll()` lists the columns, never `*`](src/DECISIONS.md#selectall-lists-the-columns-never-)
+- [`selectAll` lists the columns, never `*`](src/DECISIONS.md#selectall-lists-the-columns-never-)
+- [`selectAll` takes the name a table goes by](src/DECISIONS.md#selectall-takes-the-name-a-table-goes-by)
 - [Ordering by a selected key uses the bare key](src/DECISIONS.md#ordering-by-a-selected-key-uses-the-bare-key)
 
 ### Pagination

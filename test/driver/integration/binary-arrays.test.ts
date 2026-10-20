@@ -55,7 +55,17 @@ beforeAll(async () => {
 afterAll(async () => {
 	if (noPg) return;
 	await using admin = await open();
-	await admin.query(`drop database if exists ${DATABASE} with (force)`);
+	// a drop waits until every backend of the cluster, in any database, has
+	// taken a signal, which under a loaded parallel run took over a minute;
+	// the test cluster is removed after the run, so a drop that doesn't
+	// finish in time is left to it
+	await admin.query(`set statement_timeout = '10s'`);
+	try {
+		await admin.query(`drop database if exists ${DATABASE} with (force)`);
+	} catch (error) {
+		if (!(error instanceof PostgresError && error.code === '57014'))
+			throw error;
+	}
 });
 
 /** The rows of `sql` in text, and in binary (from its second run), on one connection. */
