@@ -294,7 +294,7 @@ The driver suite on a 4-vCPU VM (client on 2 CPUs, PostgreSQL 18 on the other 2)
 
 ([COMPILER.md](COMPILER.md#what-is-rendered-once), [EXECUTION.md](EXECUTION.md#connections-shared-or-exclusive))
 
-**Why.** After #39, a builder point lookup (`selectFrom(users).where(id).selectAll().expectOne()`) still cost about 6.3 µs of client CPU, against 2.1 µs for the same SQL through `pool.query`, which capped it at 150–179k/s against the driver's 368–464k at 0 ms. Its profile had three items the driver doesn't pay:
+**Why.** After #39, a builder point lookup (`selectFrom(users).where(id).selectAll('users').expectOne()`) still cost about 6.3 µs of client CPU, against 2.1 µs for the same SQL through `pool.query`, which capped it at 150–179k/s against the driver's 368–464k at 0 ms. Its profile had three items the driver doesn't pay:
 
 - **The driver hashing a new string per query.** The statement cache is keyed by the SQL. A string used again keeps its hash, but the builder concatenated a new one for every query, so the driver flattened it, hashed it and compared its ~230 characters (6.5% of samples).
 - **`selectAll` resolving its columns again** per query: it built each `table.column` string and looked it up in the scope's `Map`, which hashed every new string (21%).

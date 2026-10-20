@@ -142,13 +142,14 @@ describe('what the builders reuse across queries', () => {
 
 	it('renders each shape right when shapes that share a start interleave', () => {
 		const shapes = [
-			(i: number) => selectFrom(users).where('users.id', i).selectAll(),
+			(i: number) => selectFrom(users).where('users.id', i).selectAll('users'),
 			(i: number) =>
-				selectFrom(users).where('users.email', `e${i}`).selectAll(),
+				selectFrom(users).where('users.email', `e${i}`).selectAll('users'),
 			(i: number) =>
-				selectFrom(users).where('users.id', i).selectAll().limit(1),
-			(i: number) => selectFrom(users).selectAll().where('users.id', i),
-			(i: number) => selectFrom(legacyUsers).where('users.id', i).selectAll(),
+				selectFrom(users).where('users.id', i).selectAll('users').limit(1),
+			(i: number) => selectFrom(users).selectAll('users').where('users.id', i),
+			(i: number) =>
+				selectFrom(legacyUsers).where('users.id', i).selectAll('users'),
 		];
 		const expected = [
 			'select "users"."id" as "id", "users"."first_name" as "firstName", "users"."email" as "email" from "users" where "users"."id" = $1',
@@ -226,7 +227,7 @@ describe('what the builders reuse across queries', () => {
 			selectFrom(users)
 				.select(['users.id'])
 				// @ts-expect-error -- id is already in the row
-				.selectAll(),
+				.selectAll('users'),
 		).toThrow('select each key once: "id" is already in the row');
 		expect(() =>
 			insertInto(users)
@@ -246,7 +247,10 @@ describe('what the builders reuse across queries', () => {
 	it('marks what it compiles from a select or a write, not SQL written by hand', () => {
 		// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- never run
 		const db = databaseWith({} as Executor);
-		const select = selectFrom(users).where('users.id', 1).selectAll().toSQL();
+		const select = selectFrom(users)
+			.where('users.id', 1)
+			.selectAll('users')
+			.toSQL();
 		expect(isDataStatement(select)).toBe(true);
 		expect(
 			isDataStatement(
