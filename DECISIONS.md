@@ -95,7 +95,8 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 
 - [Outer joins make the joined side nullable: `NullableTable`](src/DECISIONS.md#outer-joins-make-the-joined-side-nullable-nullabletable)
 - [A table joined twice, or a key selected twice, is refused](src/DECISIONS.md#a-table-joined-twice-or-a-key-selected-twice-is-refused)
-- [`selectAll()` lists the columns, never `*`](src/DECISIONS.md#selectall-lists-the-columns-never-)
+- [`selectAll` lists the columns, never `*`](src/DECISIONS.md#selectall-lists-the-columns-never-)
+- [`selectAll` takes the name a table goes by](src/DECISIONS.md#selectall-takes-the-name-a-table-goes-by)
 - [Ordering by a selected key uses the bare key](src/DECISIONS.md#ordering-by-a-selected-key-uses-the-bare-key)
 
 ### Pagination

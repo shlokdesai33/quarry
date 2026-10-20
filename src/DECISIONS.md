@@ -532,13 +532,23 @@ The driver suite on a 4-vCPU VM (client on 2 CPUs, PostgreSQL 18 on the other 2)
 
 **Code.** `NewName`, `UniqueKeys` in [select-query-builder.ts](select-query-builder.ts) and [row.ts](row.ts); `#joined`, `checkUniqueKeys`.
 
-### `selectAll()` lists the columns, never `*`
+### `selectAll` lists the columns, never `*`
 
-**What it is.** `selectAll()` writes every column out (`"users"."id" as "id", "users"."first_name" as "firstName", …`).
+**What it is.** `selectAll('users')` writes every column out (`"users"."id" as "id", "users"."first_name" as "firstName", …`).
 
 **Why.** Each column needs its TypeScript key (an alias when it differs from the database name) and its codec. `*` would return database names, in the database's order, including columns the code doesn't declare.
 
 **Cost.** Longer SQL text.
+
+**Code.** `selectAll` in [select-query-builder.ts](select-query-builder.ts).
+
+### `selectAll` takes the name a table goes by
+
+**What it is.** `selectAll` requires one string: the name the table goes by in the query, its alias (`selectAll('u')` after `selectFrom(users.as('u'))`) or its name when not aliased (`selectAll('users')`). There is no table-object form (`selectAll(users)`) and no argument-less form selecting every table.
+
+**Why.** One form, and the same name every other reference in the query uses (`'u.id'`). A table object names the table, not what it goes by once aliased, and "every table" changes meaning when a join is added (and is a duplicate-key error as soon as two tables share a column name such as `id`).
+
+**Cost.** Selecting every column of two tables takes two calls.
 
 **Code.** `selectAll` in [select-query-builder.ts](select-query-builder.ts).
 
