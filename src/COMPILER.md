@@ -33,11 +33,11 @@ export function compile(node: StatementNode): CompiledQuery;
 type StatementNode = OperationNode | InsertNode | UpdateNode | DeleteNode;
 
 interface CompiledQuery {
-	readonly sql: string;
-	readonly params: readonly unknown[]; // values, as given (not encoded)
-	readonly paramCodecs?: readonly (Codec | undefined)[]; // per parameter
-	readonly resultCodecs?: readonly (Codec | null)[]; // per result column
-	readonly tag?: string;
+  readonly sql: string;
+  readonly params: readonly unknown[]; // values, as given (not encoded)
+  readonly paramCodecs?: readonly (Codec | undefined)[]; // per parameter
+  readonly resultCodecs?: readonly (Codec | null)[]; // per result column
+  readonly tag?: string;
 }
 ```
 
@@ -47,16 +47,16 @@ The returned object is a `Compiled` instance whose codecs are **getters over pri
 
 ```ts
 class Compiled implements CompiledQuery {
-	readonly sql: string;
-	readonly params: readonly unknown[];
-	readonly #paramCodecs;
-	readonly #resultCodecs;
-	get paramCodecs() {
-		return this.#paramCodecs;
-	}
-	get resultCodecs() {
-		return this.#resultCodecs;
-	}
+  readonly sql: string;
+  readonly params: readonly unknown[];
+  readonly #paramCodecs;
+  readonly #resultCodecs;
+  get paramCodecs() {
+    return this.#paramCodecs;
+  }
+  get resultCodecs() {
+    return this.#resultCodecs;
+  }
 }
 ```
 
@@ -66,16 +66,16 @@ So `console.log(query.toSQL())`, `JSON.stringify`, and `expect(compiled).toEqual
 
 ```ts
 interface Params {
-	values: unknown[];
-	codecs: (Codec | undefined)[];
-	typed: boolean;
+  values: unknown[];
+  codecs: (Codec | undefined)[];
+  typed: boolean;
 }
 
 function param(params: Params, value: unknown, codec?: Codec): string {
-	params.values.push(value);
-	params.codecs.push(codec);
-	if (codec !== undefined) params.typed = true;
-	return `$${params.values.length}`;
+  params.values.push(value);
+  params.codecs.push(codec);
+  if (codec !== undefined) params.typed = true;
+  return `$${params.values.length}`;
 }
 ```
 
@@ -109,13 +109,13 @@ Values are passed through **as given**. The compiler never encodes them: the dri
 
 ```ts
 function identifier(name: string): string {
-	let quoted = identifiers.get(name); // memoised, bounded: see below
-	if (quoted === undefined) {
-		quoted = `"${name.replaceAll('"', '""')}"`;
-		if (identifiers.size >= 4096) identifiers.clear();
-		identifiers.set(name, quoted);
-	}
-	return quoted;
+  let quoted = identifiers.get(name); // memoised, bounded: see below
+  if (quoted === undefined) {
+    quoted = `"${name.replaceAll('"', '""')}"`;
+    if (identifiers.size >= 4096) identifiers.clear();
+    identifiers.set(name, quoted);
+  }
+  return quoted;
 }
 ```
 
@@ -134,12 +134,12 @@ Strings are escaped like Postgres's own `quote_literal`:
 
 ```ts
 function stringLiteral(value: string): string {
-	if (value.includes('\0'))
-		throw new Error('A string literal cannot contain a NUL character');
-	const quoted = value.replaceAll("'", "''");
-	return value.includes('\\')
-		? `E'${quoted.replaceAll('\\', '\\\\')}'`
-		: `'${quoted}'`;
+  if (value.includes('\0'))
+    throw new Error('A string literal cannot contain a NUL character');
+  const quoted = value.replaceAll("'", "''");
+  return value.includes('\\')
+    ? `E'${quoted.replaceAll('\\', '\\\\')}'`
+    : `'${quoted}'`;
 }
 ```
 
@@ -149,10 +149,10 @@ Single quotes are doubled. If the string contains a backslash, it is written as 
 
 ```ts
 function renderLogical(operands, operator, empty, params) {
-	const [first, ...rest] = operands;
-	if (first === undefined) return empty; // 'true' for and, 'false' for or
-	if (rest.length === 0) return render(first, params);
-	return `(${operands.map((o) => render(o, params)).join(` ${operator} `)})`;
+  const [first, ...rest] = operands;
+  if (first === undefined) return empty; // 'true' for and, 'false' for or
+  if (rest.length === 0) return render(first, params);
+  return `(${operands.map((o) => render(o, params)).join(` ${operator} `)})`;
 }
 ```
 
@@ -199,18 +199,18 @@ Example, from `toSQL()`:
 
 ```ts
 selectFrom(posts)
-	.innerJoin(users)
-	.on('users.id', 'posts.authorId')
-	.where('users.role', 'admin')
-	.where((eb) =>
-		eb.or([
-			eb.ref('users.email').like('%@example.com'),
-			eb.ref('users.name').isNull(),
-		]),
-	)
-	.where((eb) => eb.ref('posts.id').in(['1', '2']))
-	.select(['posts.title', 'users.email'])
-	.limit(10);
+  .innerJoin(users)
+  .on('users.id', 'posts.authorId')
+  .where('users.role', 'admin')
+  .where((eb) =>
+    eb.or([
+      eb.ref('users.email').like('%@example.com'),
+      eb.ref('users.name').isNull(),
+    ]),
+  )
+  .where((eb) => eb.ref('posts.id').in(['1', '2']))
+  .select(['posts.title', 'users.email'])
+  .limit(10);
 ```
 
 ```sql
@@ -229,10 +229,10 @@ limit $5
 
 ```ts
 function renderLock(lock) {
-	let sql = ` for ${lock.strength}`; // update | no key update | share | key share
-	if (lock.of.length > 0) sql += ` of ${lock.of.map(identifier).join(', ')}`;
-	if (lock.wait !== undefined) sql += ` ${lock.wait}`; // skip locked | nowait
-	return sql;
+  let sql = ` for ${lock.strength}`; // update | no key update | share | key share
+  if (lock.of.length > 0) sql += ` of ${lock.of.map(identifier).join(', ')}`;
+  if (lock.wait !== undefined) sql += ` ${lock.wait}`; // skip locked | nowait
+  return sql;
 }
 ```
 
@@ -318,10 +318,10 @@ After rendering, `compile` collects the codec of each select-list (or `returning
 
 ```ts
 for (let i = 0; i < selections.length; i++) {
-	const codec = selections[i]?.codec;
-	if (codec === undefined) continue;
-	resultCodecs ??= selections.map(() => null);
-	resultCodecs[i] = codec;
+  const codec = selections[i]?.codec;
+  if (codec === undefined) continue;
+  resultCodecs ??= selections.map(() => null);
+  resultCodecs[i] = codec;
 }
 ```
 

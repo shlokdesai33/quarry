@@ -41,15 +41,15 @@
 
 ```ts
 interface Slot {             // one per open connection
-	readonly connection: Connection;
-	busy: boolean;           // lent out (for queries, or to one caller)
-	shared: number;          // queries in flight while lent for queries; -1 when not shared
-	readonly expiresAt: number; // end of its lifetime
-	idleSince: number;
-	depth: Depth | undefined;   // its adaptive pipeline depth, once a query was timed
-	lastDone: number;           // the pool's completion count at its last completion (for the width)
-	retiring: boolean;          // taking no new queries since the width narrowed
-	readonly settled; readonly fulfilled; readonly rejected; // callbacks made once per connection
+  readonly connection: Connection;
+  busy: boolean;           // lent out (for queries, or to one caller)
+  shared: number;          // queries in flight while lent for queries; -1 when not shared
+  readonly expiresAt: number; // end of its lifetime
+  idleSince: number;
+  depth: Depth | undefined;   // its adaptive pipeline depth, once a query was timed
+  lastDone: number;           // the pool's completion count at its last completion (for the width)
+  retiring: boolean;          // taking no new queries since the width narrowed
+  readonly settled; readonly fulfilled; readonly rejected; // callbacks made once per connection
 }
 #slots = new Map<Connection, Slot>(); // every open connection
 #idle: Slot[] = [];                   // a stack: most recently used last
@@ -81,14 +81,14 @@ State lives in fields of the slot (`busy`, `shared`) rather than in sets of busy
 
 ```ts
 #take(signal): Promise<Connection> {
-	if (this.#ended) return Promise.reject(new DriverError('The pool has ended'));
-	if (signal?.aborted) return Promise.reject(new AbortError(…));
-	const idle = this.#takeIdle();
-	if (idle !== undefined) return Promise.resolve(idle.connection);
-	const waiting = this.#wait(this.#waiters, signal);
-	this.#serveWaiters(); // open a connection if there's room
-	this.#rebalance();    // or drain a shared one, if the pool is full
-	return waiting;
+  if (this.#ended) return Promise.reject(new DriverError('The pool has ended'));
+  if (signal?.aborted) return Promise.reject(new AbortError(…));
+  const idle = this.#takeIdle();
+  if (idle !== undefined) return Promise.resolve(idle.connection);
+  const waiting = this.#wait(this.#waiters, signal);
+  this.#serveWaiters(); // open a connection if there's room
+  this.#rebalance();    // or drain a shared one, if the pool is full
+  return waiting;
 }
 ```
 
@@ -101,12 +101,12 @@ State lives in fields of the slot (`busy`, `shared`) rather than in sets of busy
 
 ```ts
 #serveWaiters(): void {
-	while (this.#waiters.length + this.#sharedWaiters.length > this.#opening && this.#total() < this.#max) {
-		this.#open().then(
-			(slot) => this.#giveBack(slot),
-			(error) => { /* reject one waiter with the error; then try again for the others */ },
-		);
-	}
+  while (this.#waiters.length + this.#sharedWaiters.length > this.#opening && this.#total() < this.#max) {
+    this.#open().then(
+      (slot) => this.#giveBack(slot),
+      (error) => { /* reject one waiter with the error; then try again for the others */ },
+    );
+  }
 }
 ```
 
@@ -119,11 +119,11 @@ State lives in fields of the slot (`busy`, `shared`) rather than in sets of busy
 
 ```ts
 #releaseSlot(slot, discard) {
-	const reusable = !discard && !connection.closed && !this.#expired(slot);
-	if (!reusable) { close it; serve waiters; refill min; return; }
-	if (connection.pending > 0 || connection.transactionStatus !== 'idle') { this.#releaseWhenIdle(slot); return; }
-	this.#unlend(slot);
-	this.#giveBack(slot);
+  const reusable = !discard && !connection.closed && !this.#expired(slot);
+  if (!reusable) { close it; serve waiters; refill min; return; }
+  if (connection.pending > 0 || connection.transactionStatus !== 'idle') { this.#releaseWhenIdle(slot); return; }
+  this.#unlend(slot);
+  this.#giveBack(slot);
 }
 ```
 
@@ -146,22 +146,22 @@ When every connection is busy, a pool without pipelining makes the next query wa
 
 ```ts
 query(sql, params, options) {
-	const slot = this.#claimShared(options?.signal);
-	if (slot === undefined) return this.#queryShared(sql, params, options); // wait in line
-	const started = this.#timing();
-	return slot.connection.queryThen(sql, params, options,
-		started < 0 ? slot.settled : this.#settledTimed(slot, started));
+  const slot = this.#claimShared(options?.signal);
+  if (slot === undefined) return this.#queryShared(sql, params, options); // wait in line
+  const started = this.#timing();
+  return slot.connection.queryThen(sql, params, options,
+    started < 0 ? slot.settled : this.#settledTimed(slot, started));
 }
 
 #claimShared(signal) {
-	if (this.#pipeline <= 1 || signal?.aborted || this.#ended) return undefined;
-	const slot = this.#taking() < this.#widthLimit() // claimed before any await
-		? (this.#takeIdle() ?? this.#pickShared())
-		: this.#pickShared();
-	if (slot === undefined) return undefined;
-	this.#claim(slot);
-	if (slot.shared > 1) this.#width?.demand(); // pipelined: a wider pool might help
-	return slot;
+  if (this.#pipeline <= 1 || signal?.aborted || this.#ended) return undefined;
+  const slot = this.#taking() < this.#widthLimit() // claimed before any await
+    ? (this.#takeIdle() ?? this.#pickShared())
+    : this.#pickShared();
+  if (slot === undefined) return undefined;
+  this.#claim(slot);
+  if (slot.shared > 1) this.#width?.demand(); // pipelined: a wider pool might help
+  return slot;
 }
 ```
 
@@ -196,22 +196,22 @@ How many queries should one connection carry? Too few, and on a slow network eac
 
 ```ts
 class Depth {
-	limit = PIPELINE_FLOOR; // 100
-	#fastest = Infinity;
-	#sum = 0;
-	#count = 0;
-	sample(latency, waiting) {
-		if (latency < this.#fastest) this.#fastest = latency;
-		this.#sum += latency;
-		if (++this.#count * SAMPLE_EVERY < this.limit) return; // a round: about `limit` queries
-		const ratio = this.#sum / this.#count / this.#fastest;
-		this.#sum = 0;
-		this.#count = 0;
-		if (ratio < 1.5 && waiting)
-			this.limit = Math.min(1000, Math.ceil(this.limit * 1.5));
-		else if (ratio > 3)
-			this.limit = Math.max(100, Math.floor(this.limit * 0.75));
-	}
+  limit = PIPELINE_FLOOR; // 100
+  #fastest = Infinity;
+  #sum = 0;
+  #count = 0;
+  sample(latency, waiting) {
+    if (latency < this.#fastest) this.#fastest = latency;
+    this.#sum += latency;
+    if (++this.#count * SAMPLE_EVERY < this.limit) return; // a round: about `limit` queries
+    const ratio = this.#sum / this.#count / this.#fastest;
+    this.#sum = 0;
+    this.#count = 0;
+    if (ratio < 1.5 && waiting)
+      this.limit = Math.min(1000, Math.ceil(this.limit * 1.5));
+    else if (ratio > 3)
+      this.limit = Math.max(100, Math.floor(this.limit * 0.75));
+  }
 }
 ```
 
@@ -253,11 +253,11 @@ The danger of sharing: under a steady stream of queries, a shared connection mig
 
 ```ts
 #rebalance() {
-	const target = this.#ended || this.#total() < this.#max ? 0 : Math.max(0, this.#waiters.length - this.#opening);
-	// release draining connections beyond the target …
-	while (this.#draining.size < target) {
-		// mark the least-loaded shared connection as draining
-	}
+  const target = this.#ended || this.#total() < this.#max ? 0 : Math.max(0, this.#waiters.length - this.#opening);
+  // release draining connections beyond the target …
+  while (this.#draining.size < target) {
+    // mark the least-loaded shared connection as draining
+  }
 }
 ```
 

@@ -49,17 +49,17 @@ Text is what `psql` shows and is universal. Binary is the type's internal-ish re
 
 ```ts
 interface Codec<In = unknown, Out = In> {
-	readonly name: string; // SQL name: 'int4', 'user_status', 'vector'; '' for any type (codecs.raw)
-	readonly oid: number; // the type's OID; 0 = look it up by name in the catalog
-	readonly arrayOid?: number; // the OID of its array type, when fixed
-	readonly paramFormat: 'text' | 'binary'; // what encode returns
-	readonly resultFormat: 'text' | 'binary'; // the format results are asked for in
-	readonly inferParamType?: boolean; // leave the parameter's type to the server (text-like types)
-	readonly element?: Codec; // for an array codec, its elements' codec
-	readonly delimiter?: string; // for an array codec, the element separator (',' or ';' for box)
-	encode(value: In): string | Uint8Array; // a non-null value as the server reads it
-	decodeText(text: string): Out; // from text output
-	decodeBinary?(bytes: Uint8Array, start: number, end: number): Out; // from binary, bytes[start, end)
+  readonly name: string; // SQL name: 'int4', 'user_status', 'vector'; '' for any type (codecs.raw)
+  readonly oid: number; // the type's OID; 0 = look it up by name in the catalog
+  readonly arrayOid?: number; // the OID of its array type, when fixed
+  readonly paramFormat: 'text' | 'binary'; // what encode returns
+  readonly resultFormat: 'text' | 'binary'; // the format results are asked for in
+  readonly inferParamType?: boolean; // leave the parameter's type to the server (text-like types)
+  readonly element?: Codec; // for an array codec, its elements' codec
+  readonly delimiter?: string; // for an array codec, the element separator (',' or ';' for box)
+  encode(value: In): string | Uint8Array; // a non-null value as the server reads it
+  decodeText(text: string): Out; // from text output
+  decodeBinary?(bytes: Uint8Array, start: number, end: number): Out; // from binary, bytes[start, end)
 }
 ```
 
@@ -139,13 +139,13 @@ What `binaryArray` can encode (one dimension): `bool[]`, `int2[]`, `int4[]`, `in
 
 ```ts
 const point = defineCodec({
-	name: 'point',
-	oid: 600,
-	encode: ({ x, y }: { x: number; y: number }) => `(${x},${y})`,
-	decodeText: (text) => {
-		const [x, y] = text.slice(1, -1).split(',').map(Number);
-		return { x, y };
-	},
+  name: 'point',
+  oid: 600,
+  encode: ({ x, y }: { x: number; y: number }) => `(${x},${y})`,
+  decodeText: (text) => {
+    const [x, y] = text.slice(1, -1).split(',').map(Number);
+    return { x, y };
+  },
 });
 ```
 
@@ -207,11 +207,11 @@ When a result's columns are known (from RowDescription, or a cached statement), 
 
 ```ts
 interface ResultPlan {
-	formats: readonly number[] | 0; // per column as asked for at Bind (0 = all text)
-	fields: readonly Field[]; // the columns, with those formats
-	codecs: (Codec | undefined)[]; // per column: what reads it (undefined = the server's text)
-	unreadable: Field | undefined; // a binary column nothing can read
-	decoders: Map<RowMode, RowDecoder>; // built on first use
+  formats: readonly number[] | 0; // per column as asked for at Bind (0 = all text)
+  fields: readonly Field[]; // the columns, with those formats
+  codecs: (Codec | undefined)[]; // per column: what reads it (undefined = the server's text)
+  unreadable: Field | undefined; // a binary column nothing can read
+  decoders: Map<RowMode, RowDecoder>; // built on first use
 }
 ```
 

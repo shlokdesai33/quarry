@@ -94,27 +94,27 @@ Errors in the string never echo values (a malformed percent-encoding might be in
 
 ```ts
 const passes =
-	config.targetSessionAttrs === 'prefer-standby'
-		? ['standby', 'any']
-		: [config.targetSessionAttrs];
+  config.targetSessionAttrs === 'prefer-standby'
+    ? ['standby', 'any']
+    : [config.targetSessionAttrs];
 for (const pass of passes)
-	for (const host of config.hosts) {
-		try {
-			connection = await connectHost(config, host, signal);
-		} catch (e) {
-			errors.push(e);
-			continue;
-		}
-		if (pass === 'any' || (await matchesTarget(connection, pass)))
-			return connection;
-		await connection.close();
-		errors.push(new ConnectionError(`${host} is not a ${pass} server`));
-	}
+  for (const host of config.hosts) {
+    try {
+      connection = await connectHost(config, host, signal);
+    } catch (e) {
+      errors.push(e);
+      continue;
+    }
+    if (pass === 'any' || (await matchesTarget(connection, pass)))
+      return connection;
+    await connection.close();
+    errors.push(new ConnectionError(`${host} is not a ${pass} server`));
+  }
 throw errors.length === 1
-	? errors[0]
-	: new ConnectionError(`Could not connect to any host: …`, {
-			cause: new AggregateError(errors),
-		});
+  ? errors[0]
+  : new ConnectionError(`Could not connect to any host: …`, {
+      cause: new AggregateError(errors),
+    });
 ```
 
 `matchesTarget` reads the server's role from the parameters it reported at login (`in_hot_standby`, `default_transaction_read_only`), and only queries (`pg_is_in_recovery()`) if they're missing. A **standby** is a read-only replica; a **primary** accepts writes. With `prefer-standby`, a first pass looks for a standby and a second accepts any.
@@ -293,13 +293,13 @@ The server picks the method, so a malicious server (or an impostor) could ask fo
 
 ```ts
 async #password(): Promise<string> {
-	const source = this.#config.password;
-	if (typeof source === 'function') return source();
-	if (source !== undefined) return source;
-	const file = await readPgpass(this.#config.passfile);
-	const found = file === undefined ? undefined : findPgpassPassword(file, { ...host, database, user });
-	if (found === undefined) throw new ConnectionError('The server requested a password, but none was given');
-	return found;
+  const source = this.#config.password;
+  if (typeof source === 'function') return source();
+  if (source !== undefined) return source;
+  const file = await readPgpass(this.#config.passfile);
+  const found = file === undefined ? undefined : findPgpassPassword(file, { ...host, database, user });
+  if (found === undefined) throw new ConnectionError('The server requested a password, but none was given');
+  return found;
 }
 ```
 

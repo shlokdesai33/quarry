@@ -19,11 +19,11 @@ Code: `CursorOp`, `FetchOp`, `ClosePortalOp`, `CopyFromOp`, `CopyToOp` in [ops.t
 
 ```ts
 for await (const batch of conn.cursor(
-	'select * from events where day = $1',
-	[day],
-	{ batchSize: 1000, signal },
+  'select * from events where day = $1',
+  [day],
+  { batchSize: 1000, signal },
 )) {
-	for (const row of batch) handle(row);
+  for (const row of batch) handle(row);
 }
 ```
 
@@ -148,8 +148,8 @@ The convenient form: `rows` is an iterable of value arrays, encoded like query p
 
 ```ts
 await conn.copyRows('copy users (id, name) from stdin', [
-	[1, 'Ada'],
-	[2, 'Grace'],
+  [1, 'Ada'],
+  [2, 'Grace'],
 ]);
 ```
 
@@ -172,7 +172,7 @@ Postgres has a built-in publish/subscribe channel. A session runs `listen orders
 
 ```ts
 const unlisten = await conn.listen('orders', (n) =>
-	console.log(n.channel, n.payload),
+  console.log(n.channel, n.payload),
 );
 await conn.notify('orders', JSON.stringify({ id: 7 })); // select pg_notify($1, $2)
 await unlisten();
