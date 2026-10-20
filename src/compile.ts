@@ -76,19 +76,12 @@ export function compile(node: StatementNode): CompiledQuery {
 				  node.kind === 'delete'
 				? node.returning
 				: [];
-	let resultCodecs: (Codec | null)[] | undefined;
-	for (let i = 0; i < selections.length; i++) {
-		const codec = selections[i]?.codec;
-		if (codec === undefined) continue;
-		resultCodecs ??= selections.map(() => null);
-		resultCodecs[i] = codec;
-	}
 	return new Compiled(
 		sqlOf(out),
 		out.values,
 		tag,
 		out.typed ? out.codecs : undefined,
-		resultCodecs,
+		sharedList(selections)?.codecs ?? resultCodecsOf(selections),
 		node.kind === 'select' ||
 			node.kind === 'insert' ||
 			node.kind === 'update' ||
@@ -378,7 +371,54 @@ function renderSelections(
 ): void {
 	if (selections.length === 0) return;
 	write(out, prefix);
-	list(out, selections, renderSelection);
+	const sql = sharedList(selections)?.sql;
+	if (sql !== undefined) write(out, sql);
+	else list(out, selections, renderSelection);
+}
+
+/** The codec of each result column, where one is known; undefined when none is. */
+function resultCodecsOf(
+	selections: readonly SelectionNode[],
+): (Codec | null)[] | undefined {
+	let codecs: (Codec | null)[] | undefined;
+	for (let i = 0; i < selections.length; i++) {
+		const codec = selections[i]?.codec;
+		if (codec === undefined) continue;
+		codecs ??= selections.map(() => null);
+		codecs[i] = codec;
+	}
+	return codecs;
+}
+
+/** A frozen select list, rendered once: its SQL, when each of its columns has shared SQL, and its result codecs. */
+interface SharedList {
+	readonly sql: string | undefined;
+	readonly codecs: readonly (Codec | null)[] | undefined;
+}
+
+/**
+ * The frozen select lists (a table's every column, see `allSelections`),
+ * which every query selecting or returning them shares: like their nodes,
+ * they never change, so they are rendered once.
+ */
+const sharedLists = new WeakMap<readonly SelectionNode[], SharedList>();
+
+function sharedList(
+	selections: readonly SelectionNode[],
+): SharedList | undefined {
+	if (!Object.isFrozen(selections)) return undefined;
+	let found = sharedLists.get(selections);
+	if (found === undefined) {
+		const parts = selections.map((selection) => shared.get(selection));
+		found = {
+			sql: parts.every((part) => part !== undefined)
+				? parts.join(', ')
+				: undefined,
+			codecs: freeze(resultCodecsOf(selections)),
+		};
+		sharedLists.set(selections, found);
+	}
+	return found;
 }
 
 function renderOnConflict(
@@ -823,4 +863,8 @@ function stringLiteral(value: string): string {
 	return value.includes('\\')
 		? `E'${quoted.replaceAll('\\', '\\\\')}'`
 		: `'${quoted}'`;
+}
+
+function freeze<T>(value: readonly T[] | undefined): readonly T[] | undefined {
+	return value === undefined ? undefined : Object.freeze(value);
 }
