@@ -11,6 +11,7 @@ import type {
 import { RowStream } from './driver/row-stream.js';
 import { Expression, type TypedExpression } from './expression.js';
 import {
+	allSelections,
 	type ExpressionBuilder,
 	expressionBuilder,
 } from './expression-builder.js';
@@ -529,15 +530,18 @@ export class SelectQueryBuilder<
 		if (tables.length === 0) {
 			throw new Error(`selectAll: "${table}" is not in the query`);
 		}
-		const eb = expressionBuilder(...this.#state.tables);
-		const refs = tables.flatMap((t) =>
-			Object.keys(t.schema.columns).map((key) => `${t.name}.${key}`),
-		);
+		const [only] = tables;
 		return new SelectQueryBuilder<
 			T,
 			AddRow<O, RowOf<RefsOf<T>, TableRefs<RefsOf<T>, N>>>,
 			L
-		>(this.#selecting(selectionNodes(eb, refs)));
+		>(
+			this.#selecting(
+				tables.length === 1 && only !== undefined
+					? allSelections(only)
+					: tables.flatMap((t) => allSelections(t)),
+			),
+		);
 	}
 
 	/**
@@ -1225,10 +1229,12 @@ export class SelectQueryBuilder<
 
 	/** The state with `added` selected; throws when a key is taken. */
 	#selecting(added: readonly SelectionNode[]): SelectState<T> {
-		checkUniqueKeys(this.#state.selections, added);
+		const { selections } = this.#state;
+		checkUniqueKeys(selections, added);
 		return {
 			...this.#state,
-			selections: [...this.#state.selections, ...added],
+			// lists are never changed in place, so the first one is kept as is
+			selections: selections.length === 0 ? added : [...selections, ...added],
 		};
 	}
 

@@ -177,6 +177,33 @@ function resolveColumn(
 	return resolved;
 }
 
+/** Each table's every column, as `selectAll` and `returningAll` list them. */
+const everyColumn = new WeakMap<AnyTable, readonly SelectionNode[]>();
+
+/**
+ * The selection of every column of `table`, in the order the schema lists
+ * them: one frozen list per table, shared by every query that selects or
+ * returns them all.
+ */
+export function allSelections(table: AnyTable): readonly SelectionNode[] {
+	let list = everyColumn.get(table);
+	if (list === undefined) {
+		list = Object.freeze(
+			Object.keys(table.schema.columns).map((key) => {
+				const resolved = resolveColumn(table, key);
+				if (resolved === undefined) {
+					throw new Error(
+						`Unknown column reference "${table.name}.${key}"`,
+					);
+				}
+				return resolved.selection;
+			}),
+		);
+		everyColumn.set(table, list);
+	}
+	return list;
+}
+
 /** The expression builder of each single-table scope: it holds nothing per query. */
 const singleTable = new WeakMap<AnyTable, ExpressionBuilder<Refs>>();
 
