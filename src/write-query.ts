@@ -173,47 +173,27 @@ export function rowsNode(
 	rows: readonly object[],
 	strategy: RowsNode['strategy'],
 ): RowsNode {
-	// each row's own enumerable keys and values, read once, as Object.entries reads them
-	const rowKeys: string[][] = [];
-	const rowValues: unknown[][] = [];
+	const entries = rows.map((row) => Object.entries(row));
 	const keys: string[] = [];
-	for (const row of rows) {
-		const own = Object.keys(row);
-		const values: unknown[] = [];
-		for (const key of own) {
-			// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- a row is a record of its columns
-			const value = (row as Record<string, unknown>)[key];
-			values.push(value);
+	for (const list of entries) {
+		for (const [key, value] of list) {
 			if (value !== undefined && !keys.includes(key)) keys.push(key);
 		}
-		rowKeys.push(own);
-		rowValues.push(values);
 	}
 	const resolved = keys.map((key) => columnOf(table, key));
-	const cells: (OperationNode | undefined)[][] = [];
-	for (let r = 0; r < rowKeys.length; r++) {
-		// oxlint-disable-next-line typescript/no-non-null-assertion -- within bounds
-		const own = rowKeys[r]!;
-		// oxlint-disable-next-line typescript/no-non-null-assertion -- within bounds
-		const values = rowValues[r]!;
-		const row: (OperationNode | undefined)[] = [];
-		for (let i = 0; i < keys.length; i++) row.push(undefined);
-		for (let j = 0; j < own.length; j++) {
-			const value = values[j];
-			if (value === undefined) continue;
-			// oxlint-disable-next-line typescript/no-non-null-assertion -- within bounds
-			const key = own[j]!;
-			const i = keys[j] === key ? j : keys.indexOf(key);
-			// oxlint-disable-next-line typescript/no-non-null-assertion -- every defined key is in keys
-			row[i] = valueNode(resolved[i]!.column, value);
-		}
-		cells.push(row);
-	}
 	return {
 		columns: resolved.map(({ name }) => name),
 		types: resolved.map(({ column }) => castType(column._quarry.dataType)),
 		codecs: resolved.map(({ column }) => column._quarry.dataType.codec),
-		rows: cells,
+		rows: entries.map((list) => {
+			const cells: (OperationNode | undefined)[] = keys.map(() => undefined);
+			for (const [key, value] of list) {
+				if (value === undefined) continue;
+				const i = keys.indexOf(key);
+				cells[i] = valueNode(resolved[i]!.column, value);
+			}
+			return cells;
+		}),
 		strategy,
 	};
 }
