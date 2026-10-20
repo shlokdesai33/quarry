@@ -515,30 +515,26 @@ export class SelectQueryBuilder<
 	}
 
 	/**
-	 * Selects every column of `table` (a table in the query, or the name it
-	 * goes by there), or without one, of every table in the query, each
-	 * keyed by its name. Each column is listed, never `*`, so it is keyed
-	 * and decoded like a selected column. Two tables with a column of the
-	 * same name can't both be selected whole: select one with `select` and
-	 * `.as()`.
+	 * Selects every column of `table`, the name a table goes by in the query
+	 * (its alias, or its name when not aliased), each keyed by its name.
+	 * Each column is listed, never `*`, so it is keyed and decoded like a
+	 * selected column. Two tables with a column of the same name can't both
+	 * be selected whole: select one with `select` and `.as()`.
 	 *
-	 * @example .selectAll()
-	 * @example .selectAll(users)
+	 * @example .selectAll('users')
+	 * @example .selectAll('u') // after selectFrom(users.as('u'))
 	 */
-	selectAll<N extends T[number]['name'] = T[number]['name']>(
-		table?: N | (T[number] & { readonly name: N }),
+	selectAll<N extends T[number]['name']>(
+		table: N,
 		..._unique: UniqueColumns<O, TableRefs<RefsOf<T>, N>>
 	): SelectQueryBuilder<
 		T,
 		AddRow<O, RowOf<RefsOf<T>, TableRefs<RefsOf<T>, N>>>,
 		L
 	> {
-		const name = typeof table === 'object' ? table.name : table;
-		const tables = this.#state.tables.filter(
-			(t) => name === undefined || t.name === name,
-		);
+		const tables = this.#state.tables.filter((t) => t.name === table);
 		if (tables.length === 0) {
-			throw new Error(`selectAll: "${String(name)}" is not in the query`);
+			throw new Error(`selectAll: "${table}" is not in the query`);
 		}
 		const eb = expressionBuilder(...this.#state.tables);
 		const refs = tables.flatMap((t) =>

@@ -595,7 +595,7 @@ When the fragment's tables are all in the query, the rest parameter is the empty
 Two more checks from #32 use an impossible extra argument:
 
 - `innerJoin(table, ..._newName: NewName<T, J>)` and the other joins: if a table of the same name is already in the query, the rest parameter becomes `[alreadyJoined: '"users" is already in the query: join it under another name, e.g. users.as(\'other\')']`, so the error message tells you the fix.
-- `select(list, ..._unique: UniqueKeys<O, S>)`, `selectAll(…, ..._unique: UniqueColumns<…>)` and `returning(…)`: if a selection's key is already in the row (or appears twice in the list), the extra argument names the duplicate key.
+- `select(list, ..._unique: UniqueKeys<O, S>)`, `selectAll(table, ..._unique: UniqueColumns<…>)` and `returning(…)`: if a selection's key is already in the row (or appears twice in the list), the extra argument names the duplicate key.
 
 Both are also checked at run time (`#joined`, `checkUniqueKeys`), because a mistake there silently corrupts results (an ambiguous reference resolves to the first table; a duplicate key loses a column in object rows).
 

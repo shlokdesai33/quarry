@@ -219,7 +219,7 @@ const rows = await db
 	.execute();
 ```
 
-`select` takes columns (keyed by name) or a callback returning columns and aliased expressions; each call adds to the list. `selectAll()` selects every column, `selectAll(users)` every column of one table. Only tables in scope can be referenced.
+`select` takes columns (keyed by name) or a callback returning columns and aliased expressions; each call adds to the list. `selectAll('users')` selects every column of a table, named as it goes by in the query (its alias, `selectAll('u')`, when aliased). Only tables in scope can be referenced.
 
 ```ts
 const emails = await db

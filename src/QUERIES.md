@@ -116,14 +116,15 @@ Every join goes through `#joined(table)`: it refuses a table whose name is alrea
 ```ts
 .select(['users.id', 'contacts.email'])                   // keyed by column key
 .select((eb) => [eb.fn.lower('users.email').as('email')]) // expressions need an alias
-.selectAll()                                              // every column of every table
-.selectAll(users)                                         // every column of one table
+.selectAll('users')                                       // every column of one table
+.selectAll('u')                                           // by its alias, after selectFrom(users.as('u'))
 ```
 
 `selectionNodes(eb, list)` ([row.ts](row.ts)) makes one `SelectionNode` per entry (a column's is made once per table and shared): the expression's node, the **alias** (the column key after the dot, or the expression's alias), and the **codec** to read it with (the column's or typed expression's `DataType.codec`). Each call appends; the row type grows with it ([TYPES.md](TYPES.md#part-6-result-row-types)).
 
 - **Each key can be in the row once.** Selecting a second `id` is a type error (`UniqueKeys`, an impossible extra argument naming the duplicate) and a build-time error (`checkUniqueKeys`); `.as('managerId')` resolves it. Before #32, two `id`s were both rendered and the driver's object row silently kept the last.
 - **`selectAll` lists the columns**, never `select *`: each column keeps its TypeScript key (`createdAt` from `created_at`) and its codec, and the SQL doesn't change meaning if the table gains a column.
+- **`selectAll` takes the name the table goes by** in the query (its alias, or its name when not aliased), and only that: not a table object, and no argument-less "every table" form.
 
 ### `nest`: a table's columns as one object
 
@@ -509,7 +510,8 @@ Why the builders work this way. Each links to its full entry (what it is, why, t
 - [`setEach` rows are typed by the table, and duplicate keys are refused](DECISIONS.md#seteach-rows-are-typed-by-the-table-and-duplicate-keys-are-refused): no misspelled or read-only columns, no ambiguous updates.
 - [Outer joins make the joined side nullable: `NullableTable`](DECISIONS.md#outer-joins-make-the-joined-side-nullable-nullabletable): the row type says which columns can be NULL.
 - [A table joined twice, or a key selected twice, is refused](DECISIONS.md#a-table-joined-twice-or-a-key-selected-twice-is-refused): both silently corrupted results.
-- [`selectAll()` lists the columns, never `*`](DECISIONS.md#selectall-lists-the-columns-never-): each column keeps its key and codec.
+- [`selectAll` lists the columns, never `*`](DECISIONS.md#selectall-lists-the-columns-never-): each column keeps its key and codec.
+- [`selectAll` takes the name a table goes by](DECISIONS.md#selectall-takes-the-name-a-table-goes-by): one form, the name every other reference uses.
 - [`nest` marks a joined row with `ctid`](DECISIONS.md#nest-marks-a-joined-row-with-ctid): flat columns plus one marker, so a missing row is `null` and a row of nulls is an object.
 - [Ordering by a selected key uses the bare key](DECISIONS.md#ordering-by-a-selected-key-uses-the-bare-key): a dot always means a column.
 - [Raw SQL only through the `sql` template tag](DECISIONS.md#raw-sql-only-through-the-sql-template-tag): `db.sql` and fragments stay injection-safe.

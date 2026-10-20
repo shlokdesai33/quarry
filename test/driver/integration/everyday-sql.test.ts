@@ -611,7 +611,7 @@ describe.skipIf(noPg)('everyday SQL on PostgreSQL', () => {
 				.on('posts.authorId', 'users.id')
 				.where('users.name', 'Grace')
 				.select(['users.name'])
-				.selectAll(posts)
+				.selectAll('posts')
 				.execute();
 			expectTypeOf(rows).toEqualTypeOf<
 				{
