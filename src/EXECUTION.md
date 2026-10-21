@@ -198,6 +198,8 @@ async execute(query, options = {}) {
 | `onQuery` timing callback                  | `onTiming`                       |
 | `query.tag`                                | `tag`                            |
 
+`Query.execute` hands the shape's read options (`keepRows`, `rowMode`) to the executor as they are when `execute()` is given no options, and merges them into a copy otherwise; the shapes without an `err` (`expectOne()`, `takeFirst()`, …) are made once, not per query.
+
 ## Connections: shared or exclusive
 
 Over a pool, an operation runs either on the pool's **shared** connections, pipelined with other callers' queries, or on a connection **of its own**, depending on whether it leaves anything on the connection that another caller's query could see:
@@ -218,10 +220,15 @@ COPY and LISTEN aren't builder operations: the driver's `pool.copyFrom`, `copyRo
 #shared(queries): Pool | undefined {
   const source = this.#source;
   if (!(source instanceof Pool)) return undefined;
-  // undefined as well when a statement matches SESSION_STATEMENT
+  // undefined as well when a statement changesSession
   return source;
 }
+
+const changesSession = (query) =>
+  !isDataStatement(query) && SESSION_STATEMENT.test(query.sql);
 ```
+
+Only SQL written by hand is read: `isDataStatement` ([compile.ts](compile.ts)) is true for a query `compile` made from a select, insert, update or delete node, which leaves no session state behind, so the builders' queries skip the regular expression. A `db.sql` statement, or a query object made anywhere else (a copy of a compiled one included), is tested as before.
 
 **Shared.** Until the pool is full, a query takes an idle connection or waits for one being opened; once it is full, it pipelines onto the least loaded busy connection, waits in the pool's FIFO of pipeline slots beyond each connection's (adaptive) depth, and a connection is drained for a caller who needs one of its own, so transactions and streams aren't starved ([driver/POOL.md](driver/POOL.md#pipelining-onto-busy-connections)). Each query keeps its own behaviour, because all of it is per query in the connection: codecs and binary results once its statement is described (the statement cache is per connection), `keepRows`, the tag, the signal (a cancel is only sent once the query is at the head of the connection's queue, so it can't hit another caller's query: [driver/CANCELLATION.md](driver/CANCELLATION.md)), the unnamed statements behind PgBouncer, and the retry of a stale cached statement. A failing query fails alone: each has its own Sync. A batch runs as one pipeline slot: `withShared` hands it one connection, its statements go out together, and the slot ends when the last one settles.
 

@@ -80,6 +80,21 @@ const slowQueries = (
 	pace: (active) => (closed ? (0.004 * max) / active : 0.004),
 });
 
+/** `server`, with the client paused for `ms` every `every` completions: a GC pause, or the process descheduled on a busy host. */
+const pausing = (
+	server: Server,
+	every: number,
+	ms: number,
+	offset = 0,
+): Server => {
+	let completions = offset;
+	return {
+		pick: (tick, active) => server.pick(tick, active),
+		pace: (active) =>
+			server.pace(active) + (++completions % every === 0 ? ms : 0),
+	};
+};
+
 const lowest = (values: number[]) =>
 	values.reduce((a, b) => Math.min(a, b), Number.POSITIVE_INFINITY);
 const highest = (values: number[]) =>
@@ -96,6 +111,23 @@ describe('Width', () => {
 		expect(median(late)).toBe(2);
 		expect(highest(late)).toBeLessThanOrEqual(3);
 	});
+
+	it.each(Array.from({ length: 8 }, (_, i) => i * 2500))(
+		'narrows when the client pauses now and then (phase %i)',
+		(offset) => {
+			const clock = { now: 0 };
+			const width = new Width(4, () => clock.now);
+			// 20 ms off the CPU every 20,000 completions (80 ms of them)
+			const limits = run(
+				width,
+				clock,
+				4,
+				200_000,
+				pausing(timeSliced(1), 20_000, 20, offset),
+			);
+			expect(median(limits.slice(100_000))).toBeLessThanOrEqual(2);
+		},
+	);
 
 	it('narrows a wide pool in one or two steps', () => {
 		const clock = { now: 0 };
