@@ -34,13 +34,13 @@ const db = database(pool); // a Pool, PoolClient or Connection you manage
 
 ```ts
 export function database(
-	source: DatabaseSource,
-	options: DatabaseOptions = {},
+  source: DatabaseSource,
+  options: DatabaseOptions = {},
 ): Database {
-	const executor = isDriverSource(source)
-		? new DriverExecutor(source, options)
-		: new DriverExecutor(createPool(source), options, true);
-	return databaseWith(executor);
+  const executor = isDriverSource(source)
+    ? new DriverExecutor(source, options)
+    : new DriverExecutor(createPool(source), options, true);
+  return databaseWith(executor);
 }
 ```
 
@@ -66,29 +66,29 @@ The `Database` object is a plain object of functions (`queries(executor)`), each
 
 ```ts
 interface Executor {
-	execute(
-		query: CompiledQuery,
-		options?: ExecuteOptions,
-	): Promise<ExecuteResult>;
-	stream(
-		query: CompiledQuery,
-		options?: StreamOptions,
-	): AsyncIterable<readonly unknown[]>;
-	describe(query: CompiledQuery): Promise<QueryDescription>;
-	batch(
-		queries: readonly BatchQuery[],
-		options?: ExecuteBatchOptions,
-	): Promise<readonly PromiseSettledResult<ExecuteResult>[]>;
-	transaction<T>(
-		fn: (executor: TransactionExecutor) => Promise<T>,
-		options?: TransactionOptions,
-	): Promise<T>;
-	close(): Promise<void>;
+  execute(
+    query: CompiledQuery,
+    options?: ExecuteOptions,
+  ): Promise<ExecuteResult>;
+  stream(
+    query: CompiledQuery,
+    options?: StreamOptions,
+  ): AsyncIterable<readonly unknown[]>;
+  describe(query: CompiledQuery): Promise<QueryDescription>;
+  batch(
+    queries: readonly BatchQuery[],
+    options?: ExecuteBatchOptions,
+  ): Promise<readonly PromiseSettledResult<ExecuteResult>[]>;
+  transaction<T>(
+    fn: (executor: TransactionExecutor) => Promise<T>,
+    options?: TransactionOptions,
+  ): Promise<T>;
+  close(): Promise<void>;
 }
 interface ExecuteResult {
-	rows: readonly unknown[];
-	rowCount: number | null;
-	command: string;
+  rows: readonly unknown[];
+  rowCount: number | null;
+  command: string;
 }
 ```
 
@@ -132,10 +132,10 @@ flowchart LR
 
 ```ts
 this.#registry =
-	registry ??
-	(options.codecs === undefined || options.codecs.length === 0
-		? quarryRegistry
-		: createCodecRegistry(options.codecs, quarryRegistry));
+  registry ??
+  (options.codecs === undefined || options.codecs.length === 0
+    ? quarryRegistry
+    : createCodecRegistry(options.codecs, quarryRegistry));
 ```
 
 `quarryRegistry` ([kind-codecs.ts](kind-codecs.ts)) is the driver's lossless defaults with quarry's choices on top: int8 as a string, timestamptz as a `Date`, ranges as `Range`, pgvector as `number[]`. `options.codecs` override it per type.
@@ -148,9 +148,9 @@ Some codecs don't know their type's OID in advance: enums (`EnumType`), `codecs.
 
 ```ts
 async #prepare(runner: Runner): Promise<void> {
-	if (this.#ready || runner.loadTypes === undefined) return;
-	await runner.loadTypes();
-	this.#ready = true;
+  if (this.#ready || runner.loadTypes === undefined) return;
+  await runner.loadTypes();
+  this.#ready = true;
 }
 ```
 
@@ -160,27 +160,27 @@ With `catalog: false` it doesn't wait for it; the driver then loads the catalog 
 
 ```ts
 async execute(query, options = {}) {
-	const observe = this.#options.onQuery !== undefined;
-	const start = observe ? performance.now() : 0;
-	try {
-		const pool = this.#shared(query);                  // the pool, if the query can share its connections
-		let result;
-		if (pool !== undefined) {
-			if (!this.#ready) await this.#prepare(pool);
-			result = await pool.query(query.sql, query.params, this.#queryOptions(options, onTiming, query));
-		} else {
-			result = await this.#run(options.signal, (runner) => {        // a connection of its own
-				if (observe) acquired = performance.now();
-				return runner.query(query.sql, query.params, this.#queryOptions(options, onTiming, query));
-			});
-		}
-		if (observe) this.#report('execute', query, start, acquired, timing, result.command, result.rowCount ?? result.rows.length);
-		return { rows: result.rows, rowCount: result.rowCount, command: result.command };
-	} catch (error) {
-		decorate(error, query, issuedAt(this.#options)); // the call site, captured now: see Errors
-		if (observe) this.#report('execute', …, error);
-		throw error;
-	}
+  const observe = this.#options.onQuery !== undefined;
+  const start = observe ? performance.now() : 0;
+  try {
+    const pool = this.#shared(query);                  // the pool, if the query can share its connections
+    let result;
+    if (pool !== undefined) {
+      if (!this.#ready) await this.#prepare(pool);
+      result = await pool.query(query.sql, query.params, this.#queryOptions(options, onTiming, query));
+    } else {
+      result = await this.#run(options.signal, (runner) => {        // a connection of its own
+        if (observe) acquired = performance.now();
+        return runner.query(query.sql, query.params, this.#queryOptions(options, onTiming, query));
+      });
+    }
+    if (observe) this.#report('execute', query, start, acquired, timing, result.command, result.rowCount ?? result.rows.length);
+    return { rows: result.rows, rowCount: result.rowCount, command: result.command };
+  } catch (error) {
+    decorate(error, query, issuedAt(this.#options)); // the call site, captured now: see Errors
+    if (observe) this.#report('execute', …, error);
+    throw error;
+  }
 }
 ```
 
@@ -218,14 +218,14 @@ COPY and LISTEN aren't builder operations: the driver's `pool.copyFrom`, `copyRo
 
 ```ts
 #shared(queries): Pool | undefined {
-	const source = this.#source;
-	if (!(source instanceof Pool)) return undefined;
-	// undefined as well when a statement changesSession
-	return source;
+  const source = this.#source;
+  if (!(source instanceof Pool)) return undefined;
+  // undefined as well when a statement changesSession
+  return source;
 }
 
 const changesSession = (query) =>
-	!isDataStatement(query) && SESSION_STATEMENT.test(query.sql);
+  !isDataStatement(query) && SESSION_STATEMENT.test(query.sql);
 ```
 
 Only SQL written by hand is read: `isDataStatement` ([compile.ts](compile.ts)) is true for a query `compile` made from a select, insert, update or delete node, which leaves no session state behind, so the builders' queries skip the regular expression. A `db.sql` statement, or a query object made anywhere else (a copy of a compiled one included), is tested as before.
@@ -238,19 +238,19 @@ Only SQL written by hand is read: `isDataStatement` ([compile.ts](compile.ts)) i
 
 ```ts
 async #run(signal, fn) {
-	const source = this.#source;
-	if (!(source instanceof Pool)) {
-		const runner = source instanceof PoolClient ? source.connection : source;
-		await this.#prepare(runner);
-		return await fn(runner); // awaited, so a failure's call site traces back through it
-	}
-	const client = await source.acquire(signal === undefined ? {} : { signal });
-	try {
-		await this.#prepare(client.connection);
-		return await fn(client.connection);
-	} finally {
-		client.release();
-	}
+  const source = this.#source;
+  if (!(source instanceof Pool)) {
+    const runner = source instanceof PoolClient ? source.connection : source;
+    await this.#prepare(runner);
+    return await fn(runner); // awaited, so a failure's call site traces back through it
+  }
+  const client = await source.acquire(signal === undefined ? {} : { signal });
+  try {
+    await this.#prepare(client.connection);
+    return await fn(client.connection);
+  } finally {
+    client.release();
+  }
 }
 ```
 
@@ -264,13 +264,13 @@ Over a `PoolClient` or `Connection`, every operation uses that one connection, a
 
 ```ts
 const [user, posts, { rowCount }] = await db.batch([
-	db
-		.selectFrom(users)
-		.where('users.id', id)
-		.select(['users.email'])
-		.expectOne(),
-	db.selectFrom(posts).where('posts.authorId', id).select(['posts.title']),
-	db.update(users).set({ seenAt: new Date() }).where('users.id', id),
+  db
+    .selectFrom(users)
+    .where('users.id', id)
+    .select(['users.email'])
+    .expectOne(),
+  db.selectFrom(posts).where('posts.authorId', id).select(['posts.title']),
+  db.update(users).set({ seenAt: new Date() }).where('users.id', id),
 ]);
 ```
 
@@ -323,12 +323,12 @@ A **transaction** groups statements so they take effect together or not at all: 
 
 ```ts
 await db.transaction(
-	async (tx) => {
-		const order = await tx.insertInto(orders).values(row).returning(['orders.id']).expectOne().execute();
-		await tx.update(stock).set(…).where(…).execute();
-		tx.afterCommit(() => queue.publish('order.created', order.id));
-	},
-	{ isolation: 'serializable', retries: 3 },
+  async (tx) => {
+    const order = await tx.insertInto(orders).values(row).returning(['orders.id']).expectOne().execute();
+    await tx.update(stock).set(…).where(…).execute();
+    tx.afterCommit(() => queue.publish('order.created', order.id));
+  },
+  { isolation: 'serializable', retries: 3 },
 );
 ```
 
@@ -348,8 +348,8 @@ The driver's framing (BEGIN sharing the first statement's Sync, deferred savepoi
 for await (const user of db.selectFrom(users).select(['users.id']).stream({ batchSize: 500, signal })) { … }
 
 await db.transaction(async (tx) => {
-	for await (const job of tx.selectFrom(jobs).select(['jobs.id']).forUpdate().stream())
-		await tx.update(jobs).set({ status: 'done' }).where('jobs.id', job.id).execute(); // runs between batches
+  for await (const job of tx.selectFrom(jobs).select(['jobs.id']).forUpdate().stream())
+    await tx.update(jobs).set({ status: 'done' }).where('jobs.id', job.id).execute(); // runs between batches
 });
 ```
 
@@ -388,19 +388,19 @@ Each `execute`, each query of a batch, each `stream` and `describe` reports one 
 
 ```ts
 interface QueryEvent {
-	kind: 'execute' | 'stream' | 'describe';
-	sql: string;
-	params: readonly unknown[];
-	tag: string | undefined;
-	command: string | undefined; // 'SELECT', 'INSERT', … on success
-	rowCount: number | undefined;
-	durationMs: number;
-	phases: {
-		acquireMs: number; // waiting for a pool connection or pipeline slot
-		queuedMs: number; // waiting on the connection behind other pipelined queries
-		execMs: number; // sent → finished (server work, transfer, decoding)
-	};
-	error: Error | undefined;
+  kind: 'execute' | 'stream' | 'describe';
+  sql: string;
+  params: readonly unknown[];
+  tag: string | undefined;
+  command: string | undefined; // 'SELECT', 'INSERT', … on success
+  rowCount: number | undefined;
+  durationMs: number;
+  phases: {
+    acquireMs: number; // waiting for a pool connection or pipeline slot
+    queuedMs: number; // waiting on the connection behind other pipelined queries
+    execMs: number; // sent → finished (server work, transfer, decoding)
+  };
+  error: Error | undefined;
 }
 ```
 

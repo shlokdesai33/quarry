@@ -29,12 +29,12 @@ New to databases? Read [Part 1 of the builder overview](../ARCHITECTURE.md#part-
 import { defineTable, integer, text, timestamptz } from 'quarry';
 
 export const users = defineTable('users', {
-	columns: {
-		id: integer().identity(),
-		email: text(),
-		name: text().nullable(),
-		createdAt: timestamptz().name('created_at').default(),
-	},
+  columns: {
+    id: integer().identity(),
+    email: text(),
+    name: text().nullable(),
+    createdAt: timestamptz().name('created_at').default(),
+  },
 });
 ```
 
@@ -52,10 +52,10 @@ Because the description can drift from the real table, `db.verify` compares the 
 
 ```ts
 export class Table<N extends string, S extends Schema> {
-	readonly name: N; // 'users': the name references use
-	readonly schema: S; // { columns: { id: …, email: …, … } }
-	declare readonly $refs: { … }; // phantom: every 'users.<key>' → its column
-	readonly _quarry: { source: string; site: CallSite | undefined };
+  readonly name: N; // 'users': the name references use
+  readonly schema: S; // { columns: { id: …, email: …, … } }
+  declare readonly $refs: { … }; // phantom: every 'users.<key>' → its column
+  readonly _quarry: { source: string; site: CallSite | undefined };
 }
 ```
 
@@ -71,10 +71,10 @@ export class Table<N extends string, S extends Schema> {
 ```ts
 // for users, $refs has the type:
 {
-	'users.id': IdentityColumn<DataType<'integer'>, number, never, never>;
-	'users.email': Column<DataType<'text'>, string, string, string>;
-	'users.name': Column<DataType<'text'>, string | null, string | null, string | null>;
-	'users.createdAt': DefaultColumn<DataType<'timestamptz'>, Date, Date | undefined, Date>;
+  'users.id': IdentityColumn<DataType<'integer'>, number, never, never>;
+  'users.email': Column<DataType<'text'>, string, string, string>;
+  'users.name': Column<DataType<'text'>, string | null, string | null, string | null>;
+  'users.createdAt': DefaultColumn<DataType<'timestamptz'>, Date, Date | undefined, Date>;
 }
 ```
 
@@ -82,7 +82,7 @@ It is computed with a **template literal type** over the column keys:
 
 ```ts
 declare readonly $refs: {
-	[K in `${N}.${keyof S['columns'] & string}`]: S['columns'][K extends `${N}.${infer C}` ? C : never];
+  [K in `${N}.${keyof S['columns'] & string}`]: S['columns'][K extends `${N}.${infer C}` ? C : never];
 };
 ```
 
@@ -107,11 +107,11 @@ A column ([base-column.ts](base-column.ts), `BaseColumn<D, S, I, U>`) carries on
 
 ```ts
 readonly _quarry: {
-	readonly dataType: D;              // the SQL type, with its codec
-	readonly columnName: string | undefined; // set by .name()
-	readonly nullable: boolean;        // set by .nullable()
-	readonly fill: 'default' | 'generated' | 'identity' | undefined;
-	readonly site: CallSite | undefined; // where the factory was called
+  readonly dataType: D;              // the SQL type, with its codec
+  readonly columnName: string | undefined; // set by .name()
+  readonly nullable: boolean;        // set by .nullable()
+  readonly fill: 'default' | 'generated' | 'identity' | undefined;
+  readonly site: CallSite | undefined; // where the factory was called
 };
 ```
 
@@ -174,10 +174,10 @@ A `DataType` ([data-type/data-type.ts](../data-type/data-type.ts)) describes the
 
 ```ts
 export class DataType<K extends Kind = Kind> {
-	readonly kind: K; // 'integer', 'text', 'timestamptz', 'enum', 'custom', 'array', …
-	readonly modifiers: readonly number[] | undefined; // [320] for varchar(320), [10, 2] for numeric(10, 2)
-	readonly codec: Codec; // the driver codec its values are sent and read with
-	withCodec(codec: Codec): this; // a frozen copy with another codec
+  readonly kind: K; // 'integer', 'text', 'timestamptz', 'enum', 'custom', 'array', …
+  readonly modifiers: readonly number[] | undefined; // [320] for varchar(320), [10, 2] for numeric(10, 2)
+  readonly codec: Codec; // the driver codec its values are sent and read with
+  withCodec(codec: Codec): this; // a frozen copy with another codec
 }
 ```
 
@@ -228,10 +228,10 @@ Each factory in [column-factories.ts](../column-factories.ts) has the same shape
 
 ```ts
 export function integer<T extends Out<'integer'> = Out<'integer'>>() {
-	return new IntegerColumn<DataType<'integer'>, T>({
-		dataType: new DataType('integer'),
-		site: captureCallSite(integer),
-	});
+  return new IntegerColumn<DataType<'integer'>, T>({
+    dataType: new DataType('integer'),
+    site: captureCallSite(integer),
+  });
 }
 ```
 
@@ -261,10 +261,10 @@ Only one dimension is modelled, so the element can't itself be an array (the par
 ```ts
 const status = defineEnum('order_status', ['pending', 'paid', 'shipped']);
 const orders = defineTable('orders', {
-	columns: { status: status().default() },
+  columns: { status: status().default() },
 });
 const refunds = defineTable('refunds', {
-	columns: { status: status<'paid'>() },
+  columns: { status: status<'paid'>() },
 });
 ```
 
@@ -298,10 +298,10 @@ at: timestamptz().useCodec(codecs.raw),          // the server's text, typed str
 
 ```ts
 override useCodec<In, Out>(codec: Codec<In, Out>) {
-	return new Column<D, SwapType<S, Out>, SwapType<I, In>, SwapType<U, In>>({
-		...this._quarry,
-		dataType: this._quarry.dataType.withCodec(codec),
-	});
+  return new Column<D, SwapType<S, Out>, SwapType<I, In>, SwapType<U, In>>({
+    ...this._quarry,
+    dataType: this._quarry.dataType.withCodec(codec),
+  });
 }
 ```
 
@@ -341,23 +341,23 @@ How `InferInsertType` works, step by step:
 
 ```ts
 export type InferInsertType<T extends AnyTable> = DrainOuterGeneric<
-	Prettify<
-		{
-			[
-				K in keyof Columns<T> as [Columns<T>[K]['$insert']] extends [never]
-					? never
-					: undefined extends Columns<T>[K]['$insert']
-						? never
-						: K
-			]: Columns<T>[K]['$insert'];
-		} & {
-			[
-				K in keyof Columns<T> as undefined extends Columns<T>[K]['$insert']
-					? K
-					: never
-			]?: Exclude<Columns<T>[K]['$insert'], undefined>;
-		}
-	>
+  Prettify<
+    {
+      [
+        K in keyof Columns<T> as [Columns<T>[K]['$insert']] extends [never]
+          ? never
+          : undefined extends Columns<T>[K]['$insert']
+            ? never
+            : K
+      ]: Columns<T>[K]['$insert'];
+    } & {
+      [
+        K in keyof Columns<T> as undefined extends Columns<T>[K]['$insert']
+          ? K
+          : never
+      ]?: Exclude<Columns<T>[K]['$insert'], undefined>;
+    }
+  >
 >;
 ```
 
@@ -384,16 +384,16 @@ db.selectFrom(users).innerJoin(managers).on('managers.id', 'users.managerId');
 
 ```ts
 export function captureCallSite(fn) {
-	if (typeof Error.captureStackTrace !== 'function') return undefined;
-	const site = {};
-	const limit = Error.stackTraceLimit;
-	Error.stackTraceLimit = 1;
-	try {
-		Error.captureStackTrace(site, fn); // records the frame that called `fn`
-	} finally {
-		Error.stackTraceLimit = limit;
-	}
-	return site;
+  if (typeof Error.captureStackTrace !== 'function') return undefined;
+  const site = {};
+  const limit = Error.stackTraceLimit;
+  Error.stackTraceLimit = 1;
+  try {
+    Error.captureStackTrace(site, fn); // records the frame that called `fn`
+  } finally {
+    Error.stackTraceLimit = limit;
+  }
+  return site;
 }
 ```
 

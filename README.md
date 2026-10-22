@@ -20,23 +20,23 @@ pnpm build # dist/: the quarry and quarry/driver entry points, and the quarry CL
 import { database, defineTable, integer, text, timestamptz } from 'quarry';
 
 const users = defineTable('users', {
-	columns: {
-		id: integer().identity(),
-		email: text(),
-		name: text().nullable(),
-		createdAt: timestamptz().name('created_at').default(),
-	},
+  columns: {
+    id: integer().identity(),
+    email: text(),
+    name: text().nullable(),
+    createdAt: timestamptz().name('created_at').default(),
+  },
 });
 
 const db = database({ connectionString: process.env.DATABASE_URL });
 
 // { id: number; name: string | null }
 const user = await db
-	.selectFrom(users)
-	.where('users.email', 'ada@example.com')
-	.select(['users.id', 'users.name'])
-	.expectOne()
-	.execute();
+  .selectFrom(users)
+  .where('users.email', 'ada@example.com')
+  .select(['users.id', 'users.name'])
+  .expectOne()
+  .execute();
 ```
 
 ## Contents
@@ -54,39 +54,39 @@ const user = await db
 
 ```ts
 import {
-	array,
-	bigint,
-	boolean,
-	defineEnum,
-	defineTable,
-	integer,
-	jsonb,
-	text,
-	timestamptz,
-	varchar,
+  array,
+  bigint,
+  boolean,
+  defineEnum,
+  defineTable,
+  integer,
+  jsonb,
+  text,
+  timestamptz,
+  varchar,
 } from 'quarry';
 
 export const role = defineEnum('user_role', ['admin', 'member', 'guest']);
 
 export const users = defineTable('users', {
-	columns: {
-		id: integer().identity(),
-		email: varchar(320),
-		name: text().nullable(),
-		role: role().default(),
-		tags: array(text()).default(),
-		settings: jsonb<{ theme: 'light' | 'dark' }>().default(),
-		createdAt: timestamptz().name('created_at').default(),
-	},
+  columns: {
+    id: integer().identity(),
+    email: varchar(320),
+    name: text().nullable(),
+    role: role().default(),
+    tags: array(text()).default(),
+    settings: jsonb<{ theme: 'light' | 'dark' }>().default(),
+    createdAt: timestamptz().name('created_at').default(),
+  },
 });
 
 export const posts = defineTable('posts', {
-	columns: {
-		id: bigint().identity(),
-		authorId: integer().name('author_id'),
-		title: text(),
-		published: boolean().default(),
-	},
+  columns: {
+    id: bigint().identity(),
+    authorId: integer().name('author_id'),
+    title: text(),
+    published: boolean().default(),
+  },
 });
 ```
 
@@ -149,7 +149,7 @@ import { defineEnum, defineTable } from 'quarry';
 const status = defineEnum('order_status', ['pending', 'paid', 'shipped']);
 
 const orders = defineTable('orders', {
-	columns: { status: status().default() },
+  columns: { status: status().default() },
 });
 ```
 
@@ -165,11 +165,11 @@ import { bigint, codecs, defineTable, defineType, timestamptz } from 'quarry';
 const citext = defineType({ sql: 'citext', codec: codecs.text });
 
 const events = defineTable('events', {
-	columns: {
-		id: bigint().identity().useCodec(codecs.int8), // bigint instead of string
-		at: timestamptz().useCodec(codecs.raw), // the server's text
-		key: citext(),
-	},
+  columns: {
+    id: bigint().identity().useCodec(codecs.int8), // bigint instead of string
+    at: timestamptz().useCodec(codecs.raw), // the server's text
+    key: citext(),
+  },
 });
 ```
 
@@ -189,8 +189,8 @@ type UserPatch = InferUpdateType<typeof users>; // every writable column optiona
 import { database } from 'quarry';
 
 const db = database(
-	{ connectionString: process.env.DATABASE_URL, max: 20 },
-	{ onQuery: (event) => console.debug(event.sql, event.durationMs) },
+  { connectionString: process.env.DATABASE_URL, max: 20 },
+  { onQuery: (event) => console.debug(event.sql, event.durationMs) },
 );
 ```
 
@@ -209,36 +209,36 @@ const db = database(
 ```ts
 // { id: string; title: string; name: string | null }[]
 const rows = await db
-	.selectFrom(posts)
-	.innerJoin(users)
-	.on('users.id', 'posts.authorId')
-	.where('posts.published', true)
-	.select(['posts.id', 'posts.title', 'users.name'])
-	.orderBy('posts.id', 'desc')
-	.limit(20)
-	.execute();
+  .selectFrom(posts)
+  .innerJoin(users)
+  .on('users.id', 'posts.authorId')
+  .where('posts.published', true)
+  .select(['posts.id', 'posts.title', 'users.name'])
+  .orderBy('posts.id', 'desc')
+  .limit(20)
+  .execute();
 ```
 
 `select` takes columns (keyed by name) or a callback returning columns and aliased expressions; each call adds to the list. `selectAll('users')` selects every column of a table, named as it goes by in the query (its alias, `selectAll('u')`, when aliased). Only tables in scope can be referenced.
 
 ```ts
 const emails = await db
-	.selectFrom(users)
-	.select((eb) => ['users.id', eb.fn.lower('users.email').as('email')])
-	.execute();
+  .selectFrom(users)
+  .select((eb) => ['users.id', eb.fn.lower('users.email').as('email')])
+  .execute();
 ```
 
 ### Where
 
 ```ts
 const admins = await db
-	.selectFrom(users)
-	.where('users.role', 'admin') // equality
-	.where((eb) =>
-		eb.or([eb.ref('users.name').isNull(), eb.ref('users.name').like('A%')]),
-	)
-	.select(['users.id'])
-	.execute();
+  .selectFrom(users)
+  .where('users.role', 'admin') // equality
+  .where((eb) =>
+    eb.or([eb.ref('users.name').isNull(), eb.ref('users.name').like('A%')]),
+  )
+  .select(['users.id'])
+  .execute();
 ```
 
 `where` takes `(column, value)`, a callback returning a condition, or a predicate built elsewhere. Several calls are joined with `and`.
@@ -247,11 +247,11 @@ const admins = await db
 
 ```ts
 const rows = await db
-	.selectFrom(users)
-	.leftJoin(posts)
-	.on('posts.authorId', 'users.id')
-	.select(['users.email', 'posts.title']) // title: string | null
-	.execute();
+  .selectFrom(users)
+  .leftJoin(posts)
+  .on('posts.authorId', 'users.id')
+  .select(['users.email', 'posts.title']) // title: string | null
+  .execute();
 ```
 
 `innerJoin`, `leftJoin`, `rightJoin`, `fullJoin` and `crossJoin`. `on` takes two columns of comparable types (the joined table's first) or any `where` form. Outer joins make the columns of the optional side nullable.
@@ -260,14 +260,14 @@ const rows = await db
 
 ```ts
 const page = await db
-	.selectFrom(posts)
-	.select(['posts.authorId', 'posts.title'])
-	.distinctOn(['posts.authorId'])
-	.orderBy('posts.authorId')
-	.orderBy('posts.id', 'desc', { nulls: 'last' })
-	.limit(20)
-	.offset(40)
-	.execute();
+  .selectFrom(posts)
+  .select(['posts.authorId', 'posts.title'])
+  .distinctOn(['posts.authorId'])
+  .orderBy('posts.authorId')
+  .orderBy('posts.id', 'desc', { nulls: 'last' })
+  .limit(20)
+  .offset(40)
+  .execute();
 ```
 
 `orderBy` takes a column, a selected key or an expression callback; several calls add keys. `distinct()` and `distinctOn([...])` are available.
@@ -277,14 +277,14 @@ const page = await db
 ```ts
 // { id: number; postCount: string }[]
 const authors = await db
-	.selectFrom(users)
-	.leftJoin(posts)
-	.on('posts.authorId', 'users.id')
-	.select((eb) => ['users.id', eb.fn.count('posts.id').as('postCount')])
-	.groupBy(['users.id'])
-	.having((eb) => eb.fn.count('posts.id').gte('5'))
-	.orderBy('postCount', 'desc')
-	.execute();
+  .selectFrom(users)
+  .leftJoin(posts)
+  .on('posts.authorId', 'users.id')
+  .select((eb) => ['users.id', eb.fn.count('posts.id').as('postCount')])
+  .groupBy(['users.id'])
+  .having((eb) => eb.fn.count('posts.id').gte('5'))
+  .orderBy('postCount', 'desc')
+  .execute();
 ```
 
 Aggregates have Postgres's types: `count` is a `bigint` (a string; `eb.fn.cast(eb.fn.count(), 'integer')` for a number), `sum` of an `integer` is a `bigint`, `avg` a `numeric`, and `min`/`max` keep their argument's type.
@@ -326,35 +326,35 @@ jsonb on `eb.json`: `get` (`->`), `text` (`->>`), `hasKey`, `hasAnyKey`, `hasAll
 
 ```ts
 const rows = await db
-	.selectFrom(users)
-	.where((eb) => eb.json.text('users.settings', 'theme').eq('dark'))
-	.where((eb) => eb.ref('users.tags').contains(['beta']))
-	.select((eb) => [
-		eb.fn.coalesce('users.name', eb.val('anonymous')).as('name'),
-		eb
-			.case()
-			.when(eb.ref('users.role').eq('admin'), 'staff')
-			.else('customer')
-			.end()
-			.as('kind'),
-	])
-	.execute();
+  .selectFrom(users)
+  .where((eb) => eb.json.text('users.settings', 'theme').eq('dark'))
+  .where((eb) => eb.ref('users.tags').contains(['beta']))
+  .select((eb) => [
+    eb.fn.coalesce('users.name', eb.val('anonymous')).as('name'),
+    eb
+      .case()
+      .when(eb.ref('users.role').eq('admin'), 'staff')
+      .else('customer')
+      .end()
+      .as('kind'),
+  ])
+  .execute();
 ```
 
 ### Locking
 
 ```ts
 await db.transaction(async (tx) => {
-	const post = await tx
-		.selectFrom(posts)
-		.where('posts.published', false)
-		.select(['posts.id'])
-		.orderBy('posts.id')
-		.limit(1)
-		.forUpdate()
-		.skipLocked()
-		.takeFirst()
-		.execute();
+  const post = await tx
+    .selectFrom(posts)
+    .where('posts.published', false)
+    .select(['posts.id'])
+    .orderBy('posts.id')
+    .limit(1)
+    .forUpdate()
+    .skipLocked()
+    .takeFirst()
+    .execute();
 });
 ```
 
@@ -369,13 +369,13 @@ const published = fragment(posts, (qb) => qb.where('posts.published', true));
 
 // { title: string; name?: string | null }[]
 const rows = await db
-	.selectFrom(posts)
-	.innerJoin(users)
-	.on('users.id', 'posts.authorId')
-	.pipe(published)
-	.select(['posts.title'])
-	.when(withAuthor, (qb) => qb.select(['users.name']))
-	.execute();
+  .selectFrom(posts)
+  .innerJoin(users)
+  .on('users.id', 'posts.authorId')
+  .pipe(published)
+  .select(['posts.title'])
+  .when(withAuthor, (qb) => qb.select(['users.name']))
+  .execute();
 ```
 
 `when(condition, build)` applies `build` only when `condition` holds; columns it selects are optional in the row. `fragment(tables, build)` defines a piece that `pipe` applies to any query containing those tables, adding its joins and columns.
@@ -385,22 +385,22 @@ const rows = await db
 ```ts
 // keyset pagination, for APIs: { rows, nextCursor, hasMore }
 const page = await db
-	.selectFrom(posts)
-	.select(['posts.id', 'posts.title'])
-	.paginateByCursor({ perPage: 20, by: 'posts.id', after: cursor });
+  .selectFrom(posts)
+  .select(['posts.id', 'posts.title'])
+  .paginateByCursor({ perPage: 20, by: 'posts.id', after: cursor });
 
 // numbered pages: { rows, page, perPage, hasMore, total }
 const numbered = await db
-	.selectFrom(users)
-	.select(['users.id', 'users.email'])
-	.paginateByOffset({ page: 2, perPage: 50, by: 'users.id', countTotal: true });
+  .selectFrom(users)
+  .select(['users.id', 'users.email'])
+  .paginateByOffset({ page: 2, perPage: 50, by: 'users.id', countTotal: true });
 
 // every row, in keyset batches of 1000
 for await (const batch of db
-	.selectFrom(users)
-	.select(['users.id'])
-	.iterateChunks(1000, { by: 'users.id' })) {
-	console.log(batch.length);
+  .selectFrom(users)
+  .select(['users.id'])
+  .iterateChunks(1000, { by: 'users.id' })) {
+  console.log(batch.length);
 }
 ```
 
@@ -410,10 +410,10 @@ for await (const batch of db
 
 ```ts
 for await (const user of db
-	.selectFrom(users)
-	.select(['users.id', 'users.email'])
-	.stream({ batchSize: 1000 })) {
-	console.log(user.email);
+  .selectFrom(users)
+  .select(['users.id', 'users.email'])
+  .stream({ batchSize: 1000 })) {
+  console.log(user.email);
 }
 ```
 
@@ -426,19 +426,19 @@ for await (const user of db
 ```ts
 // { id: number; createdAt: Date }
 const user = await db
-	.insertInto(users)
-	.values({ email: 'ada@example.com', name: 'Ada' })
-	.returning(['users.id', 'users.createdAt'])
-	.expectOne()
-	.execute();
+  .insertInto(users)
+  .values({ email: 'ada@example.com', name: 'Ada' })
+  .returning(['users.id', 'users.createdAt'])
+  .expectOne()
+  .execute();
 
 await db
-	.insertInto(users)
-	.values([
-		{ email: 'alan@example.com', name: 'Alan' },
-		{ email: 'grace@example.com', name: null },
-	])
-	.execute();
+  .insertInto(users)
+  .values([
+    { email: 'alan@example.com', name: 'Alan' },
+    { email: 'grace@example.com', name: null },
+  ])
+  .execute();
 ```
 
 `values` is typed by [`InferInsertType`](#row-types). An array of rows is sent as one array parameter per column through `unnest`, so the SQL is the same for any number of rows.
@@ -447,11 +447,11 @@ await db
 
 ```ts
 await db
-	.insertInto(users)
-	.values({ email: 'ada@example.com', name: 'Ada' })
-	.onConflict('email')
-	.doUpdate((excluded) => ({ name: excluded.name }))
-	.execute();
+  .insertInto(users)
+  .values({ email: 'ada@example.com', name: 'Ada' })
+  .onConflict('email')
+  .doUpdate((excluded) => ({ name: excluded.name }))
+  .execute();
 ```
 
 `onConflict(column | columns)` then `doNothing()`, `merge(columns?)` (set each column to the proposed value) or `doUpdate((excluded, eb) => set)`. `.onConflict(...).where(...)` targets a partial unique index.
@@ -460,11 +460,11 @@ await db
 
 ```ts
 await db
-	.update(users)
-	.set((eb) => ({ name: 'Ada Lovelace', email: eb.fn.lower('users.email') }))
-	.where('users.id', id)
-	.expectRows(1)
-	.execute();
+  .update(users)
+  .set((eb) => ({ name: 'Ada Lovelace', email: eb.fn.lower('users.email') }))
+  .where('users.id', id)
+  .expectRows(1)
+  .execute();
 ```
 
 `set` takes values or expressions for writable columns. An update runs only once it has a `where`, `.allRows()` or `setEach`; otherwise `execute()` is a type error. The same applies to deletes.
@@ -473,15 +473,15 @@ await db
 
 ```ts
 await db
-	.update(users)
-	.setEach(
-		[
-			{ id: 1, name: 'Ada' },
-			{ id: 2, email: 'alan@example.com' },
-		],
-		{ key: 'id' },
-	)
-	.execute();
+  .update(users)
+  .setEach(
+    [
+      { id: 1, name: 'Ada' },
+      { id: 2, email: 'alan@example.com' },
+    ],
+    { key: 'id' },
+  )
+  .execute();
 ```
 
 Each row is updated to its own values in one statement, matched by `key` (a column or a composite key). A column a row leaves out keeps its value; `null` sets it to null. The rows are in scope as `row` (or `as: 'name'`) in `set`, `where` and `returning`, e.g. `.where((eb) => eb.ref('users.name').ne(eb.ref('row.name')))`.
@@ -512,11 +512,11 @@ await db.deleteFrom(posts).where('posts.published', false).execute(); // { rowCo
 
 ```ts
 const email = await db
-	.selectFrom(users)
-	.where('users.id', id)
-	.select(['users.email'])
-	.expectValue((error) => new Error(`no user ${id}`, { cause: error }))
-	.execute(); // string
+  .selectFrom(users)
+  .where('users.id', id)
+  .select(['users.email'])
+  .expectValue((error) => new Error(`no user ${id}`, { cause: error }))
+  .execute(); // string
 ```
 
 The shape goes before `execute()` and leaves the SQL unchanged. `takeValue` and `expectValue` need exactly one selected column. Each `expect…` takes an optional function that maps its error to yours.
@@ -527,10 +527,10 @@ The shape goes before `execute()` and leaves the SQL unchanged. `takeValue` and 
 const controller = new AbortController();
 
 const rows = await db
-	.selectFrom(users)
-	.select(['users.id'])
-	.tag('users.list')
-	.execute({ signal: controller.signal, timeout: '2s' });
+  .selectFrom(users)
+  .select(['users.id'])
+  .tag('users.list')
+  .execute({ signal: controller.signal, timeout: '2s' });
 ```
 
 | Option    | Description                                                                                      |
@@ -546,13 +546,13 @@ const rows = await db
 
 ```ts
 const [user, titles, { rowCount }] = await db.batch([
-	db
-		.selectFrom(users)
-		.where('users.id', id)
-		.select(['users.email'])
-		.expectOne(),
-	db.selectFrom(posts).where('posts.authorId', id).select(['posts.title']),
-	db.update(users).set({ name: 'Ada' }).where('users.id', id),
+  db
+    .selectFrom(users)
+    .where('users.id', id)
+    .select(['users.email'])
+    .expectOne(),
+  db.selectFrom(posts).where('posts.authorId', id).select(['posts.title']),
+  db.update(users).set({ name: 'Ada' }).where('users.id', id),
 ]);
 ```
 
@@ -562,17 +562,17 @@ const [user, titles, { rowCount }] = await db.batch([
 
 ```ts
 const postId = await db.transaction(
-	async (tx) => {
-		const post = await tx
-			.insertInto(posts)
-			.values({ authorId: id, title: 'Hello' })
-			.returning(['posts.id'])
-			.expectOne()
-			.execute();
-		tx.afterCommit(() => console.log('created', post.id));
-		return post.id;
-	},
-	{ isolation: 'serializable', retries: 3 },
+  async (tx) => {
+    const post = await tx
+      .insertInto(posts)
+      .values({ authorId: id, title: 'Hello' })
+      .returning(['posts.id'])
+      .expectOne()
+      .execute();
+    tx.afterCommit(() => console.log('created', post.id));
+    return post.id;
+  },
+  { isolation: 'serializable', retries: 3 },
 );
 ```
 
@@ -591,16 +591,16 @@ Options: `isolation`, `readOnly`, `deferrable`, `retries` (re-runs on serializat
 import { sql } from 'quarry';
 
 const rows = await db
-	.selectFrom(users)
-	.select((eb) => [
-		sql<number>`extract(epoch from ${eb.ref('users.createdAt')})`.as('epoch'),
-	])
-	.where((eb) => sql<boolean>`${eb.ref('users.name')} % ${search}`)
-	.execute();
+  .selectFrom(users)
+  .select((eb) => [
+    sql<number>`extract(epoch from ${eb.ref('users.createdAt')})`.as('epoch'),
+  ])
+  .where((eb) => sql<boolean>`${eb.ref('users.name')} % ${search}`)
+  .execute();
 
 const count = await db.sql<{ n: string }>`select count(*) as n from posts`
-	.expectValue()
-	.execute();
+  .expectValue()
+  .execute();
 ```
 
 `sql` fragments work wherever an expression does; `db.sql` runs a whole statement with every result shape. Interpolated values are parameters; expressions, tables, `sql.id(...)` (identifiers), `sql.lit(...)` (literals) and `sql.join([...])` (lists) are written into the SQL.
@@ -611,17 +611,17 @@ const count = await db.sql<{ n: string }>`select count(*) as n from posts`
 import { UniqueViolation, violatedColumns } from 'quarry';
 
 try {
-	await db
-		.insertInto(users)
-		.values({ email: 'ada@example.com', name: null })
-		.execute();
+  await db
+    .insertInto(users)
+    .values({ email: 'ada@example.com', name: null })
+    .execute();
 } catch (error) {
-	if (
-		error instanceof UniqueViolation &&
-		violatedColumns(error, users)?.includes('email')
-	) {
-		console.log('email taken');
-	}
+  if (
+    error instanceof UniqueViolation &&
+    violatedColumns(error, users)?.includes('email')
+  ) {
+    console.log('email taken');
+  }
 }
 ```
 
@@ -650,8 +650,8 @@ import { database, defineConfig } from 'quarry';
 import * as schema from './src/schema.ts';
 
 export default defineConfig({
-	db: database({ connectionString: process.env.DATABASE_URL }),
-	schema,
+  db: database({ connectionString: process.env.DATABASE_URL }),
+  schema,
 });
 ```
 
@@ -669,27 +669,27 @@ It checks: missing tables and columns, SQL types (with modifiers and arrayness),
 import { connect, createPool } from 'quarry/driver';
 
 const pool = createPool({
-	connectionString: process.env.DATABASE_URL,
-	max: 20,
+  connectionString: process.env.DATABASE_URL,
+  max: 20,
 });
 
 const { rows, rowCount } = await pool.query(
-	'select id, email from users where id = $1',
-	[42],
+  'select id, email from users where id = $1',
+  [42],
 );
 
 await pool.transaction(
-	async (tx) => {
-		await tx.query('insert into posts (author_id, title) values ($1, $2)', [
-			42,
-			'Hi',
-		]);
-	},
-	{ isolation: 'serializable', retries: 3 },
+  async (tx) => {
+    await tx.query('insert into posts (author_id, title) values ($1, $2)', [
+      42,
+      'Hi',
+    ]);
+  },
+  { isolation: 'serializable', retries: 3 },
 );
 
 for await (const row of pool.stream('select * from posts')) {
-	console.log(row);
+  console.log(row);
 }
 
 await pool.copyRows('copy posts (author_id, title) from stdin', [[42, 'Hi']]);
@@ -765,9 +765,9 @@ Options resolve like libpq: the options object, then the connection string (`pos
 import { connect } from 'quarry/driver';
 
 await using conn = await connect({
-	host: 'db.example.com',
-	ssl: { mode: 'verify-full', rootCertFile: 'system', negotiation: 'direct' },
-	requireAuth: 'scram-sha-256',
+  host: 'db.example.com',
+  ssl: { mode: 'verify-full', rootCertFile: 'system', negotiation: 'direct' },
+  requireAuth: 'scram-sha-256',
 });
 ```
 
@@ -783,15 +783,15 @@ A codec encodes one type's parameters and decodes its results. `defaultCodecs` d
 import { codecs, createPool, defineCodec } from 'quarry/driver';
 
 const numericAsNumber = defineCodec({
-	name: 'numeric',
-	oid: 1700,
-	arrayOid: 1231,
-	encode: (value: number) => value.toFixed(2),
-	decodeText: (text) => Number(text),
+  name: 'numeric',
+  oid: 1700,
+  arrayOid: 1231,
+  encode: (value: number) => value.toFixed(2),
+  decodeText: (text) => Number(text),
 });
 
 const pool = createPool({
-	codecs: [codecs.int8AsString, codecs.timestamptz, numericAsNumber],
+  codecs: [codecs.int8AsString, codecs.timestamptz, numericAsNumber],
 });
 ```
 

@@ -232,8 +232,8 @@ socket.write(w.take());
 ```ts
 reader.push(chunk);
 for (let type = reader.nextType(); type >= 0; type = reader.nextType()) {
-	// reader.bytes[reader.start .. reader.end) is the message body
-	const msg = reader.parse(); // or read the body directly (DataRow)
+  // reader.bytes[reader.start .. reader.end) is the message body
+  const msg = reader.parse(); // or read the body directly (DataRow)
 }
 ```
 

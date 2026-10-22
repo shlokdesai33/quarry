@@ -4,5 +4,11 @@
 	"useTabs": true,
 	"singleQuote": true,
 	"sortImports": false,
-	"ignorePatterns": ["dist"]
+	"ignorePatterns": ["dist"],
+	"overrides": [
+		{
+			"files": ["*.md"],
+			"options": { "useTabs": false, "tabWidth": 2 }
+		}
+	]
 }
