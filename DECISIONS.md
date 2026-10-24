@@ -99,6 +99,7 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 - [`selectAll` lists the columns, never `*`](src/DECISIONS.md#selectall-lists-the-columns-never-)
 - [`selectAll` takes the name a table goes by](src/DECISIONS.md#selectall-takes-the-name-a-table-goes-by)
 - [Ordering by a selected key uses the bare key](src/DECISIONS.md#ordering-by-a-selected-key-uses-the-bare-key)
+- [`nest` marks a joined row with `ctid`](src/DECISIONS.md#nest-marks-a-joined-row-with-ctid)
 
 ### Pagination
 

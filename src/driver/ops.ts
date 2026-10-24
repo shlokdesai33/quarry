@@ -23,7 +23,7 @@ import {
 	type ResultPlan,
 	type ResultSpec,
 } from './results.js';
-import type { RowDecoder, RowMode } from './rows.js';
+import type { NestedObject, RowDecoder, RowMode } from './rows.js';
 
 /**
  * With $1, sets `statement_timeout` to it until the transaction ends,
@@ -247,6 +247,8 @@ export interface QueryOpOptions {
 	readonly binary: boolean;
 	/** The rows kept, from the first; the others aren't decoded. */
 	readonly keepRows: number;
+	/** Columns read into objects of the row. */
+	readonly nested: readonly NestedObject[] | undefined;
 }
 
 /** How an operation's results are read on this connection. */
@@ -456,7 +458,7 @@ export class QueryOp extends Op {
 		// no decoder for no columns until a row comes (building one compiles a function)
 		this.#decoder =
 			plan.fields.length > 0
-				? planDecoder(plan, this.#options.rowMode)
+				? planDecoder(plan, this.#options.rowMode, this.#options.nested)
 				: undefined;
 	}
 
@@ -494,7 +496,11 @@ export class QueryOp extends Op {
 				if (this.#decodeError !== undefined) return true;
 			}
 			// oxlint-disable-next-line typescript/no-non-null-assertion -- set just above
-			decoder = planDecoder(this.#current!, this.#options.rowMode);
+			decoder = planDecoder(
+				this.#current!,
+				this.#options.rowMode,
+				this.#options.nested,
+			);
 			this.#decoder = decoder;
 		}
 		try {
@@ -1186,7 +1192,11 @@ export class CursorOp extends Op {
 			);
 			return;
 		}
-		this.#decoder = planDecoder(plan, this.#options.rowMode);
+		this.#decoder = planDecoder(
+			plan,
+			this.#options.rowMode,
+			this.#options.nested,
+		);
 	}
 
 	/**

@@ -349,14 +349,18 @@ export type KeyOf<S> = S extends `${string}.${infer C}`
   ? C
   : S extends AliasedExpression<unknown, infer A>
     ? A
-    : never;
+    : S extends Nested<unknown, infer A> // nest's object
+      ? A
+      : never;
 
 export type ValueOf<R extends Refs, S> =
   S extends Ref<R>
     ? R[S]['$select']
     : S extends AliasedExpression<infer T, string>
       ? T
-      : never;
+      : S extends Nested<infer T, string>
+        ? T
+        : never;
 
 export type RowOf<R extends Refs, S> = { [K in S as KeyOf<K>]: ValueOf<R, K> };
 ```
@@ -411,6 +415,7 @@ interface NullableColumn<C extends AnyColumn> {
   readonly $insert: C['$insert'];
   readonly $update: C['$update'];
   readonly _quarry: C['_quarry']; // same SQL type, methods and codec
+  readonly $inner?: C; // phantom: the column itself, for `nest`
 }
 type NullableTable<X> =
   X extends Table<infer N, infer S>
@@ -426,6 +431,32 @@ type NullableTable<X> =
 ```
 
 `leftJoin(posts)` puts `NullableTable<typeof posts>` into the scope tuple; `rightJoin` turns the earlier tables into `NullableTables<T>` (a mapped tuple type) **and** the row already selected into `NullableRow<O>` (every key `| null`); `fullJoin` does both. Since only `$select` changes, comparisons on an outer table still take the column's values and its codec still decodes it: nullability is a property of the row, not of the SQL type. The run-time table object is the same; the cast in each join method is the type-level change only.
+
+`$inner` is optional, so a table is still assignable to its nullable type (`forUpdate().of(posts)` on a left-joined `posts`). It lets `nest` tell an outer table from the others (`'$inner' extends keyof C`) and read each column as the table reads it in a row it has, unwrapped through every outer join.
+
+### `nest`: an object per table
+
+<a id="nest-an-object-per-table"></a>
+[nest.ts](nest.ts). A select callback's `eb` is a `SelectBuilder<T>`: `ExpressionBuilder<RefsOf<T>>` plus `nest: Nest<T>`. `nest` works over the scope's tables `T`, not its references `R`, so finding a table by name is `Extract<T[number], { name: N }>` rather than a scan of every reference:
+
+```ts
+interface Nest<T extends readonly AnyTable[]> {
+  <N extends T[number]['name']>(table: N): Nested<NestedRow<TableNamed<T, N>, ColumnKey<TableNamed<T, N>>>, N>;
+  <N extends T[number]['name'], const C extends readonly [ColumnKey<…>, ...ColumnKey<…>[]]>(
+    table: N,
+    columns: C,
+  ): Nested<NestedRow<TableNamed<T, N>, C[number]>, N>;
+}
+
+type NestedRow<X extends AnyTable, K extends ColumnKey<X>> =
+  IsOuter<X['schema']['columns'][K]> extends true
+    ? { [C in K]: InnerColumn<X['schema']['columns'][C]>['$select'] } | null
+    : { [C in K]: InnerColumn<X['schema']['columns'][C]>['$select'] };
+```
+
+A table on the outer side of a join gives `{…} | null`, with its columns typed as the table's own, since the object exists only where the table has a row. The base table, an inner join and a cross join give `{…}`. A `rightJoin` after a `nest` makes the object nullable through `NullableRow<O>`, like any selected column. A `Nested<T, A>` is a select-list entry like an aliased expression: `KeyOf` gives its key `A` and `ValueOf` its type `T`. So `UniqueKeys` checks the object's key against the row, and never the columns inside it. `.as(B)` gives a `Nested<T, B>`. Listing a column twice is a type error through an impossible extra argument (`ListedOnce`, built on the same `Repeated` as `UniqueKeys`).
+
+An object's key holds no column, so it can't be ordered, grouped or keyset-paginated by. Nothing in `O` tells an object from a jsonb column, so the select builder keeps the object keys in a fourth type parameter, `K` (default `never`, read as `$nested`). `select` adds `NestedKey<S[number]>` to it, `when` and `pipe` add their piece's, and the joins carry it. `Key<R, O, K>` (`orderBy`, `groupBy`, `distinctOn`) and `KeyColumn<T, O, K>` (`iterateChunks`, `paginateByCursor`) exclude it. Measured: +0.8% instantiations on the existing type tests, with check time unchanged.
 
 ### `setEach`: rows in scope
 
@@ -547,7 +578,7 @@ So `.forUpdate().skipLocked().of(jobs)` is a type error (`of` must come right af
 
 ### The select row `O`
 
-`O` starts as `Record<never, never>` (an object with no keys) and grows with each `select`. A `Fragment<T>` is `SelectQueryBuilder<T, Record<never, never>>`: a builder over the given tables with nothing selected, which is what `fragment` and `when` callbacks receive.
+`O` starts as `Record<never, never>` (an object with no keys) and grows with each `select`; `K`, the keys of `O` that hold `nest`'s objects, grows with it ([above](#nest-an-object-per-table)). A `Fragment<T>` is `SelectQueryBuilder<T, Record<never, never>>`: a builder over the given tables with nothing selected, which is what `fragment` and `when` callbacks receive.
 
 ## Part 8: Tricks for better errors
 
@@ -630,6 +661,7 @@ Why the types work this way. Each links to its full entry (what it is, why, the 
 - [Errors as an impossible extra argument](DECISIONS.md#errors-as-an-impossible-extra-argument): `InScope`, `NewName`, `UniqueKeys`, `ValueArgs`: errors that say what is wrong.
 - [`takeValue` needs a one-column row](DECISIONS.md#takevalue-needs-a-one-column-row): an object type has no column order.
 - [Outer joins make the joined side nullable: `NullableTable`](DECISIONS.md#outer-joins-make-the-joined-side-nullable-nullabletable): only `$select` changes.
+- [`nest` marks a joined row with `ctid`](DECISIONS.md#nest-marks-a-joined-row-with-ctid): one object per table, `null` as a whole on the outer side of a join.
 - [`setEach` rows are typed by the table, and duplicate keys are refused](DECISIONS.md#seteach-rows-are-typed-by-the-table-and-duplicate-keys-are-refused): `SetEachRow` and `SetEachRefs`.
 - [Key rules in the types: non-null and selected under its own name](DECISIONS.md#key-rules-in-the-types-non-null-and-selected-under-its-own-name): `KeyColumn`.
 - [Awaiting a builder rejects](DECISIONS.md#awaiting-a-builder-rejects): `NotExecuted`.

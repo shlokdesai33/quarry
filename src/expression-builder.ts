@@ -8,6 +8,7 @@ import type { Expression, TypedExpression } from './expression.js';
 import { param, predicate, typedExpression } from './expression-methods.js';
 import { type Functions, functions } from './functions.js';
 import { type JsonFunctions, jsonFunctions } from './json.js';
+import { nestOf } from './nest.js';
 import type { OperationNode, ReferenceNode, SelectionNode } from './node.js';
 import type { AnyPredicate, Expr, Predicate, Value } from './operators.js';
 import type { NullOf, Ref, Refs, RefsOf } from './refs.js';
@@ -262,7 +263,9 @@ function makeBuilder<const T extends readonly AnyTable[]>(
 			? resolve(arg).column._quarry.dataType
 			: arg._quarry.dataType;
 
-	const eb: ExpressionBuilder<R> & Resolver = {
+	// `nest` is typed for select lists only, by `SelectBuilder`
+	const eb: ExpressionBuilder<R> &
+		Resolver & { readonly nest: ReturnType<typeof nestOf> } = {
 		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the signature supplies the type
 		ref: (column: string) => resolve(column).expression as never,
 		[RESOLVE]: resolve,
@@ -274,6 +277,7 @@ function makeBuilder<const T extends readonly AnyTable[]>(
 		not: (expression: AnyPredicate) =>
 			predicate({ kind: 'not', operand: expression._quarry.node }),
 		case: caseOf,
+		nest: nestOf(tables),
 	};
 	return eb;
 }

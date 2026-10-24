@@ -211,10 +211,11 @@ export class DriverExecutor implements TransactionExecutor {
 			codecs: this.#registry,
 			rowMode: options.rowMode ?? 'object',
 		};
-		const { paramCodecs, resultCodecs, tag } = query;
+		const { paramCodecs, resultCodecs, nested, tag } = query;
 		if (options.keepRows !== undefined) out.keepRows = options.keepRows;
 		if (paramCodecs !== undefined) out.paramCodecs = paramCodecs;
 		if (resultCodecs !== undefined) out.resultCodecs = resultCodecs;
+		if (nested !== undefined) out.nested = nested;
 		if (this.#options.prepare !== undefined)
 			out.prepare = this.#options.prepare;
 		if (options.signal !== undefined) out.signal = options.signal;

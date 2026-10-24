@@ -1,7 +1,12 @@
 import type { Codec } from './codec.js';
 import type { Field } from './protocol/messages.js';
 import type { CodecRegistry, TypeCatalog } from './registry.js';
-import { rowDecoder, type RowDecoder, type RowMode } from './rows.js';
+import {
+	type NestedObject,
+	rowDecoder,
+	type RowDecoder,
+	type RowMode,
+} from './rows.js';
 
 /** The codecs a query expects its result columns in, by position; null where it doesn't know. */
 export type ResultCodecs = readonly (Codec | null | undefined)[];
@@ -26,7 +31,8 @@ export interface ResultPlan {
 	readonly codecs: readonly (Codec | undefined)[];
 	/** A column sent in binary that nothing can read: it changed type since the statement was described. */
 	readonly unreadable: Field | undefined;
-	readonly decoders: Map<RowMode, RowDecoder>;
+	/** By row mode, and nested objects if any. */
+	readonly decoders: Map<string, RowDecoder>;
 }
 
 /** text, varchar, bpchar and name: types whose binary format is their text. */
@@ -112,14 +118,31 @@ export function resultPlan(
 	};
 }
 
-/** The plan's row decoder for `mode`, built once. */
-export function planDecoder(plan: ResultPlan, mode: RowMode): RowDecoder {
-	let decoder = plan.decoders.get(mode);
+/** The plan's row decoder for `mode` and `nested` objects, built once. */
+export function planDecoder(
+	plan: ResultPlan,
+	mode: RowMode,
+	nested?: readonly NestedObject[],
+): RowDecoder {
+	const key = nested === undefined ? mode : `${mode} ${nestedKey(nested)}`;
+	let decoder = plan.decoders.get(key);
 	if (decoder === undefined) {
-		decoder = rowDecoder(plan.fields, plan.codecs, mode);
-		plan.decoders.set(mode, decoder);
+		decoder = rowDecoder(plan.fields, plan.codecs, mode, nested);
+		plan.decoders.set(key, decoder);
 	}
 	return decoder;
+}
+
+const nestedKeys = new WeakMap<readonly NestedObject[], string>();
+
+/** `nested` as a string, for telling decoders apart; made once per list. */
+function nestedKey(nested: readonly NestedObject[]): string {
+	let key = nestedKeys.get(nested);
+	if (key === undefined) {
+		key = JSON.stringify(nested);
+		nestedKeys.set(nested, key);
+	}
+	return key;
 }
 
 /** Whether two plans ask for the same formats. */

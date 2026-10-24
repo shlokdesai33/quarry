@@ -52,7 +52,13 @@ import { ChannelNames, decodeNotification, Reader } from './protocol/reader.js';
 import { Writer } from './protocol/writer.js';
 import { Queue } from './queue.js';
 import { RowStream } from './row-stream.js';
-import { asResult, asResultPromise, type RowMode } from './rows.js';
+import {
+	asResult,
+	asResultPromise,
+	checkNested,
+	type NestedObject,
+	type RowMode,
+} from './rows.js';
 import type { DriverSocket } from './socket.js';
 import { startQuerySpan } from './telemetry.js';
 import { Transaction, type TransactionOptions } from './transaction.js';
@@ -133,6 +139,11 @@ export interface QueryOptions {
 	 * value that fails to decode in a row not kept goes unnoticed.
 	 */
 	readonly keepRows?: number;
+	/**
+	 * Columns read into objects of the row, each in place of its marker
+	 * column, and null where the marker is false (see `NestedObject`).
+	 */
+	readonly nested?: readonly NestedObject[];
 }
 
 /** A statement of `Connection.queryGroup`; per-query cancellation and timing don't apply. */
@@ -957,13 +968,15 @@ export class Connection implements AsyncDisposable {
 				options.prepare === undefined &&
 				options.binary === undefined &&
 				options.keepRows === undefined &&
-				options.rowMode === undefined)
+				options.rowMode === undefined &&
+				options.nested === undefined)
 		)
 			return (this.#defaultOptions ??= this.#optionsOf({}));
 		return this.#optionsOf(options);
 	}
 
 	#optionsOf(options: QueryOptions): QueryOpOptions {
+		if (options.nested !== undefined) checkNested(options.nested);
 		return {
 			rowMode: options.rowMode ?? 'object',
 			registry: this.#registryOf(options),
@@ -973,6 +986,7 @@ export class Connection implements AsyncDisposable {
 				this.#config.statementCacheSize > 0,
 			binary: options.binary ?? this.#config.binaryResults,
 			keepRows: options.keepRows ?? Infinity,
+			nested: options.nested,
 		};
 	}
 

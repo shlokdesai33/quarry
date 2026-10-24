@@ -144,6 +144,15 @@ export type SelectionNode = {
 	readonly alias: string;
 	/** The codec the column is read with, when its SQL type is known. */
 	readonly codec: Codec | undefined;
+	/**
+	 * Set on the entries of a nested object (`nest`): the object's key in
+	 * the row, and the column's key in the object. `column` is undefined on
+	 * the object's marker, its first entry: true where the table has a
+	 * row, and the object null where it doesn't.
+	 */
+	readonly nest?:
+		| { readonly key: string; readonly column: string | undefined }
+		| undefined;
 };
 
 /** `kind join table on condition`; a cross join has no condition. */

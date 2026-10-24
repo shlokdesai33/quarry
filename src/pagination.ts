@@ -24,13 +24,17 @@ export type KeyDirection = 'asc' | 'desc';
 
 /**
  * The columns of the tables `T` that can key the rows `O`: non-null, and
- * selected under their own name, since each page's last row gives the next
- * page's start.
+ * selected under their own name (not a key `N` of `nest`'s objects), since
+ * each page's last row gives the next page's start.
  */
-export type KeyColumn<T extends readonly AnyTable[], O> = {
+export type KeyColumn<
+	T extends readonly AnyTable[],
+	O,
+	N extends string = never,
+> = {
 	[K in Ref<RefsOf<T>>]: null extends RefsOf<T>[K]['$select']
 		? never
-		: KeyOf<K> extends keyof O
+		: KeyOf<K> extends Exclude<keyof O, N>
 			? K
 			: never;
 }[Ref<RefsOf<T>>];

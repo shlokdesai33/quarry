@@ -620,6 +620,24 @@ In one process (the sources run directly, 100 callers, 0 ms, one core), a lookup
 
 **Code.** `renderKey`, `AliasNode` in [compile.ts](compile.ts).
 
+### `nest` marks a joined row with `ctid`
+
+<a id="nest-marks-a-joined-row-with-ctid"></a>
+**What it is.** `nest('bookings', ['id', 'name'])` selects flat columns, `"bookings"."id" as "bookings.id"`, after one hidden marker per nested table, `("bookings".ctid is not null) as "bookings"`. The row decoder builds `{ id, name }` from them, or `null` where the marker is false. The marker is always `ctid`, for every table and join kind, with no fallback. `toSQL()` shows it; the row and its type don't.
+
+**Why.**
+
+- _A marker at all._ Without one, a left join's missing row and a matched row whose picked columns are all null look the same: every column NULL. Only a column that is never null in a row the table has can tell them apart.
+- _`ctid`, not a join column._ The join column (`bookings.user_id` in `on bookings.user_id = users.id`) works only for the two-column `on` shorthand, and only if that column isn't nullable. An `on` callback (`or`, an expression, `is not distinct from`) has no single column that a match guarantees non-null. The primary key would do, but quarry doesn't declare keys yet. Every row of a real table has a `ctid`, whatever the join and its condition, so one rule covers every case and needs nothing from the schema.
+- _Flat columns, not `json_build_object`._ JSON would turn every value into JSON text: bigints and numerics as JSON numbers, timestamps as strings, bytea as hex. It would also lose each column's codec and binary format. Flat columns are decoded exactly like any other selected column.
+- _Built in the decoder._ The driver takes the objects as the query's `nested` option. The generated row decoder stores a fresh object of nulls when the marker is true and stores each column straight into it, so there is no second pass over the rows and no per-row allocation for a missing row.
+
+**Alternatives.** The join column, or a non-null column of the table, as the marker: depends on the `on` form and the schema. `json_build_object`/`row_to_json`: loses codecs and exactness. Grouping after decoding (`rowMode: 'array'` then reshaping): a second pass and an extra array per row.
+
+**Cost.** One more boolean column per nested table. `ctid` exists only on real tables: a view has none, and a query nesting one fails in postgres. The table must be a real table.
+
+**Code.** `nest`/`Nested` in [nest.ts](nest.ts); `nestedNodes` in [row.ts](row.ts); `nestedObjects` in [compile.ts](compile.ts); `NestedObject` and the generated decoder in [driver/rows.ts](driver/rows.ts).
+
 ## Pagination
 
 The mechanisms are in [PAGINATION.md](PAGINATION.md).

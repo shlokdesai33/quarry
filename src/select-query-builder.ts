@@ -25,6 +25,7 @@ import type {
 	SelectionNode,
 	TableNode,
 } from './node.js';
+import type { NestedKey, SelectBuilder } from './nest.js';
 import type { AnyPredicate, EqualsValue } from './operators.js';
 import {
 	checkSize,
@@ -49,7 +50,7 @@ import {
 	type AddRow,
 	checkUniqueKeys,
 	type RowOf,
-	type Selection,
+	type SelectItem,
 	selectionNodes,
 	type TableRefs,
 	type UniqueColumns,
@@ -189,12 +190,13 @@ export type Fragment<T extends readonly AnyTable[]> = SelectQueryBuilder<
 interface AnyQuery {
 	readonly $output: unknown;
 	readonly $lock: LockState;
+	readonly $nested: string;
 	toNode(): SelectNode;
 }
 
 /** The tables the fragment's query `Q` joined onto its tables `P`. */
 type JoinedBy<Q, P extends readonly AnyTable[]> =
-	Q extends SelectQueryBuilder<infer T, infer _O, infer _L>
+	Q extends SelectQueryBuilder<infer T, infer _O, infer _L, infer _K>
 		? T extends readonly [...P, ...infer J extends AnyTable[]]
 			? J
 			: never
@@ -245,10 +247,13 @@ type OuterTables<T extends readonly AnyTable[]> =
 
 /**
  * What `group by`, `order by` and `distinct on` take over scope `R` with the
- * row `O`: a column, a selected column by its key in the row, or an
- * expression.
+ * row `O`: a column, a selected column by its key in the row (not a key
+ * `K` of `nest`'s objects), or an expression.
  */
-type Key<R extends Refs, O> = Ref<R> | (keyof O & string) | Expression<unknown>;
+type Key<R extends Refs, O, K extends string> =
+	| Ref<R>
+	| Exclude<keyof O & string, K>
+	| Expression<unknown>;
 
 /** A key as `#keys` reads it: a string, an expression, or a callback making one. */
 type KeyArg<R extends Refs> =
@@ -359,7 +364,8 @@ export function selectFromWith<T extends AnyTable>(
  * change the SQL.
  *
  * Immutable: every method returns a new builder. `L` is what its latest
- * locking clause still takes, if it has one.
+ * locking clause still takes, if it has one; `K` the keys of the row that
+ * hold `nest`'s objects, which aren't keys to order or group by.
  *
  * @example
  * const user = await db.selectFrom(users).where('users.id', id).select(['users.email']).expectOne().execute();
@@ -368,12 +374,16 @@ export class SelectQueryBuilder<
 	T extends readonly AnyTable[],
 	O,
 	L extends LockState = 'none',
+	K extends string = never,
 > {
 	/** The type of a result row. Never set. */
 	declare readonly $output: O;
 
 	/** What the latest locking clause still takes. Never set. */
 	declare readonly $lock: L;
+
+	/** The keys of the row that hold `nest`'s objects. Never set. */
+	declare readonly $nested: K;
 
 	readonly #state: SelectState<T>;
 
@@ -389,10 +399,10 @@ export class SelectQueryBuilder<
 	 * @example .where((eb) => eb.ref('users.age').gte(18))
 	 * @example .where((eb) => eb.or([eb.ref('users.age').lt(13), eb.ref('users.age').gt(65)]))
 	 */
-	readonly where: Condition<RefsOf<T>, SelectQueryBuilder<T, O, L>> = (
+	readonly where: Condition<RefsOf<T>, SelectQueryBuilder<T, O, L, K>> = (
 		...args: ConditionArgs<RefsOf<T>>
 	) =>
-		new SelectQueryBuilder<T, O, L>({
+		new SelectQueryBuilder<T, O, L, K>({
 			...this.#state,
 			where: this.#state.where.add(args),
 		});
@@ -406,8 +416,8 @@ export class SelectQueryBuilder<
 	innerJoin<J extends AnyTable>(
 		table: J,
 		..._newName: NewName<T, J>
-	): JoinBuilder<T, J, O, L> {
-		return new JoinBuilder<T, J, O, L>('inner', this.#joined(table), table);
+	): JoinBuilder<T, J, O, L, K> {
+		return new JoinBuilder<T, J, O, L, K>('inner', this.#joined(table), table);
 	}
 
 	/**
@@ -420,12 +430,12 @@ export class SelectQueryBuilder<
 	leftJoin<J extends AnyTable>(
 		table: J,
 		..._newName: NewName<T, J>
-	): JoinBuilder<T, NullableTable<J>, O, L> {
+	): JoinBuilder<T, NullableTable<J>, O, L, K> {
 		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the nullable table is the same table, typed for the rows without a match
 		const state = this.#joined(table) as unknown as SelectState<
 			[...T, NullableTable<J>]
 		>;
-		return new JoinBuilder<T, NullableTable<J>, O, L>('left', state, table);
+		return new JoinBuilder<T, NullableTable<J>, O, L, K>('left', state, table);
 	}
 
 	/**
@@ -437,12 +447,12 @@ export class SelectQueryBuilder<
 	rightJoin<J extends AnyTable>(
 		table: J,
 		..._newName: NewName<T, J>
-	): JoinBuilder<OuterTables<T>, J, NullableRow<O>, L> {
+	): JoinBuilder<OuterTables<T>, J, NullableRow<O>, L, K> {
 		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the nullable tables are the same tables, typed for the rows without a match
 		const state = this.#joined(table) as unknown as SelectState<
 			[...OuterTables<T>, J]
 		>;
-		return new JoinBuilder<OuterTables<T>, J, NullableRow<O>, L>(
+		return new JoinBuilder<OuterTables<T>, J, NullableRow<O>, L, K>(
 			'right',
 			state,
 			table,
@@ -456,16 +466,18 @@ export class SelectQueryBuilder<
 	fullJoin<J extends AnyTable>(
 		table: J,
 		..._newName: NewName<T, J>
-	): JoinBuilder<OuterTables<T>, NullableTable<J>, NullableRow<O>, L> {
+	): JoinBuilder<OuterTables<T>, NullableTable<J>, NullableRow<O>, L, K> {
 		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the nullable tables are the same tables, typed for the rows without a match
 		const state = this.#joined(table) as unknown as SelectState<
 			[...OuterTables<T>, NullableTable<J>]
 		>;
-		return new JoinBuilder<OuterTables<T>, NullableTable<J>, NullableRow<O>, L>(
-			'full',
-			state,
-			table,
-		);
+		return new JoinBuilder<
+			OuterTables<T>,
+			NullableTable<J>,
+			NullableRow<O>,
+			L,
+			K
+		>('full', state, table);
 	}
 
 	/**
@@ -477,9 +489,9 @@ export class SelectQueryBuilder<
 	crossJoin<J extends AnyTable>(
 		table: J,
 		..._newName: NewName<T, J>
-	): SelectQueryBuilder<[...T, J], O, L> {
+	): SelectQueryBuilder<[...T, J], O, L, K> {
 		const state = this.#joined(table);
-		return new SelectQueryBuilder<[...T, J], O, L>({
+		return new SelectQueryBuilder<[...T, J], O, L, K>({
 			...state,
 			joins: [
 				...state.joins,
@@ -490,22 +502,36 @@ export class SelectQueryBuilder<
 
 	/**
 	 * Adds to the select list. A column is keyed by its name, an expression
-	 * by its alias. Each key can be in the row once: selecting a second
-	 * column of the same name is a type error, which `.as()` resolves.
+	 * by its alias, and `nest`'s object of a table's columns by the table's
+	 * name. Each key can be in the row once: selecting a second column of
+	 * the same name is a type error, which `.as()` resolves.
 	 *
 	 * @example .select(['users.id', 'contacts.email'])
 	 * @example .select((eb) => [eb.fn.lower('users.email').as('email')])
 	 * @example .select((eb) => ['users.email', eb.ref('managers.email').as('managerEmail')])
+	 * @example .select(({ nest }) => ['users.id', nest('bookings', ['id', 'name'])])
 	 */
-	select<const S extends readonly Selection<RefsOf<T>>[]>(
-		selections: S | ((eb: ExpressionBuilder<RefsOf<T>>) => S),
+	select<const S extends readonly SelectItem<RefsOf<T>>[]>(
+		selections: S | ((eb: SelectBuilder<T>) => S),
 		..._unique: UniqueKeys<O, S>
-	): SelectQueryBuilder<T, AddRow<O, RowOf<RefsOf<T>, S[number]>>, L> {
+	): SelectQueryBuilder<
+		T,
+		AddRow<O, RowOf<RefsOf<T>, S[number]>>,
+		L,
+		K | NestedKey<S[number]>
+	> {
 		const eb = expressionBuilder(...this.#state.tables);
-		const list = typeof selections === 'function' ? selections(eb) : selections;
-		return new SelectQueryBuilder<T, AddRow<O, RowOf<RefsOf<T>, S[number]>>, L>(
-			this.#selecting(selectionNodes(eb, list)),
-		);
+		const list =
+			typeof selections === 'function'
+				? // eslint-disable-next-line typescript/no-unsafe-type-assertion -- every builder has `nest`, typed for select lists only
+					selections(eb as unknown as SelectBuilder<T>)
+				: selections;
+		return new SelectQueryBuilder<
+			T,
+			AddRow<O, RowOf<RefsOf<T>, S[number]>>,
+			L,
+			K | NestedKey<S[number]>
+		>(this.#selecting(selectionNodes(eb, list)));
 	}
 
 	/**
@@ -524,7 +550,8 @@ export class SelectQueryBuilder<
 	): SelectQueryBuilder<
 		T,
 		AddRow<O, RowOf<RefsOf<T>, TableRefs<RefsOf<T>, N>>>,
-		L
+		L,
+		K
 	> {
 		const tables = tablesNamed(this.#state.tables, table);
 		if (tables.length === 0) {
@@ -534,7 +561,8 @@ export class SelectQueryBuilder<
 		return new SelectQueryBuilder<
 			T,
 			AddRow<O, RowOf<RefsOf<T>, TableRefs<RefsOf<T>, N>>>,
-			L
+			L,
+			K
 		>(
 			tables.length === 1 &&
 				only !== undefined &&
@@ -551,8 +579,11 @@ export class SelectQueryBuilder<
 	 *
 	 * @example .select(['users.role']).distinct()
 	 */
-	distinct(): SelectQueryBuilder<T, O, L> {
-		return new SelectQueryBuilder<T, O, L>({ ...this.#state, distinct: true });
+	distinct(): SelectQueryBuilder<T, O, L, K> {
+		return new SelectQueryBuilder<T, O, L, K>({
+			...this.#state,
+			distinct: true,
+		});
 	}
 
 	/**
@@ -564,12 +595,12 @@ export class SelectQueryBuilder<
 	 */
 	distinctOn(
 		keys:
-			| readonly [Key<RefsOf<T>, O>, ...Key<RefsOf<T>, O>[]]
+			| readonly [Key<RefsOf<T>, O, K>, ...Key<RefsOf<T>, O, K>[]]
 			| ((
 					eb: ExpressionBuilder<RefsOf<T>>,
-			  ) => readonly [Key<RefsOf<T>, O>, ...Key<RefsOf<T>, O>[]]),
-	): SelectQueryBuilder<T, O, L> {
-		return new SelectQueryBuilder<T, O, L>({
+			  ) => readonly [Key<RefsOf<T>, O, K>, ...Key<RefsOf<T>, O, K>[]]),
+	): SelectQueryBuilder<T, O, L, K> {
+		return new SelectQueryBuilder<T, O, L, K>({
 			...this.#state,
 			distinct: this.#keys(keys),
 		});
@@ -586,10 +617,10 @@ export class SelectQueryBuilder<
 	 */
 	groupBy(
 		keys:
-			| readonly Key<RefsOf<T>, O>[]
-			| ((eb: ExpressionBuilder<RefsOf<T>>) => readonly Key<RefsOf<T>, O>[]),
-	): SelectQueryBuilder<T, O, L> {
-		return new SelectQueryBuilder<T, O, L>({
+			| readonly Key<RefsOf<T>, O, K>[]
+			| ((eb: ExpressionBuilder<RefsOf<T>>) => readonly Key<RefsOf<T>, O, K>[]),
+	): SelectQueryBuilder<T, O, L, K> {
+		return new SelectQueryBuilder<T, O, L, K>({
 			...this.#state,
 			groupBy: [...this.#state.groupBy, ...this.#keys(keys)],
 		});
@@ -602,10 +633,10 @@ export class SelectQueryBuilder<
 	 *
 	 * @example .having((eb) => eb.fn.count('posts.id').gte(5))
 	 */
-	readonly having: Condition<RefsOf<T>, SelectQueryBuilder<T, O, L>> = (
+	readonly having: Condition<RefsOf<T>, SelectQueryBuilder<T, O, L, K>> = (
 		...args: ConditionArgs<RefsOf<T>>
 	) =>
-		new SelectQueryBuilder<T, O, L>({
+		new SelectQueryBuilder<T, O, L, K>({
 			...this.#state,
 			having: this.#state.having.add(args),
 		});
@@ -622,14 +653,14 @@ export class SelectQueryBuilder<
 	 */
 	orderBy(
 		key:
-			| Key<RefsOf<T>, O>
-			| ((eb: ExpressionBuilder<RefsOf<T>>) => Key<RefsOf<T>, O>),
+			| Key<RefsOf<T>, O, K>
+			| ((eb: ExpressionBuilder<RefsOf<T>>) => Key<RefsOf<T>, O, K>),
 		direction?: 'asc' | 'desc',
 		options?: { readonly nulls?: 'first' | 'last' | undefined },
-	): SelectQueryBuilder<T, O, L> {
+	): SelectQueryBuilder<T, O, L, K> {
 		const [expression] = this.#keys([key]);
 		if (expression === undefined) throw new Error('orderBy needs a key');
-		return new SelectQueryBuilder<T, O, L>({
+		return new SelectQueryBuilder<T, O, L, K>({
 			...this.#state,
 			orderBy: [
 				...this.#state.orderBy,
@@ -647,13 +678,13 @@ export class SelectQueryBuilder<
 	 * @example .when(onlyActive, (qb) => qb.where('users.status', 'active'))
 	 * @example .when(withEmail, (qb) => qb.select(['users.email']))
 	 */
-	when<P, B extends LockState>(
+	when<P, B extends LockState, PK extends string = never>(
 		condition: boolean,
-		build: (qb: Fragment<T>) => SelectQueryBuilder<T, P, B>,
-	): SelectQueryBuilder<T, WhenRow<O, P>, LockAfter<L, B>> {
+		build: (qb: Fragment<T>) => SelectQueryBuilder<T, P, B, PK>,
+	): SelectQueryBuilder<T, WhenRow<O, P>, LockAfter<L, B>, K | PK> {
 		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the row type doesn't affect what `build` can do; `WhenRow` adds the earlier columns back
 		const query = condition ? build(this as unknown as Fragment<T>) : this;
-		return new SelectQueryBuilder<T, WhenRow<O, P>, LockAfter<L, B>>(
+		return new SelectQueryBuilder<T, WhenRow<O, P>, LockAfter<L, B>, K | PK>(
 			query.#state,
 		);
 	}
@@ -673,7 +704,8 @@ export class SelectQueryBuilder<
 	): SelectQueryBuilder<
 		[...T, ...JoinedBy<Q, P>],
 		AddRow<O, Q['$output']>,
-		LockAfter<L, Q['$lock']>
+		LockAfter<L, Q['$lock']>,
+		K | Q['$nested']
 	> {
 		type Tables = [...T, ...JoinedBy<Q, P>];
 		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- `InScope` checks every reference the fragment can make is in scope here
@@ -685,7 +717,8 @@ export class SelectQueryBuilder<
 		return new SelectQueryBuilder<
 			Tables,
 			AddRow<O, Q['$output']>,
-			LockAfter<L, Q['$lock']>
+			LockAfter<L, Q['$lock']>,
+			K | Q['$nested']
 		>(state);
 	}
 
@@ -710,7 +743,7 @@ export class SelectQueryBuilder<
 	 * @example .forUpdate().of(jobs).skipLocked()
 	 * @example .forUpdate().of(jobs).forShare().of(users)
 	 */
-	forUpdate(): SelectQueryBuilder<T, O, 'strength'> {
+	forUpdate(): SelectQueryBuilder<T, O, 'strength', K> {
 		return this.#lock('update');
 	}
 
@@ -719,7 +752,7 @@ export class SelectQueryBuilder<
 	 * that reference the rows by foreign key (`forKeyShare`). The lock an
 	 * `update` that leaves the key alone takes.
 	 */
-	forNoKeyUpdate(): SelectQueryBuilder<T, O, 'strength'> {
+	forNoKeyUpdate(): SelectQueryBuilder<T, O, 'strength', K> {
 		return this.#lock('no key update');
 	}
 
@@ -727,7 +760,7 @@ export class SelectQueryBuilder<
 	 * Adds `for share`: other transactions can share-lock the rows too, but
 	 * not update, delete or `forUpdate` them.
 	 */
-	forShare(): SelectQueryBuilder<T, O, 'strength'> {
+	forShare(): SelectQueryBuilder<T, O, 'strength', K> {
 		return this.#lock('share');
 	}
 
@@ -736,7 +769,7 @@ export class SelectQueryBuilder<
 	 * deletes and updates that change the key, not other updates. The lock a
 	 * foreign key check takes.
 	 */
-	forKeyShare(): SelectQueryBuilder<T, O, 'strength'> {
+	forKeyShare(): SelectQueryBuilder<T, O, 'strength', K> {
 		return this.#lock('key share');
 	}
 
@@ -749,9 +782,9 @@ export class SelectQueryBuilder<
 	 * @example .forUpdate().of('jobs', 'workers')
 	 */
 	of(
-		this: SelectQueryBuilder<T, O, 'strength'>,
+		this: SelectQueryBuilder<T, O, 'strength', K>,
 		...tables: readonly [LockTarget<T>, ...LockTarget<T>[]]
-	): SelectQueryBuilder<T, O, 'of'> {
+	): SelectQueryBuilder<T, O, 'of', K> {
 		const of = tables.map((table) =>
 			typeof table === 'string' ? table : table.name,
 		);
@@ -772,8 +805,8 @@ export class SelectQueryBuilder<
 	 * @example await tx.selectFrom(jobs).select(['jobs.id']).where('jobs.status', 'queued').forUpdate().skipLocked().limit(1).takeFirst().execute()
 	 */
 	skipLocked(
-		this: SelectQueryBuilder<T, O, 'strength' | 'of'>,
-	): SelectQueryBuilder<T, O, 'done'> {
+		this: SelectQueryBuilder<T, O, 'strength' | 'of', K>,
+	): SelectQueryBuilder<T, O, 'done', K> {
 		return this.#wait('skip locked');
 	}
 
@@ -782,8 +815,8 @@ export class SelectQueryBuilder<
 	 * transaction, rather than waiting for it.
 	 */
 	noWait(
-		this: SelectQueryBuilder<T, O, 'strength' | 'of'>,
-	): SelectQueryBuilder<T, O, 'done'> {
+		this: SelectQueryBuilder<T, O, 'strength' | 'of', K>,
+	): SelectQueryBuilder<T, O, 'done', K> {
 		return this.#wait('nowait');
 	}
 
@@ -794,8 +827,8 @@ export class SelectQueryBuilder<
 	 *
 	 * @example .tag('users.findByEmail')
 	 */
-	tag(name: string): SelectQueryBuilder<T, O, L> {
-		return new SelectQueryBuilder<T, O, L>({ ...this.#state, tag: name });
+	tag(name: string): SelectQueryBuilder<T, O, L, K> {
+		return new SelectQueryBuilder<T, O, L, K>({ ...this.#state, tag: name });
 	}
 
 	/**
@@ -804,11 +837,11 @@ export class SelectQueryBuilder<
 	 *
 	 * @example .forUpdate().skipLocked().limit(1)
 	 */
-	limit(count: number): SelectQueryBuilder<T, O, L> {
+	limit(count: number): SelectQueryBuilder<T, O, L, K> {
 		if (!Number.isInteger(count) || count < 0) {
 			throw new RangeError(`limit takes a whole number of rows, not ${count}`);
 		}
-		return new SelectQueryBuilder<T, O, L>({ ...this.#state, limit: count });
+		return new SelectQueryBuilder<T, O, L, K>({ ...this.#state, limit: count });
 	}
 
 	/**
@@ -819,11 +852,14 @@ export class SelectQueryBuilder<
 	 *
 	 * @example .orderBy('posts.id').limit(20).offset(40)
 	 */
-	offset(count: number): SelectQueryBuilder<T, O, L> {
+	offset(count: number): SelectQueryBuilder<T, O, L, K> {
 		if (!Number.isInteger(count) || count < 0) {
 			throw new RangeError(`offset takes a whole number of rows, not ${count}`);
 		}
-		return new SelectQueryBuilder<T, O, L>({ ...this.#state, offset: count });
+		return new SelectQueryBuilder<T, O, L, K>({
+			...this.#state,
+			offset: count,
+		});
 	}
 
 	/**
@@ -1005,7 +1041,7 @@ export class SelectQueryBuilder<
 	 */
 	async *iterateChunks(
 		size: number,
-		options: KeysetOptions<KeyColumn<T, O>>,
+		options: KeysetOptions<KeyColumn<T, O, K>>,
 	): AsyncGenerator<O[], void, undefined> {
 		checkSize('iterateChunks', 'size', size);
 		const executor = this.#executor();
@@ -1054,7 +1090,7 @@ export class SelectQueryBuilder<
 	 * const { rows, nextCursor, hasMore } = await db.selectFrom(posts).select(['posts.id', 'posts.title']).paginateByCursor({ perPage: 20, by: 'posts.id', after: request.query.cursor });
 	 */
 	async paginateByCursor(
-		options: CursorPageOptions<KeyColumn<T, O>>,
+		options: CursorPageOptions<KeyColumn<T, O, K>>,
 	): Promise<CursorPage<O>> {
 		const { perPage, after } = options;
 		checkSize('paginateByCursor', 'perPage', perPage);
@@ -1255,9 +1291,15 @@ export class SelectQueryBuilder<
 			const item = typeof key === 'function' ? key(eb) : key;
 			if (typeof item !== 'string') return item._quarry.node;
 			if (item.includes('.')) return eb.ref(item)._quarry.node;
-			if (!this.#state.selections.some((s) => s.alias === item)) {
+			const selected = this.#state.selections.find((s) => s.alias === item);
+			if (selected === undefined) {
 				throw new Error(
 					`"${item}" is not a key of the row: select it first, or name a column as 'table.column'`,
+				);
+			}
+			if (selected.nest !== undefined) {
+				throw new Error(
+					`"${item}" is a nested object: name one of its columns as 'table.column'`,
 				);
 			}
 			return { kind: 'alias', alias: item };
@@ -1272,14 +1314,16 @@ export class SelectQueryBuilder<
 		return this.#state.where.toNode();
 	}
 
-	#lock(strength: LockNode['strength']): SelectQueryBuilder<T, O, 'strength'> {
-		return new SelectQueryBuilder<T, O, 'strength'>({
+	#lock(
+		strength: LockNode['strength'],
+	): SelectQueryBuilder<T, O, 'strength', K> {
+		return new SelectQueryBuilder<T, O, 'strength', K>({
 			...this.#state,
 			locks: [...this.#state.locks, { strength, of: [], wait: undefined }],
 		});
 	}
 
-	#wait(wait: LockNode['wait']): SelectQueryBuilder<T, O, 'done'> {
+	#wait(wait: LockNode['wait']): SelectQueryBuilder<T, O, 'done', K> {
 		const method = wait === 'nowait' ? 'noWait()' : 'skipLocked()';
 		return this.#modifyLock<'done'>(method, (lock) => {
 			if (lock.wait !== undefined) {
@@ -1292,10 +1336,10 @@ export class SelectQueryBuilder<
 	}
 
 	/** Replaces the latest locking clause with what `modify` makes of it. */
-	#modifyLock<N extends LockState>(
+	#modifyLock<M extends LockState>(
 		method: string,
 		modify: (lock: LockNode) => LockNode,
-	): SelectQueryBuilder<T, O, N> {
+	): SelectQueryBuilder<T, O, M, K> {
 		const { locks } = this.#state;
 		const latest = locks.at(-1);
 		if (latest === undefined) {
@@ -1303,7 +1347,7 @@ export class SelectQueryBuilder<
 				`${method} needs a locking clause first: forUpdate(), forNoKeyUpdate(), forShare() or forKeyShare()`,
 			);
 		}
-		return new SelectQueryBuilder<T, O, N>({
+		return new SelectQueryBuilder<T, O, M, K>({
 			...this.#state,
 			locks: [...locks.slice(0, -1), modify(latest)],
 		});
@@ -1347,6 +1391,7 @@ export class JoinBuilder<
 	J extends AnyTable,
 	O,
 	L extends LockState = 'none',
+	K extends string = never,
 > {
 	readonly #kind: JoinNode['kind'];
 	readonly #state: SelectState<[...T, J]>;
@@ -1375,9 +1420,9 @@ export class JoinBuilder<
 		RefsOf<[...T, J]>,
 		T,
 		RefsOf<[J]>,
-		SelectQueryBuilder<[...T, J], O, L>
+		SelectQueryBuilder<[...T, J], O, L, K>
 	> = (...args: OnArgs<RefsOf<[...T, J]>>) =>
-		new SelectQueryBuilder<[...T, J], O, L>({
+		new SelectQueryBuilder<[...T, J], O, L, K>({
 			...this.#state,
 			joins: [
 				...this.#state.joins,
