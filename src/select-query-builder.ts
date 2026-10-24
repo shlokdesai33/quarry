@@ -11,6 +11,7 @@ import type {
 import { RowStream } from './driver/row-stream.js';
 import { Expression, type TypedExpression } from './expression.js';
 import {
+	allSelections,
 	type ExpressionBuilder,
 	expressionBuilder,
 } from './expression-builder.js';
@@ -508,40 +509,40 @@ export class SelectQueryBuilder<
 	}
 
 	/**
-	 * Selects every column of `table` (a table in the query, or the name it
-	 * goes by there), or without one, of every table in the query, each
-	 * keyed by its name. Each column is listed, never `*`, so it is keyed
-	 * and decoded like a selected column. Two tables with a column of the
-	 * same name can't both be selected whole: select one with `select` and
-	 * `.as()`.
+	 * Selects every column of `table`, the name a table goes by in the query
+	 * (its alias, or its name when not aliased), each keyed by its name.
+	 * Each column is listed, never `*`, so it is keyed and decoded like a
+	 * selected column. Two tables with a column of the same name can't both
+	 * be selected whole: select one with `select` and `.as()`.
 	 *
-	 * @example .selectAll()
-	 * @example .selectAll(users)
+	 * @example .selectAll('users')
+	 * @example .selectAll('u') // after selectFrom(users.as('u'))
 	 */
-	selectAll<N extends T[number]['name'] = T[number]['name']>(
-		table?: N | (T[number] & { readonly name: N }),
+	selectAll<N extends T[number]['name']>(
+		table: N,
 		..._unique: UniqueColumns<O, TableRefs<RefsOf<T>, N>>
 	): SelectQueryBuilder<
 		T,
 		AddRow<O, RowOf<RefsOf<T>, TableRefs<RefsOf<T>, N>>>,
 		L
 	> {
-		const name = typeof table === 'object' ? table.name : table;
-		const tables = this.#state.tables.filter(
-			(t) => name === undefined || t.name === name,
-		);
+		const tables = tablesNamed(this.#state.tables, table);
 		if (tables.length === 0) {
-			throw new Error(`selectAll: "${String(name)}" is not in the query`);
+			throw new Error(`selectAll: "${table}" is not in the query`);
 		}
-		const eb = expressionBuilder(...this.#state.tables);
-		const refs = tables.flatMap((t) =>
-			Object.keys(t.schema.columns).map((key) => `${t.name}.${key}`),
-		);
+		const [only] = tables;
 		return new SelectQueryBuilder<
 			T,
 			AddRow<O, RowOf<RefsOf<T>, TableRefs<RefsOf<T>, N>>>,
 			L
-		>(this.#selecting(selectionNodes(eb, refs)));
+		>(
+			tables.length === 1 &&
+				only !== undefined &&
+				this.#state.selections.length === 0
+				? // one table's columns, keyed by its column keys: unique
+					{ ...this.#state, selections: allSelections(only) }
+				: this.#selecting(tables.flatMap((t) => allSelections(t))),
+		);
 	}
 
 	/**
@@ -1229,10 +1230,12 @@ export class SelectQueryBuilder<
 
 	/** The state with `added` selected; throws when a key is taken. */
 	#selecting(added: readonly SelectionNode[]): SelectState<T> {
-		checkUniqueKeys(this.#state.selections, added);
+		const { selections } = this.#state;
+		checkUniqueKeys(selections, added);
 		return {
 			...this.#state,
-			selections: [...this.#state.selections, ...added],
+			// lists are never changed in place, so the first one is kept as is
+			selections: selections.length === 0 ? added : [...selections, ...added],
 		};
 	}
 
@@ -1325,6 +1328,14 @@ export class SelectQueryBuilder<
 			shape,
 		);
 	}
+}
+
+/** The tables in scope named `name`. */
+function tablesNamed<T extends readonly AnyTable[]>(
+	tables: T,
+	name: string,
+): readonly T[number][] {
+	return tables.filter((t) => t.name === name);
 }
 
 /**

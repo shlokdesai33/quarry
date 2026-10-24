@@ -1,4 +1,4 @@
-import { AbortError, DriverError } from './errors.js';
+import { AbortError } from './errors.js';
 import {
 	ClosePortalOp,
 	cursorAborted,
@@ -6,7 +6,6 @@ import {
 	type CursorBatch,
 	type CursorOp,
 	type Op,
-	type QueryResult,
 } from './ops.js';
 import type { RowDecoder } from './rows.js';
 
@@ -17,7 +16,6 @@ export interface CursorHost {
 	enqueue(op: Op, signal?: AbortSignal, timeout?: number): void;
 	/** Drops an operation not yet sent, or cancels (or interrupts) one that was. */
 	abort(op: Op, reason: 'abort' | 'timeout', cause?: unknown): void;
-	query(sql: string, params: readonly unknown[]): Promise<QueryResult<unknown>>;
 	/** A portal name not used on the connection yet. */
 	portal(): string;
 }
@@ -30,8 +28,16 @@ export interface CursorRequest {
 	readonly signal: AbortSignal | undefined;
 	readonly timeout: number | undefined;
 	readonly statementTimeout: number | string | undefined;
-	/** The operation opening the portal: '' for the unnamed one, outside a transaction. */
-	readonly open: (portal: string, held: boolean) => CursorOp;
+	/**
+	 * The operation opening the portal: '' for the unnamed one, outside a
+	 * transaction. With `statementTimeout` (an interval), it sets and
+	 * restores `statement_timeout` around the portal, under its Sync.
+	 */
+	readonly open: (
+		portal: string,
+		held: boolean,
+		statementTimeout: string | undefined,
+	) => CursorOp;
 }
 
 const DONE: IteratorReturnResult<undefined> = Object.freeze({
@@ -51,6 +57,12 @@ const interval = (timeout: number | string) =>
  * holds the connection until the portal is read or closed. Inside one, it
  * is a named portal read with an Execute + Sync per batch, so other queries
  * of the transaction run between batches; it is closed at the end.
+ *
+ * With a `statementTimeout`, it is always the first kind, whatever the
+ * transaction status says: the operation sets the timeout before the
+ * portal and restores it before the Sync, which bounds the portal alone.
+ * (A `Transaction` refuses one: its other queries couldn't run between
+ * batches.)
  */
 export class CursorIterator implements AsyncIterator<unknown[], undefined> {
 	readonly #host: CursorHost;
@@ -71,9 +83,6 @@ export class CursorIterator implements AsyncIterator<unknown[], undefined> {
 	#reading: Op | undefined;
 	/** Why a held cursor was aborted. */
 	#aborted: Error | undefined;
-	/** `begin` and the `statement_timeout`, and `commit` after the cursor. */
-	#setup: Promise<unknown> | undefined;
-	#commit: Promise<unknown> | undefined;
 	#cleanup: (() => void) | undefined;
 	/** `next` calls run one after another, as an async generator's do. */
 	#last: Promise<unknown> = Promise.resolve();
@@ -148,35 +157,17 @@ export class CursorIterator implements AsyncIterator<unknown[], undefined> {
 				`batchSize takes a whole number of rows from 1, not ${batchSize}`,
 			);
 		}
-		const status = host.status();
-		if (status !== 'I') {
-			if (statementTimeout !== undefined) {
-				throw new DriverError(
-					'A cursor inside a transaction takes no statementTimeout, since other queries run between its batches: set statement_timeout with set_config(…, true)',
-				);
-			}
+		if (statementTimeout === undefined && host.status() !== 'I') {
 			this.#openHeld(signal, timeout);
 			return;
 		}
-		const op = this.#request.open('', false);
+		const op = this.#request.open(
+			'',
+			false,
+			statementTimeout === undefined ? undefined : interval(statementTimeout),
+		);
 		this.#op = op;
-		if (statementTimeout !== undefined) {
-			// a transaction of its own, so the setting can't outlive the cursor
-			const setup = Promise.all([
-				host.query('begin', []),
-				host.query("select set_config('statement_timeout', $1, true)", [
-					interval(statementTimeout),
-				]),
-			]);
-			setup.catch(noop);
-			this.#setup = setup;
-		}
 		host.enqueue(op, signal, timeout);
-		if (statementTimeout !== undefined) {
-			const commit = host.query('commit', []);
-			commit.catch(noop);
-			this.#commit = commit;
-		}
 	}
 
 	#openHeld(
@@ -190,7 +181,7 @@ export class CursorIterator implements AsyncIterator<unknown[], undefined> {
 			});
 		}
 		this.#portal = this.#host.portal();
-		const op = this.#request.open(this.#portal, true);
+		const op = this.#request.open(this.#portal, true, undefined);
 		this.#op = op;
 		const cleanups: (() => void)[] = [];
 		if (signal !== undefined) {
@@ -261,33 +252,13 @@ export class CursorIterator implements AsyncIterator<unknown[], undefined> {
 			this.#host.abort(this.#reading, reason, cause);
 	}
 
-	/**
-	 * Ends the run: closes a held portal, waits for the transaction of a
-	 * `statementTimeout` to end, and stops listening for aborts. The error
-	 * to report: `failure`, unless the `statementTimeout` couldn't be set,
-	 * which failed it.
-	 */
+	/** Ends the run: closes a held portal and stops listening for aborts. The error to report: `failure`. */
 	async #end(failure: unknown): Promise<unknown> {
 		if (this.#done) return failure;
 		this.#done = true;
 		this.#cleanup?.();
 		if (this.#held && this.#portal !== '') {
 			this.#host.enqueue(new ClosePortalOp(this.#portal));
-		}
-		if (this.#setup !== undefined) {
-			try {
-				await this.#setup;
-			} catch (error) {
-				await this.#commit?.catch(noop);
-				return error;
-			}
-		}
-		if (this.#commit !== undefined) {
-			try {
-				await this.#commit;
-			} catch (error) {
-				return failure ?? error;
-			}
 		}
 		return failure;
 	}

@@ -1,0 +1,168 @@
+{
+	"install": {
+		"quarry (whole package: query builder + driver + src)": {
+			"bytes": 1917580,
+			"packages": 1
+		},
+		"pg": {
+			"bytes": 475143,
+			"packages": 14
+		},
+		"pg + pg-native (libpq addon, built)": {
+			"bytes": 1410029,
+			"packages": 19
+		},
+		"postgres.js": {
+			"bytes": 300263,
+			"packages": 1
+		},
+		"@neondatabase/serverless (+ ws on Node)": {
+			"bytes": 596319,
+			"packages": 2
+		},
+		"deno-postgres (jsr, source modules)": {
+			"bytes": 543682,
+			"packages": 7
+		},
+		"Bun.sql (built into Bun)": {
+			"bytes": 0,
+			"packages": 0
+		}
+	},
+	"bundle": {
+		"quarry/driver": {
+			"bytes": 78083,
+			"gzip": 26558
+		},
+		"pg": {
+			"bytes": 86405,
+			"gzip": 26881
+		},
+		"postgres.js": {
+			"bytes": 38035,
+			"gzip": 14692
+		},
+		"@neondatabase/serverless": {
+			"bytes": 146288,
+			"gzip": 47425
+		},
+		"pg-native": {
+			"note": "native addon (libpq .node + libpq.so): not bundleable"
+		}
+	},
+	"cold": {
+		"node/none": {
+			"importMs": 0.0021449999999987313,
+			"firstQueryMs": 0.008822999999999581,
+			"sinceStartMs": 42.82573,
+			"wallMs": 50.566837000000305,
+			"reps": 15
+		},
+		"node/quarry": {
+			"importMs": 4.6473159999999964,
+			"firstQueryMs": 14.158062000000001,
+			"sinceStartMs": 62.702301,
+			"wallMs": 71.80457599999863,
+			"reps": 15
+		},
+		"node/pg": {
+			"importMs": 22.216225,
+			"firstQueryMs": 7.599204,
+			"sinceStartMs": 77.154055,
+			"wallMs": 83.49237399999947,
+			"reps": 15
+		},
+		"node/pg-native": {
+			"importMs": 21.761080000000007,
+			"firstQueryMs": 8.87453099999999,
+			"sinceStartMs": 75.295848,
+			"wallMs": 83.88260799999989,
+			"reps": 15
+		},
+		"node/postgres.js": {
+			"importMs": 16.636226999999998,
+			"firstQueryMs": 9.965858999999995,
+			"sinceStartMs": 70.584856,
+			"wallMs": 79.94969299999866,
+			"reps": 15
+		},
+		"node/neon": {
+			"importMs": 24.261433000000004,
+			"firstQueryMs": 11.974644999999995,
+			"sinceStartMs": 79.648729,
+			"wallMs": 86.16476000000148,
+			"reps": 15
+		},
+		"bun/none": {
+			"importMs": 0.0008429999999999271,
+			"firstQueryMs": 0.012378,
+			"sinceStartMs": 1.831889,
+			"wallMs": 4.620340999999826,
+			"reps": 15
+		},
+		"bun/quarry": {
+			"importMs": 6.380024,
+			"firstQueryMs": 14.644827999999999,
+			"sinceStartMs": 22.61668,
+			"wallMs": 28.64713599999959,
+			"reps": 15
+		},
+		"bun/pg": {
+			"importMs": 14.360115,
+			"firstQueryMs": 8.698602000000001,
+			"sinceStartMs": 24.98384,
+			"wallMs": 28.571303999999145,
+			"reps": 15
+		},
+		"bun/postgres.js": {
+			"importMs": 13.44525,
+			"firstQueryMs": 10.088531,
+			"sinceStartMs": 25.943496,
+			"wallMs": 32.52323400000023,
+			"reps": 15
+		},
+		"bun/bun.sql": {
+			"importMs": 3.3409899999999997,
+			"firstQueryMs": 4.025825,
+			"sinceStartMs": 9.355191,
+			"wallMs": 12.891625000000204,
+			"reps": 15
+		},
+		"deno/none": {
+			"importMs": 0.0023919999999986175,
+			"firstQueryMs": 0.018775999999999016,
+			"sinceStartMs": 11.827358,
+			"wallMs": 23.752183000000514,
+			"reps": 15
+		},
+		"deno/quarry": {
+			"importMs": 2.0006880000000002,
+			"firstQueryMs": 13.089647000000001,
+			"sinceStartMs": 25.810072,
+			"wallMs": 41.092053000000305,
+			"reps": 15
+		},
+		"deno/pg": {
+			"importMs": 14.257198000000002,
+			"firstQueryMs": 8.754407,
+			"sinceStartMs": 34.413419,
+			"wallMs": 47.47169300000314,
+			"reps": 15
+		},
+		"deno/postgres.js": {
+			"importMs": 12.732228,
+			"firstQueryMs": 11.858584,
+			"sinceStartMs": 35.161607,
+			"wallMs": 50.341331999999966,
+			"reps": 15
+		},
+		"deno/deno-postgres": {
+			"importMs": 18.061757,
+			"firstQueryMs": 6.0434920000000005,
+			"sinceStartMs": 35.179696,
+			"wallMs": 48.32020399999965,
+			"reps": 15
+		}
+	},
+	"driverDistBytes": 2172
+}

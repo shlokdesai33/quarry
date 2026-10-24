@@ -104,16 +104,32 @@ export interface WriteResult {
 	readonly rowCount: number;
 }
 
+/** A column of a table: the column declared under a key, and its name in the database. */
+interface ColumnOf {
+	readonly column: AnyColumn;
+	readonly name: string;
+}
+
+/** Each table's columns by key, looked up once per table: only keys that name a column are kept. */
+const columnsOf = new WeakMap<AnyTable, Map<string, ColumnOf>>();
+
 /** The column declared under `key`, and its name in the database. */
-export function columnOf(
-	table: AnyTable,
-	key: string,
-): { readonly column: AnyColumn; readonly name: string } {
-	const column = table.schema.columns[key];
-	if (column === undefined) {
-		throw new Error(`Unknown column "${key}" in table "${table.name}"`);
+export function columnOf(table: AnyTable, key: string): ColumnOf {
+	let columns = columnsOf.get(table);
+	if (columns === undefined) {
+		columns = new Map();
+		columnsOf.set(table, columns);
 	}
-	return { column, name: column._quarry.columnName ?? key };
+	let found = columns.get(key);
+	if (found === undefined) {
+		const column = table.schema.columns[key];
+		if (column === undefined) {
+			throw new Error(`Unknown column "${key}" in table "${table.name}"`);
+		}
+		found = { column, name: column._quarry.columnName ?? key };
+		columns.set(key, found);
+	}
+	return found;
 }
 
 /** A value written to `column`: an expression as is, a value encoded by the column's codec. */
@@ -135,14 +151,21 @@ export function setNodes(
 	current: Current = updateCurrent,
 ): SetNode[] {
 	const nodes = [...set];
-	const entries = Object.entries(values);
+	const keys = Object.keys(values);
+	// read once each, before any is written, as Object.entries reads them
+	const given: unknown[] = [];
+	// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the values are a record of columns
+	for (const key of keys) given.push((values as Record<string, unknown>)[key]);
 	// a short list is searched; a long one indexed
 	const index =
-		set.length + entries.length > 32
+		set.length + keys.length > 32
 			? new Map(set.map((node, i) => [node.column, i]))
 			: undefined;
-	for (const [key, value] of entries) {
+	for (let k = 0; k < keys.length; k++) {
+		const value = given[k];
 		if (value === undefined) continue;
+		// oxlint-disable-next-line typescript/no-non-null-assertion -- within bounds
+		const key = keys[k]!;
 		const { column, name } = columnOf(table, key);
 		const node = {
 			column: name,
@@ -150,7 +173,7 @@ export function setNodes(
 		};
 		const at =
 			index === undefined
-				? nodes.findIndex((existing) => existing.column === name)
+				? indexOfColumn(nodes, name)
 				: (index.get(name) ?? -1);
 		if (at >= 0) nodes[at] = node;
 		else {
@@ -164,6 +187,12 @@ export function setNodes(
 		);
 	}
 	return nodes;
+}
+
+function indexOfColumn(nodes: readonly SetNode[], name: string): number {
+	for (let i = 0; i < nodes.length; i++)
+		if (nodes[i]?.column === name) return i;
+	return -1;
 }
 
 /**
@@ -182,17 +211,17 @@ export function rowsNode(
 			if (value !== undefined && !keys.includes(key)) keys.push(key);
 		}
 	}
-	const columns = keys.map((key) => columnOf(table, key).column);
+	const resolved = keys.map((key) => columnOf(table, key));
 	return {
-		columns: keys.map((key) => columnOf(table, key).name),
-		types: columns.map((column) => castType(column._quarry.dataType)),
-		codecs: columns.map((column) => column._quarry.dataType.codec),
+		columns: resolved.map(({ name }) => name),
+		types: resolved.map(({ column }) => castType(column._quarry.dataType)),
+		codecs: resolved.map(({ column }) => column._quarry.dataType.codec),
 		rows: entries.map((list) => {
 			const cells: (OperationNode | undefined)[] = keys.map(() => undefined);
 			for (const [key, value] of list) {
 				if (value === undefined) continue;
 				const i = keys.indexOf(key);
-				cells[i] = valueNode(columns[i]!, notIncrement(value));
+				cells[i] = valueNode(resolved[i]!.column, notIncrement(value));
 			}
 			return cells;
 		}),

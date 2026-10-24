@@ -28,27 +28,27 @@ It links to the detailed guide for each stage. If a word is new, the glossaries 
 import { database, defineTable, integer, text, timestamptz } from 'quarry';
 
 const users = defineTable('users', {
-	columns: {
-		id: integer().identity(),
-		email: text(),
-		name: text().nullable(),
-		createdAt: timestamptz().name('created_at').default(),
-	},
+  columns: {
+    id: integer().identity(),
+    email: text(),
+    name: text().nullable(),
+    createdAt: timestamptz().name('created_at').default(),
+  },
 });
 
 const db = database({
-	host: 'db.internal',
-	user: 'app',
-	database: 'app',
-	max: 1,
+  host: 'db.internal',
+  user: 'app',
+  database: 'app',
+  max: 1,
 });
 
 const user = await db
-	.selectFrom(users)
-	.where('users.email', 'ada@example.com')
-	.select(['users.id', 'users.name', 'users.createdAt'])
-	.expectOne()
-	.execute();
+  .selectFrom(users)
+  .where('users.email', 'ada@example.com')
+  .select(['users.id', 'users.name', 'users.createdAt'])
+  .expectOne()
+  .execute();
 // user: { id: number; name: string | null; createdAt: Date }
 // → { id: 1, name: 'Ada Lovelace', createdAt: 2026-10-17T03:51:00.000Z }
 ```
@@ -253,33 +253,33 @@ The row decoder is JavaScript **generated** for this exact column list and compi
 const c0 = c[0];
 const c2 = c[2];
 function columns0(b, pos, end, row) {
-	let length = 0,
-		column = -1;
-	try {
-		if (pos + 4 > end) throw short();
-		length =
-			(b[pos] << 24) | (b[pos + 1] << 16) | (b[pos + 2] << 8) | b[pos + 3];
-		pos += 4;
-		if (length !== -1) {
-			if (length < 0 || pos + length > end) throw invalid();
-			column = 0;
-			row['id'] = c0.decodeBinary(b, pos, pos + length);
-			column = -1;
-			pos += length;
-		}
-		// … the same for "name" (utf8 text) and "createdAt" (c2.decodeBinary) …
-	} catch (error) {
-		throw column < 0 ? error : failed(column, error);
-	}
-	return pos;
+  let length = 0,
+    column = -1;
+  try {
+    if (pos + 4 > end) throw short();
+    length =
+      (b[pos] << 24) | (b[pos + 1] << 16) | (b[pos + 2] << 8) | b[pos + 3];
+    pos += 4;
+    if (length !== -1) {
+      if (length < 0 || pos + length > end) throw invalid();
+      column = 0;
+      row['id'] = c0.decodeBinary(b, pos, pos + length);
+      column = -1;
+      pos += length;
+    }
+    // … the same for "name" (utf8 text) and "createdAt" (c2.decodeBinary) …
+  } catch (error) {
+    throw column < 0 ? error : failed(column, error);
+  }
+  return pos;
 }
 return function decodeRow(b, start, end) {
-	if (end - start < 2 || ((b[start] << 8) | b[start + 1]) !== count)
-		throw mismatch();
-	const row = { id: null, name: null, createdAt: null };
-	let pos = start + 2;
-	pos = columns0(b, pos, end, row);
-	return row;
+  if (end - start < 2 || ((b[start] << 8) | b[start + 1]) !== count)
+    throw mismatch();
+  const row = { id: null, name: null, createdAt: null };
+  let pos = start + 2;
+  pos = columns0(b, pos, end, row);
+  return row;
 };
 ```
 
@@ -350,7 +350,7 @@ S< ParseComplete BindComplete NoData CommandComplete(BEGIN)  ParseComplete … D
 
 **A batch.** `db.batch([q1, q2])` writes both queries in one go, each with its own Sync; with `{ transaction: true }`, BEGIN, both queries and COMMIT in one write. [EXECUTION.md](EXECUTION.md#batches).
 
-**A statement timeout.** `.execute({ timeout: '2s' })` outside a transaction pipelines four statements in one write: `begin`, `select set_config('statement_timeout', $1, true)`, the query, `commit`. [driver/CANCELLATION.md](driver/CANCELLATION.md).
+**A statement timeout.** `.execute({ timeout: '2s' })` sends three statements under one Sync, in one write: one setting `statement_timeout` with `set_config(…, true)`, the query, and one restoring the previous value. [driver/CANCELLATION.md](driver/CANCELLATION.md#statement-timeouts).
 
 **Concurrent driver queries.** Three `pool.query(…)` calls issued together on a pool of one connection go out in **one** write, three Bind/Execute/Sync groups back to back, and their replies come back in order. [driver/ARCHITECTURE.md](driver/ARCHITECTURE.md#pipelining). Builder queries take the same path, and once the pool is full, pipeline onto busy connections: [EXECUTION.md](EXECUTION.md#connections-shared-or-exclusive).
 

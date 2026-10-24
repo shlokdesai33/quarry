@@ -19,11 +19,11 @@ Code: `CursorOp`, `FetchOp`, `ClosePortalOp`, `CopyFromOp`, `CopyToOp` in [ops.t
 
 ```ts
 for await (const batch of conn.cursor(
-	'select * from events where day = $1',
-	[day],
-	{ batchSize: 1000, signal },
+  'select * from events where day = $1',
+  [day],
+  { batchSize: 1000, signal },
 )) {
-	for (const row of batch) handle(row);
+  for (const row of batch) handle(row);
 }
 ```
 
@@ -81,7 +81,7 @@ Unlike `query()`, whose columns are asked for in binary only once a cached state
 - **Opens on the first `next()`**, synchronously inside the call, so queries issued after that call run after the cursor.
 - **`next()` calls are serialised** (`#serial`), so concurrent `next()`s are answered in order (before #34, the first of two concurrent calls never settled).
 - **`return()` is immediate**: an unsent cursor is dropped from the queue; a sent one is closed (Close + Sync, then waits for the connection to be free).
-- **`statementTimeout`** (outside a transaction) runs the cursor in a transaction of its own: `begin` and `select set_config('statement_timeout', $1, true)` are queued before the cursor and `commit` after it, all pipelined, so the timeout bounds the cursor from its first batch to its last, the consumer's time included, and can't outlive it. A suspended portal keeps `statement_timeout` running across Executes (verified on PG 18). Inside a transaction it is refused, since other queries run between batches.
+- **`statementTimeout`** opens the cursor as an unnamed portal in the implicit transaction of one Sync, whatever the transaction status: a statement setting `statement_timeout` goes before the portal and one restoring it before the Sync, so the timeout bounds the cursor from its first batch to its last, the consumer's time included, and can't outlive it ([CANCELLATION.md](CANCELLATION.md#a-cursors-statement-timeout)). A suspended portal keeps `statement_timeout` running across Executes (verified on PG 18). A `Transaction` refuses it, since its other queries run between batches.
 - **`signal` and `timeout`** stop the whole cursor whenever they fire ([CANCELLATION.md](CANCELLATION.md#cursors)): between batches the portal is closed without a cancel request and the next pull rejects with `AbortError`; while a batch runs, the server is asked to cancel it (`QueryCanceled`).
 - `batchSize` must be a whole number from 1 (`RangeError`); before #34, `0` meant Execute(0), which fetches every row.
 
@@ -148,8 +148,8 @@ The convenient form: `rows` is an iterable of value arrays, encoded like query p
 
 ```ts
 await conn.copyRows('copy users (id, name) from stdin', [
-	[1, 'Ada'],
-	[2, 'Grace'],
+  [1, 'Ada'],
+  [2, 'Grace'],
 ]);
 ```
 
@@ -172,7 +172,7 @@ Postgres has a built-in publish/subscribe channel. A session runs `listen orders
 
 ```ts
 const unlisten = await conn.listen('orders', (n) =>
-	console.log(n.channel, n.payload),
+  console.log(n.channel, n.payload),
 );
 await conn.notify('orders', JSON.stringify({ id: 7 })); // select pg_notify($1, $2)
 await unlisten();

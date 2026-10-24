@@ -68,37 +68,6 @@ export function comparison(
 	value: unknown,
 	codecFor: CodecFor,
 ): OperationNode {
-	const check = (item: unknown): unknown => {
-		if (item === undefined) throw undefinedComparison(left);
-		return item;
-	};
-	const operand = (item: unknown): OperationNode => {
-		if (item instanceof Param) {
-			const inner = check(item._quarry.value);
-			return {
-				kind: 'value',
-				value: inner,
-				codec: item._quarry.codec ?? codecFor(inner),
-			};
-		}
-		return Expression.is(item)
-			? item._quarry.node
-			: { kind: 'value', value: check(item), codec: codecFor(item) };
-	};
-
-	const array = (items: unknown): OperationNode => {
-		const values = items instanceof Param ? items._quarry.value : items;
-		if (!Array.isArray(values)) return operand(items);
-		for (const item of values) check(item);
-		return {
-			kind: 'value',
-			value: values,
-			codec:
-				(items instanceof Param ? items._quarry.codec : undefined) ??
-				arrayCodec(values, codecFor),
-		};
-	};
-
 	if (value instanceof Quantified) {
 		return {
 			kind: 'binary',
@@ -107,7 +76,7 @@ export function comparison(
 			right: {
 				kind: 'function',
 				name: value._quarry.quantifier,
-				args: [array(value._quarry.array)],
+				args: [arrayNode(left, value._quarry.array, codecFor)],
 			},
 		};
 	}
@@ -144,7 +113,7 @@ export function comparison(
 					operator,
 					right: {
 						kind: 'value_list',
-						values: value.map(operand),
+						values: operandNodes(left, value, codecFor),
 					},
 				};
 			}
@@ -156,7 +125,11 @@ export function comparison(
 				kind: 'binary',
 				left,
 				operator: op,
-				right: { kind: 'function', name: fn, args: [array(value)] },
+				right: {
+					kind: 'function',
+					name: fn,
+					args: [arrayNode(left, value, codecFor)],
+				},
 			};
 		}
 		case 'between':
@@ -169,7 +142,10 @@ export function comparison(
 					right: {
 						kind: 'raw',
 						fragments: ['', ' and ', ''],
-						nodes: [operand(value[0]), operand(value[1])],
+						nodes: [
+							operandNode(left, value[0], codecFor),
+							operandNode(left, value[1], codecFor),
+						],
 					},
 				};
 			}
@@ -177,5 +153,61 @@ export function comparison(
 		}
 	}
 
-	return { kind: 'binary', left, operator, right: operand(value) };
+	return {
+		kind: 'binary',
+		left,
+		operator,
+		right: operandNode(left, value, codecFor),
+	};
+}
+
+/** `item`, unless it is `undefined`, which throws. */
+function checked(left: OperationNode, item: unknown): unknown {
+	if (item === undefined) throw undefinedComparison(left);
+	return item;
+}
+
+/** One operand: a parameter for a plain value or `eb.val`, an expression as is. */
+function operandNode(
+	left: OperationNode,
+	item: unknown,
+	codecFor: CodecFor,
+): OperationNode {
+	if (item instanceof Param) {
+		const inner = checked(left, item._quarry.value);
+		return {
+			kind: 'value',
+			value: inner,
+			codec: item._quarry.codec ?? codecFor(inner),
+		};
+	}
+	return Expression.is(item)
+		? item._quarry.node
+		: { kind: 'value', value: checked(left, item), codec: codecFor(item) };
+}
+
+function operandNodes(
+	left: OperationNode,
+	items: readonly unknown[],
+	codecFor: CodecFor,
+): OperationNode[] {
+	return items.map((item) => operandNode(left, item, codecFor));
+}
+
+/** An array of operands as one parameter, encoded by `arrayOf` their codec; any other operand as `operandNode` makes it. */
+function arrayNode(
+	left: OperationNode,
+	items: unknown,
+	codecFor: CodecFor,
+): OperationNode {
+	const values = items instanceof Param ? items._quarry.value : items;
+	if (!Array.isArray(values)) return operandNode(left, items, codecFor);
+	for (const item of values) checked(left, item);
+	return {
+		kind: 'value',
+		value: values,
+		codec:
+			(items instanceof Param ? items._quarry.codec : undefined) ??
+			arrayCodec(values, codecFor),
+	};
 }

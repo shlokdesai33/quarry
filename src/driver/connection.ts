@@ -36,6 +36,7 @@ import {
 	Op,
 	QueryOp,
 	SimpleQueryOp,
+	STATEMENT_TIMEOUT,
 	SyncGroupOp,
 	closedError,
 	type Description,
@@ -109,8 +110,9 @@ export interface QueryOptions {
 	/**
 	 * A server-side `statement_timeout` for this query only (milliseconds,
 	 * or a Postgres interval such as `'2s'`). Applied with
-	 * `set_config(…, true)`: outside a transaction the query is wrapped in
-	 * `begin … commit`; inside one, the previous value is restored after it.
+	 * `set_config(…, true)` just before the query and restored just after
+	 * it, all three under the query's Sync, so it bounds this query alone,
+	 * in a transaction or not, whatever else is pipelined.
 	 */
 	readonly statementTimeout?: number | string;
 	/** Receives where the query spent its time once it settles. */
@@ -146,7 +148,9 @@ export interface GroupStatement {
  * A cursor's options: a query's, without `keepRows` (a cursor reads every
  * row it fetches). `signal` and `timeout` stop the whole cursor, whenever
  * they fire; `statementTimeout` bounds it from its first batch to its last,
- * the consumer's time included, and is refused inside a transaction.
+ * the consumer's time included, and is refused by a `Transaction` (on a
+ * plain connection it holds the connection between batches, as outside a
+ * transaction).
  */
 export interface CursorOptions extends Omit<QueryOptions, 'keepRows'> {
 	/** Rows fetched per round trip (default 1000), each batch once the one before is taken. */
@@ -168,6 +172,8 @@ type Listener<T> = (value: T) => void;
  * queries, so a long queue is encoded only as fast as the socket takes it.
  */
 const FLUSH_BYTES = 65_536;
+
+const STATEMENT_TIMEOUT_OPTIONS = { paramTypes: [25] } as const;
 
 /**
  * One session with the server. Queries can be issued concurrently: they
@@ -1082,11 +1088,7 @@ export class Connection implements AsyncDisposable {
 		options: QueryOptions | undefined,
 		onDone: () => void,
 	): Promise<QueryResult<R>> {
-		if (
-			this.#config.telemetry === undefined &&
-			!this.#config.captureStack &&
-			options?.statementTimeout === undefined
-		)
+		if (this.#config.telemetry === undefined && !this.#config.captureStack)
 			return this.#query<R>(sql, params ?? [], options, onDone);
 		const result = this.query<R>(sql, params, options);
 		result.then(onDone, onDone);
@@ -1139,6 +1141,7 @@ export class Connection implements AsyncDisposable {
 				params,
 				options,
 				options.statementTimeout,
+				onDone,
 			);
 		}
 		// one shared executor: one closing over this query would cost a
@@ -1183,6 +1186,34 @@ export class Connection implements AsyncDisposable {
 		statements: readonly GroupStatement[],
 		{ signal }: { readonly signal?: AbortSignal | undefined } = {},
 	): Promise<QueryResult<unknown>>[] {
+		const results = this.#queryGroup(statements, signal);
+		if (this.#config.telemetry === undefined && !this.#config.captureStack)
+			return results;
+		return results.map((result, i) =>
+			this.#observe(
+				statements[i]?.sql ?? '',
+				statements[i]?.options?.tag,
+				() => result,
+				(r) => r.rowCount,
+			),
+		);
+	}
+
+	/**
+	 * `queryGroup`, with the group's client `timeout`, `onTiming` and
+	 * `onDone`. `whole`: a statement that can't be sent fails the whole
+	 * group, sending none of it.
+	 */
+	#queryGroup(
+		statements: readonly GroupStatement[],
+		signal: AbortSignal | undefined,
+		group?: {
+			readonly timeout?: number | undefined;
+			readonly onTiming?: ((timing: OpTiming) => void) | undefined;
+			readonly onDone?: (() => void) | undefined;
+			readonly whole?: boolean;
+		},
+	): Promise<QueryResult<unknown>>[] {
 		const ops: QueryOp[] = [];
 		let invalid: { error: unknown } | undefined;
 		const results = statements.map(
@@ -1224,67 +1255,75 @@ export class Connection implements AsyncDisposable {
 					);
 				}),
 		);
-		if (ops.length > 0) this.#enqueue(new SyncGroupOp(ops), signal);
+		if (invalid !== undefined && group?.whole === true) {
+			const error =
+				invalid.error instanceof Error
+					? invalid.error
+					: new DriverError(String(invalid.error));
+			for (const op of ops) op.fail(error);
+			ops.length = 0;
+		}
+		if (ops.length > 0) {
+			const op = new SyncGroupOp(ops);
+			op.onTiming = group?.onTiming;
+			op.onDone = group?.onDone;
+			this.#enqueue(op, signal, group?.timeout);
+		} else group?.onDone?.();
 		if (!this.#config.catalog.loaded) {
 			for (const { params = [], options } of statements)
 				this.#loadTypesAfter(params, options);
 		}
-		if (this.#config.telemetry === undefined && !this.#config.captureStack)
-			return results;
-		return results.map((result, i) =>
-			this.#observe(
-				statements[i]?.sql ?? '',
-				statements[i]?.options?.tag,
-				() => result,
-				(r) => r.rowCount,
-			),
-		);
+		return results;
 	}
 
+	/**
+	 * The query between a statement setting `statement_timeout` and one
+	 * restoring it, all under one Sync. Outside a transaction block, the
+	 * three run in one implicit transaction, which ends the setting at the
+	 * Sync; inside one, the restore ends it. Either way it bounds the query
+	 * alone, whatever else is pipelined on the connection, so the framing
+	 * can't depend on the transaction status, which only says how the last
+	 * answered query left the connection.
+	 */
 	async #queryWithTimeout<R>(
 		sql: string,
 		params: readonly unknown[],
 		options: QueryOptions,
-		timeout: number | string,
+		statementTimeout: number | string,
+		onDone: (() => void) | undefined,
 	): Promise<QueryResult<R>> {
-		const { statementTimeout: _, ...rest } = options;
-		const value = typeof timeout === 'number' ? `${timeout}ms` : timeout;
-		const set = "select set_config('statement_timeout', $1, true) as previous";
-		if (this.#status === 'I') {
-			// pipelined together, so they reach the server back to back
-			const settled = await Promise.allSettled([
-				this.#query('begin', [], undefined),
-				this.#query(set, [value], undefined),
-				this.#query<R>(sql, params, rest),
-				this.#query('commit', [], undefined),
-			]);
-			const result = settled[2];
-			if (result?.status === 'rejected') throw result.reason;
-			const failed = settled.find((s) => s.status === 'rejected');
-			if (failed?.status === 'rejected') throw failed.reason;
-			if (result?.status !== 'fulfilled')
-				throw new ConnectionError('Query did not run');
-			return result.value;
-		}
-		const previous = this.#query<{ previous: string }>(
-			"select current_setting('statement_timeout') as previous, set_config('statement_timeout', $1, true)",
-			[value],
-			undefined,
+		const { statementTimeout: _, signal, timeout, onTiming, ...rest } = options;
+		const interval =
+			typeof statementTimeout === 'number'
+				? `${statementTimeout}ms`
+				: statementTimeout;
+		const [set, query, restore] = this.#queryGroup(
+			[
+				{
+					sql: STATEMENT_TIMEOUT,
+					params: [interval],
+					options: STATEMENT_TIMEOUT_OPTIONS,
+				},
+				{ sql, params, options: rest },
+				{
+					sql: STATEMENT_TIMEOUT,
+					params: [null],
+					options: STATEMENT_TIMEOUT_OPTIONS,
+				},
+			],
+			signal,
+			// whole: a query that can't be sent mustn't leave the setting behind, in a transaction
+			{ timeout, onTiming, onDone, whole: true },
 		);
-		const [before, result] = await Promise.allSettled([
-			previous,
-			this.#query<R>(sql, params, rest),
-		]);
-		if (before.status === 'fulfilled' && this.#status === 'T') {
-			this.#query(
-				set,
-				[before.value.rows[0]?.previous ?? '0'],
-				undefined,
-			).catch(() => {});
-		}
-		if (result.status === 'rejected') throw result.reason;
-		if (before.status === 'rejected') throw before.reason;
-		return result.value;
+		// a failed set skips the query, which rejects with its error
+		set?.catch(() => {});
+		restore?.catch(() => {});
+		if (query === undefined || restore === undefined)
+			throw new ConnectionError('Query did not run');
+		const result = await query;
+		// outside a transaction block, a failed restore rolled the query back
+		await restore;
+		return asResult<R>(result);
 	}
 
 	/**
@@ -1395,7 +1434,11 @@ export class Connection implements AsyncDisposable {
 			signal: options?.signal,
 			timeout: options?.timeout,
 			statementTimeout: options?.statementTimeout,
-			open: (portal: string, held: boolean) => {
+			open: (
+				portal: string,
+				held: boolean,
+				statementTimeout: string | undefined,
+			) => {
 				const op = new CursorOp(
 					sql,
 					params,
@@ -1405,6 +1448,7 @@ export class Connection implements AsyncDisposable {
 					batchSize,
 					portal,
 					held,
+					statementTimeout,
 				);
 				if (!this.#config.catalog.loaded) this.#loadTypesAfter(params, options);
 				return op;
@@ -1421,7 +1465,6 @@ export class Connection implements AsyncDisposable {
 			status: () => this.#status,
 			enqueue: (op, signal, timeout) => this.#enqueue(op, signal, timeout),
 			abort: (op, reason, cause) => this.#abort(op, reason, cause),
-			query: (sql, params) => this.#query(sql, params, undefined),
 			portal: () => `quarry_${++this.#portalCount}`,
 		});
 	}

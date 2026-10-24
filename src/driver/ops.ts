@@ -25,6 +25,19 @@ import {
 } from './results.js';
 import type { RowDecoder, RowMode } from './rows.js';
 
+/**
+ * With $1, sets `statement_timeout` to it until the transaction ends,
+ * keeping the value it replaces in a custom setting,
+ * `quarry.statement_timeout` (transaction-local too; `||` evaluates its
+ * left side first). With null, puts that value back.
+ *
+ * One statement for both, so a group's only Parse of it comes first,
+ * where nothing can make the server skip it: groups pipelined behind
+ * bind its name before it is answered. Its parameter is text (OID 25).
+ */
+export const STATEMENT_TIMEOUT =
+	"select case when $1::text is null then set_config('statement_timeout', current_setting('quarry.statement_timeout'), true) else set_config('quarry.statement_timeout', current_setting('statement_timeout'), true) || set_config('statement_timeout', $1, true) end";
+
 /** A statement cached on a connection. */
 export interface Statement {
 	/** The server-side name; '' for SQL only ever sent unnamed, whose columns are still cached. */
@@ -976,6 +989,12 @@ export function cursorAborted(
  *   first batch's Execute ends with Sync, and the operation is done once
  *   that batch is read; `FetchOp` reads the next ones, so other queries
  *   run between batches. Exclusive only while it describes the statement.
+ *
+ * With a `statementTimeout` (not held), `STATEMENT_TIMEOUT` sets it before
+ * the portal and restores it before the Sync: outside a transaction block
+ * the implicit transaction ends the setting anyway, inside one the restore
+ * does. The Sync (with Close and the restore) then waits until nothing the
+ * portal asked for is unanswered, so the restore's answers come last.
  */
 export class CursorOp extends Op {
 	readonly #sql: string;
@@ -986,6 +1005,18 @@ export class CursorOp extends Op {
 	readonly #batchSize: number;
 	readonly #portal: string;
 	readonly #held: boolean;
+	/** The `statement_timeout` for the portal, as an interval. */
+	readonly #statementTimeout: string | undefined;
+	/** The setting statement is unanswered: its answers come before the portal's. */
+	#setting = false;
+	/** The restore was written: the rest before ReadyForQuery is its answers. */
+	#restoring = false;
+	/** The server failed a statement, so it skips the rest until Sync, the restore included. */
+	#serverFailed = false;
+	/** Parts of the portal unanswered: the Describe of its statement, and each Execute. */
+	#unanswered = 0;
+	/** A Sync waiting for them, with the restore; whether to close the portal first. */
+	#deferred: boolean | undefined;
 	#ctx: OpContext | undefined;
 	#spec: ResultSpec | undefined;
 	#statement: Statement | undefined;
@@ -1025,6 +1056,7 @@ export class CursorOp extends Op {
 		batchSize: number,
 		portal: string,
 		held: boolean,
+		statementTimeout?: string,
 	) {
 		super();
 		this.#sql = sql;
@@ -1035,6 +1067,7 @@ export class CursorOp extends Op {
 		this.#batchSize = batchSize;
 		this.#portal = portal;
 		this.#held = held;
+		this.#statementTimeout = held ? undefined : statementTimeout;
 		this.exclusive = true;
 	}
 
@@ -1061,8 +1094,19 @@ export class CursorOp extends Op {
 			this.#phase = 'ended';
 			return;
 		}
+		this.#setTimeout(ctx.writer);
 		this.#open(ctx);
 		this.exclusive = !this.#held || this.#phase === 'describing';
+	}
+
+	/** Writes the statement setting the timeout, unnamed: it shares the portal's implicit transaction. */
+	#setTimeout(w: Writer): void {
+		const timeout = this.#statementTimeout;
+		if (timeout === undefined) return;
+		fe.parse(w, '', STATEMENT_TIMEOUT, [25]);
+		fe.bind(w, '', '', [timeout]);
+		fe.execute(w, '', 0);
+		this.#setting = true;
 	}
 
 	#open(ctx: OpContext): void {
@@ -1097,6 +1141,7 @@ export class CursorOp extends Op {
 		fe.describe(w, 'S', this.#name);
 		fe.flush(w);
 		this.#phase = 'describing';
+		this.#unanswered++;
 	}
 
 	/** Binds the portal with each column in the format its codec reads, and fetches the first batch. */
@@ -1117,6 +1162,7 @@ export class CursorOp extends Op {
 	}
 
 	#execute(w: Writer): void {
+		this.#unanswered++;
 		fe.execute(w, this.#portal, this.#batchSize);
 		if (this.#held) {
 			fe.sync(w);
@@ -1217,11 +1263,32 @@ export class CursorOp extends Op {
 
 	#sync(closePortal: boolean): void {
 		if (this.#synced || this.#ctx === undefined) return;
+		const restore = this.#statementTimeout !== undefined && !this.#serverFailed;
+		if (restore && (this.#setting || this.#unanswered > 0)) {
+			// the server finishes a running batch anyway: nothing is lost by waiting
+			this.#deferred = this.#deferred === true || closePortal;
+			return;
+		}
 		this.#synced = true;
 		const w = this.#ctx.writer;
 		if (closePortal) fe.close(w, 'P', this.#portal);
+		if (restore) {
+			fe.parse(w, '', STATEMENT_TIMEOUT, [25]);
+			fe.bind(w, '', '', [null]);
+			fe.execute(w, '', 0);
+			this.#restoring = true;
+		}
 		fe.sync(w);
 		this.#ctx.send(w.take());
+	}
+
+	/** Writes a Sync that waited for the portal's answers, once they all came. */
+	#syncDeferred(): void {
+		const closePortal = this.#deferred;
+		if (closePortal === undefined || this.#setting || this.#unanswered > 0)
+			return;
+		this.#deferred = undefined;
+		this.#sync(closePortal);
 	}
 
 	/** Hands batches to waiting consumers, fetching one when they wait for it. */
@@ -1283,7 +1350,8 @@ export class CursorOp extends Op {
 	}
 
 	override dataRow(bytes: Uint8Array, start: number, end: number): boolean {
-		if (this.#discarding) return true;
+		// the setting's and the restore's rows, or rows dropped
+		if (this.#discarding || this.#setting || this.#restoring) return true;
 		const decoder = this.#decoder;
 		if (decoder === undefined)
 			throw new ProtocolError('DataRow before RowDescription');
@@ -1301,6 +1369,7 @@ export class CursorOp extends Op {
 			case 'DataRow':
 				return !this.dataRow(msg.payload, 0, msg.payload.length);
 			case 'ParseComplete':
+				if (this.#setting || this.#restoring) return false;
 				if (this.#statement && this.#created) this.#statement.parsed = true;
 				return false;
 			case 'ParameterDescription':
@@ -1308,29 +1377,57 @@ export class CursorOp extends Op {
 			case 'CloseComplete':
 				return false;
 			case 'RowDescription':
+				if (this.#phase === 'describing') this.#unanswered--;
 				this.#described(msg.fields, ctx);
+				this.#syncDeferred();
 				return false;
 			case 'NoData':
+				if (this.#phase === 'describing') this.#unanswered--;
 				this.#described([], ctx);
+				this.#syncDeferred();
 				return false;
 			case 'PortalSuspended':
+				this.#unanswered--;
 				this.#endBatch(true);
+				this.#syncDeferred();
 				return false;
 			case 'CommandComplete':
 			case 'EmptyQueryResponse':
-				this.#endBatch(false);
+				if (this.#restoring) return false;
+				if (this.#setting) this.#setting = false;
+				else {
+					this.#unanswered--;
+					this.#endBatch(false);
+				}
+				this.#syncDeferred();
 				return false;
-			case 'ErrorResponse':
-				this.#onError(
-					postgresError(msg.fields, { sql: this.#sql, params: this.#params }),
-					ctx,
-				);
+			case 'ErrorResponse': {
+				const error = postgresError(msg.fields, {
+					sql: this.#sql,
+					params: this.#params,
+				});
+				this.#serverFailed = true;
+				if (this.#restoring) this.#error ??= this.classify(error);
+				else if (this.#setting) this.#onSettingError(error, ctx);
+				else this.#onError(error, ctx);
 				return false;
+			}
 			case 'ReadyForQuery':
 				return this.#onReady(msg.status, ctx);
 			default:
 				return this.unexpected(msg);
 		}
+	}
+
+	/** The timeout couldn't be set (an invalid interval): the server skipped the portal, whose Parse never ran. */
+	#onSettingError(error: PostgresError, ctx: OpContext): void {
+		this.#setting = false;
+		const statement = this.#statement;
+		if (statement && this.#created && !statement.parsed) ctx.forget(statement);
+		this.#error ??= error;
+		this.#batch = [];
+		this.#discarding = true;
+		this.#sync(false);
 	}
 
 	#onError(error: PostgresError, ctx: OpContext): void {
@@ -1407,6 +1504,12 @@ export class CursorOp extends Op {
 		this.#synced = false;
 		this.#discarding = false;
 		this.#error = undefined;
+		// the implicit transaction ended with the failure, and the setting with it
+		this.#restoring = false;
+		this.#serverFailed = false;
+		this.#unanswered = 0;
+		this.#deferred = undefined;
+		this.#setTimeout(ctx.writer);
 		this.#open(ctx);
 		ctx.send(ctx.writer.take());
 	}

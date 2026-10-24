@@ -68,14 +68,14 @@ The classes ([expression.ts](expression.ts)):
 
 ```ts
 return {
-	ref: (column) => resolve(column).expression,
-	val: (value, codec) => param(value, codec),
-	fn: functions({ node, dataType }),
-	json: jsonFunctions({ node }),
-	and: junction('and'),
-	or: junction('or'),
-	not: (expression) =>
-		predicate({ kind: 'not', operand: expression._quarry.node }),
+  ref: (column) => resolve(column).expression,
+  val: (value, codec) => param(value, codec),
+  fn: functions({ node, dataType }),
+  json: jsonFunctions({ node }),
+  and: junction('and'),
+  or: junction('or'),
+  not: (expression) =>
+    predicate({ kind: 'not', operand: expression._quarry.node }),
 };
 ```
 
@@ -87,20 +87,20 @@ return {
 
 ```ts
 const resolve = (reference: string): ResolvedColumn => {
-	let resolved = references.get(reference); // this scope's, by the string as written
-	if (resolved !== undefined) return resolved;
-	const dot = reference.indexOf('.');
-	const table = tables.find(
-		(candidate) => candidate.name === reference.slice(0, dot),
-	);
-	resolved =
-		table === undefined
-			? undefined
-			: resolveColumn(table, reference.slice(dot + 1));
-	if (resolved === undefined)
-		throw new Error(`Unknown column reference "${reference}"`);
-	references.set(reference, resolved);
-	return resolved;
+  let resolved = references.get(reference); // this scope's, by the string as written
+  if (resolved !== undefined) return resolved;
+  const dot = reference.indexOf('.');
+  const table = tables.find(
+    (candidate) => candidate.name === reference.slice(0, dot),
+  );
+  resolved =
+    table === undefined
+      ? undefined
+      : resolveColumn(table, reference.slice(dot + 1));
+  if (resolved === undefined)
+    throw new Error(`Unknown column reference "${reference}"`);
+  references.set(reference, resolved);
+  return resolved;
 };
 ```
 
@@ -150,20 +150,20 @@ The methods aren't written out per type at run time. [expression-methods.ts](exp
 
 ```ts
 for (const [name, operator] of Object.entries(OPERATORS)) {
-	methods[name] = function (this: Expression<unknown>, value: unknown) {
-		return compare(this, operator, value);
-	};
+  methods[name] = function (this: Expression<unknown>, value: unknown) {
+    return compare(this, operator, value);
+  };
 }
 // … the `is` tests …
 class MethodExpression<T, D> extends TypedExpression<T, D> {}
 class MethodParam<T> extends Param<T> {}
 for (const prototype of [MethodExpression.prototype, MethodParam.prototype])
-	for (const [name, method] of Object.entries(methods))
-		Object.defineProperty(prototype, name, {
-			value: method,
-			writable: true,
-			configurable: true,
-		});
+  for (const [name, method] of Object.entries(methods))
+    Object.defineProperty(prototype, name, {
+      value: method,
+      writable: true,
+      configurable: true,
+    });
 ```
 
 So **every** typed expression has **every** method at run time; the types decide which ones you can call. `typedExpression(node, dataType)` and `param(value, codec)` construct these classes and return `never`, the bottom type, which is assignable to anything: the **caller's** signature (`ExpressionBuilder.ref`, `Functions.lower`, …) supplies the real type. That is the one place where runtime and types are bridged with a deliberate cast.
@@ -307,11 +307,11 @@ The result's SQL type follows Postgres's own rules, so its methods and codec are
 
 ```ts
 eb.case()
-	.when(eb.ref('orders.total').gte(1000), 'large')
-	.when(eb.ref('orders.total').gte(100), 'medium')
-	.else('small')
-	.end()
-	.as('size');
+  .when(eb.ref('orders.total').gte(1000), 'large')
+  .when(eb.ref('orders.total').gte(100), 'medium')
+  .else('small')
+  .end()
+  .as('size');
 // case when "orders"."total" >= $1 then $2 when … else $5 end as "size"
 ```
 
@@ -372,13 +372,13 @@ A jsonb column's own methods (`eq`, `contains`, `containedBy`) take JSON values 
 
 ```ts
 #nodeOf(args) {
-	if (args.length === 2) return compare(this.#eb.ref(args[0]), '=', args[1])._quarry.node;
-	const [first] = args;
-	return Expression.is(first) ? first._quarry.node : first(this.#eb)._quarry.node;
+  if (args.length === 2) return compare(this.#eb.ref(args[0]), '=', args[1])._quarry.node;
+  const [first] = args;
+  return Expression.is(first) ? first._quarry.node : first(this.#eb)._quarry.node;
 }
 toNode() {
-	const [only, ...rest] = this.#conditions;
-	return rest.length === 0 ? only : { kind: 'and', operands: this.#conditions };
+  const [only, ...rest] = this.#conditions;
+  return rest.length === 0 ? only : { kind: 'and', operands: this.#conditions };
 }
 ```
 

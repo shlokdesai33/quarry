@@ -125,13 +125,13 @@ describe('select', () => {
 			eb.fn.lower('posts.title').as('name'),
 		]);
 		// @ts-expect-error both tables have an `id`
-		joined.selectAll();
+		joined.selectAll('users').selectAll('posts');
 		// @ts-expect-error `title` is already selected
-		joined.select(['posts.title']).selectAll(posts);
+		joined.select(['posts.title']).selectAll('posts');
 	});
 
 	it('types selectAll by the table’s columns', () => {
-		expectTypeOf(selectFrom(posts).selectAll().$output).toEqualTypeOf<{
+		expectTypeOf(selectFrom(posts).selectAll('posts').$output).toEqualTypeOf<{
 			id: number;
 			authorId: number;
 			title: string;
@@ -140,14 +140,32 @@ describe('select', () => {
 			selectFrom(users)
 				.leftJoin(posts)
 				.on('posts.authorId', 'users.id')
-				.selectAll(posts).$output,
+				.selectAll('posts').$output,
 		).toEqualTypeOf<{
 			id: number | null;
 			authorId: number | null;
 			title: string | null;
 		}>();
+		expectTypeOf(
+			selectFrom(posts.as('p')).selectAll('p').$output,
+		).toEqualTypeOf<{
+			id: number;
+			authorId: number;
+			title: string;
+		}>();
 		// @ts-expect-error not in the query
 		selectFrom(users).selectAll('posts');
+		// @ts-expect-error an aliased table goes by its alias
+		selectFrom(posts.as('p')).selectAll('posts');
+	});
+
+	it('takes only the name a table goes by', () => {
+		// @ts-expect-error the table name is required
+		selectFrom(posts).selectAll();
+		// @ts-expect-error not a table object
+		selectFrom(posts).selectAll(posts);
+		// @ts-expect-error nor an aliased one
+		selectFrom(posts.as('p')).selectAll(posts.as('p'));
 	});
 
 	it('types the columns selected after pipe', () => {

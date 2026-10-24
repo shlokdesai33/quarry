@@ -1,4 +1,4 @@
-import type { CompiledQuery } from './compile.js';
+import { type CompiledQuery, isDataStatement } from './compile.js';
 import {
 	Connection,
 	createCodecRegistry,
@@ -159,6 +159,10 @@ const interval = (timeout: number | string) =>
 const SESSION_STATEMENT =
 	/^\s*(?:begin|start|commit|end|rollback|abort|savepoint|release|prepare|set|reset|discard|listen|unlisten|declare|fetch|move|close|create\s+(?:temp|temporary|local\s+temp|local\s+temporary)\b)\b/i;
 
+/** Whether `query` may change the session or transaction state: only SQL written by hand is read. */
+const changesSession = (query: CompiledQuery): boolean =>
+	!isDataStatement(query) && SESSION_STATEMENT.test(query.sql);
+
 /**
  * Runs quarry's queries on the driver: a pool, a reserved client, a single
  * connection, or a driver transaction. Decodes values to quarry's types,
@@ -222,23 +226,18 @@ export class DriverExecutor implements TransactionExecutor {
 
 	/**
 	 * The pool, when the operation can share its connections with other
-	 * callers' queries, pipelined: not with a `timeout` (set with
-	 * `set_config` in a transaction of its own, framed by the connection's
-	 * transaction status, which other callers' queries change), nor for a
-	 * statement that changes the session or transaction state.
+	 * callers' queries, pipelined: not for a statement that changes the
+	 * session or transaction state. A `timeout` shares too: the driver sends
+	 * it with its query under one Sync, bounding that query alone.
 	 */
 	#shared(
-		timeout: number | string | undefined,
 		queries: CompiledQuery | readonly CompiledQuery[] | undefined,
 	): Pool | undefined {
 		const source = this.#source;
-		if (!(source instanceof Pool) || timeout !== undefined) return undefined;
+		if (!(source instanceof Pool)) return undefined;
 		if (queries === undefined) return source;
-		if ('sql' in queries) {
-			return SESSION_STATEMENT.test(queries.sql) ? undefined : source;
-		}
-		for (const query of queries)
-			if (SESSION_STATEMENT.test(query.sql)) return undefined;
+		if ('sql' in queries) return changesSession(queries) ? undefined : source;
+		for (const query of queries) if (changesSession(query)) return undefined;
 		return source;
 	}
 
@@ -323,7 +322,7 @@ export class DriverExecutor implements TransactionExecutor {
 		let acquired = start;
 		let timing: OpTiming | undefined;
 		try {
-			const pool = this.#shared(options.timeout, query);
+			const pool = this.#shared(query);
 			let result: QueryResult<unknown>;
 			if (pool !== undefined) {
 				if (!this.#ready) await this.#prepare(pool);
@@ -464,7 +463,7 @@ export class DriverExecutor implements TransactionExecutor {
 	async describe(query: CompiledQuery): Promise<QueryDescription> {
 		const callsite = this.#callsite();
 		try {
-			const pool = this.#shared(undefined, undefined);
+			const pool = this.#shared(undefined);
 			let description: Description;
 			if (pool !== undefined) {
 				if (!this.#ready) await this.#prepare(pool);
@@ -600,7 +599,7 @@ export class DriverExecutor implements TransactionExecutor {
 				),
 			);
 		if (!inTransaction && transaction === undefined) {
-			const pool = this.#shared(timeout, queries);
+			const pool = this.#shared(queries);
 			if (pool !== undefined) {
 				if (!this.#ready) await this.#prepare(pool);
 				const settled = await pool.withShared(

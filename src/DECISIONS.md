@@ -213,7 +213,7 @@ The driver's decisions are in [driver/DECISIONS.md](driver/DECISIONS.md), which 
 
 **What it is.** `stream()` exists on select builders, not on shaped queries (`q.expectOne().stream()` is a type error), returns a `RowStream`, and starts when iterated rather than through `execute()` ([EXECUTION.md](EXECUTION.md#streaming)). Its `timeout` is refused inside a transaction.
 
-**Why.** A shape reads a handful of rows; streaming is for results too large to hold. A stream is consumed by iteration, so there is nothing for `execute()` to resolve to. The timeout runs the cursor in a transaction of its own, which can't be done inside another one without leaking the setting into it ([driver/DECISIONS.md](driver/DECISIONS.md#a-statement-timeout-bounds-the-whole-stream)).
+**Why.** A shape reads a handful of rows; streaming is for results too large to hold. A stream is consumed by iteration, so there is nothing for `execute()` to resolve to. The timeout is set before the cursor and restored before its Sync, so it holds the connection between batches, which a transaction, whose other queries run between them, can't allow ([driver/DECISIONS.md](driver/DECISIONS.md#a-statement-timeout-bounds-the-whole-stream)).
 
 **Alternatives.** An async generator (slower per row: [driver/DECISIONS.md](driver/DECISIONS.md#rowstream-a-hand-written-iterator-instead-of-an-async-generator)); a timeout inside a transaction by saving and restoring `statement_timeout` (an open question).
 
@@ -251,7 +251,7 @@ The driver's decisions are in [driver/DECISIONS.md](driver/DECISIONS.md), which 
 
 **Alternatives.**
 
-- A cache of SQL and parameter plans keyed by the query's shape: the key has to be computed from the query's nodes, which the builder makes anew on every call, so building it walks the same tree that rendering from cached fragments walks. It saves nothing measurable, and adds invalidation rules.
+- A cache of SQL and parameter plans keyed by the query's shape: the key has to be computed from the query's nodes, which the builder makes anew on every call, so building it walks the same tree that rendering from cached fragments walks. It saves nothing measurable, and adds invalidation rules. What it would have saved in the driver came later, without a separate key: [SQL rendered through a trie of its pieces](#sql-rendered-through-a-trie-of-its-pieces).
 - Cache rendered SQL for every node: nodes made per query (values, comparisons, `.as()` selections) would each add a `WeakMap` entry per query, which costs more than rendering them. Only the shared column nodes are kept.
 - Reuse builder state between chained calls (mutable builders): builders are immutable by design ([Immutable builders](#immutable-builders)); the copy per chained call measured about 70 ns of a point lookup's 800 ns build.
 
@@ -283,6 +283,66 @@ The driver's decisions are in [driver/DECISIONS.md](driver/DECISIONS.md), which 
 The driver suite on a 4-vCPU VM (client on 2 CPUs, PostgreSQL 18 on the other 2), Node 24, a pool of 10; `pool.query` runs the same statement written by hand (`pk`, `insert1`, `update`). At 0 ms with 100 or 1000 callers, the builder now reaches 72–100% of the driver's own throughput (point lookups 72–80%, writes 91–102%), against 20–50% before. At 5 ms with 100 callers, every configuration is bound by the round trip (100 callers per 6 ms), so throughput doesn't move, but CPU per query falls by a third to a half. With 1000 callers at 5 ms, the builder's CPU, not the round trip, was the limit before. With one caller, each query waits for its own round trip, so the CPU saved per query (38 → 20 µs for a point lookup) shows up as latency: 20k → 29k lookups/s at 0 ms.
 
 **Code.** `resolveColumn`, `expressionBuilder` in [expression-builder.ts](expression-builder.ts); `shareColumn`, `identifier` in [compile.ts](compile.ts); [test/builder-caches.test.ts](../test/builder-caches.test.ts).
+
+### SQL rendered through a trie of its pieces
+
+**What it is.** The compiler doesn't concatenate a query's SQL: it walks a trie keyed by the pieces it writes (keywords, quoted names, a shared column's SQL, placeholders), and the node a query ends on holds its SQL, made once. A query of a shape rendered before gets the same string object. With it:
+
+- `selectAll` and `returningAll` add one frozen list per table (`allSelections`), whose text and result codecs the compiler renders once.
+- The executor reads its session-statement regular expression only for SQL written by hand.
+- The result shapes without an `err` are made once.
+
+([COMPILER.md](COMPILER.md#what-is-rendered-once), [EXECUTION.md](EXECUTION.md#connections-shared-or-exclusive))
+
+**Why.** After #39, a builder point lookup (`selectFrom(users).where(id).selectAll('users').expectOne()`) still cost about 6.3 µs of client CPU, against 2.1 µs for the same SQL through `pool.query`, which capped it at 150–179k/s against the driver's 368–464k at 0 ms. Its profile had three items the driver doesn't pay:
+
+- **The driver hashing a new string per query.** The statement cache is keyed by the SQL. A string used again keeps its hash, but the builder concatenated a new one for every query, so the driver flattened it, hashed it and compared its ~230 characters (6.5% of samples).
+- **`selectAll` resolving its columns again** per query: it built each `table.column` string and looked it up in the scope's `Map`, which hashed every new string (21%).
+- **`#shared`'s regular expression** over every query's SQL, which can't match a compiled select or write (4%).
+
+**Alternatives.**
+
+- A cache of whole compiled queries keyed by shape ([above](#columns-resolved-and-quoted-once-per-table)): its key costs a walk of the query's new nodes, as much as rendering. In the trie, rendering is the lookup: each step compares the piece with the child taken last (the same object when the shape repeats), so finding the shape costs what concatenating cost, and nothing needs invalidating.
+- Interning the rendered string in a `Map`: the lookup hashes the string, which is the cost being removed.
+- Caching the SQL on a builder instance: builders are made anew for each query, so it would only help code that keeps one.
+- A precomputed statement key passed to the driver: it needs the same identity, and a second key next to the SQL in the driver's cache.
+
+**Cost.**
+
+- One more structure in the compiler, with bounds: a query's path stops at 1,024 pieces or at a piece over 4,096 characters, and the rest is concatenated as before. The trie starts over at 16,384 prefixes or about a million characters.
+- Shapes made at run time (literals, `in` lists of new lengths) add prefixes until it starts over.
+- The shared column lists must stay immutable: they are frozen, and their nodes were already shared.
+- `isDataStatement` relies on `compile` marking only select, insert, update and delete nodes. A copy of a compiled query (`{ ...query }`) is tested by the regular expression, as raw SQL is.
+- A rewrite of `rowsNode` with `Object.keys` measured 0.3 µs less per insert in-process, but put inserts at 1000 callers and 5 ms into a slower JIT mode in about half the runs (−5% throughput). It was reverted to `Object.entries`, resolving each column once.
+
+**Measured.** The driver benchmark suite (#6), with the built package, `main` (`337fc4f`) against this change interleaved in one session, a fresh process per cell, median of 5 runs, a pool of 10. The driver suite on an 8-vCPU VM: client on CPUs 0–2, PostgreSQL 18 on 4–7, Node 24.22. `pool.query` runs the same statement written by hand (`pk`, `insert1`, `update`).
+
+| Query                 | Round trip | Callers | Before: ops/s (p50 ms) | After: ops/s (p50 ms) | Client CPU µs/op | `pool.query`: ops/s, CPU µs/op |
+| --------------------- | ---------- | ------- | ---------------------- | --------------------- | ---------------- | ------------------------------ |
+| point lookup          | 0 ms       | 1       | 25,824 (0.04)          | 28,857 (0.03)         | 25.4 → 20.2      | 30,049, 17.2                   |
+| point lookup          | 0 ms       | 100     | 162,622 (0.49)         | 266,292 (0.29)        | 6.9 → 4.2        | 418,372, 2.6                   |
+| point lookup          | 0 ms       | 1000    | 172,753 (4.93)         | 287,665 (2.91)        | 6.9 → 4.1        | 443,607, 2.5                   |
+| point lookup          | 5 ms       | 1       | 164 (6.13)             | 165 (6.08)            | 396.7 → 347.4    | 164, 320.1                     |
+| point lookup          | 5 ms       | 100     | 15,638 (6.44)          | 15,813 (6.35)         | 16.0 → 12.9      | 15,736, 9.1                    |
+| point lookup          | 5 ms       | 1000    | 154,776 (6.02)         | 155,297 (6.30)        | 7.3 → 4.7        | 158,987, 3.1                   |
+| insert one row        | 0 ms       | 1       | 27,560 (0.03)          | 27,786 (0.03)         | 22.4 → 21.9      | 31,081, 16.8                   |
+| insert one row        | 0 ms       | 100     | 176,631 (0.45)         | 195,921 (0.40)        | 6.2 → 5.6        | 211,676, 4.8                   |
+| insert one row        | 0 ms       | 1000    | 214,793 (3.94)         | 235,935 (3.59)        | 5.3 → 4.9        | 193,247, 5.3                   |
+| insert one row        | 5 ms       | 1       | 164 (6.12)             | 164 (6.12)            | 404.5 → 379.9    | 166, 333.5                     |
+| insert one row        | 5 ms       | 100     | 15,654 (6.40)          | 15,767 (6.38)         | 15.5 → 15.0      | 16,035, 9.5                    |
+| insert one row        | 5 ms       | 1000    | 158,585 (6.04)         | 158,865 (6.05)        | 6.2 → 5.5        | 165,787, 3.9                   |
+| update one row by key | 0 ms       | 1       | 25,452 (0.04)          | 24,806 (0.04)         | 20.9 → 20.8      | 27,177, 16.6                   |
+| update one row by key | 0 ms       | 100     | 202,546 (0.39)         | 206,647 (0.29)        | 5.4 → 5.3        | 218,819, 4.7                   |
+| update one row by key | 0 ms       | 1000    | 223,487 (4.01)         | 219,893 (4.13)        | 5.2 → 5.2        | 227,179, 4.7                   |
+| update one row by key | 5 ms       | 1       | 163 (6.17)             | 163 (6.14)            | 393.1 → 372.2    | 166, 303.6                     |
+| update one row by key | 5 ms       | 100     | 15,384 (6.56)          | 15,503 (6.46)         | 13.5 → 12.5      | 15,583, 8.3                    |
+| update one row by key | 5 ms       | 1000    | 166,578 (5.68)         | 168,300 (5.59)        | 5.5 → 5.4        | 170,688, 4.3                   |
+
+At 0 ms with 100 or 1000 callers, point lookups go from 39% to 64–65% of the driver's own throughput (163–173k → 266–288k/s). Their client CPU falls from 6.9 to 4.1–4.2 µs, against `pool.query`'s 2.5–2.6. Single-row inserts gain 10–11% (93% of `pool.query` at 100 callers, ahead of it at 1000), measured in a second session with the final `rowsNode`. Updates are bound by the server's update work, and don't move. At 5 ms with 100 or 1000 callers, every builder statement is within 5% of `pool.query` before and after, with less CPU per query.
+
+In one process (the sources run directly, 100 callers, 0 ms, one core), a lookup went from 6.3 to 3.2–3.4 µs (`pool.query`: 2.3). Build and compile with a mock executor went 1.69 → 0.5 µs, and compile alone 270 → 130 ns. The executor and the driver add nothing over `pool.query` for the same SQL and options. What is left is the builder chain itself (about 0.5 µs: four immutable builders, the where node, the shape and `Query`), its async `execute` layers, and their garbage.
+
+**Code.** `Prefix`, `write`, `sharedList`, `isDataStatement` in [compile.ts](compile.ts); `allSelections` in [expression-builder.ts](expression-builder.ts); `changesSession` in [driver-executor.ts](driver-executor.ts); the shapes in [shape.ts](shape.ts); [test/builder-caches.test.ts](../test/builder-caches.test.ts).
 
 ### Every identifier quoted
 
@@ -532,13 +592,23 @@ The driver suite on a 4-vCPU VM (client on 2 CPUs, PostgreSQL 18 on the other 2)
 
 **Code.** `NewName`, `UniqueKeys` in [select-query-builder.ts](select-query-builder.ts) and [row.ts](row.ts); `#joined`, `checkUniqueKeys`.
 
-### `selectAll()` lists the columns, never `*`
+### `selectAll` lists the columns, never `*`
 
-**What it is.** `selectAll()` writes every column out (`"users"."id" as "id", "users"."first_name" as "firstName", …`).
+**What it is.** `selectAll('users')` writes every column out (`"users"."id" as "id", "users"."first_name" as "firstName", …`).
 
 **Why.** Each column needs its TypeScript key (an alias when it differs from the database name) and its codec. `*` would return database names, in the database's order, including columns the code doesn't declare.
 
-**Cost.** Longer SQL text.
+**Cost.** Longer SQL text. Not per query: the list is one frozen array of the table's shared selections, made once per table, and the compiler renders its text once ([SQL rendered through a trie of its pieces](#sql-rendered-through-a-trie-of-its-pieces)). Building each column's `table.column` reference string and resolving it per query had been a fifth of a builder lookup's client CPU.
+
+**Code.** `selectAll` in [select-query-builder.ts](select-query-builder.ts); `allSelections` in [expression-builder.ts](expression-builder.ts).
+
+### `selectAll` takes the name a table goes by
+
+**What it is.** `selectAll` requires one string: the name the table goes by in the query, its alias (`selectAll('u')` after `selectFrom(users.as('u'))`) or its name when not aliased (`selectAll('users')`). There is no table-object form (`selectAll(users)`) and no argument-less form selecting every table.
+
+**Why.** One form, and the same name every other reference in the query uses (`'u.id'`). A table object names the table, not what it goes by once aliased, and "every table" changes meaning when a join is added (and is a duplicate-key error as soon as two tables share a column name such as `id`).
+
+**Cost.** Selecting every column of two tables takes two calls.
 
 **Code.** `selectAll` in [select-query-builder.ts](select-query-builder.ts).
 
@@ -646,7 +716,7 @@ The mechanisms are in [PAGINATION.md](PAGINATION.md).
 
 ### Plain queries share the pool's pipelined connections
 
-**What it is.** Over a pool, a builder query (`execute()`, and `db.sql` statements), `describe()` and a default `db.batch` run on the pool's shared connections: `pool.query`, `pool.describe`, and `pool.withShared` for a batch, which runs its statements together on one connection as one pipeline slot. What leaves state on a connection takes one of its own: transactions, `stream()`, atomic batches, a `timeout`, and `db.sql` statements whose first keyword changes session or transaction state (`begin`, `set`, `listen`, `create temp table`, …) ([EXECUTION.md](EXECUTION.md#connections-shared-or-exclusive)).
+**What it is.** Over a pool, a builder query (`execute()`, and `db.sql` statements), `describe()` and a default `db.batch` run on the pool's shared connections: `pool.query`, `pool.describe`, and `pool.withShared` for a batch, which runs its statements together on one connection as one pipeline slot. A `timeout` doesn't change that: the driver sends it with its query under one Sync ([driver/DECISIONS.md](driver/DECISIONS.md#a-statement-timeout-is-framed-under-the-querys-sync-whatever-the-transaction-status)). What leaves state on a connection takes one of its own: transactions, `stream()`, atomic batches, and `db.sql` statements whose first keyword changes session or transaction state (`begin`, `set`, `listen`, `create temp table`, …) ([EXECUTION.md](EXECUTION.md#connections-shared-or-exclusive)).
 
 **Why.** From the driver's integration (#3) until #37, every operation reserved a connection with `pool.acquire()`: beyond `max` concurrent queries, callers queued for a whole connection, so the builder got one query per connection per round trip, and none of the pool's pipelining. On the shared path, once the pool is full, queries pipeline onto busy connections, in a FIFO of pipeline slots, with each connection's depth adapting to the round trip, and connections are drained for callers who need one alone, so transactions and streams don't starve ([driver/DECISIONS.md](driver/DECISIONS.md#pipelining-onto-busy-connections-only-once-the-pool-is-full)). Nothing per query is lost: codecs, binary results once described, `keepRows`, tags, signals (a cancel only targets the query at the head of the connection), PgBouncer's unnamed statements and the stale-statement retry all live per query in the connection, and each query has its own Sync, so it fails alone.
 
@@ -654,10 +724,10 @@ The mechanisms are in [PAGINATION.md](PAGINATION.md).
 
 - Keep a connection per operation (the previous design): a query's `queuedMs` was its own, at the cost of every builder query beyond `max` waiting a whole round trip per connection.
 - Send a batch's statements through `pool.query` one by one: on an idle pool they would spread over several connections, and the batch would no longer go out in one write on one connection.
-- Share queries with a `timeout` too: the driver frames a timeout by the connection's last reported transaction status (`begin`…`commit` when idle, a save-and-restore inside a transaction). On a shared connection, another caller's pipelined `begin` can make it pick the wrong one, and the setting silently doesn't apply. A connection of its own costs nothing extra: the four statements already go out in one write.
+- Give queries with a `timeout` a connection of their own (#37, until #38): the driver chose a timeout's framing from the connection's last reported transaction status, which other callers' pipelined queries change, so the setting could silently not apply. Since #38 the framing is the query's own Sync group, and a timed builder query at a 5 ms round trip went from 1,738 to 14,640 ops/s with 100 callers (1,729 to 48,548 with 500; at 0 ms, 33,233 to 57,208), 10 connections, the setup of the table below on one 4-core VM.
 - Refuse session statements in `db.sql` on a pool (postgres.js refuses `begin` outside `sql.begin`): it breaks code that worked, where giving them a connection of their own keeps their old behaviour and keeps other callers out of their state.
 
-**Cost.** A slow query delays the queries pipelined behind it on its connection (head-of-line blocking, bounded by the pipeline depth), and `queuedMs` includes them. The session check is a heuristic on the first keyword: state a `select` sets (`set_config(…, false)`, `pg_advisory_lock`) isn't seen, and lands on an arbitrary connection, as before. One anchored regular expression test per query on a pool.
+**Cost.** A slow query delays the queries pipelined behind it on its connection (head-of-line blocking, bounded by the pipeline depth), and `queuedMs` includes them. The session check is a heuristic on the first keyword: state a `select` sets (`set_config(…, false)`, `pg_advisory_lock`) isn't seen, and lands on an arbitrary connection, as before. One anchored regular expression test per hand-written statement on a pool. The builders' selects and writes skip it: `compile` marks the queries it makes from a select, insert, update or delete node (`isDataStatement`), which can't start with a session keyword. The test had been 4–5% of a builder point lookup's client CPU.
 
 **Measured.** 10 connections, point lookups by primary key through the builder (`selectFrom(users).where(id).select([6 columns]).execute()`), closed loop, median of 5 interleaved runs (the driver benchmark suite of #6, Node 24, a 4-core VM; the 5 ms round trip through Toxiproxy):
 
@@ -672,7 +742,7 @@ The mechanisms are in [PAGINATION.md](PAGINATION.md).
 
 Before, throughput was capped at `max` lookups per round trip (10 per 6 ms at 5 ms). After, 100 callers at 5 ms match the driver's own `pool.query` (15,600 ops/s); beyond that, the builder's client CPU is the limit (about 19 µs per lookup, against about 4 µs for `pool.query`: building and rendering the query and capturing the call site), not the connections. That overhead was cut afterwards ([Columns resolved and quoted once per table](#columns-resolved-and-quoted-once-per-table)). Client CPU per lookup also drops at 0 ms (29 → 19 µs): no connection reserved and released per query.
 
-**Code.** `#shared`, `SESSION_STATEMENT` and `#run` in [driver-executor.ts](driver-executor.ts); `withShared` in [driver/pool.ts](driver/pool.ts); [test/driver/integration/builder-pool.test.ts](../test/driver/integration/builder-pool.test.ts).
+**Code.** `#shared`, `changesSession`, `SESSION_STATEMENT` and `#run` in [driver-executor.ts](driver-executor.ts); `isDataStatement` in [compile.ts](compile.ts); `withShared` in [driver/pool.ts](driver/pool.ts); [test/driver/integration/builder-pool.test.ts](../test/driver/integration/builder-pool.test.ts).
 
 ### Errors carry the query (hidden) and the code awaiting it
 

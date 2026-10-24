@@ -5,7 +5,7 @@ This guide covers the four builders (select, insert, update, delete), what each 
 - Files: [select-query-builder.ts](select-query-builder.ts), [insert-query-builder.ts](insert-query-builder.ts), [update-query-builder.ts](update-query-builder.ts), [delete-query-builder.ts](delete-query-builder.ts), [write-query.ts](write-query.ts), [row.ts](row.ts), [shape.ts](shape.ts), [query.ts](query.ts), [executor.ts](executor.ts) (the error classes), [errors.ts](errors.ts).
 - The type-level side of these builders (how the row type grows, how a builder knows it still needs a `where`) is in [TYPES.md](TYPES.md). The SQL they produce is in [COMPILER.md](COMPILER.md). Running them is in [EXECUTION.md](EXECUTION.md).
 
-The builders on `main` cover everyday SQL: inner, outer and cross joins, `distinct`/`distinct on`, `group by`/`having`, `order by`, `limit`/`offset`, row locks, `case`, arithmetic, aggregates and raw `sql` fragments, plus keyset pagination ([PAGINATION.md](PAGINATION.md)) and streaming. Subqueries, CTEs, set operations and `insert … select` are still only in the [public README](../README.md#part-ii-the-query-builder)'s intended surface.
+The builders on `main` cover everyday SQL: inner, outer and cross joins, `distinct`/`distinct on`, `group by`/`having`, `order by`, `limit`/`offset`, row locks, `case`, arithmetic, aggregates and raw `sql` fragments, plus keyset pagination ([PAGINATION.md](PAGINATION.md)) and streaming. Subqueries, CTEs, set operations and `insert … select` are not built yet.
 
 ## Contents
 
@@ -29,48 +29,48 @@ Each builder class holds an immutable `#state` and returns a new instance from e
 
 ```ts
 interface SelectState<T> {
-	tables: T; // the from table, then each joined table
-	from: TableNode;
-	joins: readonly JoinNode[]; // { kind: 'inner' | 'left' | 'right' | 'full' | 'cross', table, on }
-	where: WhereBuilder<RefsOf<T>>; // conditions, joined by and
-	distinct: true | readonly (OperationNode | AliasNode)[] | undefined;
-	selections: readonly SelectionNode[];
-	groupBy: readonly (OperationNode | AliasNode)[];
-	having: WhereBuilder<RefsOf<T>>;
-	orderBy: readonly OrderNode[];
-	limit: number | undefined;
-	offset: number | undefined;
-	locks: readonly LockNode[];
-	tag: string | undefined;
-	executor: Executor | undefined; // undefined when built without a database
+  tables: T; // the from table, then each joined table
+  from: TableNode;
+  joins: readonly JoinNode[]; // { kind: 'inner' | 'left' | 'right' | 'full' | 'cross', table, on }
+  where: WhereBuilder<RefsOf<T>>; // conditions, joined by and
+  distinct: true | readonly (OperationNode | AliasNode)[] | undefined;
+  selections: readonly SelectionNode[];
+  groupBy: readonly (OperationNode | AliasNode)[];
+  having: WhereBuilder<RefsOf<T>>;
+  orderBy: readonly OrderNode[];
+  limit: number | undefined;
+  offset: number | undefined;
+  locks: readonly LockNode[];
+  tag: string | undefined;
+  executor: Executor | undefined; // undefined when built without a database
 }
 interface InsertState<T> {
-	table;
-	values: RowsNode;
-	onConflict;
-	returning;
-	tag;
-	executor;
+  table;
+  values: RowsNode;
+  onConflict;
+  returning;
+  tag;
+  executor;
 }
 interface UpdateState<T, R> {
-	table;
-	scope: readonly AnyTable[]; // the table, plus the rows of a setEach
-	eb: ExpressionBuilder<R>; // over that scope
-	set: SetNode[];
-	from: UpdateFromNode | undefined; // setEach's rows: unnest(...) as alias(columns)
-	where;
-	allRows: boolean;
-	returning;
-	tag;
-	executor;
+  table;
+  scope: readonly AnyTable[]; // the table, plus the rows of a setEach
+  eb: ExpressionBuilder<R>; // over that scope
+  set: SetNode[];
+  from: UpdateFromNode | undefined; // setEach's rows: unnest(...) as alias(columns)
+  where;
+  allRows: boolean;
+  returning;
+  tag;
+  executor;
 }
 interface DeleteState<T> {
-	table;
-	where;
-	allRows: boolean;
-	returning;
-	tag;
-	executor;
+  table;
+  where;
+  allRows: boolean;
+  returning;
+  tag;
+  executor;
 }
 ```
 
@@ -116,14 +116,15 @@ Every join goes through `#joined(table)`: it refuses a table whose name is alrea
 ```ts
 .select(['users.id', 'contacts.email'])                   // keyed by column key
 .select((eb) => [eb.fn.lower('users.email').as('email')]) // expressions need an alias
-.selectAll()                                              // every column of every table
-.selectAll(users)                                         // every column of one table
+.selectAll('users')                                       // every column of one table
+.selectAll('u')                                           // by its alias, after selectFrom(users.as('u'))
 ```
 
 `selectionNodes(eb, list)` ([row.ts](row.ts)) makes one `SelectionNode` per entry (a column's is made once per table and shared): the expression's node, the **alias** (the column key after the dot, or the expression's alias), and the **codec** to read it with (the column's or typed expression's `DataType.codec`). Each call appends; the row type grows with it ([TYPES.md](TYPES.md#part-6-result-row-types)).
 
 - **Each key can be in the row once.** Selecting a second `id` is a type error (`UniqueKeys`, an impossible extra argument naming the duplicate) and a build-time error (`checkUniqueKeys`); `.as('managerId')` resolves it. Before #32, two `id`s were both rendered and the driver's object row silently kept the last.
 - **`selectAll` lists the columns**, never `select *`: each column keeps its TypeScript key (`createdAt` from `created_at`) and its codec, and the SQL doesn't change meaning if the table gains a column.
+- **`selectAll` takes the name the table goes by** in the query (its alias, or its name when not aliased), and only that: not a table object, and no argument-less "every table" form.
 
 ### `distinct`, `distinctOn`, `groupBy`, `orderBy`, `limit`, `offset`
 
@@ -157,7 +158,7 @@ Every join goes through `#joined(table)`: it refuses a table whose name is alrea
 ```ts
 const active = fragment(users, (qb) => qb.where('users.status', 'active'));
 const withContacts = fragment(users, (qb) =>
-	qb.innerJoin(contacts).on('contacts.userId', 'users.id'),
+  qb.innerJoin(contacts).on('contacts.userId', 'users.id'),
 );
 
 db.selectFrom(users).pipe(withContacts).pipe(active).select(['contacts.email']);
@@ -187,21 +188,21 @@ When two programs change the same row at the same time, one can silently overwri
 
 ```ts
 await db.transaction(async (tx) => {
-	const job = await tx
-		.selectFrom(jobs)
-		.where('jobs.status', 'queued')
-		.select(['jobs.id'])
-		.forUpdate()
-		.skipLocked()
-		.limit(1)
-		.takeFirst()
-		.execute();
-	if (job)
-		await tx
-			.update(jobs)
-			.set({ status: 'running' })
-			.where('jobs.id', job.id)
-			.execute();
+  const job = await tx
+    .selectFrom(jobs)
+    .where('jobs.status', 'queued')
+    .select(['jobs.id'])
+    .forUpdate()
+    .skipLocked()
+    .limit(1)
+    .takeFirst()
+    .execute();
+  if (job)
+    await tx
+      .update(jobs)
+      .set({ status: 'running' })
+      .where('jobs.id', job.id)
+      .execute();
 });
 ```
 
@@ -231,14 +232,14 @@ Result shapes add no `limit`, so **every row the query returns is locked**, even
 
 ```ts
 db.insertInto(users)
-	.values({ email: 'ada@example.com', name: 'Ada' })
-	.execute(); // { rowCount: 1 }
+  .values({ email: 'ada@example.com', name: 'Ada' })
+  .execute(); // { rowCount: 1 }
 db.insertInto(users)
-	.values([
-		{ email: 'a@x', name: null },
-		{ email: 'b@x', name: 'B' },
-	])
-	.execute();
+  .values([
+    { email: 'a@x', name: null },
+    { email: 'b@x', name: 'B' },
+  ])
+  .execute();
 db.insertInto(users).values(row).returning(['users.id']).expectOne().execute(); // { id: number }
 ```
 
@@ -264,13 +265,13 @@ db.insertInto(users).values(row).returning(['users.id']).expectOne().execute(); 
 ```ts
 db.update(users).set({ name: 'Ada' }).where('users.id', id).execute(); // { rowCount }
 db.update(users)
-	.set((eb) => ({ email: eb.fn.lower('users.email') }))
-	.allRows()
-	.execute();
+  .set((eb) => ({ email: eb.fn.lower('users.email') }))
+  .allRows()
+  .execute();
 db.update(posts)
-	.set((eb) => ({ views: eb.ref('posts.views').plus(1) })) // an increment
-	.where('posts.id', id)
-	.execute();
+  .set((eb) => ({ views: eb.ref('posts.views').plus(1) })) // an increment
+  .where('posts.id', id)
+  .execute();
 ```
 
 - `set(values | (eb) => values)` takes columns of the update type, or expressions evaluating to it; read-only columns aren't offered. Calls **add up**: a column set again keeps its place and takes the new value (`setNodes` merges into a `Map` keyed by database name). An `undefined` value leaves its column out; if that leaves nothing, it throws (an update that sets nothing is almost always a bug).
@@ -284,16 +285,16 @@ db.update(posts)
 
 ```ts
 await db
-	.update(products)
-	.setEach(
-		[
-			{ id: 1, price: '9.99', stock: 12 },
-			{ id: 2, price: '19.99' }, // leaves stock as it is
-		],
-		{ key: 'id' }, // or { key: ['tenantId', 'sku'] }
-	)
-	.expectRows(2)
-	.execute();
+  .update(products)
+  .setEach(
+    [
+      { id: 1, price: '9.99', stock: 12 },
+      { id: 2, price: '19.99' }, // leaves stock as it is
+    ],
+    { key: 'id' }, // or { key: ['tenantId', 'sku'] }
+  )
+  .expectRows(2)
+  .execute();
 ```
 
 compiles to (real `toSQL()`):
@@ -324,9 +325,9 @@ Array-typed columns can't be sent through `unnest` (it would flatten them); such
 ```ts
 db.deleteFrom(users).where('users.id', id).execute();
 db.deleteFrom(sessions)
-	.where((eb) => eb.ref('sessions.expiresAt').lt(now))
-	.returning(['sessions.id'])
-	.execute();
+  .where((eb) => eb.ref('sessions.expiresAt').lt(now))
+  .returning(['sessions.id'])
+  .execute();
 db.deleteFrom(logs).allRows().execute();
 ```
 
@@ -337,10 +338,10 @@ The same `where` / `allRows` rule as update.
 ```ts
 const { rowCount } = await db.sql`vacuum analyze posts`.execute();
 const n = await db.sql<{
-	n: string;
+  n: string;
 }>`select count(*) as n from posts where author_id = ${id}`
-	.expectValue()
-	.execute();
+  .expectValue()
+  .execute();
 ```
 
 `db.sql` (and `tx.sql`, on the transaction's connection) runs a whole statement written by hand ([sql.ts](sql.ts) `SqlQuery`). Interpolated values become parameters; expressions, tables, `sql.id(…)`, `sql.lit(…)` and `sql.join(…)` are written into the SQL. It has every result shape, `expectRows`, and works in `db.batch`. The row type `R` is a promise you make: nothing checks it. The `sql` fragment tag for use inside builder queries is in [EXPRESSIONS.md](EXPRESSIONS.md#raw-sql-fragments).
@@ -381,9 +382,9 @@ A shape ([shape.ts](shape.ts)) is three things:
 
 ```ts
 interface Shape<R> {
-	read: (input: ShapeInput) => R; // rows → result, or throw
-	checked: boolean; // can `read` throw? (expect… shapes)
-	rows?: ReadOptions; // { keepRows?, rowMode? }: what the driver should return
+  read: (input: ShapeInput) => R; // rows → result, or throw
+  checked: boolean; // can `read` throw? (expect… shapes)
+  rows?: ReadOptions; // { keepRows?, rowMode? }: what the driver should return
 }
 ```
 
@@ -391,17 +392,17 @@ interface Shape<R> {
 
 ```ts
 return new Query({
-	query,
-	executor,
-	checked: shape.checked,
-	rows: shape.rows,
-	read: ({ rows, rowCount }) =>
-		shape.read({
-			query,
-			table,
-			rows,
-			count: Math.max(rowCount ?? 0, rows.length),
-		}),
+  query,
+  executor,
+  checked: shape.checked,
+  rows: shape.rows,
+  read: ({ rows, rowCount }) =>
+    shape.read({
+      query,
+      table,
+      rows,
+      count: Math.max(rowCount ?? 0, rows.length),
+    }),
 });
 ```
 
@@ -485,7 +486,8 @@ Why the builders work this way. Each links to its full entry (what it is, why, t
 - [`setEach` rows are typed by the table, and duplicate keys are refused](DECISIONS.md#seteach-rows-are-typed-by-the-table-and-duplicate-keys-are-refused): no misspelled or read-only columns, no ambiguous updates.
 - [Outer joins make the joined side nullable: `NullableTable`](DECISIONS.md#outer-joins-make-the-joined-side-nullable-nullabletable): the row type says which columns can be NULL.
 - [A table joined twice, or a key selected twice, is refused](DECISIONS.md#a-table-joined-twice-or-a-key-selected-twice-is-refused): both silently corrupted results.
-- [`selectAll()` lists the columns, never `*`](DECISIONS.md#selectall-lists-the-columns-never-): each column keeps its key and codec.
+- [`selectAll` lists the columns, never `*`](DECISIONS.md#selectall-lists-the-columns-never-): each column keeps its key and codec.
+- [`selectAll` takes the name a table goes by](DECISIONS.md#selectall-takes-the-name-a-table-goes-by): one form, the name every other reference uses.
 - [Ordering by a selected key uses the bare key](DECISIONS.md#ordering-by-a-selected-key-uses-the-bare-key): a dot always means a column.
 - [Raw SQL only through the `sql` template tag](DECISIONS.md#raw-sql-only-through-the-sql-template-tag): `db.sql` and fragments stay injection-safe.
 

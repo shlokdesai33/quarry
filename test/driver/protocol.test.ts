@@ -10,6 +10,7 @@ import {
 	textValues,
 } from '../../src/driver/protocol/reader.js';
 import type { BackendMessage } from '../../src/driver/protocol/messages.js';
+import { utf8 } from '../../src/driver/protocol/text.js';
 import { ProtocolError } from '../../src/driver/errors.js';
 import {
 	concat,
@@ -492,6 +493,35 @@ describe('NotificationResponse decoding', () => {
 		expect(ours.map((n) => [n.channel, n.payload])).toEqual(
 			theirs.map((n) => [n.channel, n.payload]),
 		);
+	});
+});
+
+describe('utf8', () => {
+	const text = 'id héllo 🐘 user42@example.com';
+	const encoded = new TextEncoder().encode(text);
+	const padded = new Uint8Array(encoded.length + 6);
+	padded.set(encoded, 3);
+
+	it('decodes a range of a Buffer that shares a larger allocation', () => {
+		const buffer = Buffer.from(padded.buffer, 0, padded.length);
+		expect(utf8(buffer, 3, 3 + encoded.length)).toBe(text);
+		expect(utf8(buffer, 3, 5)).toBe('id');
+		expect(utf8(buffer, 4, 4)).toBe('');
+		const view = buffer.subarray(3);
+		expect(utf8(view, 0, encoded.length)).toBe(text);
+	});
+
+	it('decodes a plain Uint8Array the same way', () => {
+		expect(utf8(padded, 3, 3 + encoded.length)).toBe(text);
+		expect(utf8(padded, 3, 5)).toBe('id');
+		expect(utf8(padded, 4, 4)).toBe('');
+	});
+
+	it('replaces invalid sequences as TextDecoder does', () => {
+		const bad = Uint8Array.of(0x61, 0xff, 0x62, 0xe2, 0x82);
+		const expected = new TextDecoder().decode(bad);
+		expect(utf8(Buffer.from(bad), 0, bad.length)).toBe(expected);
+		expect(utf8(bad, 0, bad.length)).toBe(expected);
 	});
 });
 

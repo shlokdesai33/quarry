@@ -1,5 +1,6 @@
 import type { Executor } from './executor.js';
 import {
+	allSelections,
 	type ExpressionBuilder,
 	expressionBuilder,
 } from './expression-builder.js';
@@ -13,7 +14,6 @@ import type { AnyPredicate } from './operators.js';
 import type { Ref, RefsOf } from './refs.js';
 import {
 	type AddRow,
-	allColumns,
 	returningNodes,
 	type RowOf,
 	type Selection,
@@ -196,12 +196,11 @@ export class InsertQueryBuilder<
 	returningAll(
 		..._unique: UniqueColumns<O, Ref<RefsOf<[T]>>>
 	): InsertQueryBuilder<T, AddRow<O, RowOf<RefsOf<[T]>, Ref<RefsOf<[T]>>>>, M> {
-		const eb = expressionBuilder(this.#state.table);
 		return new InsertQueryBuilder({
 			...this.#state,
 			returning: returningNodes(
 				this.#state.returning,
-				selectionNodes(eb, allColumns(this.#state.table)),
+				allSelections(this.#state.table),
 			),
 		});
 	}
