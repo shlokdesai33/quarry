@@ -222,31 +222,31 @@ A performance detail: `#query` creates its promise with a **shared executor func
 
 ```ts
 #schedule(): void {
-	if (this.#flushScheduled) return;
-	this.#flushScheduled = true;
-	queueMicrotask(this.#flushTask);
+  if (this.#flushScheduled) return;
+  this.#flushScheduled = true;
+  queueMicrotask(this.#flushTask);
 }
 
 #flush(): void {
-	this.#flushScheduled = false;
-	if (this.#closed || this.#backpressure) return;
-	while (this.#written < this.#queue.length && this.#blocking === undefined && this.#canceling === undefined) {
-		const op = this.#queue.at(this.#written);
-		this.#written++;
-		const before = this.#writer.length;
-		try {
-			op.write(this.#ctx);
-		} catch (error) {
-			// a request that can't be encoded fails alone; nothing of it is sent
-			this.#writer.truncate(before);
-			…
-			continue;
-		}
-		op.written = true;
-		if (op.exclusive) this.#blocking = op;
-		if (this.#writer.length >= FLUSH_BYTES && !this.#send(this.#writer.take())) return;
-	}
-	if (this.#writer.length > 0) this.#send(this.#writer.take());
+  this.#flushScheduled = false;
+  if (this.#closed || this.#backpressure) return;
+  while (this.#written < this.#queue.length && this.#blocking === undefined && this.#canceling === undefined) {
+    const op = this.#queue.at(this.#written);
+    this.#written++;
+    const before = this.#writer.length;
+    try {
+      op.write(this.#ctx);
+    } catch (error) {
+      // a request that can't be encoded fails alone; nothing of it is sent
+      this.#writer.truncate(before);
+      …
+      continue;
+    }
+    op.written = true;
+    if (op.exclusive) this.#blocking = op;
+    if (this.#writer.length >= FLUSH_BYTES && !this.#send(this.#writer.take())) return;
+  }
+  if (this.#writer.length > 0) this.#send(this.#writer.take());
 }
 ```
 
@@ -267,24 +267,24 @@ A performance detail: `#query` creates its promise with a **shared executor func
 
 ```ts
 #onData(chunk: Uint8Array): void {
-	const reader = this.#reader;
-	try {
-		reader.push(chunk);
-		for (let type = reader.nextType(); type >= 0; type = reader.nextType()) {
-			if (type === 0x44 && !this.#starting) {                   // 'D': DataRow
-				const op = this.#queue.at(0);
-				if (op?.written && op.dataRow(reader.bytes, reader.start, reader.end)) continue;
-			} else if (type === 0x41) {                                // 'A': NotificationResponse
-				this.#notify(decodeNotification(reader.bytes, reader.start, reader.end, this.#channelNames));
-				if (this.#closed) return;
-				continue;
-			}
-			this.#dispatch(reader.parse());
-			if (this.#closed) return;
-		}
-	} catch (error) {
-		this.#fail(error instanceof Error ? error : new ProtocolError(String(error)));
-	}
+  const reader = this.#reader;
+  try {
+    reader.push(chunk);
+    for (let type = reader.nextType(); type >= 0; type = reader.nextType()) {
+      if (type === 0x44 && !this.#starting) {                   // 'D': DataRow
+        const op = this.#queue.at(0);
+        if (op?.written && op.dataRow(reader.bytes, reader.start, reader.end)) continue;
+      } else if (type === 0x41) {                                // 'A': NotificationResponse
+        this.#notify(decodeNotification(reader.bytes, reader.start, reader.end, this.#channelNames));
+        if (this.#closed) return;
+        continue;
+      }
+      this.#dispatch(reader.parse());
+      if (this.#closed) return;
+    }
+  } catch (error) {
+    this.#fail(error instanceof Error ? error : new ProtocolError(String(error)));
+  }
 }
 ```
 
@@ -308,19 +308,19 @@ A message with no op in flight is either an error the server sends on its own (a
 
 ```ts
 abstract class Op {
-	written = false;
-	done = false;
-	readonly exclusive: boolean = false;
-	canceledBy: 'abort' | 'timeout' | undefined;
-	onTiming;
-	onDone;
-	queuedAt;
-	writtenAt;
-	dataRow(bytes, start, end): boolean; // the DataRow fast path; false if not accepted
-	get prepares(): number; // statements it may write named
-	abstract write(ctx: OpContext): void; // append its messages to ctx.writer
-	abstract handle(msg, ctx): boolean; // true when complete (its ReadyForQuery)
-	abstract fail(error: Error): void; // the connection failed first
+  written = false;
+  done = false;
+  readonly exclusive: boolean = false;
+  canceledBy: 'abort' | 'timeout' | undefined;
+  onTiming;
+  onDone;
+  queuedAt;
+  writtenAt;
+  dataRow(bytes, start, end): boolean; // the DataRow fast path; false if not accepted
+  get prepares(): number; // statements it may write named
+  abstract write(ctx: OpContext): void; // append its messages to ctx.writer
+  abstract handle(msg, ctx): boolean; // true when complete (its ReadyForQuery)
+  abstract fail(error: Error): void; // the connection failed first
 }
 ```
 
@@ -392,16 +392,16 @@ If a codec throws while decoding a value, the generated decoder wraps it in a `D
 
 ```ts
 interface Statement {
-	readonly name: string; // 'q7', or '' for SQL only ever sent unnamed (its columns are still cached)
-	readonly key: string; // its key in the cache: the SQL, or types and SQL (below)
-	readonly sql: string;
-	readonly types: readonly number[]; // the declared parameter types
-	used: number; // last lookup, on the connection's counter
-	unwritten: boolean; // created, its Parse not yet written
-	parsed: boolean; // ParseComplete arrived
-	fields: readonly Field[] | undefined; // its columns, once described
-	error: PostgresError | undefined; // its Parse failed
-	readonly plans: CachedPlan[]; // how its results are read, per registry/codecs
+  readonly name: string; // 'q7', or '' for SQL only ever sent unnamed (its columns are still cached)
+  readonly key: string; // its key in the cache: the SQL, or types and SQL (below)
+  readonly sql: string;
+  readonly types: readonly number[]; // the declared parameter types
+  used: number; // last lookup, on the connection's counter
+  unwritten: boolean; // created, its Parse not yet written
+  parsed: boolean; // ParseComplete arrived
+  fields: readonly Field[] | undefined; // its columns, once described
+  error: PostgresError | undefined; // its Parse failed
+  readonly plans: CachedPlan[]; // how its results are read, per registry/codecs
 }
 ```
 
@@ -509,21 +509,21 @@ The connection only talks to a `DriverSocket` ([socket.ts](socket.ts)):
 
 ```ts
 interface DriverSocket {
-	readonly encrypted: boolean;
-	write(data: Uint8Array): boolean; // false when the buffer is full
-	startTls(options: TlsConnectOptions): Promise<void>; // upgrade in place
-	peerCertificate(): Uint8Array | undefined; // DER, for channel binding
-	pause(): void;
-	resume(): void; // read backpressure
-	end(): void | Promise<void>;
-	destroy(): void;
-	onData(h);
-	onClose(h);
-	onError(h);
-	onDrain(h);
+  readonly encrypted: boolean;
+  write(data: Uint8Array): boolean; // false when the buffer is full
+  startTls(options: TlsConnectOptions): Promise<void>; // upgrade in place
+  peerCertificate(): Uint8Array | undefined; // DER, for channel binding
+  pause(): void;
+  resume(): void; // read backpressure
+  end(): void | Promise<void>;
+  destroy(): void;
+  onData(h);
+  onClose(h);
+  onError(h);
+  onDrain(h);
 }
 interface SocketFactory {
-	connect(options: SocketConnectOptions): Promise<DriverSocket>;
+  connect(options: SocketConnectOptions): Promise<DriverSocket>;
 }
 ```
 

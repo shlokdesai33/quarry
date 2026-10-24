@@ -98,11 +98,11 @@ A **query builder** is a library that lets you write queries as code instead of 
 
 ```ts
 const user = await db
-	.selectFrom(users)
-	.where('users.email', email)
-	.select(['users.id', 'users.name'])
-	.expectOne()
-	.execute();
+  .selectFrom(users)
+  .where('users.email', email)
+  .select(['users.id', 'users.name'])
+  .expectOne()
+  .execute();
 // user: { id: number; name: string | null }
 ```
 
@@ -217,7 +217,7 @@ Every builder method returns a **new** builder; none changes the one it was call
 ```ts
 // select-query-builder.ts, SelectQueryBuilder
 tag(name: string): SelectQueryBuilder<T, O, L> {
-	return new SelectQueryBuilder<T, O, L>({ ...this.#state, tag: name });
+  return new SelectQueryBuilder<T, O, L>({ ...this.#state, tag: name });
 }
 ```
 
@@ -281,11 +281,11 @@ This is the short version; [WALKTHROUGH.md](WALKTHROUGH.md) follows one query al
 
 ```ts
 const user = await db
-	.selectFrom(users)
-	.where('users.email', 'ada@example.com')
-	.select(['users.id', 'users.name', 'users.createdAt'])
-	.expectOne()
-	.execute();
+  .selectFrom(users)
+  .where('users.email', 'ada@example.com')
+  .select(['users.id', 'users.name', 'users.createdAt'])
+  .expectOne()
+  .execute();
 ```
 
 1. **`db.selectFrom(users)`** ([database.ts](database.ts) → `selectFromWith` in [select-query-builder.ts](select-query-builder.ts)) creates a `SelectQueryBuilder<[typeof users], {}>` whose state has the table, an empty `WhereBuilder` and the database's executor.

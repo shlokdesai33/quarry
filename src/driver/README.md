@@ -17,8 +17,8 @@ import { connect, createPool } from 'quarry/driver';
 
 await using conn = await connect('postgres://app@db.internal/app');
 const pool = createPool({
-	connectionString: process.env.DATABASE_URL,
-	max: 20,
+  connectionString: process.env.DATABASE_URL,
+  max: 20,
 });
 ```
 
@@ -31,12 +31,12 @@ Options come from the argument, then the connection string (URL or `key=value`),
 ```ts
 connect({ host: 'db.example.com', ssl: { mode: 'verify-full', ca: pem } });
 connect({
-	host: 'db.example.com',
-	ssl: { mode: 'require', negotiation: 'direct' },
+  host: 'db.example.com',
+  ssl: { mode: 'require', negotiation: 'direct' },
 }); // PG 17+, no SSLRequest round trip
 connect({
-	host: 'db.example.com',
-	ssl: { mode: 'verify-full', rootCertFile: 'system' },
+  host: 'db.example.com',
+  ssl: { mode: 'verify-full', rootCertFile: 'system' },
 });
 ```
 
@@ -53,14 +53,14 @@ Verify modes use `ca`, `rootCertFile`, `~/.postgresql/root.crt`, or the platform
 
 ```ts
 const { rows, rowCount, command, fields } = await conn.query(
-	'select * from users where id = $1',
-	[id],
+  'select * from users where id = $1',
+  [id],
 );
 await conn.query(sql, params, {
-	rowMode: 'array',
-	signal,
-	timeout: 5000,
-	statementTimeout: '2s',
+  rowMode: 'array',
+  signal,
+  timeout: 5000,
+  statementTimeout: '2s',
 });
 const results = await conn.simpleQuery('select 1; select 2'); // multi-statement, no parameters
 const { paramTypes, fields } = await conn.describe(sql); // without running it
@@ -72,8 +72,8 @@ Parameters:
 
   ```ts
   await conn.query('select * from unnest($1::int4[], $2::text[])', [
-  	typed(ids, arrayOf(codecs.int4)),
-  	typed(names, arrayOf(codecs.text)),
+    typed(ids, arrayOf(codecs.int4)),
+    typed(names, arrayOf(codecs.text)),
   ]);
   ```
 
@@ -131,9 +131,9 @@ const unlisten = await pool.listen('events', (n) => …); // dedicated connectio
 
 ```ts
 await pool.transaction(async (tx) => {
-	await tx.query('insert …');
-	await tx.transaction(async (sp) => { … }); // savepoint
-	tx.afterCommit(() => queue.publish(…));
+  await tx.query('insert …');
+  await tx.transaction(async (sp) => { … }); // savepoint
+  tx.afterCommit(() => queue.publish(…));
 }, { isolation: 'serializable', retries: 3, settings: { 'app.tenant_id': tenant } });
 ```
 
@@ -185,14 +185,14 @@ import { database } from 'quarry';
 
 const db = database(process.env.DATABASE_URL, { onQuery: (e) => log(e) });
 const user = await db
-	.selectFrom(users)
-	.where('users.id', id)
-	.select(['users.email'])
-	.expectOne()
-	.execute({ signal: request.signal, timeout: '2s' });
+  .selectFrom(users)
+  .where('users.id', id)
+  .select(['users.email'])
+  .expectOne()
+  .execute({ signal: request.signal, timeout: '2s' });
 await db.transaction(async (tx) => {
-	await tx.insertInto(orders).values(order).execute();
-	tx.afterCommit(() => queue.publish('order.created'));
+  await tx.insertInto(orders).values(order).execute();
+  tx.afterCommit(() => queue.publish('order.created'));
 });
 ```
 
@@ -201,5 +201,5 @@ await db.transaction(async (tx) => {
 ## Development
 
 - `pnpm test` starts a throwaway cluster (TLS, a role per auth method, PgBouncer) when PostgreSQL is installed; otherwise the integration tests skip. `PG_VERSION=17`, `PG_BIN` and `PGBOUNCER_BIN` pick other versions.
-- `pnpm bench:driver` compares against `pg` and postgres.js.
+- `pnpm bench:driver` is a quick comparison with `pg` and postgres.js. `bench/driver/suite` is the full, reproducible comparison: every client on Node, Bun and Deno, PgBouncer, simulated network latency, resources and footprint (see its README).
 - `pnpm test:compat` runs node-postgres's and postgres.js's own test suites against this driver, through test-only shims in `test/driver/compat`, on PostgreSQL 18 (add `--bouncer` for a second pass through PgBouncer in transaction mode). It clones the pinned upstream releases into `.compat/`; `test/driver/compat/expectations.ts` lists every test allowed to fail and why.

@@ -14,7 +14,6 @@ import {
 import { Nested } from './nest.js';
 import type { SelectionNode } from './node.js';
 import type { Ref, Refs } from './refs.js';
-import type { AnyTable } from './table.js';
 import type { Prettify } from './types.js';
 
 /** An entry of a select list: a column reference or a named expression. */
@@ -152,14 +151,10 @@ function repeatedKey(alias: string): Error {
 export function returningNodes(
 	existing: readonly SelectionNode[],
 	added: readonly SelectionNode[],
-): SelectionNode[] {
+): readonly SelectionNode[] {
 	checkUniqueKeys(existing, added);
-	return [...existing, ...added];
-}
-
-/** A reference to every column of `table`, as `selectAll` and `returningAll` list them. */
-export function allColumns(table: AnyTable): string[] {
-	return Object.keys(table.schema.columns).map((key) => `${table.name}.${key}`);
+	// lists are never changed in place, so the first one is kept as is
+	return existing.length === 0 ? added : [...existing, ...added];
 }
 
 /**

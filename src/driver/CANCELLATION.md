@@ -49,15 +49,15 @@ Both call `#abort(op, reason)`:
 
 ```ts
 #abort(op, reason, cause?) {
-	if (op.done) return;
-	if (!op.written) {                 // still in the queue: just drop it
-		this.#queue.removeAt(this.#queue.indexOf(op));
-		op.fail(new AbortError(reason === 'timeout' ? 'The query timed out before it was sent' : 'The query was aborted before it was sent', { cause }));
-		return;
-	}
-	op.canceledBy = reason;            // sent: ask the server
-	this.#canceling ??= op;            // hold back later writes
-	this.#cancelAtHead();
+  if (op.done) return;
+  if (!op.written) {                 // still in the queue: just drop it
+    this.#queue.removeAt(this.#queue.indexOf(op));
+    op.fail(new AbortError(reason === 'timeout' ? 'The query timed out before it was sent' : 'The query was aborted before it was sent', { cause }));
+    return;
+  }
+  op.canceledBy = reason;            // sent: ask the server
+  this.#canceling ??= op;            // hold back later writes
+  this.#cancelAtHead();
 }
 ```
 

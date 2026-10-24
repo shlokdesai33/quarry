@@ -33,7 +33,7 @@ A **type parameter** is a variable in the type program:
 
 ```ts
 function first<T>(items: T[]): T | undefined {
-	return items[0];
+  return items[0];
 }
 first([1, 2]); // T is inferred as number
 ```
@@ -123,9 +123,9 @@ A function type can have several **call signatures**; the compiler picks the fir
 
 ```ts
 interface Condition<R, B> {
-	<C extends Ref<R>>(column: C, value: …): B; // where('users.id', 1)
-	(group: (eb) => AnyPredicate): B;           // where((eb) => …)
-	(predicate: AnyPredicate): B;               // where(predicate)
+  <C extends Ref<R>>(column: C, value: …): B; // where('users.id', 1)
+  (group: (eb) => AnyPredicate): B;           // where((eb) => …)
+  (predicate: AnyPredicate): B;               // where(predicate)
 }
 ```
 
@@ -144,10 +144,10 @@ A **phantom type** is a type carried by a value but backed by nothing at run tim
 
 ```ts
 export abstract class BaseColumn<D extends DataType, S, I, U> {
-	declare readonly $select: S;
-	declare readonly $insert: I;
-	declare readonly $update: U;
-	readonly _quarry: { readonly dataType: D; … };
+  declare readonly $select: S;
+  declare readonly $insert: I;
+  declare readonly $update: U;
+  readonly _quarry: { readonly dataType: D; … };
 }
 ```
 
@@ -184,14 +184,14 @@ A query's scope is the merge of the `$refs` of its tables, in [refs.ts](refs.ts)
 
 ```ts
 export type RefsOf<T extends readonly AnyTable[]> =
-	RefsOfTuple<T> extends infer R extends Refs ? R : never;
+  RefsOfTuple<T> extends infer R extends Refs ? R : never;
 
 type RefsOfTuple<T extends readonly AnyTable[]> = T extends readonly [
-	...infer Init extends readonly AnyTable[],
-	infer Last extends AnyTable,
+  ...infer Init extends readonly AnyTable[],
+  infer Last extends AnyTable,
 ]
-	? RefsOfTuple<Init> & Last['$refs']
-	: unknown;
+  ? RefsOfTuple<Init> & Last['$refs']
+  : unknown;
 ```
 
 A select builder's first type parameter `T` is a **tuple** of its tables, `[typeof posts]`, then `[typeof posts, typeof users]` after a join. `RefsOfTuple` peels the last table off and intersects its `$refs` with the merge of the rest. Why from the end? Because a join's tuple is the previous tuple plus one table, so `RefsOf<[...T, J]>` is `RefsOf<T> & J['$refs']`, and the compiler has already computed `RefsOf<T>` for the previous step. A chain of n joins costs n steps instead of n².
@@ -222,11 +222,11 @@ Functions take "a reference or an expression of SQL type `D`" ([refs.ts](refs.ts
 
 ```ts
 export type RefsWith<R extends Refs, D extends DataType> = {
-	[K in Ref<R>]: R[K]['_quarry']['dataType'] extends D ? K : never;
+  [K in Ref<R>]: R[K]['_quarry']['dataType'] extends D ? K : never;
 }[Ref<R>];
 
 export type Operand<R extends Refs, D extends DataType = DataType> =
-	(DataType extends D ? Ref<R> : RefsWith<R, D>) | TypedExpression<unknown, D>;
+  (DataType extends D ? Ref<R> : RefsWith<R, D>) | TypedExpression<unknown, D>;
 ```
 
 `RefsWith<R, DataType<TextKind>>` is "the references in scope whose column is a text type": it maps each key to itself or `never` and then indexes the object with all keys, collecting the survivors into a union. So `eb.fn.lower('users.id')` is a type error: `'users.id'` isn't a text reference. `TypeOf<R, A>` and `DataTypeOf<R, A>` then read an operand's TypeScript type and SQL type, whether it is a reference or an expression.
@@ -248,9 +248,9 @@ What `eb.ref('users.email')` returns ([operators.ts](operators.ts)):
 
 ```ts
 export type Expr<T, D extends DataType> = TypedExpression<T, D> &
-	(MethodsByKind<NonNullable<T>, D, Extract<T, null>>[D['kind']] extends infer M
-		? M
-		: never);
+  (MethodsByKind<NonNullable<T>, D, Extract<T, null>>[D['kind']] extends infer M
+    ? M
+    : never);
 ```
 
 Step by step:
@@ -269,13 +269,13 @@ The intersection `TypedExpression<T, D> & Methods` gives an object with both the
 ```ts
 export type One<S, D extends DataType> = S | TypedExpression<unknown, D>;
 export type Binary<S, D extends DataType> =
-	| One<S, D>
-	| Quantified<S, D, null> // any([...values]) / all(...)
-	| Quantified<unknown, D, null, true>; // any(arrayExpression)
+  | One<S, D>
+  | Quantified<S, D, null> // any([...values]) / all(...)
+  | Quantified<unknown, D, null, true>; // any(arrayExpression)
 export type List<S, D extends DataType> =
-	| readonly One<S, D>[]
-	| TypedExpression<unknown, ArrayType<D>>
-	| Param<readonly S[] | null>;
+  | readonly One<S, D>[]
+  | TypedExpression<unknown, ArrayType<D>>
+  | Param<readonly S[] | null>;
 ```
 
 - A **value** must be an `S`: the column's TypeScript type, so `eb.ref('users.age').gte('18')` fails.
@@ -286,15 +286,15 @@ Which SQL types are compatible is `ComparableType` / `OperandOf`:
 
 ```ts
 type Comparable<K extends Kind> = K extends TextKind
-	? TextKind
-	: K extends NumberKind
-		? NumberKind
-		: K extends TimestampKind
-			? TimestampKind
-			: K;
+  ? TextKind
+  : K extends NumberKind
+    ? NumberKind
+    : K extends TimestampKind
+      ? TimestampKind
+      : K;
 type ComparableType<D extends DataType> = D extends EnumType | CustomType
-	? D
-	: DataType<Comparable<D['kind']>>;
+  ? D
+  : DataType<Comparable<D['kind']>>;
 ```
 
 Every text type compares with every text type, every number type with every number type, `date`/`timestamp`/`timestamptz` with each other; everything else only with itself; an enum or custom type only with the **same** one (its type carries its name).
@@ -313,8 +313,8 @@ In SQL, any comparison involving NULL is NULL ("unknown"). `where` treats unknow
 
 ```ts
 export type Predicate<N extends null = never> = Expr<
-	boolean | N,
-	DataType<'boolean'>
+  boolean | N,
+  DataType<'boolean'>
 >;
 ```
 
@@ -343,24 +343,24 @@ eb.ref('users.name').isDistinctFrom('a'); // Predicate: null-safe
 
 ```ts
 export type Selection<R extends Refs> =
-	Ref<R> | AliasedExpression<unknown, string>;
+  Ref<R> | AliasedExpression<unknown, string>;
 
 export type KeyOf<S> = S extends `${string}.${infer C}`
-	? C
-	: S extends AliasedExpression<unknown, infer A>
-		? A
-		: S extends Nested<unknown, infer A> // nest's object
-			? A
-			: never;
+  ? C
+  : S extends AliasedExpression<unknown, infer A>
+    ? A
+    : S extends Nested<unknown, infer A> // nest's object
+      ? A
+      : never;
 
 export type ValueOf<R extends Refs, S> =
-	S extends Ref<R>
-		? R[S]['$select']
-		: S extends AliasedExpression<infer T, string>
-			? T
-			: S extends Nested<infer T, string>
-				? T
-				: never;
+  S extends Ref<R>
+    ? R[S]['$select']
+    : S extends AliasedExpression<infer T, string>
+      ? T
+      : S extends Nested<infer T, string>
+        ? T
+        : never;
 
 export type RowOf<R extends Refs, S> = { [K in S as KeyOf<K>]: ValueOf<R, K> };
 ```
@@ -375,10 +375,10 @@ Each `select` call adds columns: the builder's row type `O` becomes `AddRow<O, R
 
 ```ts
 export type AddRow<O, A> = [keyof O] extends [never]
-	? A
-	: [keyof A] extends [never]
-		? O
-		: Prettify<O & A>;
+  ? A
+  : [keyof A] extends [never]
+    ? O
+    : Prettify<O & A>;
 ```
 
 If either side is empty it returns the other unchanged, avoiding a `Prettify` of an intersection on the common first `select` (cheaper, and hovers show the columns rather than an alias). `Prettify<T> = { [K in keyof T]: T[K] } & {}` flattens `{ a: 1 } & { b: 2 }` into `{ a: 1; b: 2 }` for readable hovers.
@@ -397,11 +397,11 @@ type WhenRow<O, P> = [keyof P] extends [never] ? O : Prettify<O & Partial<P>>;
 
 ```ts
 type JoinedBy<Q, P extends readonly AnyTable[]> =
-	Q extends SelectQueryBuilder<infer T, unknown, LockState>
-		? T extends readonly [...P, ...infer J extends AnyTable[]]
-			? J
-			: never
-		: never;
+  Q extends SelectQueryBuilder<infer T, unknown, LockState>
+    ? T extends readonly [...P, ...infer J extends AnyTable[]]
+      ? J
+      : never
+    : never;
 ```
 
 ### Outer joins: `NullableTable`
@@ -411,23 +411,23 @@ A left join keeps rows with no match, so the joined table's columns can be NULL 
 
 ```ts
 interface NullableColumn<C extends AnyColumn> {
-	readonly $select: C['$select'] | null; // only this changes
-	readonly $insert: C['$insert'];
-	readonly $update: C['$update'];
-	readonly _quarry: C['_quarry']; // same SQL type, methods and codec
-	readonly $inner?: C; // phantom: the column itself, for `nest`
+  readonly $select: C['$select'] | null; // only this changes
+  readonly $insert: C['$insert'];
+  readonly $update: C['$update'];
+  readonly _quarry: C['_quarry']; // same SQL type, methods and codec
+  readonly $inner?: C; // phantom: the column itself, for `nest`
 }
 type NullableTable<X> =
-	X extends Table<infer N, infer S>
-		? Table<
-				N,
-				{
-					columns: {
-						[K in keyof S['columns']]: NullableColumn<S['columns'][K]>;
-					};
-				}
-			>
-		: never;
+  X extends Table<infer N, infer S>
+    ? Table<
+        N,
+        {
+          columns: {
+            [K in keyof S['columns']]: NullableColumn<S['columns'][K]>;
+          };
+        }
+      >
+    : never;
 ```
 
 `leftJoin(posts)` puts `NullableTable<typeof posts>` into the scope tuple; `rightJoin` turns the earlier tables into `NullableTables<T>` (a mapped tuple type) **and** the row already selected into `NullableRow<O>` (every key `| null`); `fullJoin` does both. Since only `$select` changes, comparisons on an outer table still take the column's values and its codec still decodes it: nullability is a property of the row, not of the SQL type. The run-time table object is the same; the cast in each join method is the type-level change only.
@@ -441,17 +441,17 @@ type NullableTable<X> =
 
 ```ts
 interface Nest<T extends readonly AnyTable[]> {
-	<N extends T[number]['name']>(table: N): Nested<NestedRow<TableNamed<T, N>, ColumnKey<TableNamed<T, N>>>, N>;
-	<N extends T[number]['name'], const C extends readonly [ColumnKey<…>, ...ColumnKey<…>[]]>(
-		table: N,
-		columns: C,
-	): Nested<NestedRow<TableNamed<T, N>, C[number]>, N>;
+  <N extends T[number]['name']>(table: N): Nested<NestedRow<TableNamed<T, N>, ColumnKey<TableNamed<T, N>>>, N>;
+  <N extends T[number]['name'], const C extends readonly [ColumnKey<…>, ...ColumnKey<…>[]]>(
+    table: N,
+    columns: C,
+  ): Nested<NestedRow<TableNamed<T, N>, C[number]>, N>;
 }
 
 type NestedRow<X extends AnyTable, K extends ColumnKey<X>> =
-	IsOuter<X['schema']['columns'][K]> extends true
-		? { [C in K]: InnerColumn<X['schema']['columns'][C]>['$select'] } | null
-		: { [C in K]: InnerColumn<X['schema']['columns'][C]>['$select'] };
+  IsOuter<X['schema']['columns'][K]> extends true
+    ? { [C in K]: InnerColumn<X['schema']['columns'][C]>['$select'] } | null
+    : { [C in K]: InnerColumn<X['schema']['columns'][C]>['$select'] };
 ```
 
 A table on the outer side of a join gives `{…} | null`, with its columns typed as the table's own, since the object exists only where the table has a row. The base table, an inner join and a cross join give `{…}`. A `rightJoin` after a `nest` makes the object nullable through `NullableRow<O>`, like any selected column. A `Nested<T, A>` is a select-list entry like an aliased expression: `KeyOf` gives its key `A` and `ValueOf` its type `T`. So `UniqueKeys` checks the object's key against the row, and never the columns inside it. `.as(B)` gives a `Nested<T, B>`. Listing a column twice is a type error through an impossible extra argument (`ListedOnce`, built on the same `Repeated` as `UniqueKeys`).
@@ -465,12 +465,12 @@ An object's key holds no column, so it can't be ordered, grouped or keyset-pagin
 
 ```ts
 type SetEachRefs<T, K, A> = {
-	[C in K | UpdateKey<T> as `${A}.${C}`]: RowColumn<
-		Columns<T>[C],
-		C extends K
-			? NonNullable<Columns<T>[C]['$select']>
-			: Columns<T>[C]['$select'] | null
-	>;
+  [C in K | UpdateKey<T> as `${A}.${C}`]: RowColumn<
+    Columns<T>[C],
+    C extends K
+      ? NonNullable<Columns<T>[C]['$select']>
+      : Columns<T>[C]['$select'] | null
+  >;
 };
 ```
 
@@ -484,11 +484,11 @@ type SetEachRefs<T, K, A> = {
 
 ```ts
 type KeyColumn<T, O> = {
-	[K in Ref<RefsOf<T>>]: null extends RefsOf<T>[K]['$select']
-		? never
-		: KeyOf<K> extends keyof O
-			? K
-			: never;
+  [K in Ref<RefsOf<T>>]: null extends RefsOf<T>[K]['$select']
+    ? never
+    : KeyOf<K> extends keyof O
+      ? K
+      : never;
 }[Ref<RefsOf<T>>];
 ```
 
@@ -515,7 +515,7 @@ Each shape returns a `Query<R>` whose `R` is computed from the row `O`: `takeFir
 
 ```ts
 export type BatchResults<Q extends readonly Executable<unknown>[]> = {
-	-readonly [K in keyof Q]: Q[K] extends Executable<infer T> ? T : never;
+  -readonly [K in keyof Q]: Q[K] extends Executable<infer T> ? T : never;
 };
 ```
 
@@ -530,9 +530,9 @@ Some rules are about the **order** of calls: an update needs `set` and `where` b
 
 ```ts
 update(users) // UpdateQueryBuilder<T, undefined, 'set' | 'where'>
-	.set({ name: 'Ada' }) // UpdateQueryBuilder<T, undefined, 'where'>
-	.where('users.id', 1) // UpdateQueryBuilder<T, undefined, never>
-	.execute(); // allowed: M is never
+  .set({ name: 'Ada' }) // UpdateQueryBuilder<T, undefined, 'where'>
+  .where('users.id', 1) // UpdateQueryBuilder<T, undefined, never>
+  .execute(); // allowed: M is never
 ```
 
 - [update-query-builder.ts](update-query-builder.ts): `set(…)` returns `UpdateQueryBuilder<T, O, Exclude<M, 'set'>>`, `where` and `allRows()` return `Exclude<M, 'where'>`. `Exclude<'set' | 'where', 'set'>` is `'where'`.
@@ -605,7 +605,7 @@ Both are also checked at run time (`#joined`, `checkUniqueKeys`), because a mist
 
 ```ts
 export interface NotExecuted {
-	readonly [notExecuted]: 'A query runs with execute(): await q.expectOne().execute()';
+  readonly [notExecuted]: 'A query runs with execute(): await q.expectOne().execute()';
 }
 export function rejectAwait(_resolve: (value: NotExecuted) => unknown, reject: …): void
 ```

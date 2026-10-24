@@ -56,17 +56,17 @@ flowchart LR
 ```ts
 // a background job over every user, 1000 at a time
 for await (const batch of db.selectFrom(users).select(['users.id', 'users.email'])
-	.iterateChunks(1000, { by: 'users.id' })) { … }
+  .iterateChunks(1000, { by: 'users.id' })) { … }
 
 // an API endpoint: one page after the client's cursor
 const { rows, nextCursor, hasMore } = await db.selectFrom(posts)
-	.select(['posts.createdAt', 'posts.id', 'posts.title'])
-	.where('posts.published', true)
-	.paginateByCursor({ perPage: 20, by: ['posts.createdAt', 'posts.id'], direction: 'desc', after: req.query.cursor });
+  .select(['posts.createdAt', 'posts.id', 'posts.title'])
+  .where('posts.published', true)
+  .paginateByCursor({ perPage: 20, by: ['posts.createdAt', 'posts.id'], direction: 'desc', after: req.query.cursor });
 
 // numbered pages, with the total
 const page = await db.selectFrom(users).select(['users.id', 'users.email'])
-	.paginateByOffset({ page: 3, perPage: 50, by: 'users.id', countTotal: true }); // page.total
+  .paginateByOffset({ page: 3, perPage: 50, by: 'users.id', countTotal: true }); // page.total
 ```
 
 | Method                                                             | Returns                                                                | For                          |

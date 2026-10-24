@@ -41,15 +41,15 @@
 
 ```ts
 interface Slot {             // one per open connection
-	readonly connection: Connection;
-	busy: boolean;           // lent out (for queries, or to one caller)
-	shared: number;          // queries in flight while lent for queries; -1 when not shared
-	readonly expiresAt: number; // end of its lifetime
-	idleSince: number;
-	depth: Depth | undefined;   // its adaptive pipeline depth, once a query was timed
-	lastDone: number;           // the pool's completion count at its last completion (for the width)
-	retiring: boolean;          // taking no new queries since the width narrowed
-	readonly settled; readonly fulfilled; readonly rejected; // callbacks made once per connection
+  readonly connection: Connection;
+  busy: boolean;           // lent out (for queries, or to one caller)
+  shared: number;          // queries in flight while lent for queries; -1 when not shared
+  readonly expiresAt: number; // end of its lifetime
+  idleSince: number;
+  depth: Depth | undefined;   // its adaptive pipeline depth, once a query was timed
+  lastDone: number;           // the pool's completion count at its last completion (for the width)
+  retiring: boolean;          // taking no new queries since the width narrowed
+  readonly settled; readonly fulfilled; readonly rejected; // callbacks made once per connection
 }
 #slots = new Map<Connection, Slot>(); // every open connection
 #idle: Slot[] = [];                   // a stack: most recently used last
@@ -81,14 +81,14 @@ State lives in fields of the slot (`busy`, `shared`) rather than in sets of busy
 
 ```ts
 #take(signal): Promise<Connection> {
-	if (this.#ended) return Promise.reject(new DriverError('The pool has ended'));
-	if (signal?.aborted) return Promise.reject(new AbortError(…));
-	const idle = this.#takeIdle();
-	if (idle !== undefined) return Promise.resolve(idle.connection);
-	const waiting = this.#wait(this.#waiters, signal);
-	this.#serveWaiters(); // open a connection if there's room
-	this.#rebalance();    // or drain a shared one, if the pool is full
-	return waiting;
+  if (this.#ended) return Promise.reject(new DriverError('The pool has ended'));
+  if (signal?.aborted) return Promise.reject(new AbortError(…));
+  const idle = this.#takeIdle();
+  if (idle !== undefined) return Promise.resolve(idle.connection);
+  const waiting = this.#wait(this.#waiters, signal);
+  this.#serveWaiters(); // open a connection if there's room
+  this.#rebalance();    // or drain a shared one, if the pool is full
+  return waiting;
 }
 ```
 
@@ -101,12 +101,12 @@ State lives in fields of the slot (`busy`, `shared`) rather than in sets of busy
 
 ```ts
 #serveWaiters(): void {
-	while (this.#waiters.length + this.#sharedWaiters.length > this.#opening && this.#total() < this.#max) {
-		this.#open().then(
-			(slot) => this.#giveBack(slot),
-			(error) => { /* reject one waiter with the error; then try again for the others */ },
-		);
-	}
+  while (this.#waiters.length + this.#sharedWaiters.length > this.#opening && this.#total() < this.#max) {
+    this.#open().then(
+      (slot) => this.#giveBack(slot),
+      (error) => { /* reject one waiter with the error; then try again for the others */ },
+    );
+  }
 }
 ```
 
@@ -119,11 +119,11 @@ State lives in fields of the slot (`busy`, `shared`) rather than in sets of busy
 
 ```ts
 #releaseSlot(slot, discard) {
-	const reusable = !discard && !connection.closed && !this.#expired(slot);
-	if (!reusable) { close it; serve waiters; refill min; return; }
-	if (connection.pending > 0 || connection.transactionStatus !== 'idle') { this.#releaseWhenIdle(slot); return; }
-	this.#unlend(slot);
-	this.#giveBack(slot);
+  const reusable = !discard && !connection.closed && !this.#expired(slot);
+  if (!reusable) { close it; serve waiters; refill min; return; }
+  if (connection.pending > 0 || connection.transactionStatus !== 'idle') { this.#releaseWhenIdle(slot); return; }
+  this.#unlend(slot);
+  this.#giveBack(slot);
 }
 ```
 
@@ -146,22 +146,22 @@ When every connection is busy, a pool without pipelining makes the next query wa
 
 ```ts
 query(sql, params, options) {
-	const slot = this.#claimShared(options?.signal);
-	if (slot === undefined) return this.#queryShared(sql, params, options); // wait in line
-	const started = this.#timing();
-	return slot.connection.queryThen(sql, params, options,
-		started < 0 ? slot.settled : this.#settledTimed(slot, started));
+  const slot = this.#claimShared(options?.signal);
+  if (slot === undefined) return this.#queryShared(sql, params, options); // wait in line
+  const started = this.#timing();
+  return slot.connection.queryThen(sql, params, options,
+    started < 0 ? slot.settled : this.#settledTimed(slot, started));
 }
 
 #claimShared(signal) {
-	if (this.#pipeline <= 1 || signal?.aborted || this.#ended) return undefined;
-	const slot = this.#taking() < this.#widthLimit() // claimed before any await
-		? (this.#takeIdle() ?? this.#pickShared())
-		: this.#pickShared();
-	if (slot === undefined) return undefined;
-	this.#claim(slot);
-	if (slot.shared > 1) this.#width?.demand(); // pipelined: a wider pool might help
-	return slot;
+  if (this.#pipeline <= 1 || signal?.aborted || this.#ended) return undefined;
+  const slot = this.#taking() < this.#widthLimit() // claimed before any await
+    ? (this.#takeIdle() ?? this.#pickShared())
+    : this.#pickShared();
+  if (slot === undefined) return undefined;
+  this.#claim(slot);
+  if (slot.shared > 1) this.#width?.demand(); // pipelined: a wider pool might help
+  return slot;
 }
 ```
 
@@ -196,22 +196,22 @@ How many queries should one connection carry? Too few, and on a slow network eac
 
 ```ts
 class Depth {
-	limit = PIPELINE_FLOOR; // 100
-	#fastest = Infinity;
-	#sum = 0;
-	#count = 0;
-	sample(latency, waiting) {
-		if (latency < this.#fastest) this.#fastest = latency;
-		this.#sum += latency;
-		if (++this.#count * SAMPLE_EVERY < this.limit) return; // a round: about `limit` queries
-		const ratio = this.#sum / this.#count / this.#fastest;
-		this.#sum = 0;
-		this.#count = 0;
-		if (ratio < 1.5 && waiting)
-			this.limit = Math.min(1000, Math.ceil(this.limit * 1.5));
-		else if (ratio > 3)
-			this.limit = Math.max(100, Math.floor(this.limit * 0.75));
-	}
+  limit = PIPELINE_FLOOR; // 100
+  #fastest = Infinity;
+  #sum = 0;
+  #count = 0;
+  sample(latency, waiting) {
+    if (latency < this.#fastest) this.#fastest = latency;
+    this.#sum += latency;
+    if (++this.#count * SAMPLE_EVERY < this.limit) return; // a round: about `limit` queries
+    const ratio = this.#sum / this.#count / this.#fastest;
+    this.#sum = 0;
+    this.#count = 0;
+    if (ratio < 1.5 && waiting)
+      this.limit = Math.min(1000, Math.ceil(this.limit * 1.5));
+    else if (ratio > 3)
+      this.limit = Math.max(100, Math.floor(this.limit * 0.75));
+  }
 }
 ```
 
@@ -235,7 +235,7 @@ How many connections should queries be spread over? All of them, says intuition:
 
 - **Stalls, without a clock.** Every completion increments a counter; each slot remembers the count at its own last completion (`lastDone`). A connection's gap is how many queries the rest of the pool completed since: a **stall** if that is more than everything in flight (one turnover of the pool). A round trip doesn't trigger it (by Little's law, a query takes about one turnover, so its connection's gap is a bit less), and a GC pause doesn't either (it stops every connection at once). Each epoch of 4096 completions adds up the gaps and the stalled ones, including stalls still going on at its end (a backend can be off its CPU for longer than an epoch), as a share of connections' time.
 - **Narrowing.** With W such backends on C CPUs, each is off its CPU about 1 − C/W of the time, so W × (1 − stalled) estimates how many the server runs at once. Above 25% stalled two epochs in a row, the width drops to that estimate (not below 2 in one step). `#retire` marks the connections to drop (`retiring`: stalled ones first, then the least loaded): they take no new queries and go idle once theirs finish, while the others keep pipelining. Retiring connections aren't counted in the stalls.
-- **Judging it.** A slow query stalls its connection too, and there fewer connections only queue more queries behind it. So a narrowing is undone unless, the epoch after it settles, stalls fell by a quarter (or below 25%) and the mean latency (queries in flight and queued over the completion rate, from one clock read per epoch) didn't double; each such undo makes the next try wait four times as long (4 to 1024 epochs). It is also undone at once if, once it settled, completions come at under three fifths of the rate before. Under CPU contention the CPUs stay busy whatever the width, so that only happens behind slow queries, and the next try waits the full 1024 epochs: a workload of fast and slow queries can be bistable (slow queries starved, or fast ones stuck behind them), and every try can tip it from one to the other for a while.
+- **Judging it.** A slow query stalls its connection too, and there fewer connections only queue more queries behind it. So a narrowing is undone unless, the epoch after it settles, stalls fell by a quarter (or below 25%) and the mean latency (queries in flight and queued over the completion rate, from one clock read per epoch) didn't double; each such undo makes the next try wait four times as long (4 to 1024 epochs). It is also undone at once if, once it settled, completions come at under three fifths of the rate before, overall and in each of the last four windows of 256 completions: a client pause (a GC pause, the process descheduled on a busy host) slows only the window it falls in, and on its own would undo a narrowing that works and hold the next try back for the longest wait. Under CPU contention the CPUs stay busy whatever the width, so that only happens behind slow queries, and the next try waits the full 1024 epochs: a workload of fast and slow queries can be bistable (slow queries starved, or fast ones stuck behind them), and every try can tip it from one to the other for a while.
 - **Growing.** Below 5% stalled, while queries are pipelined or queued at the width, it grows by one. A growth that brings stalls back doubles the wait before the next (1 to 64 epochs), one that holds halves it, so it settles at the widest the server runs without stalls, probing upwards now and then in case the server got more room.
 - **Not judged:** the epoch after a change, one in which the pool ran out of queries, and one in which a connection took queries for the first time (while the pool fills up, not every connection is busy yet, and stalls read low).
 - **What it costs.** A few integer operations per completion; per epoch, one `performance.now()` and a scan of the slots; while a narrowing is judged, one more clock read per 256 completions.
@@ -253,11 +253,11 @@ The danger of sharing: under a steady stream of queries, a shared connection mig
 
 ```ts
 #rebalance() {
-	const target = this.#ended || this.#total() < this.#max ? 0 : Math.max(0, this.#waiters.length - this.#opening);
-	// release draining connections beyond the target …
-	while (this.#draining.size < target) {
-		// mark the least-loaded shared connection as draining
-	}
+  const target = this.#ended || this.#total() < this.#max ? 0 : Math.max(0, this.#waiters.length - this.#opening);
+  // release draining connections beyond the target …
+  while (this.#draining.size < target) {
+    // mark the least-loaded shared connection as draining
+  }
 }
 ```
 

@@ -40,23 +40,23 @@ flowchart LR
 ```ts
 const specs = describeTables(tables);
 const relations =
-	specs.length === 0
-		? []
-		: await readCatalog(
-				executor,
-				specs.map((s) => s.name),
-				options.schema,
-			);
+  specs.length === 0
+    ? []
+    : await readCatalog(
+        executor,
+        specs.map((s) => s.name),
+        options.schema,
+      );
 const {
-	diagnostics,
-	tables: results,
-	columns,
+  diagnostics,
+  tables: results,
+  columns,
 } = compare(specs, relations, options);
 return {
-	ok: errors === 0,
-	diagnostics,
-	tables: results,
-	summary: { errors, warnings, infos, tables, columns, durationMs },
+  ok: errors === 0,
+  diagnostics,
+  tables: results,
+  summary: { errors, warnings, infos, tables, columns, durationMs },
 };
 ```
 
@@ -68,18 +68,18 @@ It runs on the database's own executor, so it works through any executor (and in
 
 ```ts
 interface TableSpec {
-	name: string;
-	columns: ColumnSpec[];
-	site: CallSite | undefined;
+  name: string;
+  columns: ColumnSpec[];
+  site: CallSite | undefined;
 }
 interface ColumnSpec {
-	key: string; // 'createdAt'
-	name: string; // 'created_at'
-	type: SqlType; // { name: 'timestamptz', isEnum: false, modifiers: undefined, array: false }
-	enum: EnumSpec | undefined; // name, labels, site, when the (element) type is an enum
-	nullable: boolean; // from .nullable()
-	fill: 'default' | 'generated' | 'identity' | undefined;
-	site: CallSite | undefined;
+  key: string; // 'createdAt'
+  name: string; // 'created_at'
+  type: SqlType; // { name: 'timestamptz', isEnum: false, modifiers: undefined, array: false }
+  enum: EnumSpec | undefined; // name, labels, site, when the (element) type is an enum
+  nullable: boolean; // from .nullable()
+  fill: 'default' | 'generated' | 'identity' | undefined;
+  site: CallSite | undefined;
 }
 ```
 
@@ -117,10 +117,10 @@ The code says `DataType<'decimal'>` with modifiers `[10, 2]`; the catalog says `
 
 ```ts
 interface SqlType {
-	name: string; // 'numeric', 'varchar', 'integer', an enum's name, or format_type(...) for others
-	isEnum: boolean;
-	modifiers: readonly number[] | undefined; // [10, 2]; undefined = none (in the code: "any")
-	array: boolean;
+  name: string; // 'numeric', 'varchar', 'integer', an enum's name, or format_type(...) for others
+  isEnum: boolean;
+  modifiers: readonly number[] | undefined; // [10, 2]; undefined = none (in the code: "any")
+  array: boolean;
 }
 ```
 
@@ -176,24 +176,24 @@ Every diagnostic gets its `source` from the column's (or table's, or enum's) cal
 
 ```ts
 interface VerifyReport {
-	ok: boolean; // no errors
-	diagnostics: Diagnostic[]; // errors first, then table and column order
-	tables: TableResult[]; // per table: relation, kind, status, and each column's expected/actual/status/codes
-	summary: { errors; warnings; infos; tables; columns; durationMs };
+  ok: boolean; // no errors
+  diagnostics: Diagnostic[]; // errors first, then table and column order
+  tables: TableResult[]; // per table: relation, kind, status, and each column's expected/actual/status/codes
+  summary: { errors; warnings; infos; tables; columns; durationMs };
 }
 interface Diagnostic {
-	severity;
-	code;
-	message; // 'users.age is bigint in the database, but integer in the code'
-	table;
-	column?;
-	key?;
-	expected?;
-	actual?;
-	label?; // short label for the code frame: 'found bigint'
-	hint?;
-	fix?; // what to do; SQL that would fix the database
-	source?: { file; line; column }; // where the code declares it
+  severity;
+  code;
+  message; // 'users.age is bigint in the database, but integer in the code'
+  table;
+  column?;
+  key?;
+  expected?;
+  actual?;
+  label?; // short label for the code frame: 'found bigint'
+  hint?;
+  fix?; // what to do; SQL that would fix the database
+  source?: { file; line; column }; // where the code declares it
 }
 ```
 

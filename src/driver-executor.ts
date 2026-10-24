@@ -1,4 +1,4 @@
-import type { CompiledQuery } from './compile.js';
+import { type CompiledQuery, isDataStatement } from './compile.js';
 import {
 	Connection,
 	createCodecRegistry,
@@ -159,6 +159,10 @@ const interval = (timeout: number | string) =>
 const SESSION_STATEMENT =
 	/^\s*(?:begin|start|commit|end|rollback|abort|savepoint|release|prepare|set|reset|discard|listen|unlisten|declare|fetch|move|close|create\s+(?:temp|temporary|local\s+temp|local\s+temporary)\b)\b/i;
 
+/** Whether `query` may change the session or transaction state: only SQL written by hand is read. */
+const changesSession = (query: CompiledQuery): boolean =>
+	!isDataStatement(query) && SESSION_STATEMENT.test(query.sql);
+
 /**
  * Runs quarry's queries on the driver: a pool, a reserved client, a single
  * connection, or a driver transaction. Decodes values to quarry's types,
@@ -233,11 +237,8 @@ export class DriverExecutor implements TransactionExecutor {
 		const source = this.#source;
 		if (!(source instanceof Pool)) return undefined;
 		if (queries === undefined) return source;
-		if ('sql' in queries) {
-			return SESSION_STATEMENT.test(queries.sql) ? undefined : source;
-		}
-		for (const query of queries)
-			if (SESSION_STATEMENT.test(query.sql)) return undefined;
+		if ('sql' in queries) return changesSession(queries) ? undefined : source;
+		for (const query of queries) if (changesSession(query)) return undefined;
 		return source;
 	}
 

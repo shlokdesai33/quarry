@@ -46,9 +46,9 @@ A **serialization failure** (SQLSTATE `40001`) or a **deadlock** (`40P01`, two t
 
 ```ts
 await pool.transaction(async (tx) => {
-	await tx.query('insert into orders …', [...]);
-	await tx.transaction(async (sp) => { … });          // a savepoint
-	tx.afterCommit(() => queue.publish('order.created'));
+  await tx.query('insert into orders …', [...]);
+  await tx.transaction(async (sp) => { … });          // a savepoint
+  tx.afterCommit(() => queue.publish('order.created'));
 }, { isolation: 'serializable', retries: 3, settings: { 'app.tenant_id': tenant }, timeout: '10s' });
 ```
 
@@ -60,36 +60,36 @@ await pool.transaction(async (tx) => {
 
 ```ts
 static async run(conn, fn, options = {}) {
-	const opening = openingStatements(conn, options); // BEGIN …, select set_config(…)
-	running.add(conn);
-	try {
-		for (let attempt = 0; ; attempt++) {
-			const session = new Session(conn, opening);
-			const tx = new Transaction(session, 0);
-			let result;
-			try {
-				result = await fn(tx);
-				tx.#finished = true;
-				const commit = await session.query('commit');
-				if (commit.command === 'ROLLBACK') throw new TransactionRolledBack();
-			} catch (caught) {
-				tx.#finished = true;
-				const failure = await session.end(); // did BEGIN itself fail?
-				const error = failure === undefined ? caught : failure.error;
-				if (conn.transactionStatus !== 'idle') await conn.query('rollback').catch(() => {});
-				runCallbacks(tx.#afterRollback);
-				if (error instanceof PostgresError && error.isRetryable && attempt < retries) {
-					await sleep(retryDelay(attempt + 1));
-					continue;
-				}
-				throw error;
-			}
-			runCallbacks(tx.#afterCommit);
-			return result;
-		}
-	} finally {
-		running.delete(conn);
-	}
+  const opening = openingStatements(conn, options); // BEGIN …, select set_config(…)
+  running.add(conn);
+  try {
+    for (let attempt = 0; ; attempt++) {
+      const session = new Session(conn, opening);
+      const tx = new Transaction(session, 0);
+      let result;
+      try {
+        result = await fn(tx);
+        tx.#finished = true;
+        const commit = await session.query('commit');
+        if (commit.command === 'ROLLBACK') throw new TransactionRolledBack();
+      } catch (caught) {
+        tx.#finished = true;
+        const failure = await session.end(); // did BEGIN itself fail?
+        const error = failure === undefined ? caught : failure.error;
+        if (conn.transactionStatus !== 'idle') await conn.query('rollback').catch(() => {});
+        runCallbacks(tx.#afterRollback);
+        if (error instanceof PostgresError && error.isRetryable && attempt < retries) {
+          await sleep(retryDelay(attempt + 1));
+          continue;
+        }
+        throw error;
+      }
+      runCallbacks(tx.#afterCommit);
+      return result;
+    }
+  } finally {
+    running.delete(conn);
+  }
 }
 ```
 
@@ -128,12 +128,12 @@ Why **one Sync**? If BEGIN fails (an invalid option, a connection-level problem)
 
 ```ts
 class Session {
-	#opening: GroupStatement[] | undefined; // BEGIN + settings, until sent
-	#beginning = false; // BEGIN in flight
-	#waiting: Waiter[] | undefined; // sends waiting for BEGIN's outcome
-	#opened: Promise<void> | undefined; // settles when BEGIN's outcome is known
-	#failure: { error } | undefined; // why the transaction never began
-	#deferred: Promise<unknown> | undefined; // a statement sent without waiting (release savepoint)
+  #opening: GroupStatement[] | undefined; // BEGIN + settings, until sent
+  #beginning = false; // BEGIN in flight
+  #waiting: Waiter[] | undefined; // sends waiting for BEGIN's outcome
+  #opened: Promise<void> | undefined; // settles when BEGIN's outcome is known
+  #failure: { error } | undefined; // why the transaction never began
+  #deferred: Promise<unknown> | undefined; // a statement sent without waiting (release savepoint)
 }
 ```
 
@@ -151,27 +151,27 @@ A **savepoint** is a named point inside a transaction that you can roll back to 
 
 ```ts
 async transaction(fn, options = {}) {
-	if (options.durable) throw new DriverError('A durable transaction cannot run inside another transaction');
-	// isolation, readOnly, deferrable, retries: only on the outermost transaction
-	const name = `quarry_sp_${this.#depth + 1}_${++this.#savepoints}`;
-	await this.#conn.query(`savepoint ${name}`);
-	const inner = new Transaction(this.#conn, this.#depth + 1);
-	try {
-		if (options.settings) await this.#conn.query(settingsQuery(options.settings)…);
-		const result = await fn(inner);
-		if (this.#conn.transactionStatus === 'failed') await this.#conn.query(`release savepoint ${name}`); // fails, like a throw
-		else this.#conn.sendDeferred(`release savepoint ${name}`);
-		inner.#finished = true;
-		this.#afterCommit.push(...inner.#afterCommit);
-		this.#afterRollback.push(...inner.#afterRollback);
-		return result;
-	} catch (error) {
-		inner.#finished = true;
-		if (this.#conn.transactionStatus !== 'idle')
-			await Promise.all([query(`rollback to savepoint ${name}`), query(`release savepoint ${name}`)]);
-		runCallbacks(inner.#afterRollback);
-		throw error;
-	}
+  if (options.durable) throw new DriverError('A durable transaction cannot run inside another transaction');
+  // isolation, readOnly, deferrable, retries: only on the outermost transaction
+  const name = `quarry_sp_${this.#depth + 1}_${++this.#savepoints}`;
+  await this.#conn.query(`savepoint ${name}`);
+  const inner = new Transaction(this.#conn, this.#depth + 1);
+  try {
+    if (options.settings) await this.#conn.query(settingsQuery(options.settings)…);
+    const result = await fn(inner);
+    if (this.#conn.transactionStatus === 'failed') await this.#conn.query(`release savepoint ${name}`); // fails, like a throw
+    else this.#conn.sendDeferred(`release savepoint ${name}`);
+    inner.#finished = true;
+    this.#afterCommit.push(...inner.#afterCommit);
+    this.#afterRollback.push(...inner.#afterRollback);
+    return result;
+  } catch (error) {
+    inner.#finished = true;
+    if (this.#conn.transactionStatus !== 'idle')
+      await Promise.all([query(`rollback to savepoint ${name}`), query(`release savepoint ${name}`)]);
+    runCallbacks(inner.#afterRollback);
+    throw error;
+  }
 }
 ```
 
@@ -219,13 +219,13 @@ const opening = openingStatements(conn, options);
 const all = conn.queryGroup([...opening, ...statements], { signal }); // BEGIN + settings + statements, one Sync
 const results = all.slice(opening.length);
 const pipelined =
-	verify === undefined && !signal?.aborted ? conn.query('commit') : undefined; // COMMIT, own Sync
+  verify === undefined && !signal?.aborted ? conn.query('commit') : undefined; // COMMIT, own Sync
 const done = (async () => {
-	rows = await Promise.all(all);
-	verify?.(rows); // failure → rollback
-	const commit = await (pipelined ?? conn.query('commit'));
-	if (commit.command === 'ROLLBACK') throw new TransactionRolledBack();
-	return rows;
+  rows = await Promise.all(all);
+  verify?.(rows); // failure → rollback
+  const commit = await (pipelined ?? conn.query('commit'));
+  if (commit.command === 'ROLLBACK') throw new TransactionRolledBack();
+  return rows;
 })();
 return { results, done };
 ```

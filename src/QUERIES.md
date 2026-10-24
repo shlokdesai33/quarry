@@ -29,48 +29,48 @@ Each builder class holds an immutable `#state` and returns a new instance from e
 
 ```ts
 interface SelectState<T> {
-	tables: T; // the from table, then each joined table
-	from: TableNode;
-	joins: readonly JoinNode[]; // { kind: 'inner' | 'left' | 'right' | 'full' | 'cross', table, on }
-	where: WhereBuilder<RefsOf<T>>; // conditions, joined by and
-	distinct: true | readonly (OperationNode | AliasNode)[] | undefined;
-	selections: readonly SelectionNode[];
-	groupBy: readonly (OperationNode | AliasNode)[];
-	having: WhereBuilder<RefsOf<T>>;
-	orderBy: readonly OrderNode[];
-	limit: number | undefined;
-	offset: number | undefined;
-	locks: readonly LockNode[];
-	tag: string | undefined;
-	executor: Executor | undefined; // undefined when built without a database
+  tables: T; // the from table, then each joined table
+  from: TableNode;
+  joins: readonly JoinNode[]; // { kind: 'inner' | 'left' | 'right' | 'full' | 'cross', table, on }
+  where: WhereBuilder<RefsOf<T>>; // conditions, joined by and
+  distinct: true | readonly (OperationNode | AliasNode)[] | undefined;
+  selections: readonly SelectionNode[];
+  groupBy: readonly (OperationNode | AliasNode)[];
+  having: WhereBuilder<RefsOf<T>>;
+  orderBy: readonly OrderNode[];
+  limit: number | undefined;
+  offset: number | undefined;
+  locks: readonly LockNode[];
+  tag: string | undefined;
+  executor: Executor | undefined; // undefined when built without a database
 }
 interface InsertState<T> {
-	table;
-	values: RowsNode;
-	onConflict;
-	returning;
-	tag;
-	executor;
+  table;
+  values: RowsNode;
+  onConflict;
+  returning;
+  tag;
+  executor;
 }
 interface UpdateState<T, R> {
-	table;
-	scope: readonly AnyTable[]; // the table, plus the rows of a setEach
-	eb: ExpressionBuilder<R>; // over that scope
-	set: SetNode[];
-	from: UpdateFromNode | undefined; // setEach's rows: unnest(...) as alias(columns)
-	where;
-	allRows: boolean;
-	returning;
-	tag;
-	executor;
+  table;
+  scope: readonly AnyTable[]; // the table, plus the rows of a setEach
+  eb: ExpressionBuilder<R>; // over that scope
+  set: SetNode[];
+  from: UpdateFromNode | undefined; // setEach's rows: unnest(...) as alias(columns)
+  where;
+  allRows: boolean;
+  returning;
+  tag;
+  executor;
 }
 interface DeleteState<T> {
-	table;
-	where;
-	allRows: boolean;
-	returning;
-	tag;
-	executor;
+  table;
+  where;
+  allRows: boolean;
+  returning;
+  tag;
+  executor;
 }
 ```
 
@@ -182,7 +182,7 @@ Each entry carries `nest: { key, column }` on its `SelectionNode`. From those, `
 ```ts
 const active = fragment(users, (qb) => qb.where('users.status', 'active'));
 const withContacts = fragment(users, (qb) =>
-	qb.innerJoin(contacts).on('contacts.userId', 'users.id'),
+  qb.innerJoin(contacts).on('contacts.userId', 'users.id'),
 );
 
 db.selectFrom(users).pipe(withContacts).pipe(active).select(['contacts.email']);
@@ -212,21 +212,21 @@ When two programs change the same row at the same time, one can silently overwri
 
 ```ts
 await db.transaction(async (tx) => {
-	const job = await tx
-		.selectFrom(jobs)
-		.where('jobs.status', 'queued')
-		.select(['jobs.id'])
-		.forUpdate()
-		.skipLocked()
-		.limit(1)
-		.takeFirst()
-		.execute();
-	if (job)
-		await tx
-			.update(jobs)
-			.set({ status: 'running' })
-			.where('jobs.id', job.id)
-			.execute();
+  const job = await tx
+    .selectFrom(jobs)
+    .where('jobs.status', 'queued')
+    .select(['jobs.id'])
+    .forUpdate()
+    .skipLocked()
+    .limit(1)
+    .takeFirst()
+    .execute();
+  if (job)
+    await tx
+      .update(jobs)
+      .set({ status: 'running' })
+      .where('jobs.id', job.id)
+      .execute();
 });
 ```
 
@@ -256,14 +256,14 @@ Result shapes add no `limit`, so **every row the query returns is locked**, even
 
 ```ts
 db.insertInto(users)
-	.values({ email: 'ada@example.com', name: 'Ada' })
-	.execute(); // { rowCount: 1 }
+  .values({ email: 'ada@example.com', name: 'Ada' })
+  .execute(); // { rowCount: 1 }
 db.insertInto(users)
-	.values([
-		{ email: 'a@x', name: null },
-		{ email: 'b@x', name: 'B' },
-	])
-	.execute();
+  .values([
+    { email: 'a@x', name: null },
+    { email: 'b@x', name: 'B' },
+  ])
+  .execute();
 db.insertInto(users).values(row).returning(['users.id']).expectOne().execute(); // { id: number }
 ```
 
@@ -289,13 +289,13 @@ db.insertInto(users).values(row).returning(['users.id']).expectOne().execute(); 
 ```ts
 db.update(users).set({ name: 'Ada' }).where('users.id', id).execute(); // { rowCount }
 db.update(users)
-	.set((eb) => ({ email: eb.fn.lower('users.email') }))
-	.allRows()
-	.execute();
+  .set((eb) => ({ email: eb.fn.lower('users.email') }))
+  .allRows()
+  .execute();
 db.update(posts)
-	.set((eb) => ({ views: eb.ref('posts.views').plus(1) })) // an increment
-	.where('posts.id', id)
-	.execute();
+  .set((eb) => ({ views: eb.ref('posts.views').plus(1) })) // an increment
+  .where('posts.id', id)
+  .execute();
 ```
 
 - `set(values | (eb) => values)` takes columns of the update type, or expressions evaluating to it; read-only columns aren't offered. Calls **add up**: a column set again keeps its place and takes the new value (`setNodes` merges into a `Map` keyed by database name). An `undefined` value leaves its column out; if that leaves nothing, it throws (an update that sets nothing is almost always a bug).
@@ -309,16 +309,16 @@ db.update(posts)
 
 ```ts
 await db
-	.update(products)
-	.setEach(
-		[
-			{ id: 1, price: '9.99', stock: 12 },
-			{ id: 2, price: '19.99' }, // leaves stock as it is
-		],
-		{ key: 'id' }, // or { key: ['tenantId', 'sku'] }
-	)
-	.expectRows(2)
-	.execute();
+  .update(products)
+  .setEach(
+    [
+      { id: 1, price: '9.99', stock: 12 },
+      { id: 2, price: '19.99' }, // leaves stock as it is
+    ],
+    { key: 'id' }, // or { key: ['tenantId', 'sku'] }
+  )
+  .expectRows(2)
+  .execute();
 ```
 
 compiles to (real `toSQL()`):
@@ -349,9 +349,9 @@ Array-typed columns can't be sent through `unnest` (it would flatten them); such
 ```ts
 db.deleteFrom(users).where('users.id', id).execute();
 db.deleteFrom(sessions)
-	.where((eb) => eb.ref('sessions.expiresAt').lt(now))
-	.returning(['sessions.id'])
-	.execute();
+  .where((eb) => eb.ref('sessions.expiresAt').lt(now))
+  .returning(['sessions.id'])
+  .execute();
 db.deleteFrom(logs).allRows().execute();
 ```
 
@@ -362,10 +362,10 @@ The same `where` / `allRows` rule as update.
 ```ts
 const { rowCount } = await db.sql`vacuum analyze posts`.execute();
 const n = await db.sql<{
-	n: string;
+  n: string;
 }>`select count(*) as n from posts where author_id = ${id}`
-	.expectValue()
-	.execute();
+  .expectValue()
+  .execute();
 ```
 
 `db.sql` (and `tx.sql`, on the transaction's connection) runs a whole statement written by hand ([sql.ts](sql.ts) `SqlQuery`). Interpolated values become parameters; expressions, tables, `sql.id(…)`, `sql.lit(…)` and `sql.join(…)` are written into the SQL. It has every result shape, `expectRows`, and works in `db.batch`. The row type `R` is a promise you make: nothing checks it. The `sql` fragment tag for use inside builder queries is in [EXPRESSIONS.md](EXPRESSIONS.md#raw-sql-fragments).
@@ -406,9 +406,9 @@ A shape ([shape.ts](shape.ts)) is three things:
 
 ```ts
 interface Shape<R> {
-	read: (input: ShapeInput) => R; // rows → result, or throw
-	checked: boolean; // can `read` throw? (expect… shapes)
-	rows?: ReadOptions; // { keepRows?, rowMode? }: what the driver should return
+  read: (input: ShapeInput) => R; // rows → result, or throw
+  checked: boolean; // can `read` throw? (expect… shapes)
+  rows?: ReadOptions; // { keepRows?, rowMode? }: what the driver should return
 }
 ```
 
@@ -416,17 +416,17 @@ interface Shape<R> {
 
 ```ts
 return new Query({
-	query,
-	executor,
-	checked: shape.checked,
-	rows: shape.rows,
-	read: ({ rows, rowCount }) =>
-		shape.read({
-			query,
-			table,
-			rows,
-			count: Math.max(rowCount ?? 0, rows.length),
-		}),
+  query,
+  executor,
+  checked: shape.checked,
+  rows: shape.rows,
+  read: ({ rows, rowCount }) =>
+    shape.read({
+      query,
+      table,
+      rows,
+      count: Math.max(rowCount ?? 0, rows.length),
+    }),
 });
 ```
 

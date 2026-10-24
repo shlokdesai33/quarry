@@ -20,23 +20,23 @@ pnpm build # dist/: the quarry and quarry/driver entry points, and the quarry CL
 import { database, defineTable, integer, text, timestamptz } from 'quarry';
 
 const users = defineTable('users', {
-	columns: {
-		id: integer().identity(),
-		email: text(),
-		name: text().nullable(),
-		createdAt: timestamptz().name('created_at').default(),
-	},
+  columns: {
+    id: integer().identity(),
+    email: text(),
+    name: text().nullable(),
+    createdAt: timestamptz().name('created_at').default(),
+  },
 });
 
 const db = database({ connectionString: process.env.DATABASE_URL });
 
 // { id: number; name: string | null }
 const user = await db
-	.selectFrom(users)
-	.where('users.email', 'ada@example.com')
-	.select(['users.id', 'users.name'])
-	.expectOne()
-	.execute();
+  .selectFrom(users)
+  .where('users.email', 'ada@example.com')
+  .select(['users.id', 'users.name'])
+  .expectOne()
+  .execute();
 ```
 
 ## Contents
@@ -54,39 +54,39 @@ const user = await db
 
 ```ts
 import {
-	array,
-	bigint,
-	boolean,
-	defineEnum,
-	defineTable,
-	integer,
-	jsonb,
-	text,
-	timestamptz,
-	varchar,
+  array,
+  bigint,
+  boolean,
+  defineEnum,
+  defineTable,
+  integer,
+  jsonb,
+  text,
+  timestamptz,
+  varchar,
 } from 'quarry';
 
 export const role = defineEnum('user_role', ['admin', 'member', 'guest']);
 
 export const users = defineTable('users', {
-	columns: {
-		id: integer().identity(),
-		email: varchar(320),
-		name: text().nullable(),
-		role: role().default(),
-		tags: array(text()).default(),
-		settings: jsonb<{ theme: 'light' | 'dark' }>().default(),
-		createdAt: timestamptz().name('created_at').default(),
-	},
+  columns: {
+    id: integer().identity(),
+    email: varchar(320),
+    name: text().nullable(),
+    role: role().default(),
+    tags: array(text()).default(),
+    settings: jsonb<{ theme: 'light' | 'dark' }>().default(),
+    createdAt: timestamptz().name('created_at').default(),
+  },
 });
 
 export const posts = defineTable('posts', {
-	columns: {
-		id: bigint().identity(),
-		authorId: integer().name('author_id'),
-		title: text(),
-		published: boolean().default(),
-	},
+  columns: {
+    id: bigint().identity(),
+    authorId: integer().name('author_id'),
+    title: text(),
+    published: boolean().default(),
+  },
 });
 ```
 
@@ -149,7 +149,7 @@ import { defineEnum, defineTable } from 'quarry';
 const status = defineEnum('order_status', ['pending', 'paid', 'shipped']);
 
 const orders = defineTable('orders', {
-	columns: { status: status().default() },
+  columns: { status: status().default() },
 });
 ```
 
@@ -165,11 +165,11 @@ import { bigint, codecs, defineTable, defineType, timestamptz } from 'quarry';
 const citext = defineType({ sql: 'citext', codec: codecs.text });
 
 const events = defineTable('events', {
-	columns: {
-		id: bigint().identity().useCodec(codecs.int8), // bigint instead of string
-		at: timestamptz().useCodec(codecs.raw), // the server's text
-		key: citext(),
-	},
+  columns: {
+    id: bigint().identity().useCodec(codecs.int8), // bigint instead of string
+    at: timestamptz().useCodec(codecs.raw), // the server's text
+    key: citext(),
+  },
 });
 ```
 
@@ -189,8 +189,8 @@ type UserPatch = InferUpdateType<typeof users>; // every writable column optiona
 import { database } from 'quarry';
 
 const db = database(
-	{ connectionString: process.env.DATABASE_URL, max: 20 },
-	{ onQuery: (event) => console.debug(event.sql, event.durationMs) },
+  { connectionString: process.env.DATABASE_URL, max: 20 },
+  { onQuery: (event) => console.debug(event.sql, event.durationMs) },
 );
 ```
 
@@ -209,36 +209,36 @@ const db = database(
 ```ts
 // { id: string; title: string; name: string | null }[]
 const rows = await db
-	.selectFrom(posts)
-	.innerJoin(users)
-	.on('users.id', 'posts.authorId')
-	.where('posts.published', true)
-	.select(['posts.id', 'posts.title', 'users.name'])
-	.orderBy('posts.id', 'desc')
-	.limit(20)
-	.execute();
+  .selectFrom(posts)
+  .innerJoin(users)
+  .on('users.id', 'posts.authorId')
+  .where('posts.published', true)
+  .select(['posts.id', 'posts.title', 'users.name'])
+  .orderBy('posts.id', 'desc')
+  .limit(20)
+  .execute();
 ```
 
 `select` takes columns (keyed by name) or a callback returning columns and aliased expressions; each call adds to the list. `selectAll('users')` selects every column of a table, named as it goes by in the query (its alias, `selectAll('u')`, when aliased). Only tables in scope can be referenced.
 
 ```ts
 const emails = await db
-	.selectFrom(users)
-	.select((eb) => ['users.id', eb.fn.lower('users.email').as('email')])
-	.execute();
+  .selectFrom(users)
+  .select((eb) => ['users.id', eb.fn.lower('users.email').as('email')])
+  .execute();
 ```
 
 ### Where
 
 ```ts
 const admins = await db
-	.selectFrom(users)
-	.where('users.role', 'admin') // equality
-	.where((eb) =>
-		eb.or([eb.ref('users.name').isNull(), eb.ref('users.name').like('A%')]),
-	)
-	.select(['users.id'])
-	.execute();
+  .selectFrom(users)
+  .where('users.role', 'admin') // equality
+  .where((eb) =>
+    eb.or([eb.ref('users.name').isNull(), eb.ref('users.name').like('A%')]),
+  )
+  .select(['users.id'])
+  .execute();
 ```
 
 `where` takes `(column, value)`, a callback returning a condition, or a predicate built elsewhere. Several calls are joined with `and`.
@@ -247,11 +247,11 @@ const admins = await db
 
 ```ts
 const rows = await db
-	.selectFrom(users)
-	.leftJoin(posts)
-	.on('posts.authorId', 'users.id')
-	.select(['users.email', 'posts.title']) // title: string | null
-	.execute();
+  .selectFrom(users)
+  .leftJoin(posts)
+  .on('posts.authorId', 'users.id')
+  .select(['users.email', 'posts.title']) // title: string | null
+  .execute();
 ```
 
 `innerJoin`, `leftJoin`, `rightJoin`, `fullJoin` and `crossJoin`. `on` takes two columns of comparable types (the joined table's first) or any `where` form. Outer joins make the columns of the optional side nullable.
@@ -261,25 +261,25 @@ const rows = await db
 ```ts
 // { id: number; posts: { id: string; title: string } | null }[]
 const rows = await db
-	.selectFrom(users)
-	.leftJoin(posts)
-	.on('posts.authorId', 'users.id')
-	.select(({ nest }) => ['users.id', nest('posts', ['id', 'title'])])
-	.execute();
+  .selectFrom(users)
+  .leftJoin(posts)
+  .on('posts.authorId', 'users.id')
+  .select(({ nest }) => ['users.id', nest('posts', ['id', 'title'])])
+  .execute();
 ```
 
 ### Ordering, limit and distinct
 
 ```ts
 const page = await db
-	.selectFrom(posts)
-	.select(['posts.authorId', 'posts.title'])
-	.distinctOn(['posts.authorId'])
-	.orderBy('posts.authorId')
-	.orderBy('posts.id', 'desc', { nulls: 'last' })
-	.limit(20)
-	.offset(40)
-	.execute();
+  .selectFrom(posts)
+  .select(['posts.authorId', 'posts.title'])
+  .distinctOn(['posts.authorId'])
+  .orderBy('posts.authorId')
+  .orderBy('posts.id', 'desc', { nulls: 'last' })
+  .limit(20)
+  .offset(40)
+  .execute();
 ```
 
 `orderBy` takes a column, a selected key or an expression callback; several calls add keys. `distinct()` and `distinctOn([...])` are available.
@@ -289,14 +289,14 @@ const page = await db
 ```ts
 // { id: number; postCount: string }[]
 const authors = await db
-	.selectFrom(users)
-	.leftJoin(posts)
-	.on('posts.authorId', 'users.id')
-	.select((eb) => ['users.id', eb.fn.count('posts.id').as('postCount')])
-	.groupBy(['users.id'])
-	.having((eb) => eb.fn.count('posts.id').gte('5'))
-	.orderBy('postCount', 'desc')
-	.execute();
+  .selectFrom(users)
+  .leftJoin(posts)
+  .on('posts.authorId', 'users.id')
+  .select((eb) => ['users.id', eb.fn.count('posts.id').as('postCount')])
+  .groupBy(['users.id'])
+  .having((eb) => eb.fn.count('posts.id').gte('5'))
+  .orderBy('postCount', 'desc')
+  .execute();
 ```
 
 Aggregates have Postgres's types: `count` is a `bigint` (a string; `eb.fn.cast(eb.fn.count(), 'integer')` for a number), `sum` of an `integer` is a `bigint`, `avg` a `numeric`, and `min`/`max` keep their argument's type.
@@ -338,35 +338,35 @@ jsonb on `eb.json`: `get` (`->`), `text` (`->>`), `hasKey`, `hasAnyKey`, `hasAll
 
 ```ts
 const rows = await db
-	.selectFrom(users)
-	.where((eb) => eb.json.text('users.settings', 'theme').eq('dark'))
-	.where((eb) => eb.ref('users.tags').contains(['beta']))
-	.select((eb) => [
-		eb.fn.coalesce('users.name', eb.val('anonymous')).as('name'),
-		eb
-			.case()
-			.when(eb.ref('users.role').eq('admin'), 'staff')
-			.else('customer')
-			.end()
-			.as('kind'),
-	])
-	.execute();
+  .selectFrom(users)
+  .where((eb) => eb.json.text('users.settings', 'theme').eq('dark'))
+  .where((eb) => eb.ref('users.tags').contains(['beta']))
+  .select((eb) => [
+    eb.fn.coalesce('users.name', eb.val('anonymous')).as('name'),
+    eb
+      .case()
+      .when(eb.ref('users.role').eq('admin'), 'staff')
+      .else('customer')
+      .end()
+      .as('kind'),
+  ])
+  .execute();
 ```
 
 ### Locking
 
 ```ts
 await db.transaction(async (tx) => {
-	const post = await tx
-		.selectFrom(posts)
-		.where('posts.published', false)
-		.select(['posts.id'])
-		.orderBy('posts.id')
-		.limit(1)
-		.forUpdate()
-		.skipLocked()
-		.takeFirst()
-		.execute();
+  const post = await tx
+    .selectFrom(posts)
+    .where('posts.published', false)
+    .select(['posts.id'])
+    .orderBy('posts.id')
+    .limit(1)
+    .forUpdate()
+    .skipLocked()
+    .takeFirst()
+    .execute();
 });
 ```
 
@@ -381,13 +381,13 @@ const published = fragment(posts, (qb) => qb.where('posts.published', true));
 
 // { title: string; name?: string | null }[]
 const rows = await db
-	.selectFrom(posts)
-	.innerJoin(users)
-	.on('users.id', 'posts.authorId')
-	.pipe(published)
-	.select(['posts.title'])
-	.when(withAuthor, (qb) => qb.select(['users.name']))
-	.execute();
+  .selectFrom(posts)
+  .innerJoin(users)
+  .on('users.id', 'posts.authorId')
+  .pipe(published)
+  .select(['posts.title'])
+  .when(withAuthor, (qb) => qb.select(['users.name']))
+  .execute();
 ```
 
 `when(condition, build)` applies `build` only when `condition` holds; columns it selects are optional in the row. `fragment(tables, build)` defines a piece that `pipe` applies to any query containing those tables, adding its joins and columns.
@@ -397,22 +397,22 @@ const rows = await db
 ```ts
 // keyset pagination, for APIs: { rows, nextCursor, hasMore }
 const page = await db
-	.selectFrom(posts)
-	.select(['posts.id', 'posts.title'])
-	.paginateByCursor({ perPage: 20, by: 'posts.id', after: cursor });
+  .selectFrom(posts)
+  .select(['posts.id', 'posts.title'])
+  .paginateByCursor({ perPage: 20, by: 'posts.id', after: cursor });
 
 // numbered pages: { rows, page, perPage, hasMore, total }
 const numbered = await db
-	.selectFrom(users)
-	.select(['users.id', 'users.email'])
-	.paginateByOffset({ page: 2, perPage: 50, by: 'users.id', countTotal: true });
+  .selectFrom(users)
+  .select(['users.id', 'users.email'])
+  .paginateByOffset({ page: 2, perPage: 50, by: 'users.id', countTotal: true });
 
 // every row, in keyset batches of 1000
 for await (const batch of db
-	.selectFrom(users)
-	.select(['users.id'])
-	.iterateChunks(1000, { by: 'users.id' })) {
-	console.log(batch.length);
+  .selectFrom(users)
+  .select(['users.id'])
+  .iterateChunks(1000, { by: 'users.id' })) {
+  console.log(batch.length);
 }
 ```
 
@@ -422,10 +422,10 @@ for await (const batch of db
 
 ```ts
 for await (const user of db
-	.selectFrom(users)
-	.select(['users.id', 'users.email'])
-	.stream({ batchSize: 1000 })) {
-	console.log(user.email);
+  .selectFrom(users)
+  .select(['users.id', 'users.email'])
+  .stream({ batchSize: 1000 })) {
+  console.log(user.email);
 }
 ```
 
@@ -438,19 +438,19 @@ for await (const user of db
 ```ts
 // { id: number; createdAt: Date }
 const user = await db
-	.insertInto(users)
-	.values({ email: 'ada@example.com', name: 'Ada' })
-	.returning(['users.id', 'users.createdAt'])
-	.expectOne()
-	.execute();
+  .insertInto(users)
+  .values({ email: 'ada@example.com', name: 'Ada' })
+  .returning(['users.id', 'users.createdAt'])
+  .expectOne()
+  .execute();
 
 await db
-	.insertInto(users)
-	.values([
-		{ email: 'alan@example.com', name: 'Alan' },
-		{ email: 'grace@example.com', name: null },
-	])
-	.execute();
+  .insertInto(users)
+  .values([
+    { email: 'alan@example.com', name: 'Alan' },
+    { email: 'grace@example.com', name: null },
+  ])
+  .execute();
 ```
 
 `values` is typed by [`InferInsertType`](#row-types). An array of rows is sent as one array parameter per column through `unnest`, so the SQL is the same for any number of rows.
@@ -459,11 +459,11 @@ await db
 
 ```ts
 await db
-	.insertInto(users)
-	.values({ email: 'ada@example.com', name: 'Ada' })
-	.onConflict('email')
-	.doUpdate((excluded) => ({ name: excluded.name }))
-	.execute();
+  .insertInto(users)
+  .values({ email: 'ada@example.com', name: 'Ada' })
+  .onConflict('email')
+  .doUpdate((excluded) => ({ name: excluded.name }))
+  .execute();
 ```
 
 `onConflict(column | columns)` then `doNothing()`, `merge(columns?)` (set each column to the proposed value) or `doUpdate((excluded, eb) => set)`. `.onConflict(...).where(...)` targets a partial unique index.
@@ -472,11 +472,11 @@ await db
 
 ```ts
 await db
-	.update(users)
-	.set((eb) => ({ name: 'Ada Lovelace', email: eb.fn.lower('users.email') }))
-	.where('users.id', id)
-	.expectRows(1)
-	.execute();
+  .update(users)
+  .set((eb) => ({ name: 'Ada Lovelace', email: eb.fn.lower('users.email') }))
+  .where('users.id', id)
+  .expectRows(1)
+  .execute();
 ```
 
 `set` takes values or expressions for writable columns. An update runs only once it has a `where`, `.allRows()` or `setEach`; otherwise `execute()` is a type error. The same applies to deletes.
@@ -485,15 +485,15 @@ await db
 
 ```ts
 await db
-	.update(users)
-	.setEach(
-		[
-			{ id: 1, name: 'Ada' },
-			{ id: 2, email: 'alan@example.com' },
-		],
-		{ key: 'id' },
-	)
-	.execute();
+  .update(users)
+  .setEach(
+    [
+      { id: 1, name: 'Ada' },
+      { id: 2, email: 'alan@example.com' },
+    ],
+    { key: 'id' },
+  )
+  .execute();
 ```
 
 Each row is updated to its own values in one statement, matched by `key` (a column or a composite key). A column a row leaves out keeps its value; `null` sets it to null. The rows are in scope as `row` (or `as: 'name'`) in `set`, `where` and `returning`, e.g. `.where((eb) => eb.ref('users.name').ne(eb.ref('row.name')))`.
@@ -524,11 +524,11 @@ await db.deleteFrom(posts).where('posts.published', false).execute(); // { rowCo
 
 ```ts
 const email = await db
-	.selectFrom(users)
-	.where('users.id', id)
-	.select(['users.email'])
-	.expectValue((error) => new Error(`no user ${id}`, { cause: error }))
-	.execute(); // string
+  .selectFrom(users)
+  .where('users.id', id)
+  .select(['users.email'])
+  .expectValue((error) => new Error(`no user ${id}`, { cause: error }))
+  .execute(); // string
 ```
 
 The shape goes before `execute()` and leaves the SQL unchanged. `takeValue` and `expectValue` need exactly one selected column. Each `expect…` takes an optional function that maps its error to yours.
@@ -539,10 +539,10 @@ The shape goes before `execute()` and leaves the SQL unchanged. `takeValue` and 
 const controller = new AbortController();
 
 const rows = await db
-	.selectFrom(users)
-	.select(['users.id'])
-	.tag('users.list')
-	.execute({ signal: controller.signal, timeout: '2s' });
+  .selectFrom(users)
+  .select(['users.id'])
+  .tag('users.list')
+  .execute({ signal: controller.signal, timeout: '2s' });
 ```
 
 | Option    | Description                                                                                      |
@@ -558,13 +558,13 @@ const rows = await db
 
 ```ts
 const [user, titles, { rowCount }] = await db.batch([
-	db
-		.selectFrom(users)
-		.where('users.id', id)
-		.select(['users.email'])
-		.expectOne(),
-	db.selectFrom(posts).where('posts.authorId', id).select(['posts.title']),
-	db.update(users).set({ name: 'Ada' }).where('users.id', id),
+  db
+    .selectFrom(users)
+    .where('users.id', id)
+    .select(['users.email'])
+    .expectOne(),
+  db.selectFrom(posts).where('posts.authorId', id).select(['posts.title']),
+  db.update(users).set({ name: 'Ada' }).where('users.id', id),
 ]);
 ```
 
@@ -574,17 +574,17 @@ const [user, titles, { rowCount }] = await db.batch([
 
 ```ts
 const postId = await db.transaction(
-	async (tx) => {
-		const post = await tx
-			.insertInto(posts)
-			.values({ authorId: id, title: 'Hello' })
-			.returning(['posts.id'])
-			.expectOne()
-			.execute();
-		tx.afterCommit(() => console.log('created', post.id));
-		return post.id;
-	},
-	{ isolation: 'serializable', retries: 3 },
+  async (tx) => {
+    const post = await tx
+      .insertInto(posts)
+      .values({ authorId: id, title: 'Hello' })
+      .returning(['posts.id'])
+      .expectOne()
+      .execute();
+    tx.afterCommit(() => console.log('created', post.id));
+    return post.id;
+  },
+  { isolation: 'serializable', retries: 3 },
 );
 ```
 
@@ -603,16 +603,16 @@ Options: `isolation`, `readOnly`, `deferrable`, `retries` (re-runs on serializat
 import { sql } from 'quarry';
 
 const rows = await db
-	.selectFrom(users)
-	.select((eb) => [
-		sql<number>`extract(epoch from ${eb.ref('users.createdAt')})`.as('epoch'),
-	])
-	.where((eb) => sql<boolean>`${eb.ref('users.name')} % ${search}`)
-	.execute();
+  .selectFrom(users)
+  .select((eb) => [
+    sql<number>`extract(epoch from ${eb.ref('users.createdAt')})`.as('epoch'),
+  ])
+  .where((eb) => sql<boolean>`${eb.ref('users.name')} % ${search}`)
+  .execute();
 
 const count = await db.sql<{ n: string }>`select count(*) as n from posts`
-	.expectValue()
-	.execute();
+  .expectValue()
+  .execute();
 ```
 
 `sql` fragments work wherever an expression does; `db.sql` runs a whole statement with every result shape. Interpolated values are parameters; expressions, tables, `sql.id(...)` (identifiers), `sql.lit(...)` (literals) and `sql.join([...])` (lists) are written into the SQL.
@@ -623,17 +623,17 @@ const count = await db.sql<{ n: string }>`select count(*) as n from posts`
 import { UniqueViolation, violatedColumns } from 'quarry';
 
 try {
-	await db
-		.insertInto(users)
-		.values({ email: 'ada@example.com', name: null })
-		.execute();
+  await db
+    .insertInto(users)
+    .values({ email: 'ada@example.com', name: null })
+    .execute();
 } catch (error) {
-	if (
-		error instanceof UniqueViolation &&
-		violatedColumns(error, users)?.includes('email')
-	) {
-		console.log('email taken');
-	}
+  if (
+    error instanceof UniqueViolation &&
+    violatedColumns(error, users)?.includes('email')
+  ) {
+    console.log('email taken');
+  }
 }
 ```
 
@@ -662,8 +662,8 @@ import { database, defineConfig } from 'quarry';
 import * as schema from './src/schema.ts';
 
 export default defineConfig({
-	db: database({ connectionString: process.env.DATABASE_URL }),
-	schema,
+  db: database({ connectionString: process.env.DATABASE_URL }),
+  schema,
 });
 ```
 
@@ -681,27 +681,27 @@ It checks: missing tables and columns, SQL types (with modifiers and arrayness),
 import { connect, createPool } from 'quarry/driver';
 
 const pool = createPool({
-	connectionString: process.env.DATABASE_URL,
-	max: 20,
+  connectionString: process.env.DATABASE_URL,
+  max: 20,
 });
 
 const { rows, rowCount } = await pool.query(
-	'select id, email from users where id = $1',
-	[42],
+  'select id, email from users where id = $1',
+  [42],
 );
 
 await pool.transaction(
-	async (tx) => {
-		await tx.query('insert into posts (author_id, title) values ($1, $2)', [
-			42,
-			'Hi',
-		]);
-	},
-	{ isolation: 'serializable', retries: 3 },
+  async (tx) => {
+    await tx.query('insert into posts (author_id, title) values ($1, $2)', [
+      42,
+      'Hi',
+    ]);
+  },
+  { isolation: 'serializable', retries: 3 },
 );
 
 for await (const row of pool.stream('select * from posts')) {
-	console.log(row);
+  console.log(row);
 }
 
 await pool.copyRows('copy posts (author_id, title) from stdin', [[42, 'Hi']]);
@@ -777,9 +777,9 @@ Options resolve like libpq: the options object, then the connection string (`pos
 import { connect } from 'quarry/driver';
 
 await using conn = await connect({
-	host: 'db.example.com',
-	ssl: { mode: 'verify-full', rootCertFile: 'system', negotiation: 'direct' },
-	requireAuth: 'scram-sha-256',
+  host: 'db.example.com',
+  ssl: { mode: 'verify-full', rootCertFile: 'system', negotiation: 'direct' },
+  requireAuth: 'scram-sha-256',
 });
 ```
 
@@ -795,15 +795,15 @@ A codec encodes one type's parameters and decodes its results. `defaultCodecs` d
 import { codecs, createPool, defineCodec } from 'quarry/driver';
 
 const numericAsNumber = defineCodec({
-	name: 'numeric',
-	oid: 1700,
-	arrayOid: 1231,
-	encode: (value: number) => value.toFixed(2),
-	decodeText: (text) => Number(text),
+  name: 'numeric',
+  oid: 1700,
+  arrayOid: 1231,
+  encode: (value: number) => value.toFixed(2),
+  decodeText: (text) => Number(text),
 });
 
 const pool = createPool({
-	codecs: [codecs.int8AsString, codecs.timestamptz, numericAsNumber],
+  codecs: [codecs.int8AsString, codecs.timestamptz, numericAsNumber],
 });
 ```
 
@@ -817,82 +817,86 @@ const pool = createPool({
 
 ## Benchmarks
 
-`quarry/driver` against `pg` (unnamed and named statements), `pg-native`, postgres.js and Bun.sql, at commit `a4c50c8`: PostgreSQL 18.6 on an 8-vCPU VM (client, server and proxies on separate pinned cores), Node 24.22, Bun 1.4.3, Deno 2.9.7. Each cell ran 5 times in a fresh process in a shuffled order; figures are medians. quarry decodes like `pg` here (int8 and numeric as strings, timestamptz as `Date`), and all 608 result-equality checks across clients passed.
+`quarry/driver` against `pg` (unnamed and named statements), `pg-native`, postgres.js and Bun.sql, at commit `b02e93f`: PostgreSQL 18.6 on an 8-vCPU VM (client, server and proxies on separate pinned cores), Node 24.22, Bun 1.4.3, Deno 2.9.7. Each cell ran 5 times in a fresh process in a shuffled order; figures are medians of the runs. quarry decodes like `pg` here (int8 and numeric as strings, timestamptz as `Date`), and all 608 result-equality checks across clients passed.
 
 **Single queries, Node 24 (median latency)**
 
 | Scenario                     |      quarry |      pg | pg (named) | pg-native | postgres.js |
 | ---------------------------- | ----------: | ------: | ---------: | --------: | ----------: |
-| `select 1`                   | **21.5 µs** | 26.5 µs |    26.7 µs |   31.6 µs |     28.9 µs |
-| Point lookup by primary key  | **26.7 µs** | 47.6 µs |    35.3 µs |   50.6 µs |     33.2 µs |
-| Range scan, 100 rows         | **89.2 µs** |  191 µs |     184 µs |    200 µs |      159 µs |
-| Fetch 1,000 rows (6 columns) |  **316 µs** | 1.35 ms |    1.27 ms |   1.69 ms |      946 µs |
-| Insert one row               | **26.0 µs** | 39.2 µs |    31.0 µs |   44.7 µs |     34.2 µs |
-| `begin; insert; commit`      | **51.3 µs** | 81.7 µs |    72.2 µs |    101 µs |     88.7 µs |
-| A failing query              | **33.7 µs** | 2.36 ms |    2.42 ms |   4.81 ms |     55.2 µs |
+| `select 1`                   | **21.4 µs** | 26.2 µs |    26.2 µs |   31.5 µs |     28.2 µs |
+| Point lookup by primary key  | **26.4 µs** | 46.1 µs |    34.5 µs |   50.0 µs |     32.6 µs |
+| Range scan, 100 rows         | **88.1 µs** |  188 µs |     182 µs |    198 µs |      154 µs |
+| Fetch 1,000 rows (6 columns) |  **311 µs** | 1.34 ms |    1.30 ms |   1.62 ms |      918 µs |
+| Insert one row               | **25.8 µs** | 38.7 µs |    30.1 µs |   43.9 µs |     33.4 µs |
+| `begin; insert; commit`      | **50.7 µs** | 80.9 µs |    71.9 µs |   98.2 µs |     87.0 µs |
+| A failing query              | **33.7 µs** | 2.27 ms |    2.32 ms |   4.69 ms |     53.2 µs |
 
-**Large results, Node 24 (time per fetch)**
+**Large results, Node 24 (mean time per fetch)**
 
 | Scenario                                       |      quarry |       pg | pg-native | postgres.js |
 | ---------------------------------------------- | ----------: | -------: | --------: | ----------: |
-| Fetch 100,000 rows                             | **35.6 ms** |   128 ms |    149 ms |      101 ms |
-| Fetch 1,000,000 rows                           |  **521 ms** | 1,279 ms |  1,488 ms |    1,069 ms |
-| Stream 1,000,000 rows (cursor)                 |  **315 ms** | 1,298 ms |       n/a |    1,095 ms |
-| Wide rows: 1,000 × 100 columns                 | **3.65 ms** | 14.74 ms |  21.85 ms |    15.09 ms |
-| Arrays: 1,000 rows of `int4[100]` + `text[20]` | **3.18 ms** | 22.77 ms |  26.92 ms |     8.82 ms |
-| 10 × 1 MB `bytea`                              | **3.55 ms** | 17.22 ms |  31.73 ms |    18.43 ms |
+| Fetch 100,000 rows                             | **26.1 ms** |   118 ms |    144 ms |     94.9 ms |
+| Fetch 1,000,000 rows                           |  **412 ms** | 1,295 ms |  1,549 ms |    1,038 ms |
+| Stream 1,000,000 rows (cursor)                 |  **313 ms** | 1,241 ms |       n/a |    1,037 ms |
+| Wide rows: 1,000 × 100 columns                 | **3.81 ms** | 14.08 ms |  21.30 ms |    16.30 ms |
+| Arrays: 1,000 rows of `int4[100]` + `text[20]` | **3.34 ms** | 23.18 ms |  25.81 ms |     8.94 ms |
+| 10 × 1 MB `bytea`                              | **4.46 ms** | 17.41 ms |  32.35 ms |    15.65 ms |
+
+At equal work (the same operations for every client), fetching 1,000,000 rows three times peaks at 736 MB RSS, against 818 MB for postgres.js and 1,370 MB for `pg`.
 
 **Concurrency, Node 24 (point lookups/s)**
 
 | Pool / callers |      quarry | quarry, `pipeline: false` |     pg | postgres.js |
 | -------------- | ----------: | ------------------------: | -----: | ----------: |
-| 1 / 1,000      | **113,723** |                    34,942 | 20,088 |     109,121 |
-| 10 / 100       | **410,913** |                    95,917 | 64,722 |      41,068 |
-| 10 / 500       | **467,543** |                   105,341 | 63,042 |     115,989 |
-| 10 / 1,000     | **463,988** |                   100,864 | 62,387 |     137,091 |
-| 50 / 1,000     | **392,088** |                    91,355 | 62,214 |      42,502 |
+| 1 / 1,000      | **122,758** |                    35,982 | 21,364 |     114,461 |
+| 10 / 100       | **457,747** |                   104,724 | 61,672 |      42,225 |
+| 10 / 500       | **484,255** |                   106,031 | 66,931 |     133,382 |
+| 10 / 1,000     | **450,898** |                   106,463 | 64,926 |     148,456 |
+| 50 / 1,000     | **412,088** |                    91,893 | 63,310 |      43,299 |
+
+With 10 connections and 500 callers, the p99 is 5.0 ms, against 10.6 ms for postgres.js and 12.0 ms for `pg`.
 
 **Network latency, Node 24 (simulated round-trip time)**
 
 | Scenario                                         | RTT   |       quarry |       pg | postgres.js |
 | ------------------------------------------------ | ----- | -----------: | -------: | ----------: |
-| `begin; insert; commit` (latency)                | 5 ms  | **11.84 ms** | 17.68 ms |    17.75 ms |
-|                                                  | 20 ms | **41.85 ms** | 62.81 ms |    62.72 ms |
-| Point lookups, 50 callers, pool 10 (ops/s)       | 5 ms  |    **8,242** |    1,643 |       6,891 |
-|                                                  | 20 ms |    **2,357** |      472 |       1,888 |
-| Point lookups, 500 callers, 1 connection (ops/s) | 5 ms  |   **85,080** |      168 |       7,799 |
-|                                                  | 20 ms |   **23,367** |     47.7 |       2,330 |
+| `begin; insert; commit` (latency)                | 5 ms  | **11.75 ms** | 17.53 ms |    17.59 ms |
+|                                                  | 20 ms | **41.75 ms** | 62.67 ms |    62.66 ms |
+| Point lookups, 50 callers, pool 10 (ops/s)       | 5 ms  |    **8,286** |    1,652 |       7,033 |
+|                                                  | 20 ms |    **2,359** |      473 |       2,004 |
+| Point lookups, 500 callers, 1 connection (ops/s) | 5 ms  |   **88,941** |      169 |       7,958 |
+|                                                  | 20 ms |   **23,550** |     47.8 |       2,333 |
 
-A transaction takes two round trips (`BEGIN` travels with the first statement), and `db.batch` with `{ transaction: true }` takes one: three statements in a transaction at 5 ms RTT run at 164 ops/s with `db.batch`, against 56 with `Promise.all` and 42 one after another.
+A transaction takes two round trips (`BEGIN` travels with the first statement), and `db.batch` with `{ transaction: true }` takes one: three statements in a transaction at 5 ms RTT run at 166 ops/s with `db.batch`, against 57 with `Promise.all` and 43 one after another.
 
-Through the query builder (`database()`, pool 10, 1,000 callers, 5 ms RTT), lookups, inserts and updates run at 153–164k ops/s, within 4% of the driver alone, about 2× postgres.js (73–75k) and 100× pg (1.6k).
+Through the query builder (`database()`, pool 10), lookups run at 270–312k ops/s with 100–1,000 callers and no added latency, 71–79% of the driver alone. At 5 ms RTT with 1,000 callers, lookups, inserts and updates run at 160–168k ops/s, within 3% of the driver, about 2.2× postgres.js (73–75k) and 100× `pg` (1.6k).
 
 **Bun 1.4, against Bun.sql**
 
 | Scenario                        |      quarry | Bun.sql | pg (named) |
 | ------------------------------- | ----------: | ------: | ---------: |
-| Point lookup (median latency)   | **24.0 µs** | 28.8 µs |    28.6 µs |
-| Fetch 1,000,000 rows            |  **284 ms** |  388 ms |   1,055 ms |
-| 50 concurrent inserts (ops/s)   | **225,028** | 144,441 |    106,261 |
-| `begin; insert; commit` (ops/s) |  **20,396** |  10,178 |     15,015 |
+| Point lookup (median latency)   | **24.0 µs** | 28.2 µs |    28.6 µs |
+| Fetch 1,000,000 rows (mean)     |  **258 ms** |  477 ms |     965 ms |
+| 50 concurrent inserts (ops/s)   | **239,045** | 145,671 |    106,432 |
+| `begin; insert; commit` (ops/s) |  **20,698** |  10,723 |     14,998 |
 
 **Through PgBouncer 1.26, transaction mode, Node 24 (ops/s)**
 
 | Scenario                  |      quarry |     pg | pg (named) | postgres.js |
 | ------------------------- | ----------: | -----: | ---------: | ----------: |
-| Point lookups, 50 callers | **109,860** | 67,209 |     63,332 |      39,051 |
-| Fetch 1,000 rows          |   **2,572** |    719 |        721 |         795 |
-| `begin; insert; commit`   |   **9,148** |  6,445 |      6,881 |       5,928 |
+| Point lookups, 50 callers | **105,379** | 67,721 |     61,029 |      40,138 |
+| Fetch 1,000 rows          |   **2,674** |    726 |        739 |         808 |
+| `begin; insert; commit`   |   **9,332** |  6,307 |      5,638 |       5,638 |
 
 **Connecting, Node 24 (connect + `select 1` + close)**
 
 | Authentication           |      quarry |      pg | postgres.js |
 | ------------------------ | ----------: | ------: | ----------: |
-| trust, no TLS            | **2.43 ms** | 3.99 ms |     6.92 ms |
-| SCRAM, no TLS            | **2.72 ms** | 5.37 ms |     7.96 ms |
-| SCRAM, TLS `verify-full` | **5.41 ms** | 6.80 ms |     53.1 ms |
+| trust, no TLS            | **2.29 ms** | 3.88 ms |     6.76 ms |
+| SCRAM, no TLS            | **2.59 ms** | 5.22 ms |     7.74 ms |
+| SCRAM, TLS `verify-full` | **5.19 ms** | 6.59 ms |     53.3 ms |
 
-`pnpm bench:driver` runs a quick comparison against `pg` and postgres.js. The full suite behind these numbers (`bench/driver/suite`: setup, orchestration, analysis and charts) is in [#6](https://github.com/shlokdesai33/quarry/pull/6).
+`pnpm bench:driver` runs a quick comparison against `pg` and postgres.js. The full suite behind these numbers (setup, orchestration, analysis and charts) is in `bench/driver/suite`.
 
 ## Development
 
