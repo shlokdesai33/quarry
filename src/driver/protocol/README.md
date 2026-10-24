@@ -271,7 +271,7 @@ Every length is checked: a message length below 4 or above `maxMessageSize` (def
 
 ### UTF-8: [text.ts](text.ts)
 
-`utf8(bytes, start, end)` decodes with Node `Buffer.toString('utf8', …)` when the bytes are a `Buffer` (native and fast for short strings), otherwise builds short ASCII strings by hand and uses `TextDecoder` for the rest. `asBuffer` wraps a chunk as a `Buffer` sharing its memory (no copy) so that fast path applies.
+`utf8(bytes, start, end)` decodes natively when the bytes are a `Buffer` (fast for short strings): with `Buffer#utf8Slice` on Node and Bun, the call `toString('utf8', …)` makes after checking its arguments (about 10% less per short string), and with `toString` on Deno, whose `utf8Slice` is slower. Otherwise it builds short ASCII strings by hand and uses `TextDecoder` for the rest. `asBuffer` wraps a chunk as a `Buffer` sharing its memory (no copy) so that fast path applies.
 
 ## Decisions
 
