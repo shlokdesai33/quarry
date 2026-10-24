@@ -8,8 +8,9 @@ import {
 	type RunOptions,
 	type TooManyRowsError,
 } from './executor.js';
-import { Expression } from './expression.js';
+import { Expression, type TypedExpression } from './expression.js';
 import { typedExpression } from './expression-methods.js';
+import { Increment, isNumberKind } from './increment.js';
 import type {
 	DeleteNode,
 	InsertNode,
@@ -18,7 +19,7 @@ import type {
 	SetNode,
 	UpdateNode,
 } from './node.js';
-import type { Expr } from './operators.js';
+import type { Expr, NumberKind } from './operators.js';
 import { type Missing, type Query, rejectAwait } from './query.js';
 import {
 	type ColumnValue,
@@ -52,13 +53,38 @@ export type UpdateKey<T extends AnyTable> = {
 }[ColumnKey<T>];
 
 /**
+ * The `inc` / `dec` a numeric column `C` takes, by `A`; `never` for a column
+ * of any other type.
+ */
+export type IncrementOf<
+	C extends AnyColumn,
+	A,
+> = C['_quarry']['dataType'] extends {
+	readonly kind: NumberKind;
+}
+	? Increment<A>
+	: never;
+
+/**
+ * An `inc` / `dec` of the numeric column `C` in an update's `set`: by a
+ * non-null value of its update type, or a numeric expression of that type.
+ */
+export type SetIncrement<C extends AnyColumn> = IncrementOf<
+	C,
+	| NonNullable<C['$update']>
+	| TypedExpression<C['$update'], DataType<NumberKind>>
+>;
+
+/**
  * What an update sets: any of the columns it can, each to a value of its
- * update type or an expression that evaluates to one.
+ * update type or an expression that evaluates to one, or, for a numeric
+ * column, an `inc` / `dec` of it.
  */
 export type SetValues<T extends AnyTable> = {
 	readonly [K in UpdateKey<T>]?:
 		| Columns<T>[K]['$update']
-		| Expression<Columns<T>[K]['$update']>;
+		| Expression<Columns<T>[K]['$update']>
+		| SetIncrement<Columns<T>[K]>;
 };
 
 /**
@@ -115,13 +141,14 @@ function valueNode(column: AnyColumn, value: unknown): OperationNode {
 
 /**
  * The assignments of `values` merged over `set`: a column set again keeps its
- * place and takes the new value, and an undefined value is left out. Throws
- * when that leaves nothing to set.
+ * place and takes the new value, and an undefined value is left out. An
+ * `inc` / `dec` adds to `current`. Throws when that leaves nothing to set.
  */
 export function setNodes(
 	table: AnyTable,
 	set: readonly SetNode[],
 	values: object,
+	current: Current = updateCurrent,
 ): SetNode[] {
 	const nodes = [...set];
 	const keys = Object.keys(values);
@@ -138,8 +165,12 @@ export function setNodes(
 		const value = given[k];
 		if (value === undefined) continue;
 		// oxlint-disable-next-line typescript/no-non-null-assertion -- within bounds
-		const { column, name } = columnOf(table, keys[k]!);
-		const node = { column: name, value: valueNode(column, value) };
+		const key = keys[k]!;
+		const { column, name } = columnOf(table, key);
+		const node = {
+			column: name,
+			value: setValueNode(table, key, column, name, value, current),
+		};
 		const at =
 			index === undefined
 				? indexOfColumn(nodes, name)
@@ -190,7 +221,7 @@ export function rowsNode(
 			for (const [key, value] of list) {
 				if (value === undefined) continue;
 				const i = keys.indexOf(key);
-				cells[i] = valueNode(resolved[i]!.column, value);
+				cells[i] = valueNode(resolved[i]!.column, notIncrement(value));
 			}
 			return cells;
 		}),
@@ -208,6 +239,143 @@ function castType(dataType: DataType): string {
 		castTypes.set(dataType, type);
 	}
 	return type;
+}
+
+/** `value`, which can't be an `inc` / `dec`: those only change a value already there. */
+function notIncrement(value: unknown): unknown {
+	if (value instanceof Increment) {
+		throw new Error(
+			'inc() and dec() only work in an update’s set, an upsert’s doUpdate, or the rows of a setEach',
+		);
+	}
+	return value;
+}
+
+/** Checks that `inc` / `dec` was given for a numeric column. */
+function incrementable(table: AnyTable, key: string, column: AnyColumn): void {
+	const { kind } = column._quarry.dataType;
+	if (!isNumberKind(kind)) {
+		throw new Error(
+			`inc() and dec() need a numeric column, and "${table.name}"."${key}" is ${kind}`,
+		);
+	}
+}
+
+/**
+ * The reference to the current value of the column named `name`, which an
+ * `inc` / `dec` adds to: unqualified in an update (qualified once it has
+ * `setEach`'s rows, which have the same columns), qualified by the table in
+ * an upsert, where `excluded` has the same columns.
+ */
+export type Current = (name: string) => OperationNode;
+
+/** An update's current value: `"views"`. */
+export const updateCurrent: Current = (name) => ({
+	kind: 'column',
+	column: name,
+});
+
+/** `current op amount`, with `coalesce(current, 0)` when the increment counts null as 0. */
+export function incremented(
+	current: OperationNode,
+	operator: '+' | '-',
+	amount: OperationNode,
+	coalesce: boolean,
+): OperationNode {
+	return {
+		kind: 'binary',
+		left: coalesce
+			? {
+					kind: 'function',
+					name: 'coalesce',
+					args: [current, { kind: 'literal', value: 0 }],
+				}
+			: current,
+		operator,
+		right: amount,
+	};
+}
+
+/** A value set on `column`: `inc` / `dec` relative to its current value, or as `valueNode` writes it. */
+function setValueNode(
+	table: AnyTable,
+	key: string,
+	column: AnyColumn,
+	name: string,
+	value: unknown,
+	current: Current,
+): OperationNode {
+	if (!(value instanceof Increment)) return valueNode(column, value);
+	incrementable(table, key, column);
+	const { operator, amount, coalesce } = value._quarry;
+	return incremented(
+		current(name),
+		operator,
+		valueNode(column, amount),
+		coalesce,
+	);
+}
+
+/** How a column of `setEach`'s rows changes the table's: by `inc` / `dec` of its row's value. */
+export interface EachIncrement {
+	readonly operator: '+' | '-';
+	readonly coalesce: boolean;
+}
+
+/**
+ * The rows of a `setEach` with each `inc` / `dec` replaced by its amount,
+ * and the columns those add to or subtract from, by database name. Throws
+ * unless every row that gives such a column gives the same `inc` or `dec`
+ * of it (a row may leave it out), or for one on a key column.
+ */
+export function eachIncrements(
+	table: AnyTable,
+	rows: readonly Readonly<Record<string, unknown>>[],
+	keys: readonly string[],
+): {
+	rows: Readonly<Record<string, unknown>>[];
+	increments: Map<string, EachIncrement>;
+} {
+	const increments = new Map<string, EachIncrement & { key: string }>();
+	const plain = new Set<string>();
+	const unwrapped = rows.map((row) =>
+		Object.fromEntries(
+			Object.entries(row).map(([key, value]) => {
+				if (value === undefined) return [key, value];
+				if (!(value instanceof Increment)) {
+					plain.add(key);
+					return [key, value];
+				}
+				const { column, name } = columnOf(table, key);
+				if (keys.includes(key)) {
+					throw new Error(
+						`The key column "${key}" of setEach matches rows, so it can't be an inc() or dec()`,
+					);
+				}
+				incrementable(table, key, column);
+				const { operator, amount, coalesce } = value._quarry;
+				const seen = increments.get(name);
+				if (
+					seen !== undefined &&
+					(seen.operator !== operator || seen.coalesce !== coalesce)
+				) {
+					throw new Error(
+						`setEach needs every row to change "${key}" alike: the same inc() or dec(), with the same options`,
+					);
+				}
+				increments.set(name, { key, operator, coalesce });
+				return [key, amount];
+			}),
+		),
+	);
+	for (const { key } of increments.values()) {
+		if (plain.has(key)) {
+			throw new Error(
+				`setEach needs every row to change "${key}" alike: some rows set it to a value and others inc() or dec() it`,
+			);
+		}
+	}
+	return { rows: unwrapped, increments: new Map(increments) };
 }
 
 /** The `excluded` row of an upsert into `table`. */

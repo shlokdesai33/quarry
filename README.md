@@ -469,6 +469,8 @@ await db
 
 `set` takes values or expressions for writable columns. An update runs only once it has a `where`, `.allRows()` or `setEach`; otherwise `execute()` is a type error. The same applies to deletes.
 
+`inc(n)` / `dec(n)` change a numeric column relative to its value, race-free: `.set({ logins: inc(1), balance: dec('2.50') })` is `"logins" = "logins" + $1, …`. `inc(1, { coalesce: true })` counts null as 0; upserts take `inc(excluded.hits)`, and `setEach` rows their own amount (`{ id: 1, balance: inc('5') }`).
+
 ### Updating many rows with setEach
 
 ```ts

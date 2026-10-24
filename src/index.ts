@@ -94,6 +94,12 @@ export {
 } from './expression-builder.js';
 export { deleteFrom, type DeleteQueryBuilder } from './delete-query-builder.js';
 export {
+	dec,
+	inc,
+	type Increment,
+	type IncrementOptions,
+} from './increment.js';
+export {
 	insertInto,
 	type InsertQueryBuilder,
 	type OnConflictBuilder,
