@@ -365,7 +365,9 @@ export class UpdateQueryBuilder<
 	 * @example .returningAll()
 	 */
 	returningAll(
-		..._unique: UniqueColumns<O, Ref<RefsOf<[T]>>>
+		..._unique: [keyof O] extends [never]
+			? []
+			: UniqueColumns<O, Ref<RefsOf<[T]>>>
 	): UpdateQueryBuilder<
 		T,
 		AddRow<O, RowOf<RefsOf<[T]>, Ref<RefsOf<[T]>>>>,

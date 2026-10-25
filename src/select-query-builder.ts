@@ -546,7 +546,9 @@ export class SelectQueryBuilder<
 	 */
 	selectAll<N extends T[number]['name']>(
 		table: N,
-		..._unique: UniqueColumns<O, TableRefs<RefsOf<T>, N>>
+		..._unique: [keyof O] extends [never]
+			? []
+			: UniqueColumns<O, TableRefs<RefsOf<T>, N>>
 	): SelectQueryBuilder<
 		T,
 		AddRow<O, RowOf<RefsOf<T>, TableRefs<RefsOf<T>, N>>>,
