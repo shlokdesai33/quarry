@@ -399,7 +399,7 @@ export function captureCallSite(fn) {
 
 - `Error.captureStackTrace(obj, fn)` is a V8 feature that attaches a `stack` to `obj`, skipping frames above `fn`, so the first frame is "where `fn` was called". Limiting the stack to one frame keeps it around a microsecond, cheap enough to do for every column.
 - V8 only **formats** the stack the first time `.stack` is read. Nothing is formatted unless `verify` reports a problem.
-- `resolveCallSite(site)` parses the frame (`at … (/app/schema.ts:3:9)`), maps it through a source map when Node has one loaded (`node:module`'s `findSourceMap`), and turns a `file:` URL into a path. It reaches Node's modules through `process.getBuiltinModule` so the library still loads where Node's modules don't exist.
+- `resolveCallSite(site)` parses the frame (`at … (/app/schema.ts:3:9)`), maps it through a source map when Node has one loaded (`node:module`'s `findSourceMap`), and turns a `file:` URL into a path. It reaches Node's modules through `process.getBuiltinModule`, so they load only when a call site is resolved.
 
 ## Decisions
 

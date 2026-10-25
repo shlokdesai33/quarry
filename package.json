@@ -36,8 +36,6 @@
 		"lint": "oxlint --type-aware",
 		"test": "vitest run --typecheck",
 		"test:runtime": "vitest run",
-		"test:runtimes": "node --import ./bench/driver/register.mjs test/driver/runtime/smoke.ts && bun test/driver/runtime/smoke.ts && deno run -A --sloppy-imports --no-lock test/driver/runtime/smoke.ts",
-		"test:workers": "pnpm build && node test/driver/runtime/workers.mjs",
 		"test:compat": "node --import ./test/driver/compat/hooks.ts test/driver/compat/run.ts",
 		"test:types": "vitest run --typecheck.only",
 		"test:watch": "vitest --typecheck",
@@ -69,6 +67,6 @@
 		}
 	},
 	"engines": {
-		"node": ">=22.12"
+		"node": ">=24.11"
 	}
 }

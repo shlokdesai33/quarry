@@ -2,6 +2,8 @@
 
 The generated tables (`analyze.ts`), footprint figures (`footprint.ts`) and run metadata of full runs, kept because `results/` is gitignored. The raw results stayed on the benchmark VM.
 
+These runs also cover Bun and Deno. quarry no longer supports them ([Node only](../../../../src/driver/DECISIONS.md#node-only)), so their rows are historical, and `analyze.ts`, `compare.ts`, `report-tables.py` and `charts.py` skip them.
+
 | Run                  | quarry              | Notes                                                                                                                                                                                                                                                                                                                                                   |
 | -------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `2026-10-11-e45dd3c` | `main` at `e45dd3c` | First full run, before the pool pipelining fix (#12)                                                                                                                                                                                                                                                                                                    |

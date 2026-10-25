@@ -426,11 +426,8 @@ const ENV_KEYWORDS: Readonly<Record<string, string>> = {
 };
 
 function processEnv(): Readonly<Record<string, string | undefined>> {
-	const proc = Reflect.get(globalThis, 'process');
-	const env: unknown = proc ? Reflect.get(proc, 'env') : undefined;
-	if (typeof env !== 'object' || env === null) return {};
 	const out: Record<string, string | undefined> = {};
-	for (const [key, value] of Object.entries(env)) {
+	for (const [key, value] of Object.entries(process.env)) {
 		if (typeof value === 'string') out[key] = value;
 	}
 	return out;

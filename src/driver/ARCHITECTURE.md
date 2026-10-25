@@ -6,17 +6,17 @@ It assumes basic TypeScript and nothing about databases or networking. [Part 1](
 
 The driver documentation:
 
-| Document                                 | Covers                                                                                                                                                       |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| this file                                | foundations, layers, files, the connection and its operations, the statement cache, pipelining and backpressure, PgBouncer, memory, timing, runtimes, errors |
-| [protocol/README.md](protocol/README.md) | the wire protocol: message formats, the extended query protocol, the reader and the writer                                                                   |
-| [auth/README.md](auth/README.md)         | connecting: configuration, hosts and failover, TLS and certificates, startup, protocol negotiation, SCRAM, channel binding, md5, IAM passwords               |
-| [CODECS.md](CODECS.md)                   | codecs, built-ins, `arrayOf`, the registry, parameter OIDs, binary after describe, the type catalog                                                          |
-| [POOL.md](POOL.md)                       | the pool: slots, waiters, pipelining onto busy connections, adaptive depth, draining for exclusive callers, lifetimes, ending                                |
-| [TRANSACTIONS.md](TRANSACTIONS.md)       | transactions, savepoints, retries, and how BEGIN, COMMIT and batches are framed on the wire                                                                  |
-| [STREAMING.md](STREAMING.md)             | cursors and streams, COPY in and out, LISTEN/NOTIFY                                                                                                          |
-| [CANCELLATION.md](CANCELLATION.md)       | `AbortSignal`, client timeouts, cancel requests, statement and transaction timeouts                                                                          |
-| [DECISIONS.md](DECISIONS.md)             | every design decision and optimisation in the driver: what it is, why, the alternatives, the cost, the measured impact                                       |
+| Document                                 | Covers                                                                                                                                                      |
+| ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| this file                                | foundations, layers, files, the connection and its operations, the statement cache, pipelining and backpressure, PgBouncer, memory, timing, sockets, errors |
+| [protocol/README.md](protocol/README.md) | the wire protocol: message formats, the extended query protocol, the reader and the writer                                                                  |
+| [auth/README.md](auth/README.md)         | connecting: configuration, hosts and failover, TLS and certificates, startup, protocol negotiation, SCRAM, channel binding, md5, IAM passwords              |
+| [CODECS.md](CODECS.md)                   | codecs, built-ins, `arrayOf`, the registry, parameter OIDs, binary after describe, the type catalog                                                         |
+| [POOL.md](POOL.md)                       | the pool: slots, waiters, pipelining onto busy connections, adaptive depth, draining for exclusive callers, lifetimes, ending                               |
+| [TRANSACTIONS.md](TRANSACTIONS.md)       | transactions, savepoints, retries, and how BEGIN, COMMIT and batches are framed on the wire                                                                 |
+| [STREAMING.md](STREAMING.md)             | cursors and streams, COPY in and out, LISTEN/NOTIFY                                                                                                         |
+| [CANCELLATION.md](CANCELLATION.md)       | `AbortSignal`, client timeouts, cancel requests, statement and transaction timeouts                                                                         |
+| [DECISIONS.md](DECISIONS.md)             | every design decision and optimisation in the driver: what it is, why, the alternatives, the cost, the measured impact                                      |
 
 ## Contents
 
@@ -30,7 +30,7 @@ The driver documentation:
 - [Part 8: Behind PgBouncer](#part-8-behind-pgbouncer)
 - [Part 9: Memory and allocation](#part-9-memory-and-allocation)
 - [Part 10: Timing and telemetry](#timing)
-- [Part 11: Runtimes and sockets](#part-11-runtimes-and-sockets)
+- [Part 11: Sockets](#part-11-sockets)
 - [Part 12: Errors](#errors)
 - [Part 13: The driver knows nothing about quarry](#the-driver-knows-nothing-about-quarry)
 - [Part 14: Testing](#part-14-testing)
@@ -55,7 +55,7 @@ Opening a connection costs several **round trips** (a message sent and its answe
 
 ### The event loop
 
-Node (and Bun, Deno, browsers, Workers) runs JavaScript on **one thread**. I/O doesn't block it: a socket read registers a callback and the thread moves on; when bytes arrive, the **event loop** runs the callback. Promises' `.then` callbacks run as **microtasks**: right after the current piece of code finishes, before the next I/O callback. The driver uses this to batch: anything queued during the current tick is written together in one microtask ([Part 4](#writing-the-flush)).
+Node runs JavaScript on **one thread**. I/O doesn't block it: a socket read registers a callback and the thread moves on; when bytes arrive, the **event loop** runs the callback. Promises' `.then` callbacks run as **microtasks**: right after the current piece of code finishes, before the next I/O callback. The driver uses this to batch: anything queued during the current tick is written together in one microtask ([Part 4](#writing-the-flush)).
 
 ### What a wire protocol is
 
@@ -87,7 +87,7 @@ flowchart TD
     Ops["Ops (ops.ts)<br/>QueryOp, SyncGroupOp, SimpleQueryOp, DescribeOp, CursorOp, FetchOp, CopyFromOp, CopyToOp"]
     Codecs["Codecs (codec.ts, codecs.ts, registry.ts, params.ts, results.ts, rows.ts, binary.ts, …)"]
     Proto["Protocol (protocol/)<br/>Writer + frontend.ts → bytes, bytes → Reader → messages"]
-    Sock["DriverSocket (socket.ts)<br/>node-socket.ts · cloudflare-socket.ts · yours"]
+    Sock["DriverSocket (socket.ts)<br/>node-socket.ts · yours"]
     PG[(PostgreSQL)]
     createPool --> Pool
     connect --> Conn
@@ -111,37 +111,36 @@ flowchart TD
 
 ## Part 3: Every file in `src/driver/`
 
-| File                                         | What it does                                                                                                                                                                                                |
-| -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [index.ts](index.ts)                         | The public API of `quarry/driver`.                                                                                                                                                                          |
-| [connect.ts](connect.ts)                     | `connect()`, `openConnection()`: hosts in turn, TLS plans, protocol-version retry, connect timeout, cancel requests. [auth/README.md](auth/README.md)                                                       |
-| [config.ts](config.ts)                       | `ConnectionOptions`, connection-string parsing, `PG*` environment variables, `resolveConfig`, `.pgpass`. [auth/README.md](auth/README.md#configuration)                                                     |
-| [connection.ts](connection.ts)               | `Connection`: startup and authentication, the op queue, flushing, dispatching replies, the statement cache, `query`/`queryGroup`/`simpleQuery`/`describe`/`cursor`/`copy*`/`listen`, cancellation, closing. |
-| [ops.ts](ops.ts)                             | The operations: `Op`, `QueryOp`, `SyncGroupOp`, `SimpleQueryOp`, `DescribeOp`, `CursorOp`, `FetchOp`, `ClosePortalOp`, `CopyFromOp`, `CopyToOp`; `QueryResult`, `OpTiming`, `Statement`.                    |
-| [cursor.ts](cursor.ts)                       | `CursorIterator`: one run of a cursor (opening, serialised `next()`, `return()`, `statementTimeout`, aborts). [STREAMING.md](STREAMING.md#cursors)                                                          |
-| [row-stream.ts](row-stream.ts)               | `RowStream`: rows one at a time over a cursor's batches; async iterable and disposable.                                                                                                                     |
-| [queue.ts](queue.ts)                         | `Queue<T>`: a FIFO that keeps its array's capacity.                                                                                                                                                         |
-| [pool.ts](pool.ts)                           | `Pool`, `PoolClient`, `createPool`, the adaptive `Depth`, the pool's LISTEN connection. [POOL.md](POOL.md)                                                                                                  |
-| [transaction.ts](transaction.ts)             | `Transaction`, `Session`, `TransactionRolledBack`, `Transaction.run`/`batch`. [TRANSACTIONS.md](TRANSACTIONS.md)                                                                                            |
-| [protocol/](protocol/README.md)              | `frontend.ts` (client messages), `writer.ts`, `reader.ts`, `messages.ts` (server message types), `text.ts` (UTF-8 helpers).                                                                                 |
-| [auth/](auth/README.md)                      | `scram.ts` (SCRAM-SHA-256, channel binding, SASLprep), `md5.ts`, `encoding.ts` (base64, UTF-8, hex).                                                                                                        |
-| [codec.ts](codec.ts)                         | The `Codec` interface, `defineCodec`, `arrayOf`, `declareParamType`, `typed`/`TypedValue`. [CODECS.md](CODECS.md)                                                                                           |
-| [codecs.ts](codecs.ts)                       | The built-in codecs (`codecs`) and `defaultCodecs`.                                                                                                                                                         |
-| [registry.ts](registry.ts)                   | `CodecRegistry` (codec by type OID), `TypeCatalog` (types looked up by name), `catalogQuery`.                                                                                                               |
-| [params.ts](params.ts)                       | `encodeParams`, `paramOids`: encoding a query's parameters and choosing the OIDs to declare.                                                                                                                |
-| [results.ts](results.ts)                     | Result plans: which codec and format each column is read with, cached per statement.                                                                                                                        |
-| [rows.ts](rows.ts)                           | Row decoders: generated JavaScript per result shape, and a fallback.                                                                                                                                        |
-| [binary.ts](binary.ts)                       | Binary-format decoders (`int4`, `float8`, `timestamptz`, `numeric`, `uuid`, `jsonb`, `vector`, arrays).                                                                                                     |
-| [array-params.ts](array-params.ts)           | `binaryArray`: encoding arrays of common types in binary.                                                                                                                                                   |
-| [types.ts](types.ts)                         | Text helpers: OID tables, `parseArray`, `parseBytea`, `formatTimestamp`, `encodeParam`, COPY text format.                                                                                                   |
-| [parsers.ts](parsers.ts)                     | Text parsers: `parseTimestamptz`, `parseRange`, `vectorValues`.                                                                                                                                             |
-| [capabilities.ts](capabilities.ts)           | `Capabilities`, PgBouncer detection, `statementNames`, the PostgreSQL 18 check.                                                                                                                             |
-| [errors.ts](errors.ts)                       | Every error class and `postgresError()`.                                                                                                                                                                    |
-| [notice.ts](notice.ts)                       | `Notice` and `Notification` shapes.                                                                                                                                                                         |
-| [telemetry.ts](telemetry.ts)                 | OpenTelemetry-compatible spans, without depending on OpenTelemetry.                                                                                                                                         |
-| [socket.ts](socket.ts)                       | The `DriverSocket` and `SocketFactory` interfaces.                                                                                                                                                          |
-| [node-socket.ts](node-socket.ts)             | Sockets on `node:net`/`node:tls` (Node, Bun, Deno).                                                                                                                                                         |
-| [cloudflare-socket.ts](cloudflare-socket.ts) | Sockets on `cloudflare:sockets` (Workers).                                                                                                                                                                  |
+| File                               | What it does                                                                                                                                                                                                |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [index.ts](index.ts)               | The public API of `quarry/driver`.                                                                                                                                                                          |
+| [connect.ts](connect.ts)           | `connect()`, `openConnection()`: hosts in turn, TLS plans, protocol-version retry, connect timeout, cancel requests. [auth/README.md](auth/README.md)                                                       |
+| [config.ts](config.ts)             | `ConnectionOptions`, connection-string parsing, `PG*` environment variables, `resolveConfig`, `.pgpass`. [auth/README.md](auth/README.md#configuration)                                                     |
+| [connection.ts](connection.ts)     | `Connection`: startup and authentication, the op queue, flushing, dispatching replies, the statement cache, `query`/`queryGroup`/`simpleQuery`/`describe`/`cursor`/`copy*`/`listen`, cancellation, closing. |
+| [ops.ts](ops.ts)                   | The operations: `Op`, `QueryOp`, `SyncGroupOp`, `SimpleQueryOp`, `DescribeOp`, `CursorOp`, `FetchOp`, `ClosePortalOp`, `CopyFromOp`, `CopyToOp`; `QueryResult`, `OpTiming`, `Statement`.                    |
+| [cursor.ts](cursor.ts)             | `CursorIterator`: one run of a cursor (opening, serialised `next()`, `return()`, `statementTimeout`, aborts). [STREAMING.md](STREAMING.md#cursors)                                                          |
+| [row-stream.ts](row-stream.ts)     | `RowStream`: rows one at a time over a cursor's batches; async iterable and disposable.                                                                                                                     |
+| [queue.ts](queue.ts)               | `Queue<T>`: a FIFO that keeps its array's capacity.                                                                                                                                                         |
+| [pool.ts](pool.ts)                 | `Pool`, `PoolClient`, `createPool`, the adaptive `Depth`, the pool's LISTEN connection. [POOL.md](POOL.md)                                                                                                  |
+| [transaction.ts](transaction.ts)   | `Transaction`, `Session`, `TransactionRolledBack`, `Transaction.run`/`batch`. [TRANSACTIONS.md](TRANSACTIONS.md)                                                                                            |
+| [protocol/](protocol/README.md)    | `frontend.ts` (client messages), `writer.ts`, `reader.ts`, `messages.ts` (server message types), `text.ts` (UTF-8 helpers).                                                                                 |
+| [auth/](auth/README.md)            | `scram.ts` (SCRAM-SHA-256, channel binding, SASLprep), `md5.ts`, `encoding.ts` (base64, UTF-8, hex).                                                                                                        |
+| [codec.ts](codec.ts)               | The `Codec` interface, `defineCodec`, `arrayOf`, `declareParamType`, `typed`/`TypedValue`. [CODECS.md](CODECS.md)                                                                                           |
+| [codecs.ts](codecs.ts)             | The built-in codecs (`codecs`) and `defaultCodecs`.                                                                                                                                                         |
+| [registry.ts](registry.ts)         | `CodecRegistry` (codec by type OID), `TypeCatalog` (types looked up by name), `catalogQuery`.                                                                                                               |
+| [params.ts](params.ts)             | `encodeParams`, `paramOids`: encoding a query's parameters and choosing the OIDs to declare.                                                                                                                |
+| [results.ts](results.ts)           | Result plans: which codec and format each column is read with, cached per statement.                                                                                                                        |
+| [rows.ts](rows.ts)                 | Row decoders: generated JavaScript per result shape, and a fallback.                                                                                                                                        |
+| [binary.ts](binary.ts)             | Binary-format decoders (`int4`, `float8`, `timestamptz`, `numeric`, `uuid`, `jsonb`, `vector`, arrays).                                                                                                     |
+| [array-params.ts](array-params.ts) | `binaryArray`: encoding arrays of common types in binary.                                                                                                                                                   |
+| [types.ts](types.ts)               | Text helpers: OID tables, `parseArray`, `parseBytea`, `formatTimestamp`, `encodeParam`, COPY text format.                                                                                                   |
+| [parsers.ts](parsers.ts)           | Text parsers: `parseTimestamptz`, `parseRange`, `vectorValues`.                                                                                                                                             |
+| [capabilities.ts](capabilities.ts) | `Capabilities`, PgBouncer detection, `statementNames`, the PostgreSQL 18 check.                                                                                                                             |
+| [errors.ts](errors.ts)             | Every error class and `postgresError()`.                                                                                                                                                                    |
+| [notice.ts](notice.ts)             | `Notice` and `Notification` shapes.                                                                                                                                                                         |
+| [telemetry.ts](telemetry.ts)       | OpenTelemetry-compatible spans, without depending on OpenTelemetry.                                                                                                                                         |
+| [socket.ts](socket.ts)             | The `DriverSocket` and `SocketFactory` interfaces.                                                                                                                                                          |
+| [node-socket.ts](node-socket.ts)   | Sockets on `node:net`/`node:tls`.                                                                                                                                                                           |
 
 ## Part 4: The connection
 
@@ -503,7 +502,7 @@ The benchmarks behind these choices live in `bench/driver` (`pnpm bench:driver`)
 - **`telemetry: { tracer }`** ([telemetry.ts](telemetry.ts)): each query becomes an OpenTelemetry-style client span (kind client, `db.system.name: postgresql`, the operation name from the SQL's first keyword, `db.query.summary` from the tag, the SQL text unless `queryText: false`, the row count, the SQLSTATE on error). The driver defines the few interfaces it calls (`TracerLike`, `SpanLike`) instead of depending on `@opentelemetry/api`. Parameters are never recorded.
 - **`captureStack`**: appends the issuing code's stack to errors ("--- query issued at ---"). Off by default because quarry's executor does its own.
 
-## Part 11: Runtimes and sockets
+## Part 11: Sockets
 
 The connection only talks to a `DriverSocket` ([socket.ts](socket.ts)):
 
@@ -527,29 +526,18 @@ interface SocketFactory {
 }
 ```
 
-### Node, Bun and Deno: [node-socket.ts](node-socket.ts)
+### Node: [node-socket.ts](node-socket.ts)
 
-- `node:net` and `node:tls` are loaded **on first use**, through `process.getBuiltinModule` where available (much cheaper than `import()` at cold start). `node:tls` loads the whole crypto stack (~3 ms), so a plain connection never loads it, and a pool preloads what it will need in the background (`preloadSockets`), as `connect.ts` does while the TCP handshake is in flight.
+- `node:net` and `node:tls` are loaded **on first use**, through `process.getBuiltinModule` (much cheaper than `import()` at cold start). `node:tls` loads the whole crypto stack (~3 ms), so a plain connection never loads it, and a pool preloads what it will need in the background (`preloadSockets`), as `connect.ts` does while the TCP handshake is in flight.
 - `TCP_NODELAY` (`setNoDelay(true)`) on TCP sockets: without it, the operating system may hold small writes back up to ~40 ms hoping to merge them (Nagle's algorithm), which the driver's own batching makes unnecessary.
 - TCP keepalive when configured.
 - **TLS contexts are cached** (`secureContext`, up to 16, keyed by CA, certificate, key and passphrase): building one parses the certificates, which would otherwise happen per connection.
 - `startTls` upgrades the existing socket (after an SSLRequest is accepted) by wrapping it with `tls.connect({ socket })`, moving the event handlers to the TLS socket.
-- `peerCertificate()` uses `getPeerX509Certificate().raw` where available (parsed lazily) rather than `getPeerCertificate()`, which decodes every field.
-- Bun and Deno run the same code through their Node compatibility layers; `pnpm test:runtimes` runs a smoke test on all three.
-
-### Cloudflare Workers: [cloudflare-socket.ts](cloudflare-socket.ts)
-
-Workers provide sockets through `cloudflare:sockets`, chosen automatically when `navigator.userAgent === 'Cloudflare-Workers'`:
-
-- The module name is in a variable so bundlers and the type checker leave it alone outside Workers.
-- Reading is a loop over the socket's `ReadableStream`; `pause()`/`resume()` gate that loop with a promise.
-- Workers' writable stream always reports a `desiredSize` of 1, so the adapter counts the bytes whose writes haven't completed itself and reports a full buffer at 64 KiB (Node's default high-water mark).
-- `startTls` uses the socket's own `startTls()` (`secureTransport: 'starttls'`).
-- Workers' TLS always verifies against public CAs and doesn't expose the server certificate, so custom CAs, client certificates, direct TLS (no ALPN) and `sslmode` below `verify-ca` are refused with clear errors, and SCRAM runs without channel binding. Unix sockets don't exist there. SCRAM uses WebCrypto when `node:crypto` is unavailable ([auth/README.md](auth/README.md#crypto)). Generated row decoders need `new Function`, which Workers forbid: [rows.ts](rows.ts) falls back to a generic decoder.
+- `peerCertificate()` uses `getPeerX509Certificate().raw` (parsed lazily) rather than `getPeerCertificate()`, which decodes every field.
 
 ### Anything else
 
-Pass `socket: { connect(options) { … } }` to use your own transport (a test double, an SSH tunnel, a different runtime). The walkthrough's captures were made exactly this way ([../WALKTHROUGH.md](../WALKTHROUGH.md)).
+Pass `socket: { connect(options) { … } }` to use your own transport (a test double, an SSH tunnel). The walkthrough's captures were made exactly this way ([../WALKTHROUGH.md](../WALKTHROUGH.md)).
 
 ## Part 12: Errors
 
@@ -607,7 +595,6 @@ This keeps the driver testable against other drivers' test suites (`pnpm test:co
 - [test/driver/fake-server.test.ts](../../test/driver/fake-server.test.ts) scripts a fake server over a real TCP socket, for behaviour a real server won't produce on demand (protocol negotiation, odd replies). [test/driver/helpers/backend.ts](../../test/driver/helpers/backend.ts) encodes server messages.
 - Unit tests: protocol framing, the reader, codecs, rows, config, the queue.
 - `pnpm test:compat` runs node-postgres's and postgres.js's own suites against this driver ([test/driver/compat/](../../test/driver/compat/)); `expectations.ts` lists every test allowed to fail and why.
-- `pnpm test:runtimes` and `pnpm test:workers`: smoke tests on Bun, Deno and workerd.
 
 ## Decisions
 
@@ -623,7 +610,8 @@ Why the driver is built this way. Each links to its full entry (what it is, why,
 - [Binary only after describe](DECISIONS.md#binary-only-after-describe): no column is requested in a format before its type is known.
 - [Zero-copy reads: messages decoded in place](DECISIONS.md#zero-copy-reads-messages-decoded-in-place): and [generated row decoders](DECISIONS.md#generated-monomorphic-row-decoders): the most frequent work is the cheapest.
 - [Allocation cuts for the small-query tail](DECISIONS.md#allocation-cuts-for-the-small-query-tail): less garbage, fewer GC pauses in the tail.
-- [One small socket interface](DECISIONS.md#one-small-socket-interface): a new runtime needs one small adapter.
+- [Node only](DECISIONS.md#node-only): Bun, Deno and edge runtimes aren't supported, so there are no code paths for them.
+- [One small socket interface](DECISIONS.md#one-small-socket-interface): custom transports and test doubles plug in through one small interface.
 - [PostgreSQL 18 or later only](DECISIONS.md#postgresql-18-or-later-only): no compatibility code for old servers.
 - [Errors carry everything and leak nothing](DECISIONS.md#errors-carry-everything-and-leak-nothing): every server field kept; parameters stay out of logs.
 

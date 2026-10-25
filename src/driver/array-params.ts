@@ -1,4 +1,4 @@
-import { allocate, NodeBuffer } from './protocol/text.js';
+import { allocate } from './protocol/text.js';
 import { notBytes } from './types.js';
 
 /*
@@ -8,8 +8,6 @@ import { notBytes } from './types.js';
  * element it can't encode exactly as the text path would be read, and the
  * array is then sent as a literal, as before.
  */
-
-const encoder = new TextEncoder();
 
 const PG_EPOCH_MS = 946_684_800_000;
 const TWO_32 = 4294967296;
@@ -219,12 +217,7 @@ function encodeVariable(
 			nulls = true;
 			size += 4;
 		} else if (typeof value === 'string') {
-			size +=
-				4 +
-				prefix +
-				(NodeBuffer === undefined
-					? value.length * 3
-					: NodeBuffer.byteLength(value));
+			size += 4 + prefix + Buffer.byteLength(value);
 		} else {
 			return undefined;
 		}
@@ -232,8 +225,6 @@ function encodeVariable(
 	const out = allocate(size);
 	const view = viewOf(out);
 	let pos = header(view, codec.element, values.length, nulls);
-	const buffer =
-		NodeBuffer !== undefined && out instanceof NodeBuffer ? out : undefined;
 	for (const value of values) {
 		if (typeof value !== 'string') {
 			view.setInt32(pos, -1);
@@ -243,10 +234,7 @@ function encodeVariable(
 		const start = pos + 4;
 		let end = start;
 		if (codec.prefix !== undefined) out[end++] = codec.prefix;
-		end +=
-			buffer === undefined
-				? encoder.encodeInto(value, out.subarray(end)).written
-				: buffer.write(value, end);
+		end += out.write(value, end);
 		view.setInt32(pos, end - start);
 		pos = end;
 	}

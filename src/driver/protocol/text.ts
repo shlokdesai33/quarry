@@ -1,49 +1,33 @@
 const decoder = new TextDecoder();
 
-/** Node's Buffer, where it exists: its native slicing beats TextDecoder for short strings. */
-export const NodeBuffer: typeof Buffer | undefined =
-	typeof Buffer === 'undefined' ? undefined : Buffer;
-
-/** The bytes as a Node Buffer sharing the same memory, where Buffer exists. */
-export function asBuffer(bytes: Uint8Array): Uint8Array {
-	if (NodeBuffer === undefined || bytes instanceof NodeBuffer) return bytes;
-	return NodeBuffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+/** The bytes as a Buffer sharing the same memory. */
+export function asBuffer(bytes: Uint8Array): Buffer {
+	if (bytes instanceof Buffer) return bytes;
+	return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 }
 
-/** A new buffer of `size` bytes: a Buffer where it exists, so `utf8` takes its fast path. */
-export function allocate(size: number): Uint8Array {
-	return NodeBuffer === undefined
-		? new Uint8Array(size)
-		: NodeBuffer.allocUnsafe(size);
+/** A new, uninitialized buffer of `size` bytes, so `utf8` takes its fast path. */
+export function allocate(size: number): Buffer {
+	return Buffer.allocUnsafe(size);
 }
 
-type Utf8Buffer = Uint8Array & {
+type Utf8Buffer = Buffer & {
 	utf8Slice(start: number, end: number): string;
 };
 
+const isBuffer = (bytes: Uint8Array): bytes is Utf8Buffer =>
+	bytes instanceof Buffer;
+
 /**
- * Whether Buffers have `utf8Slice` (Node, Bun): the native call
+ * Decodes UTF-8 bytes in `[start, end)`, which must lie within `bytes`.
+ * From a Buffer it calls `utf8Slice`: the native call
  * `toString('utf8', start, end)` makes once it has normalized its
  * arguments and looked up the encoding, which costs a short string about a
- * tenth more. Deno's `utf8Slice` is slower than its `toString`.
- */
-const slicesUtf8 =
-	NodeBuffer !== undefined &&
-	Reflect.get(globalThis, 'Deno') === undefined &&
-	typeof Reflect.get(NodeBuffer.prototype, 'utf8Slice') === 'function';
-
-const hasUtf8Slice = (bytes: Uint8Array): bytes is Utf8Buffer =>
-	slicesUtf8 && NodeBuffer !== undefined && bytes instanceof NodeBuffer;
-
-/**
- * Decodes UTF-8 bytes in `[start, end)`, which must lie within `bytes`:
- * natively from a Node Buffer, otherwise building short ASCII runs directly
- * and using `TextDecoder` for the rest.
+ * tenth more. Other byte arrays build short ASCII runs directly and use
+ * `TextDecoder` for the rest.
  */
 export function utf8(bytes: Uint8Array, start: number, end: number): string {
-	if (hasUtf8Slice(bytes)) return bytes.utf8Slice(start, end);
-	if (NodeBuffer !== undefined && bytes instanceof NodeBuffer)
-		return bytes.toString('utf8', start, end);
+	if (isBuffer(bytes)) return bytes.utf8Slice(start, end);
 	const length = end - start;
 	if (length === 0) return '';
 	if (length <= 24) {

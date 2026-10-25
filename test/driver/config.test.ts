@@ -13,8 +13,6 @@ import {
 	ScramClient,
 	saslprep,
 	serverEndPoint,
-	webScramCrypto,
-	type ScramCrypto,
 } from '../../src/driver/auth/scram.js';
 import { parseServerVersion } from '../../src/driver/capabilities.js';
 import {
@@ -36,6 +34,8 @@ async function scramProof(password: string, salt: string): Promise<string> {
 		await client.final(utf8Encode(`r=abcdef,s=${salt},i=4096`)),
 	);
 }
+
+const toArray = (value: Uint8Array) => [...value];
 
 describe('parseConnectionString', () => {
 	it('parses URLs', () => {
@@ -334,22 +334,28 @@ describe('auth primitives', () => {
 		);
 	});
 
-	it('derives the same SCRAM values with node:crypto and WebCrypto', async () => {
-		const node = nodeScramCrypto(nodeCrypto);
-		const web = webScramCrypto;
+	it('derives SCRAM values with node:crypto', async () => {
+		const crypto = nodeScramCrypto(nodeCrypto);
 		const key = utf8Encode('key');
 		const data = utf8Encode('data');
-		const results = (crypto: ScramCrypto) =>
-			Promise.all([
-				crypto.hmac(key, data),
-				crypto.digest('SHA-256', data),
-				crypto.digest('SHA-384', data),
-				crypto.digest('SHA-512', data),
-				crypto.pbkdf2(key, data, 4096),
-			]).then((values) => values.map((value) => [...value]));
-		expect(await results(node)).toEqual(await results(web));
-		expect(node.random(18)).toHaveLength(18);
-		expect(web.random(18)).toHaveLength(18);
+		const hashes = [
+			['SHA-256', 'sha256'],
+			['SHA-384', 'sha384'],
+			['SHA-512', 'sha512'],
+		] as const;
+		const digests = await Promise.all(
+			hashes.map(([hash]) => crypto.digest(hash, data)),
+		);
+		expect(toArray(await crypto.hmac(key, data))).toEqual(
+			toArray(nodeCrypto.createHmac('sha256', key).update(data).digest()),
+		);
+		expect(digests.map(toArray)).toEqual(
+			hashes.map(([, name]) => toArray(createHash(name).update(data).digest())),
+		);
+		expect(toArray(await crypto.pbkdf2(key, data, 4096))).toEqual(
+			toArray(nodeCrypto.pbkdf2Sync(key, data, 4096, 32, 'sha256')),
+		);
+		expect(crypto.random(18)).toHaveLength(18);
 	});
 
 	it('SCRAM rejects a server nonce that does not extend the client’s', async () => {

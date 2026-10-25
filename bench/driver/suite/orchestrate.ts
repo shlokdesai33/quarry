@@ -1,13 +1,12 @@
 /* oxlint-disable no-await-in-loop -- cells run one at a time, on purpose */
 /**
- * Runs the benchmark matrix: every cell (runtime × client × scenario ×
- * parameters) `--runs` times, each run in a fresh process pinned to the
+ * Runs the benchmark matrix: every cell (client × scenario × parameters) `--runs` times, each run in a fresh process pinned to the
  * client CPUs, in a seeded random order. Results append to
  * `results/<id>/raw.jsonl` as they come, so an interrupted run resumes
  * with `--id <id>`.
  *
  *   node orchestrate.ts [--phases main,conc,pipeline,rtt,bouncer,reconnect,verify]
- *                       [--runtimes node,bun,deno] [--runs 5] [--seed 1] [--id name]
+ *                       [--runs 5] [--seed 1] [--id name]
  *                       [--only-drivers a,b] [--only-scenarios a,b] [--quick] [--parallel 1]
  */
 import { execSync, spawn } from 'node:child_process';
@@ -57,7 +56,6 @@ const PHASES = list('phases') ?? [
 	'bouncer',
 	'reconnect',
 ];
-const RUNTIMES = list('runtimes') ?? ['node', 'bun', 'deno'];
 const ONLY_DRIVERS = list('only-drivers');
 const ONLY_SCENARIOS = list('only-scenarios');
 const ID =
@@ -66,12 +64,15 @@ const ID =
 const CANDIDATE = process.env['QUARRY_DIST_CANDIDATE'];
 const OUT = join(import.meta.dirname, 'results', ID);
 
-/** The main clients per runtime; every scenario runs on each. */
-export const CORE: Record<string, readonly string[]> = {
-	node: ['quarry', 'pg', 'pg-named', 'pg-native', 'postgres.js', 'neon'],
-	bun: ['quarry', 'pg', 'pg-named', 'postgres.js', 'bun.sql'],
-	deno: ['quarry', 'pg', 'pg-named', 'postgres.js', 'deno-postgres-nodelay'],
-};
+/** The main clients; every scenario runs on each. */
+export const CORE: readonly string[] = [
+	'quarry',
+	'pg',
+	'pg-named',
+	'pg-native',
+	'postgres.js',
+	'neon',
+];
 
 const PREPARE_SET = [
 	'select1',
@@ -93,36 +94,18 @@ const DECODE_SET = [
 	...SCENARIOS.filter((s) => s.group === 'types').map((s) => s.id),
 ];
 /** Configuration variants, with the scenarios where they're informative. */
-const VARIANTS: Record<string, Record<string, readonly string[]>> = {
-	node: {
-		'quarry-lossless': DECODE_SET,
-		'quarry-noprep': PREPARE_SET,
-		'postgres.js-noprep': PREPARE_SET,
-		'pg-native-named': PREPARE_SET,
-		'neon-default': ['select1', 'pk', 'fetch1k', 'insert1', 'tx-insert'],
-	},
-	bun: {
-		'quarry-lossless': DECODE_SET,
-		'quarry-noprep': PREPARE_SET,
-		'postgres.js-noprep': PREPARE_SET,
-		'bun.sql-noprep': PREPARE_SET,
-	},
-	deno: {
-		'quarry-noprep': PREPARE_SET,
-		'postgres.js-noprep': PREPARE_SET,
-		'deno-postgres': [
-			'select1',
-			'pk',
-			'fetch1k',
-			'insert1',
-			'connect-plain-trust',
-		],
-	},
+const VARIANTS: Record<string, readonly string[]> = {
+	'quarry-lossless': DECODE_SET,
+	'quarry-noprep': PREPARE_SET,
+	'postgres.js-noprep': PREPARE_SET,
+	'pg-native-named': PREPARE_SET,
+	'neon-default': ['select1', 'pk', 'fetch1k', 'insert1', 'tx-insert'],
 };
 
 interface Cell {
 	readonly phase: string;
-	readonly runtime: string;
+	/** Always `node`; kept so results stay keyed like earlier snapshots. */
+	readonly runtime: 'node';
 	readonly driver: string;
 	readonly scenario: string;
 	readonly via: 'direct' | 'bouncer' | 'toxiproxy';
@@ -156,10 +139,7 @@ const keep = (driver: string, scenario: string) =>
 function matrix(phase: string): Cell[] {
 	const cells: Cell[] = [];
 	const push = (c: Cell) => {
-		if (
-			keep(c.driver, c.scenario) &&
-			DRIVERS[c.driver]?.runtimes.includes(c.runtime)
-		)
+		if (keep(c.driver, c.scenario) && DRIVERS[c.driver] !== undefined)
 			cells.push(c);
 	};
 	const add = (c: Cell) => {
@@ -175,18 +155,27 @@ function matrix(phase: string): Cell[] {
 				push({ ...c, driver: 'quarry-candidate', memOps: s.memOps });
 		}
 	};
-	for (const runtime of RUNTIMES) {
-		const core = CORE[runtime] ?? [];
-		if (phase === 'main' || phase === 'verify') {
-			for (const s of SCENARIOS) {
-				if (
-					s.id === 'reconnect' ||
-					s.group === 'batches' ||
-					s.group === 'builder'
-				)
-					continue;
-				if (phase === 'verify' && (s.kind !== 'ops' || !s.verify)) continue;
-				for (const driver of core)
+	const runtime = 'node';
+	if (phase === 'main' || phase === 'verify') {
+		for (const s of SCENARIOS) {
+			if (
+				s.id === 'reconnect' ||
+				s.group === 'batches' ||
+				s.group === 'builder'
+			)
+				continue;
+			if (phase === 'verify' && (s.kind !== 'ops' || !s.verify)) continue;
+			for (const driver of CORE)
+				add({
+					phase,
+					runtime,
+					driver,
+					scenario: s.id,
+					via: 'direct',
+					max: 10,
+				});
+			for (const [driver, scenarios] of Object.entries(VARIANTS))
+				if (scenarios.includes(s.id))
 					add({
 						phase,
 						runtime,
@@ -195,73 +184,129 @@ function matrix(phase: string): Cell[] {
 						via: 'direct',
 						max: 10,
 					});
-				for (const [driver, scenarios] of Object.entries(
-					VARIANTS[runtime] ?? {},
-				))
-					if (scenarios.includes(s.id))
-						add({
-							phase,
-							runtime,
-							driver,
-							scenario: s.id,
-							via: 'direct',
-							max: 10,
-						});
-			}
 		}
-		if (phase === 'conc' && runtime !== 'deno') {
-			const drivers =
-				runtime === 'node'
-					? [...core, 'quarry-nopipe']
-					: ['quarry', 'pg', 'postgres.js', 'bun.sql'];
-			for (const driver of drivers)
-				for (const concurrency of [1, 10, 50, 100, 500, 1000])
-					for (const max of [1, 5, 10, 50])
-						add({
-							phase,
-							runtime,
-							driver,
-							scenario: 'pk',
-							via: 'direct',
-							max,
-							concurrency,
-						});
-		}
-		if (phase === 'pipeline' && runtime === 'node') {
-			for (const rtt of [0, 5])
-				// undefined: the default, adaptive depth
-				for (const pipeline of [1, 2, 4, 8, 16, 32, 64, 100, undefined])
+	}
+	if (phase === 'conc') {
+		for (const driver of [...CORE, 'quarry-nopipe'])
+			for (const concurrency of [1, 10, 50, 100, 500, 1000])
+				for (const max of [1, 5, 10, 50])
 					add({
 						phase,
 						runtime,
-						driver: 'quarry',
+						driver,
 						scenario: 'pk',
+						via: 'direct',
+						max,
+						concurrency,
+					});
+	}
+	if (phase === 'pipeline') {
+		for (const rtt of [0, 5])
+			// undefined: the default, adaptive depth
+			for (const pipeline of [1, 2, 4, 8, 16, 32, 64, 100, undefined])
+				add({
+					phase,
+					runtime,
+					driver: 'quarry',
+					scenario: 'pk',
+					via: 'toxiproxy',
+					rtt,
+					max: 1,
+					concurrency: 100,
+					...(pipeline === undefined ? {} : { pipeline }),
+					durationMs: 2000,
+				});
+	}
+	if (phase === 'rtt') {
+		const scenarios: [string, number, number?][] = [
+			['select1', 10],
+			['pk', 10],
+			['pk', 10, 50],
+			['pk', 1, 100],
+			['pk', 1, 500],
+			['fetch1k', 10],
+			['tx-insert', 10],
+			['tx-empty', 10],
+			['savepoints', 10],
+			['insert1-c50', 10],
+			['connect-plain-trust', 10],
+		];
+		for (const rtt of [0, 1, 5, 20])
+			for (const driver of CORE)
+				for (const [scenario, max, concurrency] of scenarios)
+					add({
+						phase,
+						runtime,
+						driver,
+						scenario,
 						via: 'toxiproxy',
 						rtt,
-						max: 1,
-						concurrency: 100,
-						...(pipeline === undefined ? {} : { pipeline }),
-						durationMs: 2000,
+						max,
+						...(concurrency ? { concurrency } : {}),
+						durationMs: rtt >= 5 ? 2000 : 1000,
 					});
-		}
-		if (phase === 'rtt' && runtime !== 'deno') {
-			const drivers = runtime === 'node' ? core : ['quarry', 'bun.sql'];
-			const scenarios: [string, number, number?][] = [
-				['select1', 10],
-				['pk', 10],
-				['pk', 10, 50],
-				['pk', 1, 100],
-				['pk', 1, 500],
-				['fetch1k', 10],
-				['tx-insert', 10],
-				['tx-empty', 10],
-				['savepoints', 10],
-				['insert1-c50', 10],
-				['connect-plain-trust', 10],
-			];
-			for (const rtt of [0, 1, 5, 20])
-				for (const driver of drivers)
-					for (const [scenario, max, concurrency] of scenarios)
+	}
+	if (phase === 'bouncer') {
+		const drivers = [
+			'quarry',
+			'quarry-noprep',
+			'pg',
+			'pg-named',
+			'pg-native',
+			'postgres.js',
+			'postgres.js-noprep',
+		];
+		const scenarios: [string, number?][] = [
+			['select1'],
+			['pk'],
+			['pk', 50],
+			['fetch1k'],
+			['insert1'],
+			['tx-insert'],
+			['insert1-c50'],
+			['error'],
+		];
+		for (const driver of drivers)
+			for (const [scenario, concurrency] of scenarios)
+				add({
+					phase,
+					runtime,
+					driver,
+					scenario,
+					via: 'bouncer',
+					max: 10,
+					...(concurrency ? { concurrency } : {}),
+				});
+	}
+	// quarry's query builder: db.batch against sequential and Promise.all
+	if (phase === 'batch') {
+		for (const s of SCENARIOS.filter((x) => x.group === 'batches'))
+			for (const rtt of [0, 5])
+				add({
+					phase,
+					runtime,
+					driver: 'quarry-db',
+					scenario: s.id,
+					via: 'toxiproxy',
+					rtt,
+					max: 10,
+					durationMs: rtt >= 5 ? 2000 : 1000,
+				});
+	}
+	// quarry's query builder under concurrency, with the same statements
+	// through the drivers for reference
+	if (phase === 'builder') {
+		const plan: [string, string[]][] = [
+			['quarry-db', ['db-pk', 'db-pk-timed', 'db-insert', 'db-update']],
+			...['quarry', 'pg', 'postgres.js'].map((d): [string, string[]] => [
+				d,
+				['pk', 'insert1', 'update'],
+			]),
+		];
+		for (const rtt of [0, 5])
+			for (const [driver, scenarios] of plan)
+				for (const scenario of scenarios)
+					for (const concurrency of [1, 100, 500, 1000])
 						add({
 							phase,
 							runtime,
@@ -269,104 +314,21 @@ function matrix(phase: string): Cell[] {
 							scenario,
 							via: 'toxiproxy',
 							rtt,
-							max,
-							...(concurrency ? { concurrency } : {}),
+							max: 10,
+							concurrency,
 							durationMs: rtt >= 5 ? 2000 : 1000,
 						});
-		}
-		if (phase === 'bouncer' && runtime !== 'deno') {
-			const drivers =
-				runtime === 'node'
-					? [
-							'quarry',
-							'quarry-noprep',
-							'pg',
-							'pg-named',
-							'pg-native',
-							'postgres.js',
-							'postgres.js-noprep',
-						]
-					: ['quarry', 'bun.sql', 'bun.sql-noprep'];
-			const scenarios: [string, number?][] = [
-				['select1'],
-				['pk'],
-				['pk', 50],
-				['fetch1k'],
-				['insert1'],
-				['tx-insert'],
-				['insert1-c50'],
-				['error'],
-			];
-			for (const driver of drivers)
-				for (const [scenario, concurrency] of scenarios)
-					add({
-						phase,
-						runtime,
-						driver,
-						scenario,
-						via: 'bouncer',
-						max: 10,
-						...(concurrency ? { concurrency } : {}),
-					});
-		}
-		// quarry's query builder: db.batch against sequential and Promise.all
-		if (phase === 'batch' && runtime === 'node') {
-			for (const s of SCENARIOS.filter((x) => x.group === 'batches'))
-				for (const rtt of [0, 5])
-					add({
-						phase,
-						runtime,
-						driver: 'quarry-db',
-						scenario: s.id,
-						via: 'toxiproxy',
-						rtt,
-						max: 10,
-						durationMs: rtt >= 5 ? 2000 : 1000,
-					});
-		}
-		// quarry's query builder under concurrency, with the same statements
-		// through the drivers for reference
-		if (phase === 'builder' && runtime === 'node') {
-			const plan: [string, string[]][] = [
-				['quarry-db', ['db-pk', 'db-pk-timed', 'db-insert', 'db-update']],
-				...['quarry', 'pg', 'postgres.js'].map((d): [string, string[]] => [
-					d,
-					['pk', 'insert1', 'update'],
-				]),
-			];
-			for (const rtt of [0, 5])
-				for (const [driver, scenarios] of plan)
-					for (const scenario of scenarios)
-						for (const concurrency of [1, 100, 500, 1000])
-							add({
-								phase,
-								runtime,
-								driver,
-								scenario,
-								via: 'toxiproxy',
-								rtt,
-								max: 10,
-								concurrency,
-								durationMs: rtt >= 5 ? 2000 : 1000,
-							});
-		}
-		if (phase === 'reconnect') {
-			const drivers =
-				runtime === 'node'
-					? core.filter((d) => d !== 'neon')
-					: runtime === 'bun'
-						? ['quarry', 'postgres.js', 'bun.sql']
-						: ['quarry', 'deno-postgres-nodelay'];
-			for (const driver of drivers)
-				add({
-					phase,
-					runtime,
-					driver,
-					scenario: 'reconnect',
-					via: 'direct',
-					max: 10,
-				});
-		}
+	}
+	if (phase === 'reconnect') {
+		for (const driver of CORE.filter((d) => d !== 'neon'))
+			add({
+				phase,
+				runtime,
+				driver,
+				scenario: 'reconnect',
+				via: 'direct',
+				max: 10,
+			});
 	}
 	return cells;
 }
@@ -388,27 +350,9 @@ function shuffle<T>(items: T[], random: () => number): T[] {
 	return items;
 }
 
-function command(runtime: string, json: string): string[] {
+function command(json: string): string[] {
 	const pin = PARALLEL > 1 ? [] : ['taskset', '-c', CPUS.client];
-	switch (runtime) {
-		case 'node':
-			return [...pin, 'node', '--expose-gc', 'worker.ts', json];
-		case 'bun':
-			return [...pin, 'bun', 'worker.ts', json];
-		case 'deno':
-			return [
-				...pin,
-				'deno',
-				'run',
-				'-A',
-				'--no-lock',
-				'--v8-flags=--expose-gc',
-				'worker.ts',
-				json,
-			];
-		default:
-			throw new Error(runtime);
-	}
+	return [...pin, 'node', '--expose-gc', 'worker.ts', json];
 }
 
 function targetFor(cell: Cell): Target {
@@ -440,7 +384,7 @@ async function runCell(
 		verify,
 		memOps: cell.memOps,
 	};
-	const [cmd, ...rest] = command(cell.runtime, JSON.stringify(job));
+	const [cmd, ...rest] = command(JSON.stringify(job));
 	const child = spawn(cmd!, rest, {
 		cwd: import.meta.dirname,
 		stdio: ['pipe', 'pipe', 'pipe'],
@@ -500,8 +444,6 @@ const pkg = (name: string) => {
 function versions(): Record<string, string> {
 	return {
 		node: process.version,
-		bun: sh('bun --version'),
-		deno: sh('deno --version').split('\n')[0] ?? 'n/a',
 		postgresql: sh(
 			`${process.env['PG_BIN'] ?? '/usr/lib/postgresql/18/bin'}/postgres --version`,
 		),
@@ -516,7 +458,6 @@ function versions(): Record<string, string> {
 		'@neondatabase/serverless': pkg('@neondatabase/serverless'),
 		'pg-cursor': pkg('pg-cursor'),
 		'pg-copy-streams': pkg('pg-copy-streams'),
-		'deno-postgres': 'jsr:@db/postgres@0.19.5',
 		quarry: sh('git -C ../../.. rev-parse --short HEAD'),
 		kernel: release(),
 		os: sh('. /etc/os-release && echo $PRETTY_NAME'),
@@ -542,7 +483,7 @@ async function main() {
 		runs: RUNS,
 		quick: QUICK,
 		phases: PHASES,
-		runtimes: RUNTIMES,
+		runtimes: ['node'],
 		cpu: cpus()[0]?.model,
 		cores: cpus().length,
 		memoryGB: Math.round(totalmem() / 2 ** 30),
@@ -594,7 +535,7 @@ async function main() {
 					const eta =
 						(((Date.now() - started) / i) * (queue.length - i)) / 60000;
 					console.error(
-						`[${phase} ${i}/${queue.length} eta ${eta.toFixed(0)}m] ${cell.runtime} ${cell.driver} ${cell.scenario} via=${cell.via} max=${cell.max} c=${cell.concurrency ?? '-'} rtt=${cell.rtt ?? '-'} p=${cell.pipeline ?? '-'} → ` +
+						`[${phase} ${i}/${queue.length} eta ${eta.toFixed(0)}m] ${cell.driver} ${cell.scenario} via=${cell.via} max=${cell.max} c=${cell.concurrency ?? '-'} rtt=${cell.rtt ?? '-'} p=${cell.pipeline ?? '-'} → ` +
 							(r.ok
 								? (r.digest ??
 									`${r.throughput?.toFixed(0)}/s p50=${((r.lat?.p50 ?? 0) * 1000).toFixed(0)}µs`)
