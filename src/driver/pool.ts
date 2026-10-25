@@ -28,6 +28,21 @@ export interface PoolOptions extends ConnectionOptions {
 	/** The most callers waiting for a connection before `acquire` fails fast (default unlimited). */
 	readonly maxWaiting?: number | undefined;
 	/**
+	 * Replaces a connection once it has served this many queries and
+	 * borrowers (default unlimited): e.g. to spread load again after a
+	 * failover, or to bound per-session memory on the server.
+	 */
+	readonly maxUses?: number | undefined;
+	/**
+	 * After a failed connection attempt, waits about this long (milliseconds,
+	 * ±50% jitter) before the next one, instead of retrying at once (default
+	 * 0). The delay doesn't grow with consecutive failures, so the pool is
+	 * back within about one delay once the server is; waiting callers keep
+	 * waiting meanwhile (up to `acquireTimeout`), and `min` connections are
+	 * opened again after it.
+	 */
+	readonly connectRetryDelay?: number | undefined;
+	/**
 	 * Once every connection is in use, `query`, `simpleQuery` and `describe`
 	 * share connections, pipelining several queries on each. Beyond that,
 	 * queries wait in line and take the next free slot.
@@ -60,11 +75,60 @@ export interface PoolStats {
 	readonly waiting: number;
 }
 
+/** What the pool has done since it was created, counted. */
+export interface PoolMetrics {
+	/** Connections opened (and through `onConnect`). */
+	readonly opened: number;
+	/** Connection attempts that failed. */
+	readonly openFailed: number;
+	/** Connections closed, for any reason. */
+	readonly closed: number;
+	/** Callers that had to wait for a connection or a pipeline slot. */
+	readonly waited: number;
+	/** Waits that ended with `acquireTimeout`. */
+	readonly waitTimeouts: number;
+	/** Callers refused at once because `maxWaiting` callers were waiting. */
+	readonly waitRefusals: number;
+}
+
+/** Why the pool closed a connection. */
+export type PoolCloseReason =
+	/** Idle longer than `idleTimeout`. */
+	| 'idle'
+	/** Older than `maxLifetime`. */
+	| 'lifetime'
+	/** Used `maxUses` times. */
+	| 'maxUses'
+	/** Released with `release(true)` or an error. */
+	| 'discarded'
+	/** Released with a transaction still open. */
+	| 'transaction'
+	/** Closed by the server or the network, or failed. */
+	| 'lost'
+	/** The pool ended. */
+	| 'end';
+
+/** Something that happened to the pool's connections or callers; see `Pool.onEvent`. */
+export type PoolEvent =
+	| { readonly type: 'open'; readonly connection: Connection }
+	| { readonly type: 'openFailed'; readonly error: Error }
+	| {
+			readonly type: 'close';
+			readonly connection: Connection;
+			readonly reason: PoolCloseReason;
+	  }
+	| { readonly type: 'waitTimeout' }
+	| { readonly type: 'waitRefused' };
+
 interface Waiter {
 	resolve(connection: Connection): void;
 	reject(error: Error): void;
+	/** When it times out (`performance.now()`), or infinity. */
+	readonly deadline: number;
 	cleanup(): void;
 }
+
+const noop = () => {};
 
 /** The pool's bookkeeping for one open connection. */
 interface Slot {
@@ -75,6 +139,14 @@ interface Slot {
 	shared: number;
 	/** When its lifetime ends (ms since epoch); infinite without one. */
 	readonly expiresAt: number;
+	/** Why it takes no new work, once its lifetime ended or it was used `maxUses` times. */
+	expired: 'lifetime' | 'maxUses' | undefined;
+	/** Queries and borrowers it has served, for `maxUses`. */
+	uses: number;
+	/** Sets `expired` when its lifetime ends. */
+	lifetime: ReturnType<typeof setTimeout> | undefined;
+	/** Why the pool is closing it, once it is. */
+	closing: PoolCloseReason | undefined;
 	/** When it was last parked idle (ms since epoch). */
 	idleSince: number;
 	/** Its adaptive pipeline depth, once a query was timed on it. */
@@ -88,6 +160,9 @@ interface Slot {
 	readonly fulfilled: (value: unknown) => unknown;
 	readonly rejected: (error: unknown) => never;
 }
+
+/** The longest delay a timer takes. */
+const MAX_TIMER = 2_147_483_647;
 
 function unref(timer: ReturnType<typeof setTimeout>): void {
 	if (typeof timer === 'object' && timer !== null && 'unref' in timer)
@@ -526,7 +601,23 @@ export class Pool implements AsyncDisposable {
 	readonly #maxLifetime: number;
 	readonly #acquireTimeout: number;
 	readonly #maxWaiting: number;
+	readonly #maxUses: number;
+	readonly #connectRetryDelay: number;
+	/** No connection attempt before this (ms since epoch), after one failed. */
+	#retryAt = 0;
+	#retryTimer: ReturnType<typeof setTimeout> | undefined;
+	/** One timer for every waiter's `acquireTimeout`, at the earliest. */
+	#waitTimer: ReturnType<typeof setTimeout> | undefined;
 	readonly #onConnect: PoolOptions['onConnect'];
+	readonly #eventListeners = new Set<(event: PoolEvent) => void>();
+	readonly #metrics = {
+		opened: 0,
+		openFailed: 0,
+		closed: 0,
+		waited: 0,
+		waitTimeouts: 0,
+		waitRefusals: 0,
+	};
 	/** The fixed pipeline depth, or the adaptive one's floor; 0 when off. */
 	readonly #pipeline: number;
 	/** Whether each connection's depth adapts (`pipeline` wasn't given). */
@@ -576,6 +667,8 @@ export class Pool implements AsyncDisposable {
 		this.#maxLifetime = o.maxLifetime ?? 3_600_000;
 		this.#acquireTimeout = o.acquireTimeout ?? 30_000;
 		this.#maxWaiting = o.maxWaiting ?? Number.POSITIVE_INFINITY;
+		this.#maxUses = o.maxUses ?? Number.POSITIVE_INFINITY;
+		this.#connectRetryDelay = o.connectRetryDelay ?? 0;
 		this.#onConnect = o.onConnect;
 		this.#pipeline = o.pipeline === false ? 0 : (o.pipeline ?? PIPELINE_FLOOR);
 		this.#adaptive = o.pipeline === undefined;
@@ -596,6 +689,33 @@ export class Pool implements AsyncDisposable {
 		};
 	}
 
+	/** Counts of what the pool has done since it was created. */
+	get metrics(): PoolMetrics {
+		return { ...this.#metrics };
+	}
+
+	/**
+	 * Calls `listener` when the pool opens or closes a connection, fails to
+	 * open one, or times out or refuses a waiting caller (never per query).
+	 * Returns a function that removes it.
+	 */
+	onEvent(listener: (event: PoolEvent) => void): () => void {
+		this.#eventListeners.add(listener);
+		return () => this.#eventListeners.delete(listener);
+	}
+
+	#emit(event: PoolEvent): void {
+		for (const listener of this.#eventListeners) {
+			try {
+				listener(event);
+			} catch (error) {
+				queueMicrotask(() => {
+					throw error;
+				});
+			}
+		}
+	}
+
 	get ended(): boolean {
 		return this.#ended;
 	}
@@ -604,11 +724,15 @@ export class Pool implements AsyncDisposable {
 		return this.#idle.length + this.#busy + this.#opening;
 	}
 
-	#expired(slot: Slot): boolean {
-		return (
-			slot.expiresAt !== Number.POSITIVE_INFINITY &&
-			Date.now() >= slot.expiresAt
-		);
+	/** Closes a connection the pool is done with, for `reason`. */
+	#close(slot: Slot, reason: PoolCloseReason): Promise<void> {
+		slot.closing ??= reason;
+		return slot.connection.close().catch(noop);
+	}
+
+	/** Counts a query or borrower on a connection: past `maxUses`, it takes no more. */
+	#use(slot: Slot): void {
+		if (++slot.uses >= this.#maxUses) slot.expired ??= 'maxUses';
 	}
 
 	#lend(slot: Slot): void {
@@ -626,21 +750,33 @@ export class Pool implements AsyncDisposable {
 	async #open(): Promise<Slot> {
 		this.#opening++;
 		try {
-			const connection = await openConnection(this.#config);
+			let connection: Connection;
 			try {
-				await this.#onConnect?.(connection);
+				connection = await openConnection(this.#config);
+				try {
+					await this.#onConnect?.(connection);
+				} catch (error) {
+					connection.destroy();
+					throw error;
+				}
 			} catch (error) {
-				connection.destroy();
+				this.#failedOpen(error);
 				throw error;
 			}
+			this.#retryAt = 0;
+			const lifetime =
+				this.#maxLifetime > 0
+					? this.#maxLifetime * (1 - Math.random() * 0.1)
+					: Number.POSITIVE_INFINITY;
 			const slot: Slot = {
 				connection,
 				busy: false,
 				shared: -1,
-				expiresAt:
-					this.#maxLifetime > 0
-						? Date.now() + this.#maxLifetime * (1 - Math.random() * 0.1)
-						: Number.POSITIVE_INFINITY,
+				expiresAt: Date.now() + lifetime,
+				expired: undefined,
+				uses: 0,
+				lifetime: undefined,
+				closing: undefined,
 				idleSince: 0,
 				depth: undefined,
 				lastDone: 0,
@@ -655,16 +791,77 @@ export class Pool implements AsyncDisposable {
 					throw error;
 				},
 			};
+			// a flag set once, so taking and sharing a connection read no clock
+			if (lifetime !== Number.POSITIVE_INFINITY) this.#expireAt(slot);
 			this.#slots.set(connection, slot);
 			connection.onClose(() => this.#forget(slot));
+			this.#metrics.opened++;
+			if (this.#eventListeners.size > 0)
+				this.#emit({ type: 'open', connection });
 			return slot;
 		} finally {
 			this.#opening--;
 		}
 	}
 
+	/** Sets `expired` once a connection's lifetime ends (in steps: a timer waits at most 2^31 − 1 ms). */
+	#expireAt(slot: Slot): void {
+		const left = slot.expiresAt - Date.now();
+		slot.lifetime = setTimeout(
+			() => {
+				if (left > MAX_TIMER) this.#expireAt(slot);
+				else slot.expired ??= 'lifetime';
+			},
+			Math.max(0, Math.min(left, MAX_TIMER)),
+		);
+		unref(slot.lifetime);
+	}
+
+	/** Counts a failed attempt and, with `connectRetryDelay`, holds the next one back. */
+	#failedOpen(error: unknown): void {
+		this.#metrics.openFailed++;
+		if (this.#connectRetryDelay > 0)
+			this.#retryAt =
+				Date.now() + this.#connectRetryDelay * (0.5 + Math.random());
+		if (this.#eventListeners.size > 0)
+			this.#emit({
+				type: 'openFailed',
+				error:
+					error instanceof Error ? error : new ConnectionError(String(error)),
+			});
+	}
+
+	/** Whether a connection attempt must wait for `connectRetryDelay`; if so, retries once it has passed. */
+	#holdingBack(): boolean {
+		if (this.#retryAt === 0) return false;
+		const wait = this.#retryAt - Date.now();
+		if (wait <= 0) {
+			this.#retryAt = 0;
+			return false;
+		}
+		if (this.#retryTimer === undefined) {
+			this.#retryTimer = setTimeout(() => {
+				this.#retryTimer = undefined;
+				this.#serveWaiters();
+				this.#fillMin();
+			}, wait);
+			// waiters keep the process alive with their own timeout; `min` alone doesn't
+			if (this.#waiters.length + this.#sharedWaiters.length === 0)
+				unref(this.#retryTimer);
+		}
+		return true;
+	}
+
 	/** Drops a connection that closed on its own (server restart, network loss, idle timeout). */
 	#forget(slot: Slot): void {
+		if (slot.lifetime !== undefined) clearTimeout(slot.lifetime);
+		this.#metrics.closed++;
+		if (this.#eventListeners.size > 0)
+			this.#emit({
+				type: 'close',
+				connection: slot.connection,
+				reason: slot.closing ?? 'lost',
+			});
 		this.#slots.delete(slot.connection);
 		const index = this.#idle.indexOf(slot);
 		if (index >= 0) this.#idle.splice(index, 1);
@@ -679,11 +876,12 @@ export class Pool implements AsyncDisposable {
 
 	#fillMin(): void {
 		if (this.#ended) return;
-		while (this.#total() < this.#min) {
+		while (this.#total() < this.#min && !this.#holdingBack()) {
 			this.#open().then(
 				(slot) => this.#giveBack(slot),
 				() => {
-					// retried on the next acquire or release
+					// retried on the next acquire or release, or after connectRetryDelay
+					if (this.#connectRetryDelay > 0) this.#fillMin();
 				},
 			);
 		}
@@ -706,6 +904,7 @@ export class Pool implements AsyncDisposable {
 		if (waiter !== undefined) {
 			waiter.cleanup();
 			this.#lend(slot);
+			this.#use(slot);
 			waiter.resolve(connection);
 			this.#rebalance();
 			return;
@@ -725,7 +924,7 @@ export class Pool implements AsyncDisposable {
 			return;
 		}
 		if (this.#ended) {
-			this.#closing.push(connection.close().catch(() => {}));
+			this.#closing.push(this.#close(slot, 'end'));
 			this.#checkDrained();
 			return;
 		}
@@ -771,14 +970,14 @@ export class Pool implements AsyncDisposable {
 			const index = this.#idle.indexOf(slot);
 			if (index < 0) continue;
 			this.#idle.splice(index, 1);
-			if (this.#expired(slot)) {
+			if (slot.expired !== undefined || now >= slot.expiresAt) {
 				// replaced even when that leaves fewer than min
-				void slot.connection.close();
+				void this.#close(slot, slot.expired ?? 'lifetime');
 				this.#fillMin();
 			} else if (this.#total() < this.#min) {
 				this.#giveBack(slot);
 			} else {
-				void slot.connection.close();
+				void this.#close(slot, 'idle');
 			}
 		}
 		let next = Number.POSITIVE_INFINITY;
@@ -822,7 +1021,8 @@ export class Pool implements AsyncDisposable {
 	#serveWaiters(): void {
 		while (
 			this.#waiters.length + this.#sharedWanted() > this.#opening &&
-			this.#total() < this.#max
+			this.#total() < this.#max &&
+			!this.#holdingBack()
 		) {
 			this.#open().then(
 				(slot) => this.#giveBack(slot),
@@ -849,9 +1049,9 @@ export class Pool implements AsyncDisposable {
 	#shareable(slot: Slot): boolean {
 		const { connection } = slot;
 		return (
+			slot.expired === undefined &&
 			!connection.closed &&
-			connection.transactionStatus === 'idle' &&
-			!this.#expired(slot)
+			connection.transactionStatus === 'idle'
 		);
 	}
 
@@ -891,6 +1091,7 @@ export class Pool implements AsyncDisposable {
 		this.#share(slot);
 		slot.shared++;
 		this.#inFlight++;
+		this.#use(slot);
 	}
 
 	/** The connection is no longer lent for queries. */
@@ -996,8 +1197,8 @@ export class Pool implements AsyncDisposable {
 		while (this.#idle.length > 0) {
 			const slot = this.#idle.pop();
 			if (slot === undefined) break;
-			if (slot.connection.closed || this.#expired(slot)) {
-				void slot.connection.close();
+			if (slot.connection.closed || slot.expired !== undefined) {
+				void this.#close(slot, slot.expired ?? 'lost');
 				continue;
 			}
 			this.#lend(slot);
@@ -1016,7 +1217,10 @@ export class Pool implements AsyncDisposable {
 				}),
 			);
 		const idle = this.#takeIdle();
-		if (idle !== undefined) return Promise.resolve(idle.connection);
+		if (idle !== undefined) {
+			this.#use(idle);
+			return Promise.resolve(idle.connection);
+		}
 		const waiting = this.#wait(this.#waiters, signal);
 		this.#serveWaiters();
 		this.#rebalance();
@@ -1026,52 +1230,95 @@ export class Pool implements AsyncDisposable {
 	/** Queues a caller; it is resolved with a connection by `#giveBack` or `#fillShared`. */
 	#wait(queue: Waiter[], signal: AbortSignal | undefined): Promise<Connection> {
 		if (this.#waiters.length + this.#sharedWaiters.length >= this.#maxWaiting) {
+			this.#metrics.waitRefusals++;
+			if (this.#eventListeners.size > 0) this.#emit({ type: 'waitRefused' });
 			return Promise.reject(
 				new DriverError(
 					`Too many callers waiting for a connection (maxWaiting ${this.#maxWaiting})`,
 				),
 			);
 		}
+		this.#metrics.waited++;
 		return new Promise((resolve, reject) => {
-			let timer: ReturnType<typeof setTimeout> | undefined;
 			const waiter: Waiter = {
 				resolve,
 				reject,
-				cleanup: () => {
-					if (timer !== undefined) clearTimeout(timer);
-					signal?.removeEventListener('abort', onAbort);
-				},
+				deadline:
+					this.#acquireTimeout > 0
+						? performance.now() + this.#acquireTimeout
+						: Number.POSITIVE_INFINITY,
+				cleanup: noop,
 			};
-			const remove = (error: Error) => {
-				const index = queue.indexOf(waiter);
-				if (index < 0) return;
-				queue.splice(index, 1);
-				waiter.cleanup();
-				reject(error);
-				this.#rebalance();
-				this.#checkDrained();
-			};
-			const onAbort = () =>
-				remove(
-					new AbortError('Acquiring a connection was aborted', {
-						cause: signal?.reason,
-					}),
-				);
-			if (this.#acquireTimeout > 0) {
-				timer = setTimeout(
-					() =>
-						remove(
-							new ConnectionError(
-								`Timed out after ${this.#acquireTimeout}ms waiting for a connection`,
-								{ code: 'ETIMEDOUT' },
-							),
-						),
-					this.#acquireTimeout,
+			if (signal !== undefined) this.#abortWait(queue, waiter, signal);
+			queue.push(waiter);
+			if (waiter.deadline !== Number.POSITIVE_INFINITY)
+				this.#waitTimer ??= this.#armWaitTimer(waiter.deadline);
+		});
+	}
+
+	#abortWait(queue: Waiter[], waiter: Waiter, signal: AbortSignal): void {
+		const onAbort = () =>
+			this.#unwait(
+				queue,
+				waiter,
+				new AbortError('Acquiring a connection was aborted', {
+					cause: signal.reason,
+				}),
+			);
+		signal.addEventListener('abort', onAbort, { once: true });
+		waiter.cleanup = () => signal.removeEventListener('abort', onAbort);
+	}
+
+	/** Takes a waiter out of its queue and fails it. */
+	#unwait(queue: Waiter[], waiter: Waiter, error: Error): void {
+		const index = queue.indexOf(waiter);
+		if (index < 0) return;
+		queue.splice(index, 1);
+		waiter.cleanup();
+		waiter.reject(error);
+		this.#rebalance();
+		this.#checkDrained();
+	}
+
+	/**
+	 * The timer for waiters' `acquireTimeout`: one for every waiter, at the
+	 * earliest deadline. Every waiter waits as long, so each queue is in
+	 * deadline order: the timer only looks at their heads, and a waiter
+	 * served before its deadline needs no timer cleared.
+	 */
+	#armWaitTimer(deadline: number): ReturnType<typeof setTimeout> {
+		return setTimeout(
+			() => this.#timeOutWaiters(),
+			Math.max(0, deadline - performance.now()),
+		);
+	}
+
+	#timeOutWaiters(): void {
+		this.#waitTimer = undefined;
+		const now = performance.now();
+		let next = Number.POSITIVE_INFINITY;
+		for (const queue of [this.#waiters, this.#sharedWaiters]) {
+			for (let head = queue[0]; head !== undefined; head = queue[0]) {
+				if (head.deadline > now) {
+					next = Math.min(next, head.deadline);
+					break;
+				}
+				queue.shift();
+				head.cleanup();
+				this.#metrics.waitTimeouts++;
+				if (this.#eventListeners.size > 0) this.#emit({ type: 'waitTimeout' });
+				head.reject(
+					new ConnectionError(
+						`Timed out after ${this.#acquireTimeout}ms waiting for a connection`,
+						{ code: 'ETIMEDOUT' },
+					),
 				);
 			}
-			signal?.addEventListener('abort', onAbort, { once: true });
-			queue.push(waiter);
-		});
+		}
+		this.#rebalance();
+		this.#checkDrained();
+		if (next !== Number.POSITIVE_INFINITY && this.#waitTimer === undefined)
+			this.#waitTimer = this.#armWaitTimer(next);
 	}
 
 	#release = (connection: Connection, discard: boolean): void => {
@@ -1082,10 +1329,13 @@ export class Pool implements AsyncDisposable {
 	#releaseSlot(slot: Slot, discard: boolean): void {
 		if (!slot.busy) return;
 		const { connection } = slot;
-		const reusable = !discard && !connection.closed && !this.#expired(slot);
+		const reusable = !discard && !connection.closed && slot.expired === undefined;
 		if (!reusable) {
 			this.#unlend(slot);
-			const closing = connection.close().catch(() => {});
+			const closing = this.#close(
+				slot,
+				discard ? 'discarded' : (slot.expired ?? 'lost'),
+			);
 			if (this.#ended) this.#closing.push(closing);
 			this.#serveWaiters();
 			this.#fillMin();
@@ -1112,6 +1362,7 @@ export class Pool implements AsyncDisposable {
 				this.#releaseSlot(slot, false);
 			} else {
 				this.#unlend(slot);
+				slot.closing = 'transaction';
 				connection.destroy(new DriverError('Released with a transaction open'));
 				this.#serveWaiters();
 				this.#checkDrained();
@@ -1504,9 +1755,11 @@ export class Pool implements AsyncDisposable {
 		if (this.#sweep !== undefined) clearTimeout(this.#sweep);
 		this.#sweep = undefined;
 		this.#sweepAt = Number.POSITIVE_INFINITY;
+		if (this.#retryTimer !== undefined) clearTimeout(this.#retryTimer);
+		this.#retryTimer = undefined;
 		const closing = this.#idle
 			.splice(0)
-			.map(({ connection }) => connection.close());
+			.map((slot) => this.#close(slot, 'end'));
 		const drained = new Promise<void>((resolve) => {
 			this.#drainWaiters.push(resolve);
 			this.#checkDrained();
@@ -1531,10 +1784,15 @@ export class Pool implements AsyncDisposable {
 					waiter.cleanup();
 					waiter.reject(new DriverError('The pool has ended'));
 				}
-				for (const slot of this.#slots.values())
-					if (slot.busy) closing.push(slot.connection.close({ timeout: 0 }));
+				for (const slot of this.#slots.values()) {
+					if (!slot.busy) continue;
+					slot.closing ??= 'end';
+					closing.push(slot.connection.close({ timeout: 0 }));
+				}
 			}
 		}
+		if (this.#waitTimer !== undefined) clearTimeout(this.#waitTimer);
+		this.#waitTimer = undefined;
 		await Promise.all([
 			...closing,
 			...this.#closing.splice(0),

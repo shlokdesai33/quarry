@@ -49,6 +49,8 @@ export interface Statement {
 	readonly types: readonly number[];
 	/** When the statement was last looked up, on the connection's counter: the cache evicts the lowest. */
 	used: number;
+	/** How often its SQL ran unnamed and succeeded, towards the connection's `prepareThreshold`. */
+	seen: number;
 	/** Created, and its Parse not yet written: the operation that finds it so writes it. */
 	unwritten: boolean;
 	/** Set once ParseComplete arrives. */
@@ -75,8 +77,9 @@ export interface OpContext {
 	readonly specs: { readonly binary: ResultSpec; readonly text: ResultSpec };
 	/**
 	 * The cached statement for this SQL, created if new (`unwritten` until
-	 * its Parse is written). A `named` one is created with a name, to be
-	 * parsed; an unnamed entry is then replaced.
+	 * its Parse is written). With `named`, one run often enough
+	 * (`prepareThreshold`) has a name, to be parsed, replacing its unnamed
+	 * entry; until then, and without `named`, it is unnamed (name '').
 	 */
 	statement(sql: string, types: readonly number[], named: boolean): Statement;
 	/**
@@ -404,10 +407,9 @@ export class QueryOp extends Op {
 		this.#spec = spec;
 		const types = this.#paramTypes;
 		if (this.#options.prepare && ctx.preparable(this.#sql, types)) {
-			const named = ctx.named();
-			const statement = ctx.statement(this.#sql, types, named);
+			const statement = ctx.statement(this.#sql, types, ctx.named());
 			this.#statement = statement;
-			if (!named) {
+			if (statement.name === '') {
 				this.#unnamed = true;
 				// binary only for columns already described
 				let formats: readonly number[] | 0 = 0;
@@ -658,6 +660,8 @@ export class QueryOp extends Op {
 			return true;
 		}
 		if (error === undefined) {
+			if (this.#unnamed && this.#statement !== undefined)
+				this.#statement.seen++;
 			const { command, rowCount } = parseTag(this.#tag);
 			this.#resolve({
 				command,
@@ -1126,11 +1130,10 @@ export class CursorOp extends Op {
 			this.#describe(w);
 			return;
 		}
-		const named = ctx.named();
-		const statement = ctx.statement(this.#sql, types, named);
+		const statement = ctx.statement(this.#sql, types, ctx.named());
 		this.#statement = statement;
-		if (!named) {
-			// behind a pooler that rewrites named statements: parsed unnamed, with the cached columns
+		if (statement.name === '') {
+			// not prepared (yet), or behind a pooler that rewrites named statements: parsed unnamed, with the cached columns
 			fe.parse(w, '', this.#sql, types);
 			if (statement.fields === undefined) this.#describe(w);
 			else this.#bind(w, statement.fields, true);
@@ -1489,6 +1492,7 @@ export class CursorOp extends Op {
 				'The cursor was opened outside a transaction, and closed with its first batch',
 			);
 		}
+		if (this.#error === undefined && statement?.name === '') statement.seen++;
 		this.#finished = true;
 		this.#phase = 'ended';
 		this.settle();

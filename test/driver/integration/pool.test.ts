@@ -861,6 +861,122 @@ describe.skipIf(noPg)('pool', () => {
 		expect(rows[0]?.pid).not.toBe(pid);
 	});
 
+	it('replaces a connection after maxUses queries and borrowers, and reports why', async () => {
+		await using p = pool({ max: 1, maxUses: 3 });
+		const events: string[] = [];
+		p.onEvent((event) =>
+			events.push(event.type === 'close' ? `close:${event.reason}` : event.type),
+		);
+		const pid = async () =>
+			(await p.query<{ pid: number }>('select pg_backend_pid() as pid'))
+				.rows[0]?.pid;
+		const first = await pid();
+		expect(await pid()).toBe(first);
+		const client = await p.acquire();
+		expect(client.connection.processId).toBe(first);
+		client.release();
+		await sleep(20);
+		const second = await pid();
+		expect(second).not.toBe(first);
+		expect(events).toEqual(['open', 'close:maxUses', 'open']);
+		expect(p.metrics).toMatchObject({ opened: 2, closed: 1, openFailed: 0 });
+	});
+
+	it('counts and reports waits that time out or are refused, and connections closed idle', async () => {
+		await using p = pool({ max: 1, acquireTimeout: 50, maxWaiting: 1, idleTimeout: 50 });
+		const events: string[] = [];
+		const stop = p.onEvent((event) =>
+			events.push(event.type === 'close' ? `close:${event.reason}` : event.type),
+		);
+		const held = await p.acquire();
+		const timedOut = rejection(p.acquire(), ConnectionError);
+		await expect(p.acquire()).rejects.toThrow(/maxWaiting/);
+		expect((await timedOut).code).toBe('ETIMEDOUT');
+		held.release();
+		await sleep(200);
+		expect(events).toEqual(['open', 'waitRefused', 'waitTimeout', 'close:idle']);
+		expect(p.metrics).toEqual({
+			opened: 1,
+			openFailed: 0,
+			closed: 1,
+			// the first acquire waited for the connection to open
+			waited: 2,
+			waitTimeouts: 1,
+			waitRefusals: 1,
+		});
+		stop();
+		await p.query('select 1');
+		expect(events).toHaveLength(4);
+	});
+
+	it('times each waiter out at its own deadline, with waiters served in between', async () => {
+		await using p = pool({ max: 1, acquireTimeout: 150 });
+		const held = await p.acquire();
+		const started = performance.now();
+		const early = Array.from({ length: 20 }, () =>
+			p.acquire().then(
+				(client) => {
+					client.release();
+					return 'served';
+				},
+				() => performance.now() - started,
+			),
+		);
+		await sleep(100);
+		const late = p.acquire().then(
+			(client) => {
+				client.release();
+				return 'served';
+			},
+			() => performance.now() - started,
+		);
+		held.release();
+		const outcomes = await Promise.all(early);
+		// handed to the first waiter, which releases it to the next, and so on
+		expect(outcomes.every((outcome) => outcome === 'served')).toBe(true);
+		expect(await late).toBe('served');
+		const blocked = await p.acquire();
+		const timedOut = await p.acquire().then(
+			() => 0,
+			() => performance.now() - started,
+		);
+		blocked.release();
+		expect(timedOut).toBeGreaterThanOrEqual(240);
+	});
+
+	it('waits connectRetryDelay after a failed connect, without growing the delay', async () => {
+		const { createServer } = await import('node:net');
+		const server = createServer();
+		await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+		const address = server.address();
+		const port = typeof address === 'object' && address ? address.port : 0;
+		await new Promise((resolve) => server.close(resolve));
+		const dead = { host: '127.0.0.1', port, connectTimeout: 1000 };
+		const failures = async (overrides: PoolOptions) => {
+			await using p = pool({ ...dead, max: 1, acquireTimeout: 0, ...overrides });
+			const failedOpens: number[] = [];
+			const started = performance.now();
+			p.onEvent((event) => {
+				if (event.type === 'openFailed')
+					failedOpens.push(performance.now() - started);
+			});
+			await Promise.all(
+				[1, 2, 3].map(() => rejection(p.query('select 1'), ConnectionError)),
+			);
+			return failedOpens;
+		};
+		const immediate = await failures({});
+		expect(immediate).toHaveLength(3);
+		expect(immediate[2]).toBeLessThan(80);
+		const delayed = await failures({ connectRetryDelay: 100 });
+		expect(delayed).toHaveLength(3);
+		const gaps = [delayed[1]! - delayed[0]!, delayed[2]! - delayed[1]!];
+		for (const gap of gaps) {
+			expect(gap).toBeGreaterThanOrEqual(45);
+			expect(gap).toBeLessThan(250);
+		}
+	});
+
 	it('replaces connections that die while idle', async () => {
 		await using p = pool({ max: 1 });
 		const client = await p.acquire();

@@ -395,14 +395,20 @@ describe.skipIf(noPg)('result codecs', () => {
 					a: [1, 2],
 				},
 			]);
+			// prepared, and described, by its second run
 			const second = await c.query(SQL, [], {
 				resultCodecs: expected,
 				prepare,
 			});
-			expect(second.fields.map((f) => f.format)).toEqual(
+			expect(second.fields.map((f) => f.format)).toEqual([0, 0, 0, 0]);
+			const third = await c.query(SQL, [], {
+				resultCodecs: expected,
+				prepare,
+			});
+			expect(third.fields.map((f) => f.format)).toEqual(
 				prepare ? [1, 1, 0, 1] : [0, 0, 0, 0],
 			);
-			expect(second.rows).toEqual(first.rows);
+			expect([second.rows, third.rows]).toEqual([first.rows, first.rows]);
 		}
 	});
 
@@ -535,6 +541,7 @@ describe.skipIf(noPg)('types looked up by name', () => {
 			pool.query('select m, ms, n from feelings', [], {
 				resultCodecs: [mood, arrayOf(mood), posint],
 			});
+		await feelings();
 		await feelings();
 		const read = await feelings();
 		expect(read.rows).toEqual([{ m: 'happy', ms: ['happy', 'sad'], n: 3 }]);

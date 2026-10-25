@@ -48,6 +48,7 @@ test('TCP sockets are opened with NODELAY and keepalive in the connect options, 
 	try {
 		const socket = await nodeSockets.connect({
 			target,
+			tls: undefined,
 			keepAlive: true,
 			keepAliveInitialDelay: 1000,
 		});
@@ -62,7 +63,17 @@ test('TCP sockets are opened with NODELAY and keepalive in the connect options, 
 				target,
 				keepAlive: false,
 				keepAliveInitialDelay: 0,
-				tls: { verifyChain: false, verifyHostname: false, host: '127.0.0.1' },
+				tls: {
+					servername: undefined,
+					ca: undefined,
+					cert: undefined,
+					key: undefined,
+					passphrase: undefined,
+					alpn: undefined,
+					verifyChain: false,
+					verifyHostname: false,
+					host: '127.0.0.1',
+				},
 			})
 			.catch(() => {});
 		expect(tlsConnect.mock.calls[0]?.[0]).toMatchObject({ noDelay: true });

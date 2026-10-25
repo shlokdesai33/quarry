@@ -274,7 +274,7 @@ describe.skipIf(noPg)('queries', () => {
 		) as t(b, i2, i4, o, f4, f8, bytes, ts)`;
 		await using c = await open({ codecs: [codecs.timestamptz] });
 		const text = await c.query(sql, [], { binary: false });
-		await c.query(sql); // describes the statement
+		await c.query(sql); // prepares and describes the statement
 		const binary = await c.query(sql);
 		expect(binary.fields.map((f) => f.format)).toEqual([
 			1, 1, 1, 1, 0, 1, 1, 1,
@@ -292,6 +292,7 @@ describe.skipIf(noPg)('queries', () => {
 				decodeText: (t) => `custom ${t}`,
 			}),
 		];
+		await c.query('select now() as t, 1 as n', [], { codecs: custom });
 		await c.query('select now() as t, 1 as n', [], { codecs: custom });
 		const mixed = await c.query<{ t: string; n: number }>(
 			'select now() as t, 1 as n',

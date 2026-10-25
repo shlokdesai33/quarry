@@ -87,7 +87,10 @@ export interface QueryOptions {
 	 * connection's: a registry (`createCodecRegistry`), or a list.
 	 */
 	readonly codecs?: CodecRegistry | readonly Codec[];
-	/** Use a cached named prepared statement (default: the connection's `prepare` option). */
+	/**
+	 * Use a cached named prepared statement, once the SQL has run
+	 * `prepareThreshold` times (default: the connection's `prepare` option).
+	 */
 	readonly prepare?: boolean;
 	/**
 	 * The codec of each parameter, by position (as `typed` gives one): the
@@ -835,6 +838,16 @@ export class Connection implements AsyncDisposable {
 	 * compared: a SQL string used again keeps its hash, where a key built
 	 * per query (types and SQL) would be hashed in full every time. The same
 	 * SQL with other types is keyed by both.
+	 *
+	 * With `named`, SQL is prepared on its `prepareThreshold`th run: before
+	 * that its entry is unnamed, keeping only the columns its runs
+	 * described, so SQL run once never takes a server-side statement or
+	 * pushes a prepared one out. Only runs that succeeded count, so a
+	 * statement isn't prepared in the middle of a pipeline that repeats it,
+	 * behind a statement that may fail and make the server skip its Parse.
+	 * It is prepared like new SQL (described, its results in text that
+	 * run): its columns may have changed since. When the cache is full, the
+	 * least recently used unnamed entry goes first.
 	 */
 	#statement(sql: string, types: readonly number[], named: boolean): Statement {
 		let key = sql;
@@ -847,24 +860,28 @@ export class Connection implements AsyncDisposable {
 				existing = found;
 			}
 		}
+		const threshold = this.#config.prepareThreshold;
 		if (existing !== undefined) {
-			if (!named || existing.name !== '') {
-				// a use stamp instead of moving the entry to the Map's end: deleting
-				// and re-adding a key on every hit makes the Map rehash, garbage
-				// that adds up to GC pauses on small queries
-				existing.used = ++this.#statementUses;
+			// a use stamp instead of moving the entry to the Map's end: deleting
+			// and re-adding a key on every hit makes the Map rehash, garbage
+			// that adds up to GC pauses on small queries
+			existing.used = ++this.#statementUses;
+			if (!named || existing.name !== '' || existing.seen + 1 < threshold)
 				return existing;
-			}
-			// an unnamed entry, replaced by a named statement
+			// run often enough: replaced by a named statement
 			this.#statements.delete(key);
 		}
 		const statement: Statement = {
-			name: named ? `q${++this.#statementCount}` : '',
+			name:
+				named && (existing !== undefined || threshold <= 1)
+					? `q${++this.#statementCount}`
+					: '',
 			key,
 			sql,
 			// a copy: `paramTypes` is the caller's array
 			types: [...types],
 			used: ++this.#statementUses,
+			seen: existing?.seen ?? 0,
 			unwritten: true,
 			parsed: false,
 			fields: undefined,
@@ -873,13 +890,21 @@ export class Connection implements AsyncDisposable {
 		};
 		if (this.#statements.size >= this.#config.statementCacheSize) {
 			let oldest: Statement | undefined;
-			for (const candidate of this.#statements.values())
+			let oldestUnnamed: Statement | undefined;
+			for (const candidate of this.#statements.values()) {
 				if (oldest === undefined || candidate.used < oldest.used)
 					oldest = candidate;
-			if (oldest !== undefined) {
-				this.#statements.delete(oldest.key);
+				if (
+					candidate.name === '' &&
+					(oldestUnnamed === undefined || candidate.used < oldestUnnamed.used)
+				)
+					oldestUnnamed = candidate;
+			}
+			const evicted = oldestUnnamed ?? oldest;
+			if (evicted !== undefined) {
+				this.#statements.delete(evicted.key);
 				// written before the new statement's Parse; the op ignores the CloseComplete
-				if (oldest.name !== '') fe.close(this.#writer, 'S', oldest.name);
+				if (evicted.name !== '') fe.close(this.#writer, 'S', evicted.name);
 			}
 		}
 		this.#statements.set(key, statement);

@@ -47,6 +47,9 @@ export {
 	createPool,
 	Pool,
 	PoolClient,
+	type PoolCloseReason,
+	type PoolEvent,
+	type PoolMetrics,
 	type PoolOptions,
 	type PoolStats,
 } from './pool.js';

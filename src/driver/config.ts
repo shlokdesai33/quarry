@@ -145,6 +145,14 @@ export interface ConnectionOptions {
 	/** The most prepared statements kept per connection (default 100). */
 	readonly statementCacheSize?: number | undefined;
 	/**
+	 * How many times a connection runs a SQL text, as an unnamed statement,
+	 * before preparing it (default 2; 1 prepares on first use). SQL run once
+	 * then costs no server-side statement and pushes no prepared one out of
+	 * the cache; repeated SQL is prepared on its second run, with binary
+	 * results from that run, as its first run described the columns.
+	 */
+	readonly prepareThreshold?: number | undefined;
+	/**
 	 * Use named statements for queries pipelined with others on the
 	 * connection too. Default: true, except behind a pooler that rewrites
 	 * them (PgBouncer 1.26+ in transaction mode says so at login), where
@@ -224,6 +232,7 @@ export interface ResolvedConfig {
 	readonly catalog: TypeCatalog;
 	readonly prepare: boolean;
 	readonly statementCacheSize: number;
+	readonly prepareThreshold: number;
 	/** Undefined: decided by what the other end reports at login. */
 	readonly preparePipelined: boolean | undefined;
 	readonly binaryResults: boolean;
@@ -663,6 +672,7 @@ export function resolveConfig(options: ConnectionOptions = {}): ResolvedConfig {
 		catalog: new TypeCatalog(),
 		prepare: options.prepare ?? true,
 		statementCacheSize: options.statementCacheSize ?? 100,
+		prepareThreshold: prepareThreshold(options.prepareThreshold),
 		preparePipelined: options.preparePipelined,
 		binaryResults: options.binaryResults ?? true,
 		telemetry: options.telemetry,
@@ -685,6 +695,15 @@ function hideSecrets(config: ResolvedConfig): ResolvedConfig {
 	Object.defineProperty(config.ssl, 'key', { enumerable: false });
 	Object.defineProperty(config.ssl, 'passphrase', { enumerable: false });
 	return config;
+}
+
+function prepareThreshold(value: number | undefined): number {
+	const threshold = value ?? 2;
+	if (!Number.isInteger(threshold) || threshold < 1)
+		throw new DriverError(
+			`prepareThreshold takes a whole number of runs from 1, not ${threshold}`,
+		);
+	return threshold;
 }
 
 function scramMaxIterations(options: ConnectionOptions): number {

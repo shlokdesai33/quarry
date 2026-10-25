@@ -560,8 +560,9 @@ describe('statement names behind a pooler', () => {
 			maxPreparedStatements: 200,
 		});
 		expect(statementNames(capabilities.pgbouncer)).toBe('rewritten');
-		expect(parsed).toEqual(['q1', '', '', '']);
-		expect(bound).toEqual(['q1', '', '', '', 'q1']);
+		// unnamed on its first run, then pipelined; named once alone again
+		expect(parsed).toEqual(['', '', '', '', 'q1']);
+		expect(bound).toEqual(['', '', '', '', 'q1']);
 	});
 
 	it('names no statement when PgBouncer in transaction mode keeps none', async () => {
@@ -581,8 +582,9 @@ describe('statement names behind a pooler', () => {
 			const { port, parsed, bound } = await pooler(parameters);
 			// oxlint-disable-next-line no-await-in-loop
 			await run(port, preparePipelined);
-			expect(parsed).toEqual(['q1']);
-			expect(bound).toEqual(['q1', 'q1', 'q1', 'q1', 'q1']);
+			// unnamed on its first run, prepared on its second
+			expect(parsed).toEqual(['', 'q1']);
+			expect(bound).toEqual(['', 'q1', 'q1', 'q1', 'q1']);
 		}
 	});
 
@@ -590,7 +592,39 @@ describe('statement names behind a pooler', () => {
 		const { port, parsed, bound } = await pooler({});
 		const capabilities = await run(port, false);
 		expect(capabilities.pgbouncer).toBeUndefined();
-		expect(parsed).toEqual(['q1', '', '', '']);
-		expect(bound).toEqual(['q1', '', '', '', 'q1']);
+		expect(parsed).toEqual(['', '', '', '', 'q1']);
+		expect(bound).toEqual(['', '', '', '', 'q1']);
+	});
+
+	it('prepares SQL on its prepareThreshold-th successful run', async () => {
+		for (const [threshold, names] of [
+			[1, ['q1']],
+			[3, ['', '', 'q1']],
+		] as const) {
+			// oxlint-disable-next-line no-await-in-loop
+			const { port, parsed } = await pooler({});
+			// oxlint-disable-next-line no-await-in-loop
+			await using conn = await connect({
+				...options(port),
+				prepareThreshold: threshold,
+			});
+			for (let i = 0; i < 4; i++)
+				// oxlint-disable-next-line no-await-in-loop
+				await conn.query('insert into t values ($1)', [i]);
+			expect(parsed).toEqual(names);
+		}
+	});
+
+	it('keeps prepared statements cached when SQL run once fills the cache', async () => {
+		const { port, parsed, bound } = await pooler({});
+		await using conn = await connect({ ...options(port), statementCacheSize: 4 });
+		const hot = ['a', 'b'].map((t) => `insert into ${t} values ($1)`);
+		for (const sql of [...hot, ...hot]) await conn.query(sql, [1]);
+		for (let i = 0; i < 20; i++)
+			await conn.query(`insert into once${i} values ($1)`, [1]);
+		for (const sql of hot) await conn.query(sql, [1]);
+		// the hot statements were prepared once, and are still bound by name
+		expect(parsed.filter((name) => name !== '')).toEqual(['q1', 'q2']);
+		expect(bound.slice(-2)).toEqual(['q1', 'q2']);
 	});
 });
