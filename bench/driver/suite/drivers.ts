@@ -96,120 +96,80 @@ const QUARRY_DIST =
 
 export type DriverFactory = (o: DriverOptions) => Promise<Driver>;
 
-/** Client configurations, by name. `runtimes` lists where each runs. */
+/** Client configurations, by name. */
 export const DRIVERS: Record<
 	string,
-	{ runtimes: readonly string[]; describe: string; make: DriverFactory }
+	{ describe: string; make: DriverFactory }
 > = {
 	quarry: {
-		runtimes: ['node', 'bun', 'deno'],
 		describe:
 			'quarry/driver (built dist). Like-for-like decoding (int8/numeric as string, timestamptz as Date, as pg does: `codecs: [codecs.int8AsString, codecs.timestamptz]`). Defaults: prepared statements (LRU 100), binary results once a statement is described, pipelining onto shared connections when the pool is busy (adaptive depth 100–1000).',
 		make: (o) => quarry(o, { decode: 'compat' }),
 	},
 	'quarry-candidate': {
-		runtimes: ['node', 'bun', 'deno'],
 		describe:
 			'quarry (like-for-like decoding) from the build at `QUARRY_DIST_CANDIDATE`, for A/B runs of a driver change against `quarry`. Only in the matrix when that variable is set.',
 		make: (o) =>
 			quarry(o, { decode: 'compat' }, process.env['QUARRY_DIST_CANDIDATE']),
 	},
 	'quarry-db': {
-		runtimes: ['node'],
 		describe:
 			"quarry's query builder (`database()` from the built `dist/index.js`) on its default driver pool, for the builder scenarios only (`db.batch`, and builder lookups, inserts and updates under concurrency).",
 		make: (o) => quarryDb(o),
 	},
 	'quarry-lossless': {
-		runtimes: ['node', 'bun', 'deno'],
 		describe:
 			'quarry/driver with its standalone lossless defaults: int8 as bigint, timestamptz/date as text (no Date construction).',
 		make: (o) => quarry(o, { decode: 'lossless' }),
 	},
 	'quarry-noprep': {
-		runtimes: ['node', 'bun', 'deno'],
 		describe:
 			'quarry/driver with `prepare: false` (unnamed statements; text results).',
 		make: (o) => quarry(o, { decode: 'compat', prepare: false }),
 	},
 	'quarry-nopipe': {
-		runtimes: ['node'],
 		describe:
 			'quarry/driver with `pipeline: false` (exclusive connection checkout, like pg).',
 		make: (o) => quarry({ ...o, pipeline: false }, { decode: 'compat' }),
 	},
 	pg: {
-		runtimes: ['node', 'bun', 'deno'],
 		describe:
 			'node-postgres 8.23 Pool, `pool.query(text, values)`: unnamed statements (Parse every time), text results, default type parsers.',
 		make: (o) => pgDriver(o, { named: false }),
 	},
 	'pg-named': {
-		runtimes: ['node', 'bun', 'deno'],
 		describe:
 			'node-postgres 8.23 Pool with named prepared statements (`{ name, text, values }`, one name per distinct SQL text): its fastest documented mode for repeated queries.',
 		make: (o) => pgDriver(o, { named: true }),
 	},
 	'pg-native': {
-		runtimes: ['node'],
 		describe:
 			'node-postgres 8.23 `pg.native` Pool over libpq (pg-native 3.9, libpq 18 client), unnamed statements.',
 		make: (o) => pgDriver(o, { named: false, native: true }),
 	},
 	'pg-native-named': {
-		runtimes: ['node'],
 		describe: 'pg.native Pool with named prepared statements.',
 		make: (o) => pgDriver(o, { named: true, native: true }),
 	},
 	'postgres.js': {
-		runtimes: ['node', 'bun', 'deno'],
 		describe:
 			'postgres.js 3.4.9 defaults: `prepare: true` (named statements), `sql.unsafe(text, params)`, implicit pipelining on each connection, `fetch_types: true`.',
 		make: (o) => postgresJs(o, { prepare: true }),
 	},
 	'postgres.js-noprep': {
-		runtimes: ['node', 'bun', 'deno'],
 		describe:
 			'postgres.js 3.4.9 with `prepare: false` (unnamed statements, for transaction poolers without prepared-statement support).',
 		make: (o) => postgresJs(o, { prepare: false }),
 	},
-	'bun.sql': {
-		runtimes: ['bun'],
-		describe:
-			'Bun.sql (built-in Zig client) defaults: `prepare: true`, `sql.unsafe(text, params)`, pipelining.',
-		make: (o) => bunSql(o, { prepare: true }),
-	},
-	'bun.sql-noprep': {
-		runtimes: ['bun'],
-		describe: 'Bun.sql with `prepare: false`.',
-		make: (o) => bunSql(o, { prepare: false }),
-	},
 	neon: {
-		runtimes: ['node'],
 		describe:
 			"@neondatabase/serverless 1.2 Pool (bundled pg over WebSocket) through Neon's Go wsproxy on localhost; unnamed statements; `coalesceWrites: false` (the default batches writes with setTimeout(0), ≥1 ms per round trip on Node); `pipelineConnect: false` (needs cleartext password auth).",
 		make: (o) => neon(o, { coalesceWrites: false }),
 	},
 	'neon-default': {
-		runtimes: ['node'],
 		describe:
 			'@neondatabase/serverless 1.2 Pool with its default `coalesceWrites: true`.',
 		make: (o) => neon(o, { coalesceWrites: true }),
-	},
-	'deno-postgres': {
-		runtimes: ['deno'],
-		describe:
-			'deno-postgres (jsr:@db/postgres 0.19.5) Pool, lazy connections, `queryObject(text, args)`, as shipped: it writes Parse/Bind/Describe/Execute/Sync as separate socket writes without TCP_NODELAY, so each query waits for a delayed ACK (~40 ms on Linux).',
-		make: (o) => denoPostgres(o),
-	},
-	'deno-postgres-nodelay': {
-		runtimes: ['deno'],
-		describe:
-			'deno-postgres with `Deno.connect` patched to call `setNoDelay(true)` on every socket: its best case (not configurable through its API).',
-		make: (o) => {
-			noDelayDenoConnect();
-			return denoPostgres(o);
-		},
 	},
 };
 
@@ -568,73 +528,6 @@ async function postgresJs(
 	};
 }
 
-// ---------------------------------------------------------------- Bun.sql
-
-const bunTx = (tx: any): Tx => ({
-	query: (s, p) => tx.unsafe(s, p ?? []),
-	savepoint: (fn) => tx.savepoint((sp: any) => fn(bunTx(sp))),
-});
-
-async function bunSql(
-	o: DriverOptions,
-	v: { prepare: boolean },
-): Promise<Driver> {
-	const { SQL } = Reflect.get(globalThis, 'Bun') as { SQL: any };
-	const t = o.target;
-	const sql = new SQL({
-		hostname: t.host,
-		port: t.port,
-		username: t.user,
-		...(t.password ? { password: t.password } : {}),
-		database: t.database,
-		...(t.caFile
-			? {
-					tls: { ca: readFileSync(t.caFile, 'utf8'), rejectUnauthorized: true },
-				}
-			: { tls: false }),
-		max: o.max,
-		prepare: v.prepare,
-	});
-	const driver: Driver = {
-		name: 'bun.sql',
-		query: (s, p) => sql.unsafe(s, p ?? []),
-		// JS arrays through sql.array(); int4[] as a literal, since
-		// sql.array(…, 'int4') fails with "insufficient data left in message"
-		queryTyped: (s, p, types) =>
-			sql.unsafe(
-				s,
-				p.map((value, i) =>
-					!Array.isArray(value)
-						? value
-						: types[i] === 1007
-							? `{${value.join(',')}}`
-							: sql.array(
-									value,
-									({ 1009: 'text', 1022: 'float8' } as Record<number, string>)[
-										types[i]!
-									],
-								),
-				),
-			),
-		transaction: async (fn) => {
-			await sql.begin((tx: any) => fn(bunTx(tx)));
-		},
-		listen: async (channel, handler) => {
-			const subscription = await sql.listen(channel, (payload: string) =>
-				handler(payload),
-			);
-			return () => subscription.unlisten();
-		},
-		cancellable: async (s) => {
-			const query = sql.unsafe(s);
-			const done = query.then((r: unknown) => r);
-			return { done, cancel: () => query.cancel() };
-		},
-		end: () => sql.close({ timeout: 5 }),
-	};
-	return driver;
-}
-
 // ---------------------------------------------------------------- @neondatabase/serverless
 
 async function neon(
@@ -697,79 +590,6 @@ async function neon(
 				await client.query(`unlisten ${channel}`);
 				client.release();
 			};
-		},
-		end: () => pool.end(),
-	};
-}
-
-// ---------------------------------------------------------------- deno-postgres
-
-function noDelayDenoConnect(): void {
-	const deno = Reflect.get(globalThis, 'Deno') as {
-		connect: (o: unknown) => Promise<{ setNoDelay(on: boolean): void }>;
-	};
-	const original = deno.connect.bind(deno);
-	Object.defineProperty(deno, 'connect', {
-		configurable: true,
-		value: async (options: unknown) => {
-			const conn = await original(options);
-			conn.setNoDelay(true);
-			return conn;
-		},
-	});
-}
-
-async function denoPostgres(o: DriverOptions): Promise<Driver> {
-	const spec = 'jsr:@db/postgres@0.19.5';
-	const { Pool } = await import(spec);
-	const t = o.target;
-	const pool = new Pool(
-		{
-			hostname: t.host,
-			port: t.port,
-			user: t.user,
-			password: t.password,
-			database: t.database,
-			tls: t.caFile
-				? {
-						enabled: true,
-						enforce: true,
-						caCertificates: [readFileSync(t.caFile, 'utf8')],
-					}
-				: { enabled: false },
-		},
-		o.max,
-		true,
-	);
-	let n = 0;
-	const wrap = (tx: any): Tx => ({
-		query: async (s, p) => (await tx.queryObject(s, p)).rows,
-		savepoint: async (fn) => {
-			const sp = await tx.savepoint(`sp${n++}`);
-			await fn(wrap(tx));
-			await sp.release();
-		},
-	});
-	return {
-		name: 'deno-postgres',
-		query: async (s, p) => {
-			const client = await pool.connect();
-			try {
-				return (await client.queryObject(s, p)).rows;
-			} finally {
-				client.release();
-			}
-		},
-		transaction: async (fn) => {
-			const client = await pool.connect();
-			try {
-				const tx = client.createTransaction(`t${n++}`);
-				await tx.begin();
-				await fn(wrap(tx));
-				await tx.commit();
-			} finally {
-				client.release();
-			}
 		},
 		end: () => pool.end(),
 	};
@@ -851,21 +671,6 @@ export async function connectOnce(name: string, t: Target): Promise<void> {
 			await sql.end();
 			return;
 		}
-		case 'bun.sql': {
-			const { SQL } = Reflect.get(globalThis, 'Bun') as { SQL: any };
-			const sql = new SQL({
-				hostname: t.host,
-				port: t.port,
-				username: t.user,
-				...(t.password ? { password: t.password } : {}),
-				database: t.database,
-				...(ca ? { tls: { ca, rejectUnauthorized: true } } : { tls: false }),
-				max: 1,
-			});
-			await sql`select 1`;
-			await sql.close();
-			return;
-		}
 		case 'neon': {
 			const { Client, neonConfig } = await import('@neondatabase/serverless');
 			neonConfig.webSocketConstructor = (await import('ws')).default;
@@ -884,26 +689,6 @@ export async function connectOnce(name: string, t: Target): Promise<void> {
 			});
 			await client.connect();
 			await client.query('select 1');
-			await client.end();
-			return;
-		}
-		case 'deno-postgres':
-		case 'deno-postgres-nodelay': {
-			if (base === 'deno-postgres-nodelay') noDelayDenoConnect();
-			const spec = 'jsr:@db/postgres@0.19.5';
-			const { Client } = await import(spec);
-			const client = new Client({
-				hostname: t.host,
-				port: t.port,
-				user: t.user,
-				password: t.password,
-				database: t.database,
-				tls: ca
-					? { enabled: true, enforce: true, caCertificates: [ca] }
-					: { enabled: false },
-			});
-			await client.connect();
-			await client.queryArray('select 1');
 			await client.end();
 			return;
 		}

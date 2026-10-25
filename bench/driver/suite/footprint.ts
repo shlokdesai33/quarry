@@ -3,7 +3,7 @@
  * Footprint and cold start: per client, install size and dependency count
  * (a clean `npm install` of the published package), minified bundle size
  * (esbuild, platform node), module import time and process-start → first
- * query result, on each runtime. Needs the environment from env.ts running
+ * query result. Needs the environment from env.ts running
  * (orchestrate.ts starts it; or run this after `node env-up.ts`).
  *
  *   node footprint.ts [--id name] [--reps 15]
@@ -141,26 +141,6 @@ async function main() {
 			'ws@8.22.0',
 		]),
 	};
-	try {
-		const info = JSON.parse(
-			execFileSync('deno', ['info', '--json', 'jsr:@db/postgres@0.19.5'], {
-				encoding: 'utf8',
-			}),
-		);
-		const modules = info.modules as { size?: number; specifier: string }[];
-		const pkgs = new Set(
-			modules
-				.map((m) => /jsr\.io\/(@[^/]+\/[^/]+)\//.exec(m.specifier)?.[1])
-				.filter(Boolean),
-		);
-		installs['deno-postgres (jsr, source modules)'] = {
-			bytes: modules.reduce((a, m) => a + (m.size ?? 0), 0),
-			packages: pkgs.size,
-		};
-	} catch (error) {
-		installs['deno-postgres (jsr, source modules)'] = { error: String(error) };
-	}
-	installs['Bun.sql (built into Bun)'] = { bytes: 0, packages: 0 };
 	out['install'] = installs;
 	console.error('install sizes done');
 
@@ -190,52 +170,48 @@ async function main() {
 	console.error('bundles done');
 
 	// ---- cold start
-	const runtimes: Record<string, (driver: string) => string[]> = {
-		node: (d) => ['node', 'cold.ts', d, '55432'],
-		bun: (d) => ['bun', 'cold.ts', d, '55432'],
-		deno: (d) => ['deno', 'run', '-A', '--no-lock', 'cold.ts', d, '55432'],
-	};
-	const support: Record<string, string[]> = {
-		node: ['none', 'quarry', 'pg', 'pg-native', 'postgres.js', 'neon'],
-		bun: ['none', 'quarry', 'pg', 'postgres.js', 'bun.sql'],
-		deno: ['none', 'quarry', 'pg', 'postgres.js', 'deno-postgres'],
-	};
 	const cold: Record<string, unknown> = {};
-	for (const [runtime, cmd] of Object.entries(runtimes)) {
-		for (const driver of support[runtime]!) {
-			const samples: {
-				importMs: number;
-				firstQueryMs: number;
-				sinceStartMs: number;
-				wallMs: number;
-			}[] = [];
-			for (let r = 0; r < REPS + 2; r++) {
-				const t = performance.now();
-				const line = execFileSync(
-					'taskset',
-					['-c', CPUS.client, ...cmd(driver)],
-					{
-						cwd: import.meta.dirname,
-						encoding: 'utf8',
-						env: { ...process.env, NO_COLOR: '1' },
-						stdio: ['ignore', 'pipe', 'ignore'],
-					},
-				)
-					.trim()
-					.split('\n')
-					.pop()!;
-				const wallMs = performance.now() - t;
-				if (r >= 2) samples.push({ ...JSON.parse(line), wallMs });
-			}
-			cold[`${runtime}/${driver}`] = {
-				importMs: median(samples.map((s) => s.importMs)),
-				firstQueryMs: median(samples.map((s) => s.firstQueryMs)),
-				sinceStartMs: median(samples.map((s) => s.sinceStartMs)),
-				wallMs: median(samples.map((s) => s.wallMs)),
-				reps: samples.length,
-			};
-			console.error(`cold ${runtime}/${driver}`, cold[`${runtime}/${driver}`]);
+	// keyed `node/<client>`, as in earlier snapshots
+	for (const driver of [
+		'none',
+		'quarry',
+		'pg',
+		'pg-native',
+		'postgres.js',
+		'neon',
+	]) {
+		const samples: {
+			importMs: number;
+			firstQueryMs: number;
+			sinceStartMs: number;
+			wallMs: number;
+		}[] = [];
+		for (let r = 0; r < REPS + 2; r++) {
+			const t = performance.now();
+			const line = execFileSync(
+				'taskset',
+				['-c', CPUS.client, 'node', 'cold.ts', driver, '55432'],
+				{
+					cwd: import.meta.dirname,
+					encoding: 'utf8',
+					env: { ...process.env, NO_COLOR: '1' },
+					stdio: ['ignore', 'pipe', 'ignore'],
+				},
+			)
+				.trim()
+				.split('\n')
+				.pop()!;
+			const wallMs = performance.now() - t;
+			if (r >= 2) samples.push({ ...JSON.parse(line), wallMs });
 		}
+		cold[`node/${driver}`] = {
+			importMs: median(samples.map((s) => s.importMs)),
+			firstQueryMs: median(samples.map((s) => s.firstQueryMs)),
+			sinceStartMs: median(samples.map((s) => s.sinceStartMs)),
+			wallMs: median(samples.map((s) => s.wallMs)),
+			reps: samples.length,
+		};
+		console.error(`cold ${driver}`, cold[`node/${driver}`]);
 	}
 	out['cold'] = cold;
 	out['driverDistBytes'] = statSync(join(ROOT, 'dist/driver/index.js')).size;

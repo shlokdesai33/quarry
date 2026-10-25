@@ -40,16 +40,14 @@ COLORS = {
     "pg-native-named": "#98df8a",
     "postgres.js": "#9467bd",
     "postgres.js-noprep": "#c5b0d5",
-    "bun.sql": "#ff7f0e",
-    "bun.sql-noprep": "#ffbb78",
     "neon": "#17becf",
     "neon-default": "#9edae5",
-    "deno-postgres-nodelay": "#7f7f7f",
-    "deno-postgres": "#c7c7c7",
 }
 ORDER = list(COLORS)
-CORE = ["quarry", "quarry-candidate", "pg", "pg-named", "pg-native", "postgres.js", "neon", "bun.sql", "deno-postgres-nodelay"]
-RT = {"node": "Node 24", "bun": "Bun 1.4", "deno": "Deno 2.9"}
+CORE = ["quarry", "quarry-candidate", "pg", "pg-named", "pg-native", "postgres.js", "neon"]
+# earlier snapshots also hold Bun and Deno cells, which are no longer charted
+RUNTIMES = ["node"]
+RT = {"node": "Node 24"}
 plt.rcParams.update({"figure.dpi": 130, "font.size": 9, "axes.grid": True, "grid.alpha": 0.3, "axes.axisbelow": True})
 written = []
 
@@ -124,8 +122,8 @@ def grouped_bars(ax, groups, drivers, getter, ylabel, log=False, errs=None):
         ax.set_yscale("log")
 
 
-# 1. latency percentiles (select 1 and point lookup), per runtime
-for runtime in ["node", "bun", "deno"]:
+# 1. latency percentiles (select 1 and point lookup)
+for runtime in RUNTIMES:
     ds = drivers_in("main", runtime)
     if not ds:
         continue
@@ -138,9 +136,9 @@ for runtime in ["node", "bun", "deno"]:
     axes[0].legend(fontsize=7)
     save(fig, f"latency-percentiles-{runtime}.png")
 
-# 2. relative throughput overview vs pg, per runtime
+# 2. relative throughput overview vs pg
 OVERVIEW = ["select1", "pk", "range100", "fetch1k", "fetch100k", "wide", "arrays", "params100", "insert1", "insert1-c50", "insert-multi100", "bulk-unnest", "update", "upsert", "tx-insert", "savepoints", "error"]
-for runtime in ["node", "bun", "deno"]:
+for runtime in RUNTIMES:
     ds = drivers_in("main", runtime)
     if "pg" not in ds:
         continue
@@ -157,7 +155,7 @@ for runtime in ["node", "bun", "deno"]:
     save(fig, f"throughput-relative-{runtime}.png")
 
 # 3. concurrency sweep
-for runtime in ["node", "bun"]:
+for runtime in RUNTIMES:
     ds = drivers_in("conc", runtime, core_only=False)
     if not ds:
         continue
@@ -189,7 +187,7 @@ RTT_VARIANTS = [
     ("insert1-c50", 10, None, "insert, 50 concurrent, pool 10"),
     ("connect-plain-trust", 10, None, "connect + select 1 + close"),
 ]
-for runtime in ["node", "bun"]:
+for runtime in RUNTIMES:
     ds = drivers_in("rtt", runtime)
     if not ds:
         continue
@@ -260,40 +258,38 @@ if any(c["phase"] == "builder" and c["runs"] for c in cells):
     fig.suptitle("Node 24: quarry's query builder against the same SQL through the drivers")
     save(fig, "builder-concurrency.png")
 
-# 6. large-result throughput (rows/s), per runtime
+# 6. large-result throughput (rows/s)
 LARGE = ["fetch1k", "fetch100k", "fetch1m", "stream1m", "wide", "arrays"]
-fig, axes = plt.subplots(1, 3, figsize=(16, 4.2))
-for ax, runtime in zip(axes, ["node", "bun", "deno"]):
-    ds = drivers_in("main", runtime)
-    def rows_s(s, d):
-        c = find("main", runtime, d, s)
-        v = val(c, "throughput")
-        return c, (v * summary["scenarios"][s]["rowsPerOp"] if v else None)
-    grouped_bars(ax, LARGE, ds, rows_s, "rows/s (log)", log=True)
-    ax.set_xticklabels([SHORT[s] for s in LARGE], fontsize=7)
-    ax.set_title(f"{RT[runtime]}: large results, rows/s")
-    ax.legend(fontsize=6.5)
+fig, ax = plt.subplots(figsize=(8, 4.2))
+ds = drivers_in("main", "node")
+def rows_s(s, d):
+    c = find("main", "node", d, s)
+    v = val(c, "throughput")
+    return c, (v * summary["scenarios"][s]["rowsPerOp"] if v else None)
+grouped_bars(ax, LARGE, ds, rows_s, "rows/s (log)", log=True)
+ax.set_xticklabels([SHORT[s] for s in LARGE], fontsize=7)
+ax.set_title(f"{RT['node']}: large results, rows/s")
+ax.legend(fontsize=6.5)
 save(fig, "large-results.png")
 
 # 7. memory: peak RSS for 1M rows in one result vs streamed vs slow consumer
-fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-for ax, runtime in zip(axes, ["node", "bun", "deno"]):
-    ds = drivers_in("main", runtime)
-    def mem(s, d):
-        # equal work where the scenario has it, else the time-window figure
-        ops = summary["scenarios"][s].get("memOps")
-        c = find("main", runtime, d, s, memOps=ops) if ops else None
-        c = c or find("main", runtime, d, s)
-        return c, val(c, "rssPeakMB")
-    grouped_bars(ax, ["pk", "fetch100k", "fetch1m", "stream1m", "stream-slow"], ds, mem, "peak RSS (MB)")
-    ax.set_xticklabels(["point lookup\n(baseline)", "fetch 100k\n(× 5)", "fetch 1M\n(× 3)", "stream 1M\n(× 3)", "stream 200k\nslow consumer"], fontsize=7)
-    ax.set_title(f"{RT[runtime]}: peak RSS, equal work (× ops)")
-    ax.legend(fontsize=6.5)
+fig, ax = plt.subplots(figsize=(7, 4))
+ds = drivers_in("main", "node")
+def mem(s, d):
+    # equal work where the scenario has it, else the time-window figure
+    ops = summary["scenarios"][s].get("memOps")
+    c = find("main", "node", d, s, memOps=ops) if ops else None
+    c = c or find("main", "node", d, s)
+    return c, val(c, "rssPeakMB")
+grouped_bars(ax, ["pk", "fetch100k", "fetch1m", "stream1m", "stream-slow"], ds, mem, "peak RSS (MB)")
+ax.set_xticklabels(["point lookup\n(baseline)", "fetch 100k\n(× 5)", "fetch 1M\n(× 3)", "stream 1M\n(× 3)", "stream 200k\nslow consumer"], fontsize=7)
+ax.set_title(f"{RT['node']}: peak RSS, equal work (× ops)")
+ax.legend(fontsize=6.5)
 save(fig, "memory.png")
 
 # 8. per-type decode cost
 TYPES = ["i4", "i8", "f8", "num", "txt", "b", "ts", "d", "u", "j", "i4a", "by"]
-for runtime in ["node", "bun", "deno"]:
+for runtime in RUNTIMES:
     ds = [d for d in drivers_in("main", runtime, core_only=False) if d in CORE or d == "quarry-lossless"]
     if not ds:
         continue
@@ -306,13 +302,12 @@ for runtime in ["node", "bun", "deno"]:
 
 # 9. connections
 CONN = ["connect-plain-trust", "connect-plain-scram", "connect-tls-trust", "connect-tls-scram", "pool-warmup"]
-fig, axes = plt.subplots(1, 3, figsize=(16, 4))
-for ax, runtime in zip(axes, ["node", "bun", "deno"]):
-    ds = drivers_in("main", runtime)
-    grouped_bars(ax, CONN, ds, lambda s, d: (find("main", runtime, d, s), val(find("main", runtime, d, s), "p50")), "median ms (log)", log=True, errs="p50")
-    ax.set_xticklabels(["plain\ntrust", "plain\nSCRAM", "TLS\ntrust", "TLS\nSCRAM", "pool warm-up\n(10 conns)"], fontsize=7)
-    ax.set_title(f"{RT[runtime]}: connect + select 1 + close")
-    ax.legend(fontsize=6.5)
+fig, ax = plt.subplots(figsize=(8, 4))
+ds = drivers_in("main", "node")
+grouped_bars(ax, CONN, ds, lambda s, d: (find("main", "node", d, s), val(find("main", "node", d, s), "p50")), "median ms (log)", log=True, errs="p50")
+ax.set_xticklabels(["plain\ntrust", "plain\nSCRAM", "TLS\ntrust", "TLS\nSCRAM", "pool warm-up\n(10 conns)"], fontsize=7)
+ax.set_title(f"{RT['node']}: connect + select 1 + close")
+ax.legend(fontsize=6.5)
 save(fig, "connections.png")
 
 # 10. CPU per query, client and server (Node)
@@ -346,6 +341,7 @@ if ds:
 fp = summary.get("footprint")
 if fp:
     cold = fp["cold"]
+    cold = {k: v for k, v in cold.items() if k.startswith("node/")}
     keys = [k for k in cold if not k.endswith("/none")]
     fig, ax = plt.subplots(figsize=(12, 4))
     base = {k.split("/")[0]: cold[k]["sinceStartMs"] for k in cold if k.endswith("/none")}
@@ -424,7 +420,7 @@ if len(sys.argv) > 4:
     axes[1].legend(fontsize=7)
     if p99:
         xs = [10, 50, 100, 500, 1000]
-        for runtime, color in [("node", "#d62728"), ("bun", "#ff7f0e")]:
+        for runtime, color in [("node", "#d62728")]:
             for pool, ms in [(10, "o"), (50, "s")]:
                 axes[2].plot(xs, [base.get(("p99", runtime, pool, c)) for c in xs], color=color, ls="--", marker=ms, ms=3, label=f"{RT[runtime]}, pool {pool}, before")
                 axes[2].plot(xs, [cand.get(("p99", runtime, pool, c)) for c in xs], color=color, marker=ms, ms=3, label=f"{RT[runtime]}, pool {pool}, after")

@@ -66,38 +66,6 @@ switch (driver) {
 		end = () => pool.end();
 		break;
 	}
-	case 'bun.sql': {
-		const { SQL } = Reflect.get(globalThis, 'Bun') as { SQL: any };
-		const sql = new SQL({ url, max: 1, tls: false });
-		query = () => sql`select 1`;
-		end = () => sql.close();
-		break;
-	}
-	case 'deno-postgres': {
-		const spec = 'jsr:@db/postgres@0.19.5';
-		const { Pool } = await import(spec);
-		const pool = new Pool(
-			{
-				hostname: '127.0.0.1',
-				port,
-				user: 'bench_trust',
-				database: 'bench',
-				tls: { enabled: false },
-			},
-			1,
-			true,
-		);
-		query = async () => {
-			const c = await pool.connect();
-			try {
-				return await c.queryArray('select 1');
-			} finally {
-				c.release();
-			}
-		};
-		end = () => pool.end();
-		break;
-	}
 	default:
 		query = async () => {};
 		end = async () => {};

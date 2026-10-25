@@ -1,8 +1,8 @@
 /* oxlint-disable no-await-in-loop -- closed-loop benchmark workers */
 /**
  * Runs one benchmark cell (one client configuration × one scenario) in a
- * fresh process and prints one JSON line. Started by orchestrate.ts under
- * Node, Bun or Deno, pinned to the client CPUs.
+ * fresh process and prints one JSON line. Started by orchestrate.ts,
+ * pinned to the client CPUs.
  *
  *   node worker.ts '<job json>'
  */
@@ -59,30 +59,14 @@ export interface CellResult {
 const job: Job = JSON.parse(
 	process.argv[2] ?? process.argv[process.argv.length - 1]!,
 );
-const runtime = Reflect.has(globalThis, 'Bun')
-	? 'bun'
-	: Reflect.has(globalThis, 'Deno')
-		? 'deno'
-		: 'node';
-
-function gcNow(): void {
-	const bun = Reflect.get(globalThis, 'Bun') as
-		| { gc?: (sync: boolean) => void }
-		| undefined;
-	if (bun?.gc) bun.gc(true);
-	else (Reflect.get(globalThis, 'gc') as (() => void) | undefined)?.();
-}
-
 /**
- * A forced GC from a fresh macrotask. Bun's JavaScriptCore scans the
- * stack conservatively, and the frame that delivered the last result
- * (node:net's data callback) stays live through the microtask drain, so a
- * GC inside that drain keeps the just-settled result alive. That inflates
- * the following measurement for every client.
+ * A forced GC (`--expose-gc`) from a fresh macrotask, outside the microtask
+ * drain that delivered the last result. Kept as is so runs stay comparable
+ * with earlier snapshots.
  */
 async function freshGc(): Promise<void> {
 	await new Promise((r) => setTimeout(r, 0));
-	gcNow();
+	(Reflect.get(globalThis, 'gc') as (() => void) | undefined)?.();
 }
 
 /** CPU time (µs) of every PostgreSQL process, from /proc. */
@@ -133,7 +117,7 @@ function summarize(latencies: Float64Array) {
 	};
 }
 
-/** RSS, heap and event-loop lag, sampled every 10 ms; GC pauses where the runtime reports them. */
+/** RSS, heap and event-loop lag, sampled every 10 ms, and GC pauses. */
 const mb = (b: number) => b / 1048576;
 
 async function monitor() {
@@ -157,10 +141,7 @@ async function monitor() {
 	let observer: { disconnect(): void } | undefined;
 	try {
 		const { PerformanceObserver } = await import('node:perf_hooks');
-		if (
-			runtime === 'node' &&
-			PerformanceObserver.supportedEntryTypes.includes('gc')
-		) {
+		if (PerformanceObserver.supportedEntryTypes.includes('gc')) {
 			gc = { count: 0, totalMs: 0, maxMs: 0 };
 			const g = gc;
 			const o = new PerformanceObserver((list) => {

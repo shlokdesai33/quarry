@@ -214,12 +214,8 @@ const LABEL: Record<string, string> = {
 	'pg-native-named': 'pg-native (named)',
 	'postgres.js': 'postgres.js',
 	'postgres.js-noprep': 'postgres.js (prepare: false)',
-	'bun.sql': 'Bun.sql',
-	'bun.sql-noprep': 'Bun.sql (prepare: false)',
 	neon: 'neon (WS)',
 	'neon-default': 'neon (WS, defaults)',
-	'deno-postgres': 'deno-postgres (stock)',
-	'deno-postgres-nodelay': 'deno-postgres (+nodelay)',
 };
 const label = (d: string) => LABEL[d] ?? d;
 
@@ -333,11 +329,9 @@ const mainPick =
 		};
 	};
 
-const RUNTIMES = ['node', 'bun', 'deno'];
-const RT = { node: 'Node 24', bun: 'Bun 1.4', deno: 'Deno 2.9' } as Record<
-	string,
-	string
->;
+// Earlier snapshots also hold Bun and Deno cells, which are no longer reported.
+const RUNTIMES = ['node'];
+const RT = { node: 'Node 24' } as Record<string, string>;
 const driversIn = (phase: string, runtime: string) => {
 	const order = Object.keys(LABEL);
 	const seen = new Set<string>();
@@ -354,8 +348,6 @@ const CORE = new Set([
 	'pg-native',
 	'postgres.js',
 	'neon',
-	'bun.sql',
-	'deno-postgres-nodelay',
 ]);
 const coreIn = (phase: string, runtime: string) =>
 	driversIn(phase, runtime).filter((d) => CORE.has(d));
@@ -369,7 +361,7 @@ const title = (id: string) => byId.get(id)?.title ?? id;
 	const lines = [
 		'### Correctness',
 		'',
-		'Every result compared in canonical form (see `canon.ts`) against the majority digest for its runtime and scenario.',
+		'Every result compared in canonical form (see `canon.ts`) against the majority digest for its scenario.',
 		'',
 	];
 	const bad: string[] = [];
@@ -404,7 +396,7 @@ const title = (id: string) => byId.get(id)?.title ?? id;
 		}
 	}
 	lines.push(
-		`${checked} (runtime, client, scenario) results checked; ${bad.length} differ from the majority${bad.length ? ':' : '.'}`,
+		`${checked} (client, scenario) results checked; ${bad.length} differ from the majority${bad.length ? ':' : '.'}`,
 		'',
 		...bad,
 		'',
@@ -812,9 +804,7 @@ for (const runtime of RUNTIMES) {
 				'connect-tls-scram',
 				'pool-warmup',
 			].map((s) => ({ label: title(s), pick: mainPick(runtime, s, 'p50') })),
-			driversIn('main', runtime).filter(
-				(d) => CORE.has(d) || d === 'deno-postgres',
-			),
+			driversIn('main', runtime).filter((d) => CORE.has(d)),
 			fmtTime,
 			true,
 			true,
@@ -873,26 +863,12 @@ for (const runtime of RUNTIMES) {
 		),
 	);
 	// prepared vs unprepared
-	const pairs: [string, string][] =
-		runtime === 'node'
-			? [
-					['quarry', 'quarry-noprep'],
-					['pg-named', 'pg'],
-					['pg-native-named', 'pg-native'],
-					['postgres.js', 'postgres.js-noprep'],
-				]
-			: runtime === 'bun'
-				? [
-						['quarry', 'quarry-noprep'],
-						['pg-named', 'pg'],
-						['postgres.js', 'postgres.js-noprep'],
-						['bun.sql', 'bun.sql-noprep'],
-					]
-				: [
-						['quarry', 'quarry-noprep'],
-						['pg-named', 'pg'],
-						['postgres.js', 'postgres.js-noprep'],
-					];
+	const pairs: [string, string][] = [
+		['quarry', 'quarry-noprep'],
+		['pg-named', 'pg'],
+		['pg-native-named', 'pg-native'],
+		['postgres.js', 'postgres.js-noprep'],
+	];
 	const prepRows: string[] = [
 		`**${RT[runtime]}: prepared vs unprepared, operations/s (prepared / unprepared / gain)**`,
 		'',
@@ -948,13 +924,7 @@ for (const runtime of RUNTIMES) {
 			),
 		);
 	}
-	const variants = driversIn('main', runtime).filter(
-		(d) => d === 'neon-default' || d === 'deno-postgres',
-	);
-	if (variants.length) {
-		const base = variants.map((v) =>
-			v === 'neon-default' ? 'neon' : 'deno-postgres-nodelay',
-		);
+	if (driversIn('main', runtime).includes('neon-default')) {
 		out.push(
 			table(
 				`${RT[runtime]}: shipped defaults vs tuned (median latency)`,
@@ -967,42 +937,11 @@ for (const runtime of RUNTIMES) {
 					'tx-insert',
 					'connect-plain-trust',
 				].map((s) => ({ label: title(s), pick: mainPick(runtime, s, 'p50') })),
-				[...base, ...variants],
+				['neon', 'neon-default'],
 				fmtTime,
 				true,
 			),
 		);
-	}
-}
-
-// ------------------------------------------------------------ cross-runtime
-{
-	const rows = [
-		'select1',
-		'pk',
-		'fetch1k',
-		'fetch100k',
-		'insert1',
-		'insert1-c50',
-		'tx-insert',
-	];
-	const cols: [string, string][] = [];
-	for (const runtime of RUNTIMES)
-		for (const d of coreIn('main', runtime)) cols.push([runtime, d]);
-	if (cols.length) {
-		const lines = [
-			'## Across runtimes',
-			'',
-			'**Throughput (operations/s) by runtime**',
-			'',
-			`| Scenario | ${cols.map(([r, d]) => `${label(d)} (${r})`).join(' | ')} |`,
-			`|---|${cols.map(() => '---:').join('|')}|`,
-		];
-		for (const s of rows)
-			lines.push(
-				`| ${title(s)} | ${cols.map(([r, d]) => fmtRate(get('main', r, d, s)?.m['throughput']?.median ?? Number.NaN)).join(' | ')} |`,
-			);
-		out.push(lines.join('\n') + '\n');
 	}
 }
 
@@ -1342,7 +1281,7 @@ summary['rtt'] = {};
 			const raw = groups.get(keyOf(a.cell)) ?? [];
 			const recovered = raw.filter((r) => r.result['extra']?.recovered).length;
 			rows.push(
-				`| ${RT[runtime]} | ${label(d)} | ${recovered}/${raw.length} | ${fmtTime(a.m['recoveryMs']!.median)} | ${fmtNum(a.m['failedQueries']!.median, 0)} |`,
+				`| ${label(d)} | ${recovered}/${raw.length} | ${fmtTime(a.m['recoveryMs']!.median)} | ${fmtNum(a.m['failedQueries']!.median, 0)} |`,
 			);
 		}
 	if (rows.length)
@@ -1352,8 +1291,8 @@ summary['rtt'] = {};
 				'',
 				'`pg_ctl restart -m fast` while a pool runs `select 1` every 5 ms (2 s client timeout per query).',
 				'',
-				'| Runtime | Client | Recovered | Time from server up to first success (median) | Failed queries (median) |',
-				'|---|---|---:|---:|---:|',
+				'| Client | Recovered | Time from server up to first success (median) | Failed queries (median) |',
+				'|---|---:|---:|---:|',
 				...rows,
 				'',
 			].join('\n'),
@@ -1361,6 +1300,9 @@ summary['rtt'] = {};
 }
 
 // ------------------------------------------------------------ footprint
+/** Bun and Deno entries of earlier snapshots. */
+const dropped = (key: string) =>
+	/^(bun|deno)\/|Bun\.sql|deno-postgres/.test(key);
 for (const id of ids) {
 	const file = join(import.meta.dirname, 'results', id, 'footprint.json');
 	if (!existsSync(file)) continue;
@@ -1375,9 +1317,10 @@ for (const id of ids) {
 	for (const [k, v] of Object.entries(
 		f.install as Record<string, { bytes?: number; packages?: number }>,
 	))
-		lines.push(
-			`| ${k} | ${v.bytes === undefined ? '—' : `${(v.bytes / 1024).toFixed(0)} KiB`} | ${v.packages ?? '—'} |`,
-		);
+		if (!dropped(k))
+			lines.push(
+				`| ${k} | ${v.bytes === undefined ? '—' : `${(v.bytes / 1024).toFixed(0)} KiB`} | ${v.packages ?? '—'} |`,
+			);
 	lines.push(
 		'',
 		'| Bundle (esbuild, minified, platform node) | Size | gzip |',
@@ -1394,7 +1337,7 @@ for (const id of ids) {
 		);
 	lines.push(
 		'',
-		'| Runtime / client | Import | Connect + first query | Process start → first result | Wall time of the process |',
+		'| Client | Import | Connect + first query | Process start → first result | Wall time of the process |',
 		'|---|---:|---:|---:|---:|',
 	);
 	for (const [k, v] of Object.entries(
@@ -1408,9 +1351,10 @@ for (const id of ids) {
 			}
 		>,
 	))
-		lines.push(
-			`| ${k} | ${fmtTime(v.importMs)} | ${fmtTime(v.firstQueryMs)} | ${fmtTime(v.sinceStartMs)} | ${fmtTime(v.wallMs)} |`,
-		);
+		if (!dropped(k))
+			lines.push(
+				`| ${k.replace(/^node\//, '')} | ${fmtTime(v.importMs)} | ${fmtTime(v.firstQueryMs)} | ${fmtTime(v.sinceStartMs)} | ${fmtTime(v.wallMs)} |`,
+			);
 	out.push(lines.join('\n') + '\n');
 }
 
