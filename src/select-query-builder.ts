@@ -631,7 +631,7 @@ export class SelectQueryBuilder<
 	 * `groupBy` (or the one group of an aggregate query), in any form
 	 * `where` takes, joined to the others by `and`.
 	 *
-	 * @example .having((eb) => eb.fn.count('posts.id').gte(5))
+	 * @example .having((eb) => eb.fn.count('posts.id').gte('5'))
 	 */
 	readonly having: Condition<RefsOf<T>, SelectQueryBuilder<T, O, L, K>> = (
 		...args: ConditionArgs<RefsOf<T>>
@@ -729,9 +729,10 @@ export class SelectQueryBuilder<
 	 * locks as it returns. The other strengths are `forNoKeyUpdate`,
 	 * `forShare` and `forKeyShare`.
 	 *
-	 * Right after it, `of(...)` limits the lock to some of the query's tables,
-	 * and `skipLocked()` or `noWait()` says what to do with rows already
-	 * locked (by default, wait for them). A query can have several locking
+	 * After it, `of(...)` limits the lock to some of the query's tables (other
+	 * builder methods may come in between, and it may name tables joined
+	 * later), and `skipLocked()` or `noWait()` says what to do with rows
+	 * already locked (by default, wait for them). A query can have several locking
 	 * clauses, usually each `of` different tables; postgres takes the
 	 * strongest lock where they overlap. A query with a locking clause can't
 	 * select aggregates: compiling it throws.

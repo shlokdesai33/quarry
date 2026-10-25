@@ -12,8 +12,8 @@ const config = findConfig(
 		: argv[configIndex + 1],
 );
 
-// Node strips TypeScript types by default from 22.18 and 23.6 on; before
-// that, rerun with the flag so a quarry.config.ts loads.
+// Node 24.11+ strips TypeScript types by default; where that is turned off,
+// rerun with the flag so a quarry.config.ts loads.
 if (
 	config !== undefined &&
 	/\.[cm]?ts$/.test(config) &&

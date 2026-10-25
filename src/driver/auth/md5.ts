@@ -11,7 +11,7 @@ const K = Array.from(
 	(_, i) => Math.floor(Math.abs(Math.sin(i + 1)) * 2 ** 32) >>> 0,
 );
 
-/** MD5 of `input`. WebCrypto has no MD5, and Postgres's `md5` auth needs it. */
+/** MD5 of `input`, for Postgres's `md5` authentication. */
 export function md5(input: Uint8Array): Uint8Array {
 	const length = input.length;
 	const padded = new Uint8Array((((length + 8) >> 6) + 1) << 6);
