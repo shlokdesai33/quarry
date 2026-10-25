@@ -1012,9 +1012,9 @@ Untimed lookups are unchanged (77,092, 79,339, 14,941 and 56,411/s before).
 
 ### Node only
 
-**What it is.** quarry runs on Node 24.11 or later (`engines.node`) and nowhere else: Bun, Deno and edge runtimes such as Cloudflare Workers are not supported. Their code paths are gone: the `cloudflare:sockets` adapter, the WebCrypto SCRAM fallback, the Deno branch in `utf8` decoding (#45), the fallbacks for a missing `Buffer` or `process.getBuiltinModule`, the cross-runtime smoke tests (`test:runtimes`, `test:workers`), and the Bun and Deno clients in the benchmark suite.
+**What it is.** quarry runs on Node 24.11 or later (`engines.node`) and nowhere else: Bun, Deno and edge runtimes such as Cloudflare Workers are not supported. Their code paths are gone: the `cloudflare:sockets` adapter, the WebCrypto SCRAM fallback, the Deno branch in `utf8` decoding ([#45](https://github.com/shlokdesai33/quarry/pull/45)), the fallbacks for a missing `Buffer` or `process.getBuiltinModule`, the cross-runtime smoke tests (`test:runtimes`, `test:workers`), and the Bun and Deno clients in the benchmark suite ([#49](https://github.com/shlokdesai33/quarry/pull/49)).
 
-**Why.** quarry isn't a published library, and the only deployment target is Node. Every extra runtime had its own code paths, a test harness, benchmark phases and per-runtime tuning (#45 kept `toString` on Deno because its `utf8Slice` is slower), all for runtimes nothing runs on.
+**Why.** quarry isn't a published library, and the only deployment target is Node. Every extra runtime had its own code paths, a test harness, benchmark phases and per-runtime tuning (#45 kept `toString` on Deno, whose `utf8Slice` is slower), all for runtimes nothing runs on.
 
 **Alternatives.** Keep them as untested best effort: they would break without anyone noticing. Keep only the socket adapters: the fallbacks around them were most of the cost.
 
