@@ -528,6 +528,12 @@ describe('utf8', () => {
 const row = (value: string) =>
 	encodeBackend({ type: 'DataRow', payload: dataRowPayload([value]) });
 
+const copyData = (fill: number) =>
+	encodeBackend({
+		type: 'CopyData',
+		data: new Uint8Array(100_000).fill(fill),
+	});
+
 describe('buffer memory', () => {
 	it('copies only a message split across chunks, and reads the rest in place', () => {
 		const [a, b, c] = [row('first'), row('second'), row('third')];
@@ -588,13 +594,8 @@ describe('buffer memory', () => {
 			'b'.repeat(100_000),
 		]);
 		// CopyData is handed out as a view, so it gets a buffer of its own
-		const copy = (fill: number) =>
-			encodeBackend({
-				type: 'CopyData',
-				data: new Uint8Array(100_000).fill(fill),
-			});
-		const c1 = read(copy(1));
-		const c2 = read(copy(2));
+		const c1 = read(copyData(1));
+		const c2 = read(copyData(2));
 		expect(c1.bytes.buffer).not.toBe(b.bytes.buffer);
 		expect(c1.bytes.buffer).not.toBe(c2.bytes.buffer);
 		expect(c1.bytes[c1.start]).toBe(1);
