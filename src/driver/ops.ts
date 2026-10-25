@@ -226,26 +226,31 @@ interface ParsedTag {
 	readonly rowCount: number | null;
 }
 
-/** The latest tag parsed: a connection mostly sees the same few tags in a row. */
-let lastTag = '';
-let lastParsed: ParsedTag = { command: '', rowCount: null };
+/**
+ * Tags parsed lately: a transaction alternates BEGIN, its statements and
+ * COMMIT, which a cache of the last tag alone would parse every time.
+ */
+const parsedTags = new Map<string, ParsedTag>();
 
 export function parseTag(tag: string): ParsedTag {
-	if (tag === lastTag) return lastParsed;
+	let parsed = parsedTags.get(tag);
+	if (parsed !== undefined) return parsed;
 	const space = tag.lastIndexOf(' ');
 	let digits = space > 0 && space < tag.length - 1;
 	for (let i = space + 1; digits && i < tag.length; i++) {
 		const code = tag.charCodeAt(i);
 		digits = code >= 0x30 && code <= 0x39;
 	}
-	lastParsed = digits
+	parsed = digits
 		? {
 				command: tag.slice(0, tag.indexOf(' ')),
 				rowCount: Number(tag.slice(space + 1)),
 			}
 		: { command: tag, rowCount: null };
-	lastTag = tag;
-	return lastParsed;
+	// row counts make many distinct tags: start over rather than grow
+	if (parsedTags.size >= 64) parsedTags.clear();
+	parsedTags.set(tag, parsed);
+	return parsed;
 }
 
 export interface QueryOpOptions {

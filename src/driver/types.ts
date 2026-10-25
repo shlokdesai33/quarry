@@ -338,11 +338,22 @@ export async function* copyChunks(
 	size = 65536,
 ): AsyncGenerator<string, void, undefined> {
 	let chunk = '';
-	for await (const row of rows) {
-		chunk += copyLine(row);
-		if (chunk.length >= size) {
-			yield chunk;
-			chunk = '';
+	if (Symbol.asyncIterator in rows) {
+		for await (const row of rows) {
+			chunk += copyLine(row);
+			if (chunk.length >= size) {
+				yield chunk;
+				chunk = '';
+			}
+		}
+	} else {
+		// synchronously: `for await` over a sync iterable costs a promise per row
+		for (const row of rows) {
+			chunk += copyLine(row);
+			if (chunk.length >= size) {
+				yield chunk;
+				chunk = '';
+			}
 		}
 	}
 	if (chunk !== '') yield chunk;

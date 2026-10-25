@@ -289,23 +289,31 @@ function readyForQuery(bytes: Uint8Array, start: number, end: number) {
 	}
 }
 
-/** The latest command tag: queries mostly repeat it, so its string is reused rather than decoded again. */
-let lastTagBytes = EMPTY;
-let lastTag = '';
+/**
+ * The last 8 command tags' bytes and strings: queries mostly repeat a few
+ * (a transaction alternates BEGIN, its statements and COMMIT), so their
+ * strings are reused rather than decoded again.
+ */
+const TAG_CACHE = 8;
+const tagBytes: Uint8Array[] = [];
+const tagStrings: string[] = [];
+let tagNext = 0;
 
 function commandTag(bytes: Uint8Array, start: number, end: number): string {
 	const nul = nulAt(bytes, start, end);
 	const length = nul - start;
-	const known = lastTagBytes;
-	if (known.length === length) {
+	for (let k = 0; k < tagBytes.length; k++) {
+		const known = tagBytes[k];
+		if (known === undefined || known.length !== length) continue;
 		let i = 0;
 		while (i < length && known[i] === bytes[start + i]) i++;
-		if (i === length) return lastTag;
+		if (i === length) return tagStrings[k] ?? '';
 	}
 	const tag = utf8(bytes, start, nul);
-	// a copy: a view would keep the whole read buffer alive
-	lastTagBytes = new Uint8Array(bytes.subarray(start, nul));
-	lastTag = tag;
+	// a copy: a view would keep the read buffer alive
+	tagBytes[tagNext] = new Uint8Array(bytes.subarray(start, nul));
+	tagStrings[tagNext] = tag;
+	tagNext = (tagNext + 1) % TAG_CACHE;
 	return tag;
 }
 
