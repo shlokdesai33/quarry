@@ -780,6 +780,7 @@ const aggregates = new Set([
 	'string_agg',
 	'bool_and',
 	'bool_or',
+	'jsonb_agg',
 ]);
 
 /** Whether `node` calls an aggregate of its own query, not of a subquery's. */
