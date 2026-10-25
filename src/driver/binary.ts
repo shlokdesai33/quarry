@@ -1,5 +1,5 @@
 import { DriverError } from './errors.js';
-import { NodeBuffer, utf8 } from './protocol/text.js';
+import { utf8 } from './protocol/text.js';
 
 /** Decodes one binary-format value, `bytes[start, end)`. */
 export type BinaryParser = (
@@ -149,7 +149,7 @@ type Latin1Buffer = Uint8Array & {
 	latin1Slice(start: number, end: number): string;
 };
 const hasLatin1Slice = (b: Uint8Array): b is Latin1Buffer =>
-	NodeBuffer !== undefined && b instanceof NodeBuffer;
+	b instanceof Buffer;
 
 /** Elements whose binary format is their UTF-8 text. */
 export const TEXT = 'text';

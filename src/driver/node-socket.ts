@@ -8,30 +8,19 @@ import type {
 	TlsConnectOptions,
 } from './socket.js';
 
-/**
- * Node's built-in module `id`, through `process.getBuiltinModule` where the
- * runtime has it: much cheaper than `import()` on a cold start.
- */
-function builtin<const I extends 'node:net' | 'node:tls'>(id: I) {
-	return typeof process === 'object' &&
-		typeof process.getBuiltinModule === 'function'
-		? process.getBuiltinModule(id)
-		: undefined;
-}
+let netModule: typeof Net | undefined;
+let tlsModule: typeof Tls | undefined;
 
-let netModule: typeof Net | Promise<typeof Net> | undefined;
-let tlsModule: typeof Tls | Promise<typeof Tls> | undefined;
-
-// Loaded on first use, so the core stays importable elsewhere. `node:tls`
-// loads the whole crypto stack (~3 ms), so plain connections never load it.
-const loadNet = () => (netModule ??= builtin('node:net') ?? import('node:net'));
-const loadTls = () => (tlsModule ??= builtin('node:tls') ?? import('node:tls'));
+// Loaded on first use through `process.getBuiltinModule`, much cheaper than
+// `import()` on a cold start. `node:tls` loads the whole crypto stack
+// (~3 ms), so plain connections never load it.
+const loadNet = () => (netModule ??= process.getBuiltinModule('node:net'));
+const loadTls = () => (tlsModule ??= process.getBuiltinModule('node:tls'));
 
 /** Loads the modules connections will need (`node:tls` too with `tls`) ahead of time. */
 export function preloadNodeSockets(tls: boolean): void {
-	for (const loading of [loadNet(), tls ? loadTls() : undefined]) {
-		if (loading instanceof Promise) loading.catch(() => {});
-	}
+	loadNet();
+	if (tls) loadTls();
 }
 
 const contexts = new Map<string, Tls.SecureContext>();
@@ -145,7 +134,7 @@ class NodeSocket implements DriverSocket {
 	}
 
 	async startTls(options: TlsConnectOptions): Promise<void> {
-		const tls = await loadTls();
+		const tls = loadTls();
 		const raw = this.#socket;
 		raw.removeAllListeners('data');
 		raw.removeAllListeners('close');
@@ -184,10 +173,7 @@ class NodeSocket implements DriverSocket {
 		const socket = this.#secure;
 		if (socket === undefined) return undefined;
 		// an X509Certificate is parsed lazily; getPeerCertificate() decodes every field
-		const raw =
-			typeof socket.getPeerX509Certificate === 'function'
-				? socket.getPeerX509Certificate()?.raw
-				: socket.getPeerCertificate(false)?.raw;
+		const raw = socket.getPeerX509Certificate()?.raw;
 		return raw === undefined ? undefined : new Uint8Array(raw);
 	}
 
@@ -224,7 +210,7 @@ class NodeSocket implements DriverSocket {
 	}
 }
 
-/** Sockets from Node's `net` and `tls` modules. Also works on Bun and Deno's Node compatibility. */
+/** Sockets from Node's `net` and `tls` modules. */
 export const nodeSockets: SocketFactory = {
 	async connect(options: SocketConnectOptions): Promise<DriverSocket> {
 		const { target } = options;
@@ -235,13 +221,10 @@ export const nodeSockets: SocketFactory = {
 		let open: () => Net.Socket;
 		let secure: Tls.TLSSocket | undefined;
 		if (options.tls === undefined) {
-			// connects without yielding when the module is loaded, so callers
-			// can do other work while the TCP handshake is in flight
-			const loading = loadNet();
-			const net = loading instanceof Promise ? await loading : loading;
+			const net = loadNet();
 			open = () => net.connect(base);
 		} else {
-			const [tls, direct] = [await loadTls(), options.tls];
+			const [tls, direct] = [loadTls(), options.tls];
 			open = () =>
 				(secure = tls.connect({ ...base, ...tlsOptions(tls, direct) }));
 		}

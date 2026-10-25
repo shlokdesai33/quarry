@@ -175,8 +175,8 @@ export class Writer {
 			this.#buf = new Uint8Array(this.#size);
 			this.#view = new DataView(this.#buf.buffer);
 		} else {
-			// a Buffer where Buffer exists: small ones come from its shared
-			// pool, and Node's socket takes them without wrapping them first
+			// a Buffer: small ones come from its shared pool, and Node's socket
+			// takes them without wrapping them first
 			const length = this.#pos;
 			const buf = this.#buf;
 			out = allocate(length);

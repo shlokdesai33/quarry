@@ -8,12 +8,10 @@ import {
 } from './config.js';
 import { Connection } from './connection.js';
 import { ConnectionError, PostgresError } from './errors.js';
-import { cloudflareSockets, isCloudflareWorkers } from './cloudflare-socket.js';
 import { nodeSockets, preloadNodeSockets } from './node-socket.js';
 import * as fe from './protocol/frontend.js';
 import type {
 	DriverSocket,
-	SocketFactory,
 	SocketTarget,
 	TlsConnectOptions,
 } from './socket.js';
@@ -38,14 +36,9 @@ export async function connect(
 	);
 }
 
-/** `cloudflare:sockets` on Cloudflare Workers; Node's `net`/`tls` elsewhere (Node, Bun, Deno). */
-function defaultSockets(): SocketFactory {
-	return isCloudflareWorkers() ? cloudflareSockets : nodeSockets;
-}
-
 /** Loads the socket modules a configuration's connections will need, ahead of its first connect. */
 export function preloadSockets(config: ResolvedConfig): void {
-	if (config.socket !== undefined || isCloudflareWorkers()) return;
+	if (config.socket !== undefined) return;
 	preloadNodeSockets(
 		config.ssl.mode !== 'disable' &&
 			config.hosts.some((host) => !host.host.startsWith('/')),
@@ -249,7 +242,7 @@ async function attempt(
 	version: number,
 	state: Attempt,
 ): Promise<Connection> {
-	const factory = config.socket ?? defaultSockets();
+	const factory = config.socket ?? nodeSockets;
 	const target = socketTarget(host);
 	// certificate files are read while the TCP connection and SSLRequest are under way
 	const tls =
@@ -415,7 +408,7 @@ async function sendCancel(
 	pid: number,
 	key: Uint8Array,
 ): Promise<void> {
-	const factory = config.socket ?? defaultSockets();
+	const factory = config.socket ?? nodeSockets;
 	const tls =
 		plan === 'plain'
 			? undefined

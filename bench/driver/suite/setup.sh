@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # One-time setup of everything the driver benchmark needs, on Ubuntu 24.04
-# (x86-64). Installs PostgreSQL 18 + PgBouncer (PGDG), Bun, Deno, Go (to
-# build Neon's wsproxy), Toxiproxy, matplotlib, and the benchmark's npm
-# dependencies, including the pg-native addon.
+# (x86-64). Installs PostgreSQL 18 + PgBouncer (PGDG), Go (to build Neon's
+# wsproxy), Toxiproxy, matplotlib, and the benchmark's npm dependencies,
+# including the pg-native addon.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 sudo apt-get update -qq
-sudo apt-get install -y -qq curl ca-certificates gnupg lsb-release unzip psmisc build-essential libpq-dev python3-pip
+sudo apt-get install -y -qq curl ca-certificates gnupg lsb-release psmisc build-essential libpq-dev python3-pip
 sudo install -d /usr/share/postgresql-common/pgdg
 sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
 echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
@@ -15,9 +15,6 @@ sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql-18 pgbouncer
 # the packaged cluster and PgBouncer service aren't used
 sudo systemctl disable --now postgresql pgbouncer 2>/dev/null || true
-
-command -v bun >/dev/null || curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.3"
-command -v deno >/dev/null || curl -fsSL https://deno.land/install.sh | sh -s -- -y v2.9.7
 
 BIN="${BENCH_BIN:-$HOME/benchbin}"
 mkdir -p "$BIN"

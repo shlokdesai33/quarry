@@ -28,57 +28,10 @@ export interface ScramCrypto {
 	random(length: number): Uint8Array;
 }
 
-/** A copy backed by a plain ArrayBuffer, as WebCrypto's types require. */
-const fresh = (bytes: Uint8Array): Uint8Array<ArrayBuffer> =>
-	new Uint8Array(bytes);
-
-const subtle = (): SubtleCrypto => {
-	const value = globalThis.crypto?.subtle;
-	if (!value) {
-		throw new ConnectionError(
-			'SCRAM authentication needs WebCrypto (crypto.subtle)',
-		);
-	}
-	return value;
-};
-
-/** WebCrypto, for runtimes without `node:crypto` (Workers without `nodejs_compat`). */
-export const webScramCrypto: ScramCrypto = {
-	async hmac(key, data) {
-		const k = await subtle().importKey(
-			'raw',
-			fresh(key),
-			{ name: 'HMAC', hash: 'SHA-256' },
-			false,
-			['sign'],
-		);
-		return new Uint8Array(await subtle().sign('HMAC', k, fresh(data)));
-	},
-	async digest(hash, data) {
-		return new Uint8Array(await subtle().digest(hash, fresh(data)));
-	},
-	async pbkdf2(password, salt, iterations) {
-		const key = await subtle().importKey(
-			'raw',
-			fresh(password),
-			'PBKDF2',
-			false,
-			['deriveBits'],
-		);
-		const bits = await subtle().deriveBits(
-			{ name: 'PBKDF2', hash: 'SHA-256', salt: fresh(salt), iterations },
-			key,
-			256,
-		);
-		return new Uint8Array(bits);
-	},
-	random: (length) => globalThis.crypto.getRandomValues(new Uint8Array(length)),
-};
-
 /**
  * `node:crypto`: HMACs and digests are synchronous and take microseconds,
- * where each WebCrypto call is a round trip through Node's thread pool;
- * PBKDF2 still runs off the main thread.
+ * where each WebCrypto call would be a round trip through Node's thread
+ * pool; PBKDF2 still runs off the main thread.
  */
 export function nodeScramCrypto(crypto: typeof NodeCrypto): ScramCrypto {
 	return {
@@ -101,27 +54,11 @@ export function nodeScramCrypto(crypto: typeof NodeCrypto): ScramCrypto {
 
 let selected: ScramCrypto | undefined;
 
-/** `node:crypto` where the runtime has it (Node, Bun, Deno, Workers with `nodejs_compat`), else WebCrypto. */
+/** `node:crypto`, loaded on first use. */
 export function scramCrypto(): ScramCrypto {
-	if (selected === undefined) {
-		let crypto: typeof NodeCrypto | undefined;
-		try {
-			crypto =
-				typeof process === 'object' &&
-				typeof process.getBuiltinModule === 'function'
-					? process.getBuiltinModule('node:crypto')
-					: undefined;
-		} catch {
-			// no Node compatibility
-		}
-		selected =
-			crypto !== undefined &&
-			typeof crypto.createHmac === 'function' &&
-			typeof crypto.pbkdf2 === 'function'
-				? nodeScramCrypto(crypto)
-				: webScramCrypto;
-	}
-	return selected;
+	return (selected ??= nodeScramCrypto(
+		process.getBuiltinModule('node:crypto'),
+	));
 }
 
 interface Keys {

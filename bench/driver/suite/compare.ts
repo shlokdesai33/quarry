@@ -2,7 +2,7 @@
  * Compares two result sets cell by cell (e.g. main against a QUARRY_DIST
  * candidate): median throughput and p99 of each, and the change.
  *
- *   node compare.ts <baseline id> <candidate id> [--driver quarry] [--runtime node]
+ *   node compare.ts <baseline id> <candidate id> [--driver quarry]
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -15,7 +15,6 @@ const opt = (name: string) => {
 	return i >= 0 ? process.argv[i + 1] : undefined;
 };
 const driver = opt('driver') ?? 'quarry';
-const runtime = opt('runtime') ?? 'node';
 
 interface Raw {
 	cell: {
@@ -40,7 +39,8 @@ const load = (id: string) =>
 				r.result.ok &&
 				r.result.lat !== undefined &&
 				r.cell.driver === driver &&
-				r.cell.runtime === runtime,
+				// earlier snapshots also hold Bun and Deno cells
+				r.cell.runtime === 'node',
 		);
 const median = (v: number[]) => {
 	const s = v.toSorted((a, b) => a - b);

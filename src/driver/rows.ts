@@ -284,8 +284,8 @@ function factory(source: string): MakeDecoder | undefined {
  * A decoder compiled for one result shape: it decodes each value straight
  * into the row, so no temporary values array is allocated per row, and every
  * row gets the same hidden class. Undefined where `new Function` is
- * forbidden (e.g. Cloudflare Workers) or when a name can't be written as a
- * plain property (`__proto__`).
+ * forbidden (`--disallow-code-generation-from-strings`) or when a name
+ * can't be written as a plain property (`__proto__`).
  */
 function compiledDecoder(
 	fields: readonly Field[],
