@@ -217,9 +217,23 @@ The driver's decisions are in [driver/DECISIONS.md](driver/DECISIONS.md), which 
 
 **Alternatives.** An async generator (slower per row: [driver/DECISIONS.md](driver/DECISIONS.md#rowstream-a-hand-written-iterator-instead-of-an-async-generator)); a timeout inside a transaction by saving and restoring `statement_timeout` (an open question).
 
-**Cost.** Over a pool, a stream holds one connection from its first batch until it ends (released on `break`, `return`, a throw or an abort).
+**Cost.** Over a pool, a stream holds one connection from its first batch until it ends (released on `break`, `return`, a throw or an abort). A slow loop waits a round trip per batch, unless `readAhead: true` fetches one batch ahead ([driver/DECISIONS.md](driver/DECISIONS.md#streams-strict-pull-read-ahead-opt-in)).
 
 **Code.** `stream` in [select-query-builder.ts](select-query-builder.ts); [driver-executor.ts](driver-executor.ts) `stream`; the driver's [row-stream.ts](driver/row-stream.ts).
+
+### `execute({ commit: true })` for a transaction's last statement
+
+**What it is.** Inside `db.transaction`, `execute({ commit: true })` makes a statement the transaction's last: the driver sends COMMIT right behind it, so a callback whose only statement commits so is one round trip ([driver/DECISIONS.md](driver/DECISIONS.md#commit-pipelined-behind-a-transactions-last-statement)). It is refused outside a transaction, in a savepoint, and with an `expect…` shape.
+
+**Why.** `db.batch({ transaction: true })` reaches one round trip for statements known up front; a callback transaction, which can branch on results, paid one more for COMMIT.
+
+**Why an option, and refused with `expect…` shapes.** Only the caller knows which statement is the last. An `expect…` shape checks the rows after they arrive, which would be after COMMIT was sent: a `NoRowError` could no longer roll anything back, so the combination is refused rather than allowed to mislead (a batch with `verify` makes COMMIT wait for the check instead).
+
+**Alternatives.** A method that commits (`commitWith`): a second way to run a query. Detecting the last statement: the callback may always issue another.
+
+**Cost.** Once the statement succeeded, an error thrown later in the callback no longer rolls the transaction back.
+
+**Code.** [query.ts](query.ts) `execute`; [driver-executor.ts](driver-executor.ts) `#queryOptions`.
 
 ## Compiling to SQL
 
@@ -343,6 +357,16 @@ At 0 ms with 100 or 1000 callers, point lookups go from 39% to 64–65% of the d
 In one process (the sources run directly, 100 callers, 0 ms, one core), a lookup went from 6.3 to 3.2–3.4 µs (`pool.query`: 2.3). Build and compile with a mock executor went 1.69 → 0.5 µs, and compile alone 270 → 130 ns. The executor and the driver add nothing over `pool.query` for the same SQL and options. What is left is the builder chain itself (about 0.5 µs: four immutable builders, the where node, the shape and `Query`), its async `execute` layers, and their garbage.
 
 **Code.** `Prefix`, `write`, `sharedList`, `isDataStatement` in [compile.ts](compile.ts); `allSelections` in [expression-builder.ts](expression-builder.ts); `changesSession` in [driver-executor.ts](driver-executor.ts); the shapes in [shape.ts](shape.ts); [test/builder-caches.test.ts](../test/builder-caches.test.ts).
+
+### The builder's remaining per-query cost: profiled, nothing cut
+
+**What it is.** After #43, a profile of builder point lookups (500 callers, pool 10) puts the builder's own code at about 14% of the client's CPU, spread over three parts, none of which a change could remove without giving something up: building the query's objects (`selectFrom`, `where`, `selectAll`, the shape: ~4%), rendering it into the SQL trie (`compile`: 5.6%, though the select list is already rendered once per table), and the two `async` frames between `execute()` and the driver (~4%, with their share of microtask work).
+
+**Why nothing was cut.** The `async` frames are what lets the call-site stack reach the caller's code ([below](#errors-carry-the-query-hidden-and-the-code-awaiting-it)); a cache of the rendered prefix up to `where` would save a few trie steps (~1–2%), under the run-to-run noise of the benchmark; a cache of whole compiled queries needs a key that costs a walk of the new nodes ([above](#sql-rendered-through-a-trie-of-its-pieces)).
+
+**Measured.** The profile: 500 callers on a pool of 10, Node 24, client on 2 CPUs and PostgreSQL on the other 2 (builder files 13.9% of samples, `compile` 5.6% inclusive, `render` and `renderSelect` 3.5–3.7%). In the benchmark suite's builder phase on that machine, builder lookups ran at 184–211k/s against the driver's 168–221k (100–1000 callers, 0 ms), within noise of each other because the server is the bottleneck there; the report's 0.85 µs gap came from the 8-vCPU machine, where the client is.
+
+**Code.** [compile.ts](compile.ts), [query.ts](query.ts), [driver-executor.ts](driver-executor.ts).
 
 ### Every identifier quoted
 

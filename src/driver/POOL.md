@@ -24,16 +24,20 @@
 
 `PoolOptions` extends the connection options ([auth/README.md](auth/README.md#configuration)) with:
 
-| Option           | Default   | Meaning                                                                                                                                                                                    |
-| ---------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `max`            | 10        | most connections open at once (opening ones count)                                                                                                                                         |
-| `min`            | 0         | connections kept open even when idle                                                                                                                                                       |
-| `idleTimeout`    | 30 s      | close a connection idle this long (0: never)                                                                                                                                               |
-| `maxLifetime`    | 1 h       | replace connections older than this, minus up to 10% random jitter (0: never)                                                                                                              |
-| `acquireTimeout` | 30 s      | how long a caller waits for a connection (0: forever)                                                                                                                                      |
-| `maxWaiting`     | unlimited | fail fast once this many callers are waiting                                                                                                                                               |
-| `pipeline`       | adaptive  | pipeline depth per shared connection: adaptive from 100 to 1000, over an adaptive number of connections; a number fixes the depth and spreads over all `max`; `false`/`0` disables sharing |
-| `onConnect`      |           | runs on each new connection before first use (e.g. to `SET` session state)                                                                                                                 |
+| Option              | Default   | Meaning                                                                                                                                                                                    |
+| ------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `max`               | 10        | most connections open at once (opening ones count)                                                                                                                                         |
+| `min`               | 0         | connections kept open even when idle                                                                                                                                                       |
+| `idleTimeout`       | 30 s      | close a connection idle this long (0: never)                                                                                                                                               |
+| `maxLifetime`       | 1 h       | replace connections older than this, minus up to 10% random jitter (0: never)                                                                                                              |
+| `acquireTimeout`    | 30 s      | how long a caller waits for a connection (0: forever)                                                                                                                                      |
+| `maxWaiting`        | unlimited | fail fast once this many callers are waiting                                                                                                                                               |
+| `maxUses`           | unlimited | replace a connection once it has served this many queries and borrowers                                                                                                                    |
+| `connectRetryDelay` | 0         | after a failed connect, wait about this long (±50%) before the next attempt; doesn't grow with consecutive failures                                                                        |
+| `pipeline`          | adaptive  | pipeline depth per shared connection: adaptive from 100 to 1000, over an adaptive number of connections; a number fixes the depth and spreads over all `max`; `false`/`0` disables sharing |
+| `onConnect`         |           | runs on each new connection before first use (e.g. to `SET` session state)                                                                                                                 |
+
+`pool.stats` is a point-in-time view (`total`, `idle`, `busy`, `waiting`); `pool.metrics` counts what happened since the pool was created (`opened`, `openFailed`, `closed`, `waited`, `waitTimeouts`, `waitRefusals`); `pool.onEvent(listener)` reports each `open`, `openFailed`, `close` (with its reason: `idle`, `lifetime`, `maxUses`, `discarded`, `transaction`, `lost`, `end`), `waitTimeout` and `waitRefused`, never per query.
 
 `createPool(options | connectionString)` resolves the configuration once (`resolveConfig`), fills `min`, and in the background preloads the socket modules the connections will need (`preloadSockets`) so the first query doesn't pay for loading `node:tls`.
 
@@ -112,14 +116,15 @@ State lives in fields of the slot (`busy`, `shared`) rather than in sets of busy
 
 - It opens one connection per waiter not already covered by one being opened, up to `max`. Queued queries count only up to the [width](#adaptive-width) (`#sharedWanted`): once that many connections carry queries, more connections wouldn't take any.
 - `#open()` calls `openConnection(config)` ([auth/README.md](auth/README.md)), runs `onConnect` (destroying the connection if it throws), creates the slot with a **jittered** expiry (`maxLifetime × (1 − random × 0.1)`, so connections opened together don't all expire together), and registers `connection.onClose(() => this.#forget(slot))`.
-- **A failure rejects one waiter** (the first) with the connection error, then calls `#serveWaiters` again: each waiter gets its own attempt, so a transient failure doesn't fail every waiter at once, and a persistent one fails them one by one with the real error.
+- **A failure rejects one waiter** (the first) with the connection error, then calls `#serveWaiters` again: each waiter gets its own attempt, so a transient failure doesn't fail every waiter at once, and a persistent one fails them one by one with the real error. With `connectRetryDelay`, the next attempt waits that long first (`#holdingBack`, one timer), and waiters keep waiting meanwhile.
+- **Rerunning a query that never ran**: a connection whose session the server ended (FATAL `57P01`–`57P03`, `57P05`) before answering anything written hands its `pool.query` calls back, and queued ones it never wrote; `#rerun` runs each once more, from the next turn of the event loop, on another connection ([DECISIONS.md](DECISIONS.md#run-a-query-again-when-the-server-ended-the-session-before-answering-it)).
 - `#forget(slot)`: a connection closed on its own (server restart, network loss, the server's idle timeout) is removed everywhere, and the pool re-serves waiters, rebalances and refills `min`.
 
 ## Releasing and giving back
 
 ```ts
 #releaseSlot(slot, discard) {
-  const reusable = !discard && !connection.closed && !this.#expired(slot);
+  const reusable = !discard && !connection.closed && this.#expired(slot) === undefined;
   if (!reusable) { close it; serve waiters; refill min; return; }
   if (connection.pending > 0 || connection.transactionStatus !== 'idle') { this.#releaseWhenIdle(slot); return; }
   this.#unlend(slot);
@@ -271,9 +276,9 @@ The danger of sharing: under a steady stream of queries, a shared connection mig
 ## Idle timeout, lifetime and `min`
 
 - **Idle timeout**: a connection idle for `idleTimeout` is closed, unless that would leave fewer than `min`.
-- **Lifetime**: a connection past `maxLifetime` is closed when released or found idle, and replaced if needed for `min` (even if that briefly leaves fewer than `min`). Recycling connections picks up server configuration changes and DNS changes, and limits per-backend memory growth. `#shareable` stops putting new queries on an expired connection.
+- **Lifetime and uses**: a connection past `maxLifetime`, or that has served `maxUses` queries and borrowers, is closed when released or found idle, and replaced if needed for `min` (even if that briefly leaves fewer than `min`). Recycling connections picks up server configuration changes and DNS changes, and limits per-backend memory growth. `#expired` reports which (`#use` counts the uses), and `#shareable`, `#takeIdle` and `#releaseSlot` stop putting new work on it.
 - **One timer for all idle connections**: parking a connection doesn't start a timer of its own. `#armSweep(deadline)` only re-arms the single sweep timer if this deadline is earlier than the armed one; `#sweepIdle` closes (or keeps, below `min`) the connections that are due and re-arms for the next deadline. Timers are `unref`'d, so an idle pool doesn't keep the process alive.
-- **`min`**: `#fillMin` opens connections until `min` exist; failures are retried on the next acquire or release.
+- **`min`**: `#fillMin` opens connections until `min` exist; failures are retried on the next acquire or release, or after `connectRetryDelay` when it is set.
 
 ## Ending the pool
 
@@ -311,6 +316,9 @@ Why the pool works this way. Each links to its full entry (what it is, why, the 
 - [Adaptive width: no more pipelined backends than the server runs at once](DECISIONS.md#adaptive-width-no-more-pipelined-backends-than-the-server-runs-at-once): a CPU-saturated server time-slices pipelined backends, and the queries on a descheduled one make the tail; why stalls, why each narrowing is judged.
 - [Pool policies: LIFO idle, jittered lifetime, safe release, fail fast](DECISIONS.md#pool-policies-lifo-idle-jittered-lifetime-safe-release-fail-fast): LIFO idle stack, no mid-transaction hand-over, per-waiter attempts, fail-fast limits.
 - [One sweep timer for every idle connection](DECISIONS.md#one-sweep-timer-for-every-idle-connection): no timer allocated per release.
+- [The pool's hot path: no change from the clock reads or per-waiter timers](DECISIONS.md#the-pools-hot-path-no-change-from-the-clock-reads-or-per-waiter-timers): both changes measured, neither helped.
+- [`maxUses`](DECISIONS.md#maxuses), [pool events and counters](DECISIONS.md#pool-events-and-counters), [connect retry delay](DECISIONS.md#connect-retry-delay-opt-in-and-not-escalating): operating the pool.
+- [Run a query again when the server ended the session before answering it](DECISIONS.md#run-a-query-again-when-the-server-ended-the-session-before-answering-it): a query sent on an idle connection the server had just ended.
 - [Allocation cuts for the small-query tail](DECISIONS.md#allocation-cuts-for-the-small-query-tail): fields instead of sets, callbacks made once: no per-query garbage in the hottest path.
 
 ## Glossary

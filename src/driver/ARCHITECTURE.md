@@ -396,6 +396,7 @@ interface Statement {
   readonly sql: string;
   readonly types: readonly number[]; // the declared parameter types
   used: number; // last lookup, on the connection's counter
+  seen: number; // unnamed runs the server parsed, towards prepareThreshold
   unwritten: boolean; // created, its Parse not yet written
   parsed: boolean; // ParseComplete arrived
   fields: readonly Field[] | undefined; // its columns, once described
@@ -411,8 +412,9 @@ The same SQL with different declared parameter types is a different server-side 
 `Connection.#statement(sql, types, named)`:
 
 - Look up the SQL; if it isn't there, or its statement declares other types, look up the types-and-SQL key.
-- Found: stamp `used` with `++#statementUses` and return it. (A use stamp rather than moving the entry to the end of the `Map`: deleting and re-adding a key on every hit makes the `Map` rehash, garbage that adds up to GC pauses on small queries.)
-- Not found: create it with the next name. If the cache is full (`statementCacheSize`, default 100), evict the entry with the lowest `used` and write a **Close** for its server-side statement **before** the new Parse, in the same buffer (the op ignores the CloseComplete).
+- Found: stamp `used` with `++#statementUses` and return it. (A use stamp rather than moving the entry to the end of the `Map`: deleting and re-adding a key on every hit makes the `Map` rehash, garbage that adds up to GC pauses on small queries.) An unnamed entry whose SQL the server has now parsed `prepareThreshold − 1` times unnamed (`seen`, counted by the op at its ParseComplete) is replaced by a named one, which the op parses and describes like new SQL.
+- Not found: create it, **unnamed** until its SQL has run `prepareThreshold` times (default 2; with 1, named at once). If the cache is full (`statementCacheSize`, default 100), evict the least recently used unnamed entry, or else the entry with the lowest `used`, writing a **Close** for a named one's server-side statement **before** the new Parse, in the same buffer (the op ignores the CloseComplete).
+- An unnamed entry's query runs as Parse(""), Bind, Describe(portal), Execute, with the columns it described cached on the entry: SQL run once costs no server-side statement and pushes no prepared one out of the cache.
 
 `prepare: false` (per query or per connection) or `statementCacheSize: 0` disables named statements.
 

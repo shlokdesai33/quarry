@@ -429,7 +429,7 @@ for await (const user of db
 }
 ```
 
-`stream()` reads rows through a cursor, one batch at a time with backpressure, decoded as `execute()` decodes them. Leaving the loop (or aborting its `signal`) closes the cursor and frees its connection. Inside `db.transaction`, other queries of the transaction can run in the loop. A stream is an async iterable, so `Readable.from(stream)` and `ReadableStream.from(stream)` work.
+`stream()` reads rows through a cursor, one batch at a time with backpressure, decoded as `execute()` decodes them. Leaving the loop (or aborting its `signal`) closes the cursor and frees its connection. `readAhead: true` fetches the next batch while the loop works on one. Inside `db.transaction`, other queries of the transaction can run in the loop. A stream is an async iterable, so `Readable.from(stream)` and `ReadableStream.from(stream)` work.
 
 ## Writing
 
@@ -594,8 +594,9 @@ The transaction commits when the callback resolves and rolls back when it throws
 - `tx.afterCommit(fn)`: runs once the outermost transaction commits.
 - `tx.afterRollback(fn)`: runs if this transaction or savepoint rolls back.
 - `tx.setLocal(name, value)`: a transaction-local setting, with a bound value.
+- `execute({ commit: true })` on the callback's last statement: COMMIT goes out right behind it, so a one-statement transaction is one round trip.
 
-Options: `isolation`, `readOnly`, `deferrable`, `retries` (re-runs on serialization failures and deadlocks), `settings` (transaction-local settings, e.g. for row-level security), `timeout`, and `durable` (throws if already inside a transaction).
+An error the callback caught and carried on after fails the savepoint (or the transaction) with that error. Options: `isolation`, `readOnly`, `deferrable`, `retries` (re-runs on serialization failures and deadlocks), `settings` (transaction-local settings, e.g. for row-level security), `timeout`, and `durable` (throws if already inside a transaction).
 
 ## Raw SQL
 
@@ -715,12 +716,13 @@ await conn.query('select 1');
 - **Queries**: `query(sql, params, options)` returns `{ rows, rowCount, command, fields }`. Per-query options: `rowMode: 'array'`, `signal`, `timeout`, `statementTimeout`, `paramTypes`, `paramCodecs`, `resultCodecs`, `codecs`, `prepare`, `keepRows`, `tag`, `onTiming`. `simpleQuery(sql)` runs several statements; `describe(sql)` returns parameter and result types.
 - **Parameters** are always sent separately from the SQL. `typed(value, codec)` encodes a parameter with a codec and declares its type; arrays declared with `arrayOf(codec)` go in binary.
 - **Prepared statements** are cached per connection (100 by default); one made stale by a schema change is retried once, unnamed. Concurrent queries are pipelined on shared connections once the pool is busy.
-- **Transactions** (`pool.transaction`, `conn.transaction`) take `isolation`, `readOnly`, `deferrable`, `retries`, `retryDelay`, `settings`, `timeout` and `durable`; `BEGIN` travels with the first statement. `tx.transaction` nests a savepoint; `tx.afterCommit`, `tx.afterRollback` and `tx.setLocal` work as in the [query builder](#transactions).
-- **Streaming and COPY**: `conn.cursor(sql, params, { batchSize })` yields batches, `pool.stream` yields rows, `copyRows`, `copyFrom` and `copyTo` run `COPY`, all with backpressure.
-- **LISTEN/NOTIFY**: `pool.listen(channel, handler)` resubscribes after reconnects; `conn.notify(channel, payload)` sends.
+- **Transactions** (`pool.transaction`, `conn.transaction`) take `isolation`, `readOnly`, `deferrable`, `retries`, `retryDelay`, `settings`, `timeout` and `durable`; `BEGIN` travels with the first statement, and `tx.query(sql, params, { commit: true })` sends COMMIT behind the last one. `tx.transaction` nests a savepoint, which adds no round trip; `tx.afterCommit`, `tx.afterRollback` and `tx.setLocal` work as in the [query builder](#transactions).
+- **Prepared statements** start on a SQL text's second run (`prepareThreshold`, default 2), so SQL run once takes no server-side statement.
+- **Streaming and COPY**: `conn.cursor(sql, params, { batchSize, readAhead })` yields batches, `pool.stream` yields rows, `copyRows`, `copyFrom` and `copyTo` run `COPY`, all with backpressure; `createCopyFromStream` and `createCopyToStream` are the same as Node streams, for `pipeline`.
+- **LISTEN/NOTIFY**: `pool.listen(channel, handler, { onGap })` resubscribes after reconnects and reports the gap; `conn.notify(channel, payload)` sends.
 - **Cancellation**: `signal` and `timeout` cancel a query on the server; `statementTimeout` sets a server-side timeout for one query; `conn.cancel()` cancels the running query.
-- **Pool**: `pool.acquire()` reserves a connection (`await using client = await pool.acquire()`), `pool.stats` reports `{ total, idle, busy, waiting }`, `pool.end({ timeout })` drains and closes.
-- **Observability**: `telemetry: { tracer }` emits OpenTelemetry client spans, `onNotice` receives server notices, `captureStack` adds the caller's stack to errors.
+- **Pool**: `pool.acquire()` reserves a connection (`await using client = await pool.acquire()`), `pool.stats` reports `{ total, idle, busy, waiting }`, `pool.metrics` counts opens, closes, waits and timeouts, `pool.onEvent(listener)` reports them as they happen, and `pool.end({ timeout })` drains and closes. `maxUses` replaces connections after that many queries; `connectRetryDelay` spaces out connection attempts after a failure. A query sent on an idle connection the server had just ended runs again on another.
+- **Observability**: `telemetry: { tracer }` emits OpenTelemetry client spans for queries, cursors, COPY and transactions, `onNotice` receives server notices, `captureStack` adds the caller's stack to errors.
 
 ### Connection options
 
@@ -736,6 +738,7 @@ Options resolve like libpq: the options object, then the connection string (`pos
 | `ssl`                | see below                  | An `sslmode` string or an options object.                                           |
 | `channelBinding`     | `'prefer'`                 | SCRAM channel binding: `'disable'`, `'prefer'` or `'require'`.                      |
 | `requireAuth`        |                            | Accepted authentication methods, as libpq's `require_auth`.                         |
+| `scramMaxIterations` | `1000000`                  | Most PBKDF2 iterations a server may ask for in SCRAM.                               |
 | `connectTimeout`     | `30000`                    | Milliseconds to connect and authenticate.                                           |
 | `keepAlive`          | `true`                     | TCP keep-alive, with `keepAliveInitialDelay`.                                       |
 | `targetSessionAttrs` | `'any'`                    | `'read-write'`, `'read-only'`, `'primary'`, `'standby'` or `'prefer-standby'`.      |
@@ -745,6 +748,7 @@ Options resolve like libpq: the options object, then the connection string (`pos
 | `codecs`             | `defaultCodecs`            | Result codecs by type, over the defaults, or a registry.                            |
 | `prepare`            | `true`                     | Use named prepared statements.                                                      |
 | `statementCacheSize` | `100`                      | Prepared statements kept per connection.                                            |
+| `prepareThreshold`   | `2`                        | Runs of a SQL text, unnamed, before it is prepared (1: on first use).               |
 | `preparePipelined`   | detected                   | Use named statements for pipelined queries too.                                     |
 | `binaryResults`      | `true`                     | Receive columns in binary where their codec supports it.                            |
 | `protocol`           | `'auto'`                   | `'auto'` (3.2, accepting 3.0), `'3.0'` or `'3.2'`; also `min`/`maxProtocolVersion`. |
@@ -758,16 +762,18 @@ Options resolve like libpq: the options object, then the connection string (`pos
 
 ### Pool options
 
-| Option           | Default   | Description                                                           |
-| ---------------- | --------- | --------------------------------------------------------------------- |
-| `max`            | `10`      | Most open connections.                                                |
-| `min`            | `0`       | Connections kept open when idle.                                      |
-| `idleTimeout`    | `30000`   | Close connections idle this long (ms).                                |
-| `maxLifetime`    | `3600000` | Replace connections older than this (ms), with jitter.                |
-| `acquireTimeout` | `30000`   | How long `acquire` waits (ms).                                        |
-| `maxWaiting`     | unlimited | Most waiting callers before `acquire` fails fast.                     |
-| `pipeline`       | adaptive  | Pipelining depth on busy connections: adaptive, a number, or `false`. |
-| `onConnect`      |           | Runs on each new connection before it is used.                        |
+| Option              | Default   | Description                                                           |
+| ------------------- | --------- | --------------------------------------------------------------------- |
+| `max`               | `10`      | Most open connections.                                                |
+| `min`               | `0`       | Connections kept open when idle.                                      |
+| `idleTimeout`       | `30000`   | Close connections idle this long (ms).                                |
+| `maxLifetime`       | `3600000` | Replace connections older than this (ms), with jitter.                |
+| `acquireTimeout`    | `30000`   | How long `acquire` waits (ms).                                        |
+| `maxWaiting`        | unlimited | Most waiting callers before `acquire` fails fast.                     |
+| `maxUses`           | unlimited | Replace a connection after this many queries and borrowers.           |
+| `connectRetryDelay` | `0`       | After a failed connect, wait about this long (ms) before the next.    |
+| `pipeline`          | adaptive  | Pipelining depth on busy connections: adaptive, a number, or `false`. |
+| `onConnect`         |           | Runs on each new connection before it is used.                        |
 
 ### TLS and authentication
 
@@ -867,7 +873,7 @@ With 10 connections and 500 callers, the p99 is 5.0 ms, against 10.6 ms for post
 | Point lookups, 500 callers, 1 connection (ops/s) | 5 ms  |   **88,941** |      169 |       7,958 |
 |                                                  | 20 ms |   **23,550** |     47.8 |       2,333 |
 
-A transaction takes two round trips (`BEGIN` travels with the first statement), and `db.batch` with `{ transaction: true }` takes one: three statements in a transaction at 5 ms RTT run at 166 ops/s with `db.batch`, against 57 with `Promise.all` and 43 one after another.
+A transaction takes two round trips (`BEGIN` travels with the first statement), one when its last statement is run with `execute({ commit: true })`, and `db.batch` with `{ transaction: true }` takes one: three statements in a transaction at 5 ms RTT run at 166 ops/s with `db.batch`, against 57 with `Promise.all` and 43 one after another.
 
 Through the query builder (`database()`, pool 10), lookups run at 270–312k ops/s with 100–1,000 callers and no added latency, 71–79% of the driver alone. At 5 ms RTT with 1,000 callers, lookups, inserts and updates run at 160–168k ops/s, within 3% of the driver, about 2.2× postgres.js (73–75k) and 100× `pg` (1.6k).
 

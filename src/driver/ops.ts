@@ -51,7 +51,7 @@ export interface Statement {
 	readonly types: readonly number[];
 	/** When the statement was last looked up, on the connection's counter: the cache evicts the lowest. */
 	used: number;
-	/** How often its SQL ran unnamed and succeeded, towards the connection's `prepareThreshold`. */
+	/** How often its SQL was parsed unnamed (ParseComplete), towards the connection's `prepareThreshold`. */
 	seen: number;
 	/** Created, and its Parse not yet written: the operation that finds it so writes it. */
 	unwritten: boolean;
@@ -559,8 +559,10 @@ export class QueryOp extends Op {
 			case 'DataRow':
 				return !this.dataRow(msg.payload, 0, msg.payload.length);
 			case 'ParseComplete':
-				if (this.#statement && this.#createdStatement)
-					this.#statement.parsed = true;
+				if (this.#statement === undefined) return false;
+				if (this.#createdStatement) this.#statement.parsed = true;
+				// its SQL parsed, run unnamed: one more run towards preparing it
+				else if (this.#unnamed) this.#statement.seen++;
 				return false;
 			case 'BindComplete': {
 				// an unnamed one's columns come next, from the portal's description
@@ -695,8 +697,6 @@ export class QueryOp extends Op {
 			return true;
 		}
 		if (error === undefined) {
-			if (this.#unnamed && this.#statement !== undefined)
-				this.#statement.seen++;
 			const { command, rowCount } = parseTag(this.#tag);
 			this.#resolve({
 				command,
@@ -1444,6 +1444,7 @@ export class CursorOp extends Op {
 			case 'ParseComplete':
 				if (this.#setting || this.#restoring) return false;
 				if (this.#statement && this.#created) this.#statement.parsed = true;
+				else if (this.#statement?.name === '') this.#statement.seen++;
 				return false;
 			case 'ParameterDescription':
 			case 'BindComplete':
@@ -1550,7 +1551,6 @@ export class CursorOp extends Op {
 				'The cursor was opened outside a transaction, and closed with its first batch',
 			);
 		}
-		if (this.#error === undefined && statement?.name === '') statement.seen++;
 		this.#finished = true;
 		this.#phase = 'ended';
 		this.settle();

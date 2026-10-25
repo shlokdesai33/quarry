@@ -107,8 +107,8 @@ Enums, domains and extension types have no fixed OIDs. A codec for one (`oid: 0`
 ### Cancelling and timeouts
 
 - `signal` cancels a running query (a cancel request over a new connection), or drops one not yet sent. A query pipelined behind others is canceled once the server gets to it, never one ahead of it.
-- `timeout` is a client-side deadline that cancels.
-- `statementTimeout` is enforced by the server, with `set_config(…, true)`, so it never leaks into other sessions behind a pooler.
+- `timeout` is a client-side deadline that cancels, counted from when the query is queued on its connection (so it includes waiting behind queries pipelined ahead of it).
+- `statementTimeout` is enforced by the server, with `set_config(…, true)`, so it never leaks into other sessions behind a pooler. Statements that only run outside a transaction block (`vacuum`, `create index concurrently`, …) refuse it.
 - `conn.cancel()` cancels whatever is running.
 
 Canceled queries throw `QueryCanceled`, whose `reason` is `'abort'`, `'timeout'`, `'statement_timeout'` or `'user'`.
@@ -117,12 +117,14 @@ Canceled queries throw `QueryCanceled`, whose `reason` is `'abort'`, `'timeout'`
 
 ```ts
 for await (const batch of conn.cursor(sql, params, { batchSize: 1000 })) { … } // a batch per pull, binary columns from the first run
+for await (const batch of conn.cursor(sql, params, { readAhead: true })) { … } // the next batch fetched while you work on one
 for await (const row of pool.stream(sql, params)) { … } // a connection of its own until the loop ends
 for await (const row of tx.stream(sql, params)) await tx.query(…); // inside a transaction, queries run between batches
 await conn.copyRows('copy items (id, name) from stdin', rows); // bulk insert: rows as value arrays, encoded like parameters
 await conn.copyFrom('copy items from stdin', asyncIterableOfChunks);
-for await (const chunk of conn.copyTo('copy items to stdout')) { … }
-const unlisten = await pool.listen('events', (n) => …); // dedicated connection, re-subscribes after reconnecting
+for await (const chunk of conn.copyTo('copy items to stdout')) { … } // each chunk: every row received since the last
+await pipeline(createReadStream('items.csv'), pool.createCopyFromStream('copy items from stdin (format csv)')); // Node streams
+const unlisten = await pool.listen('events', (n) => …, { onGap: ({ from, to }) => … }); // dedicated connection, re-subscribes after reconnecting
 ```
 
 ## Transactions
@@ -139,7 +141,9 @@ await pool.transaction(async (tx) => {
 - `settings` are applied with bound parameters.
 - A COMMIT that the server turned into a ROLLBACK (because an error was swallowed inside) throws `TransactionRolledBack`.
 - BEGIN (with the settings) is sent with the callback's first statement, under one Sync, so a transaction takes 2 round trips. If BEGIN fails, the server skips that statement, and the transaction rejects with BEGIN's error. The callback has already started by then.
-- A savepoint's `release` isn't waited for; if it fails, the next statement in the transaction, or the COMMIT, reports its error.
+- A savepoint's `savepoint` goes out with its first statement and its `release` with the statement after it (or the COMMIT), under their Sync: a savepoint adds no round trip, and one that runs nothing sends nothing.
+- An error the callback caught and carried on after fails the savepoint (or the transaction) with that error, not with the "current transaction is aborted" of the statements after it.
+- `tx.query(sql, params, { commit: true })` sends COMMIT right behind the transaction's last statement: a one-statement transaction is one round trip.
 - quarry's `db.batch(queries, { transaction: true })` runs a fixed list of statements in one round trip: BEGIN, the settings and the statements under one Sync, then COMMIT with its own, all in one write. A failed statement skips the rest, so COMMIT reports ROLLBACK; a failed BEGIN runs nothing, and the COMMIT after it does nothing.
 
 ## Pool
@@ -149,19 +153,23 @@ await pool.transaction(async (tx) => {
 - `max`, `min`
 - `idleTimeout` (30 s), `maxLifetime` (1 h, with jitter)
 - `acquireTimeout` (30 s), `maxWaiting`
+- `maxUses`: replace a connection after that many queries and borrowers
+- `connectRetryDelay`: after a failed connect, wait about that long before the next attempt (not growing)
 - `pipeline`: once every connection is busy, `query`, `simpleQuery` and `describe` are pipelined onto shared connections. Further queries wait in line and take the next free slot.
   - By default the depth adapts per connection. It starts at 100 queries in flight. While queries are waiting and finish nearly as fast as the round trip allows, so the network rather than the server is the limit, it grows by half each round trip, up to 1000. Once queries queue on the server, more depth would only line them up behind each other, so it shrinks back towards 100. At 0 ms it stays at 100; at 5 ms with 1000 callers on one connection it reaches the server's throughput instead of 100 per round trip.
   - A number fixes the depth; `false` gives every query a connection to itself.
   - Reserved clients, transactions, cursors and COPY always get a connection of their own. While one waits, one shared connection per waiter takes no new queries, and it is handed over once the queries already in flight on it finish, so a steady stream of queries can't hold it back.
 - `onConnect`
 
-`pool.acquire()` reserves a client; release it with `release()` or `await using`. Connections that die, or are released mid-transaction, are discarded. `maxLifetime` also recycles idle connections, including those kept open by `min`.
+`pool.acquire()` reserves a client; release it with `release()` or `await using`. Connections that die, or are released mid-transaction, are discarded. `maxLifetime` also recycles idle connections, including those kept open by `min`. A `pool.query` sent on an idle connection the server had just ended (before reading the query) runs again on another.
+
+`pool.stats` is the current state; `pool.metrics` counts connections opened, failed and closed, and waits, wait timeouts and refusals; `pool.onEvent(listener)` reports those as they happen.
 
 `pool.end()` stops new work and closes the pool once the work already issued is done: queries and callers already waiting get a connection, and reserved clients and transactions keep theirs until released. `end({ timeout })` fails whatever is still waiting or running after that long.
 
 ## Poolers and proxies
 
-- **Protocol version:** the driver asks for protocol 3.2 and accepts 3.0 from poolers that negotiate down. A pooler that rejects 3.2 outright gets one retry with 3.0; `minProtocolVersion` / `maxProtocolVersion` override this.
+- **Protocol version:** the driver asks for protocol 3.2 and accepts 3.0 from poolers that negotiate down. A pooler that rejects 3.2 outright gets one retry with 3.0, and is asked for 3.0 straight away for the next hour; `minProtocolVersion` / `maxProtocolVersion` override this.
 - **PgBouncer in transaction mode** (tested with 1.26): named prepared statements work from 1.21 with `max_prepared_statements` set, and pipelined queries are sent unnamed (see [Queries](#queries); `preparePipelined: false` for 1.21–1.25). With older versions, or other poolers without prepared-statement support, use `prepare: false`; PgBouncer 1.26+ without `max_prepared_statements` is detected, and no statement is named.
 - **Session state** (`SET`, `LISTEN`, temporary tables, session advisory locks) doesn't survive between transactions in transaction mode. The driver's own settings never use it: `statementTimeout`, transaction `settings` and `timeout` all go through `set_config(…, true)` inside a transaction. `LISTEN` needs a direct or session-mode connection.
 - **RDS Proxy, Supavisor, Neon and other transaction poolers:** the same rules apply. Avoid session-level `SET`, which can pin a session to a server connection. If a proxy pins or rejects named prepared statements, use `prepare: false`.
@@ -170,8 +178,9 @@ await pool.transaction(async (tx) => {
 ## Errors
 
 - Server errors are `PostgresError`s carrying every field the server sent, plus `query` (non-enumerable, so parameters don't leak into logs).
-- Common SQLSTATEs have their own classes: `UniqueViolation`, `ForeignKeyViolation`, `NotNullViolation`, `CheckViolation`, `ExclusionViolation` (with `columns`), `SerializationFailure`, `DeadlockDetected` (`isRetryable`), `QueryCanceled`, `LockNotAvailable`, `ReadOnlyTransaction`, `UndefinedTable`, `UndefinedColumn`.
+- Common SQLSTATEs have their own classes, each with its own `name`: `UniqueViolation`, `ForeignKeyViolation`, `NotNullViolation`, `CheckViolation`, `ExclusionViolation` (with `columns`), `SerializationFailure`, `DeadlockDetected` (`isRetryable`), `QueryCanceled`, `LockNotAvailable`, `ReadOnlyTransaction`, `UndefinedTable`, `UndefinedColumn`.
 - Client-side failures are `ConnectionError`, `ProtocolError` or `AbortError`.
+- Only a `Uint8Array` (or `Buffer`) is sent as bytes; other typed arrays are refused.
 - A result value whose parser throws fails only that query, with a `DecodeError` naming the column and type (never the value); the connection stays usable.
 
 ## With quarry

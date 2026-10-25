@@ -63,6 +63,8 @@ Both call `#abort(op, reason)`:
 
 A query that was never sent can't have done anything, so it fails with `AbortError` and the connection is unaffected. A sent one is canceled on the server.
 
+**`timeout` counts from when the query is queued on its connection**, not from when it is written: the wait behind queries pipelined ahead of it on that connection counts, as the caller waits. A pool's wait for a connection or a pipeline slot comes before that and is bounded by `acquireTimeout`; quarry's `execute({ timeout })` is a server-side `statementTimeout`, which counts only the server's work on the statement.
+
 ## The cancel request
 
 `connection.cancel()` calls the `cancel` function `connect.ts` gave the connection at open time: `sendCancel(config, host, plan, pid, key)`.
@@ -94,11 +96,13 @@ sequenceDiagram
     Note over C: B failed (QueryCanceled 'abort'), canceling cleared → write C
 ```
 
-**Repeated, with backoff.** The server drops a cancel that arrives while it is still reading the query's messages (before it starts executing). So `#cancelAtHead` sends the cancel, and while the op is still running and at the head, sends it again after 50, 100, 200, 400 and 800 ms (at most 6 attempts). The timers are `unref`'d and cleared when the op settles.
+**Repeated, with backoff, until the server answered.** The server drops a cancel that arrives while it is still reading the query's messages (before it starts executing). So `#cancelAtHead` sends the cancel, and while the op is still running, at the head, and **has received no message**, sends it again after 50, 100, 200, 400 and 800 ms (at most 6 attempts). Once any message for the op has arrived (`op.answered`: ParseComplete, BindComplete, a row), the server has read all of it, so the cancel sent then is the last: a repeat sent after the query finished would hit a query pipelined behind it. The timers are `unref`'d and cleared when the op settles.
 
 If another aborted op is waiting further back, `#canceling` moves to it when the first settles, keeping later writes held back until it too is done.
 
 In a `SyncGroupOp` (several statements under one Sync), a cancel applies to the group: `canceledBy` is passed to the statement currently running, which is the one the server interrupts; the rest are skipped by the server as after any error.
+
+**Statements that can't run in a transaction block** (`vacuum`, `create index concurrently`, `create database`, `alter system`, …) are refused with a `statementTimeout` before anything is sent: the timeout's set and restore put the statement in an implicit transaction block, where the server refuses them with an error that says nothing about the timeout. A client-side `timeout` still works for them.
 
 ## Cursors
 
@@ -187,6 +191,8 @@ Why cancellation works this way. Each links to its full entry (what it is, why, 
 - [A statement timeout is framed under the query's Sync, whatever the transaction status](DECISIONS.md#a-statement-timeout-is-framed-under-the-querys-sync-whatever-the-transaction-status): it bounds its own query alone, whatever else is pipelined.
 - [A statement timeout bounds the whole stream](DECISIONS.md#a-statement-timeout-bounds-the-whole-stream): for cursors.
 - [Every wait has a timeout](DECISIONS.md#every-wait-has-a-timeout): nothing waits forever by default.
+- [Stop repeating a cancel once the server answered the query](DECISIONS.md#stop-repeating-a-cancel-once-the-server-answered-the-query): closes the race with a query pipelined behind.
+- [A statement timeout is refused for statements that can't run in a transaction block](DECISIONS.md#a-statement-timeout-is-refused-for-statements-that-cant-run-in-a-transaction-block): a clear error instead of the server's.
 
 ## Glossary
 

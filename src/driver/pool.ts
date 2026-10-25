@@ -129,8 +129,6 @@ export type PoolEvent =
 interface Waiter {
 	resolve(connection: Connection): void;
 	reject(error: Error): void;
-	/** When it times out (`performance.now()`), or infinity. */
-	readonly deadline: number;
 	cleanup(): void;
 }
 
@@ -145,12 +143,10 @@ interface Slot {
 	shared: number;
 	/** When its lifetime ends (ms since epoch); infinite without one. */
 	readonly expiresAt: number;
-	/** Why it takes no new work, once its lifetime ended or it was used `maxUses` times. */
-	expired: 'lifetime' | 'maxUses' | undefined;
+	/** Set once it has served `maxUses` queries and borrowers: it takes no new work. */
+	usedUp: boolean;
 	/** Queries and borrowers it has served, for `maxUses`. */
 	uses: number;
-	/** Sets `expired` when its lifetime ends. */
-	lifetime: ReturnType<typeof setTimeout> | undefined;
 	/** Why the pool is closing it, once it is. */
 	closing: PoolCloseReason | undefined;
 	/** When it was last parked idle (ms since epoch). */
@@ -166,9 +162,6 @@ interface Slot {
 	readonly fulfilled: (value: unknown) => unknown;
 	readonly rejected: (error: unknown) => never;
 }
-
-/** The longest delay a timer takes. */
-const MAX_TIMER = 2_147_483_647;
 
 function unref(timer: ReturnType<typeof setTimeout>): void {
 	if (typeof timer === 'object' && timer !== null && 'unref' in timer)
@@ -612,8 +605,6 @@ export class Pool implements AsyncDisposable {
 	/** No connection attempt before this (ms since epoch), after one failed. */
 	#retryAt = 0;
 	#retryTimer: ReturnType<typeof setTimeout> | undefined;
-	/** One timer for every waiter's `acquireTimeout`, at the earliest. */
-	#waitTimer: ReturnType<typeof setTimeout> | undefined;
 	readonly #onConnect: PoolOptions['onConnect'];
 	readonly #eventListeners = new Set<(event: PoolEvent) => void>();
 	readonly #metrics = {
@@ -738,7 +729,16 @@ export class Pool implements AsyncDisposable {
 
 	/** Counts a query or borrower on a connection: past `maxUses`, it takes no more. */
 	#use(slot: Slot): void {
-		if (++slot.uses >= this.#maxUses) slot.expired ??= 'maxUses';
+		if (++slot.uses >= this.#maxUses) slot.usedUp = true;
+	}
+
+	/** Why a connection takes no new work: its lifetime ended, or it was used `maxUses` times. */
+	#expired(slot: Slot): 'lifetime' | 'maxUses' | undefined {
+		if (slot.usedUp) return 'maxUses';
+		return slot.expiresAt !== Number.POSITIVE_INFINITY &&
+			Date.now() >= slot.expiresAt
+			? 'lifetime'
+			: undefined;
 	}
 
 	#lend(slot: Slot): void {
@@ -779,9 +779,8 @@ export class Pool implements AsyncDisposable {
 				busy: false,
 				shared: -1,
 				expiresAt: Date.now() + lifetime,
-				expired: undefined,
+				usedUp: false,
 				uses: 0,
-				lifetime: undefined,
 				closing: undefined,
 				idleSince: 0,
 				depth: undefined,
@@ -797,8 +796,6 @@ export class Pool implements AsyncDisposable {
 					throw error;
 				},
 			};
-			// a flag set once, so taking and sharing a connection read no clock
-			if (lifetime !== Number.POSITIVE_INFINITY) this.#expireAt(slot);
 			this.#slots.set(connection, slot);
 			connection.onClose(() => this.#forget(slot));
 			connection.rerun = this.#rerun;
@@ -809,19 +806,6 @@ export class Pool implements AsyncDisposable {
 		} finally {
 			this.#opening--;
 		}
-	}
-
-	/** Sets `expired` once a connection's lifetime ends (in steps: a timer waits at most 2^31 − 1 ms). */
-	#expireAt(slot: Slot): void {
-		const left = slot.expiresAt - Date.now();
-		slot.lifetime = setTimeout(
-			() => {
-				if (left > MAX_TIMER) this.#expireAt(slot);
-				else slot.expired ??= 'lifetime';
-			},
-			Math.max(0, Math.min(left, MAX_TIMER)),
-		);
-		unref(slot.lifetime);
 	}
 
 	/** Counts a failed attempt and, with `connectRetryDelay`, holds the next one back. */
@@ -861,7 +845,6 @@ export class Pool implements AsyncDisposable {
 
 	/** Drops a connection that closed on its own (server restart, network loss, idle timeout). */
 	#forget(slot: Slot): void {
-		if (slot.lifetime !== undefined) clearTimeout(slot.lifetime);
 		this.#metrics.closed++;
 		if (this.#eventListeners.size > 0)
 			this.#emit({
@@ -977,9 +960,10 @@ export class Pool implements AsyncDisposable {
 			const index = this.#idle.indexOf(slot);
 			if (index < 0) continue;
 			this.#idle.splice(index, 1);
-			if (slot.expired !== undefined || now >= slot.expiresAt) {
+			const expired = this.#expired(slot);
+			if (expired !== undefined) {
 				// replaced even when that leaves fewer than min
-				void this.#close(slot, slot.expired ?? 'lifetime');
+				void this.#close(slot, expired);
 				this.#fillMin();
 			} else if (this.#total() < this.#min) {
 				this.#giveBack(slot);
@@ -1056,9 +1040,9 @@ export class Pool implements AsyncDisposable {
 	#shareable(slot: Slot): boolean {
 		const { connection } = slot;
 		return (
-			slot.expired === undefined &&
 			!connection.closed &&
-			connection.transactionStatus === 'idle'
+			connection.transactionStatus === 'idle' &&
+			this.#expired(slot) === undefined
 		);
 	}
 
@@ -1204,8 +1188,9 @@ export class Pool implements AsyncDisposable {
 		while (this.#idle.length > 0) {
 			const slot = this.#idle.pop();
 			if (slot === undefined) break;
-			if (slot.connection.closed || slot.expired !== undefined) {
-				void this.#close(slot, slot.expired ?? 'lost');
+			const expired = this.#expired(slot);
+			if (slot.connection.closed || expired !== undefined) {
+				void this.#close(slot, expired ?? 'lost');
 				continue;
 			}
 			this.#lend(slot);
@@ -1247,91 +1232,46 @@ export class Pool implements AsyncDisposable {
 		}
 		this.#metrics.waited++;
 		return new Promise((resolve, reject) => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
 			const waiter: Waiter = {
 				resolve,
 				reject,
-				deadline:
-					this.#acquireTimeout > 0
-						? performance.now() + this.#acquireTimeout
-						: Number.POSITIVE_INFINITY,
-				cleanup: noop,
+				cleanup: () => {
+					if (timer !== undefined) clearTimeout(timer);
+					signal?.removeEventListener('abort', onAbort);
+				},
 			};
-			if (signal !== undefined) this.#abortWait(queue, waiter, signal);
-			queue.push(waiter);
-			// for the full timeout from now, as a timer of its own would be: it
-			// fires before a connect timeout of the same length started after it
-			if (waiter.deadline !== Number.POSITIVE_INFINITY)
-				this.#waitTimer ??= setTimeout(
-					() => this.#timeOutWaiters(),
-					this.#acquireTimeout,
+			const remove = (error: Error) => {
+				const index = queue.indexOf(waiter);
+				if (index < 0) return;
+				queue.splice(index, 1);
+				waiter.cleanup();
+				reject(error);
+				this.#rebalance();
+				this.#checkDrained();
+			};
+			const onAbort = () =>
+				remove(
+					new AbortError('Acquiring a connection was aborted', {
+						cause: signal?.reason,
+					}),
 				);
-		});
-	}
-
-	#abortWait(queue: Waiter[], waiter: Waiter, signal: AbortSignal): void {
-		const onAbort = () =>
-			this.#unwait(
-				queue,
-				waiter,
-				new AbortError('Acquiring a connection was aborted', {
-					cause: signal.reason,
-				}),
-			);
-		signal.addEventListener('abort', onAbort, { once: true });
-		waiter.cleanup = () => signal.removeEventListener('abort', onAbort);
-	}
-
-	/** Takes a waiter out of its queue and fails it. */
-	#unwait(queue: Waiter[], waiter: Waiter, error: Error): void {
-		const index = queue.indexOf(waiter);
-		if (index < 0) return;
-		queue.splice(index, 1);
-		waiter.cleanup();
-		waiter.reject(error);
-		this.#rebalance();
-		this.#checkDrained();
-	}
-
-	/**
-	 * The timer for waiters' `acquireTimeout`: one for every waiter, at the
-	 * earliest deadline. Every waiter waits as long, so each queue is in
-	 * deadline order: the timer only looks at their heads, and a waiter
-	 * served before its deadline needs no timer cleared.
-	 */
-	#armWaitTimer(deadline: number): ReturnType<typeof setTimeout> {
-		return setTimeout(
-			() => this.#timeOutWaiters(),
-			Math.max(0, deadline - performance.now()),
-		);
-	}
-
-	#timeOutWaiters(): void {
-		this.#waitTimer = undefined;
-		// timers fire on the event loop's millisecond clock, up to one early
-		const now = performance.now() + 1;
-		let next = Number.POSITIVE_INFINITY;
-		for (const queue of [this.#waiters, this.#sharedWaiters]) {
-			for (let head = queue[0]; head !== undefined; head = queue[0]) {
-				if (head.deadline > now) {
-					next = Math.min(next, head.deadline);
-					break;
-				}
-				queue.shift();
-				head.cleanup();
-				this.#metrics.waitTimeouts++;
-				if (this.#eventListeners.size > 0) this.#emit({ type: 'waitTimeout' });
-				head.reject(
-					new ConnectionError(
-						`Timed out after ${this.#acquireTimeout}ms waiting for a connection`,
-						{ code: 'ETIMEDOUT' },
-					),
-				);
+			if (this.#acquireTimeout > 0) {
+				timer = setTimeout(() => {
+					this.#metrics.waitTimeouts++;
+					if (this.#eventListeners.size > 0)
+						this.#emit({ type: 'waitTimeout' });
+					remove(
+						new ConnectionError(
+							`Timed out after ${this.#acquireTimeout}ms waiting for a connection`,
+							{ code: 'ETIMEDOUT' },
+						),
+					);
+				}, this.#acquireTimeout);
 			}
-		}
-		this.#rebalance();
-		this.#checkDrained();
-		if (next !== Number.POSITIVE_INFINITY && this.#waitTimer === undefined)
-			this.#waitTimer = this.#armWaitTimer(next);
+			signal?.addEventListener('abort', onAbort, { once: true });
+			queue.push(waiter);
+		});
 	}
 
 	#release = (connection: Connection, discard: boolean): void => {
@@ -1342,13 +1282,13 @@ export class Pool implements AsyncDisposable {
 	#releaseSlot(slot: Slot, discard: boolean): void {
 		if (!slot.busy) return;
 		const { connection } = slot;
-		const reusable =
-			!discard && !connection.closed && slot.expired === undefined;
+		const expired = this.#expired(slot);
+		const reusable = !discard && !connection.closed && expired === undefined;
 		if (!reusable) {
 			this.#unlend(slot);
 			const closing = this.#close(
 				slot,
-				discard ? 'discarded' : (slot.expired ?? 'lost'),
+				discard ? 'discarded' : (expired ?? 'lost'),
 			);
 			if (this.#ended) this.#closing.push(closing);
 			this.#serveWaiters();
@@ -1860,8 +1800,6 @@ export class Pool implements AsyncDisposable {
 				}
 			}
 		}
-		if (this.#waitTimer !== undefined) clearTimeout(this.#waitTimer);
-		this.#waitTimer = undefined;
 		await Promise.all([
 			...closing,
 			...this.#closing.splice(0),

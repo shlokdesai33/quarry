@@ -340,8 +340,9 @@ await db.transaction(
 - **`afterCommit(fn)`** runs `fn` once the outermost transaction commits; dropped on rollback or retry. **`afterRollback(fn)`** runs if this transaction or savepoint rolls back.
 - **`setLocal(name, value)`** sets a run-time parameter for the rest of the transaction with `set_config(name, $value, true)`: bound, never interpolated.
 - **`settings`** (an option) does the same for several settings at the start, sent with BEGIN.
+- **`execute({ commit: true })`** marks the callback's last statement: `#queryOptions` passes `commit` to the driver `Transaction`, which sends COMMIT right behind the statement, so a one-statement transaction is one round trip. `Query.execute` refuses it with an `expect…` shape (`checked`: its check would run after COMMIT was sent), `#queryOptions` outside a transaction, and the driver in a savepoint.
 
-The driver's framing (BEGIN sharing the first statement's Sync, deferred savepoint releases, detecting a COMMIT that rolled back) is in [driver/TRANSACTIONS.md](driver/TRANSACTIONS.md).
+The driver's framing (BEGIN sharing the first statement's Sync, savepoints and releases sharing the next statement's Sync, COMMIT behind the last statement, a caught error resurfacing as itself, detecting a COMMIT that rolled back) is in [driver/TRANSACTIONS.md](driver/TRANSACTIONS.md).
 
 ## Streaming
 
@@ -358,7 +359,7 @@ await db.transaction(async (tx) => {
 
 1. Refuses a `timeout` inside a transaction (other queries of the transaction run between the stream's batches, so a transaction-local `statement_timeout` would apply to them too; use `tx.setLocal`).
 2. Over a pool, **acquires a connection** when the first batch is asked for, and releases it in `finally`, however the iteration ends: read to the end, `break`, `return`, a throw, an abort. Inside a transaction, it uses the transaction's connection.
-3. Iterates `runner.cursor(sql, params, { batchSize, …codecs, signal, statementTimeout })` ([driver/STREAMING.md](driver/STREAMING.md#cursors)): each batch is fetched only once the rows before it are taken, columns come in their codecs' formats (binary where they can) **from the first run**, and outside a transaction a `timeout` becomes the cursor's `statementTimeout`: the driver sets it before the portal and restores it before the portal's Sync, so it bounds the whole stream (the loop's time included) and can't leak.
+3. Iterates `runner.cursor(sql, params, { batchSize, readAhead, …codecs, signal, statementTimeout })` ([driver/STREAMING.md](driver/STREAMING.md#cursors)): each batch is fetched only once the rows before it are taken, columns come in their codecs' formats (binary where they can) **from the first run**, and outside a transaction a `timeout` becomes the cursor's `statementTimeout`: the driver sets it before the portal and restores it before the portal's Sync, so it bounds the whole stream (the loop's time included) and can't leak.
 4. Decorates an error with the query and the call site, as `execute` does; an error in the middle (a division by zero at row 10,001) rejects the pull that reaches it, after the rows before it.
 5. Reports one `onQuery` event of kind `'stream'` with the total row count.
 

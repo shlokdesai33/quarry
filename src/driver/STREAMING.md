@@ -27,7 +27,7 @@ for await (const batch of conn.cursor(
 }
 ```
 
-Code: `CursorOp`, `FetchOp`, `ClosePortalOp` in [ops.ts](ops.ts); `CursorIterator` in [cursor.ts](cursor.ts); `Connection.cursor` in [connection.ts](connection.ts). This was reworked in #34; what changed and why is in [DECISIONS.md](DECISIONS.md#streams-strict-pull).
+Code: `CursorOp`, `FetchOp`, `ClosePortalOp` in [ops.ts](ops.ts); `CursorIterator` in [cursor.ts](cursor.ts); `Connection.cursor` in [connection.ts](connection.ts). This was reworked in #34; what changed and why is in [DECISIONS.md](DECISIONS.md#streams-strict-pull-read-ahead-opt-in).
 
 ### How it works on the wire
 
@@ -70,6 +70,8 @@ The cursor is exclusive only while it describes the statement; between batches t
 
 A batch is fetched **only when the consumer asks for it** (`#pump` sends the next Execute when a `next()` waits and no batch is unread). Before #34 the cursor sent the next Execute as soon as it handed a batch out, one batch ahead; strict pull means a slow loop holds exactly one batch in memory, and the server does no work the consumer won't take. The cost is that the consumer waits one round trip per batch.
 
+`readAhead: true` (outside a transaction) sends the next Execute as soon as a batch is handed out, when none is left unread: at most one batch ahead, so a loop that spends time on each batch overlaps it with the next round trip. Inside a transaction a prefetch would sit ahead of the loop's own queries, so the option does nothing there.
+
 ### Binary from the first run
 
 Unlike `query()`, whose columns are asked for in binary only once a cached statement has been described ([CODECS.md](CODECS.md#binary-after-describe)), a cursor **describes the statement first** when its columns aren't cached (Describe(S) + Flush, then Bind once the RowDescription arrives, in `#described`), so its Bind already asks for each column in its codec's format, binary where it can, even on the first run and even unprepared or unnamed (PgBouncer pipelining). That costs one extra round trip once per statement and connection, which a large streamed result amortises; a small query wouldn't (see [DECISIONS.md](DECISIONS.md#binary-only-after-describe)). An unnamed statement bound from cached columns adds a Describe of the portal, and if the columns changed (a schema change), the rows are decoded by what the server sent.
@@ -103,7 +105,8 @@ Unlike `query()`, whose columns are asked for in binary only once a cached state
 - Inside a **transaction**, the session waits for BEGIN (and any deferred savepoint release) before starting the cursor ([TRANSACTIONS.md](TRANSACTIONS.md#the-session)).
 - `Readable.from(stream)` and `ReadableStream.from(stream)` read it with backpressure and close it when destroyed or canceled.
 - A long stream holds a **snapshot**: an open cursor keeps its backend's `xmin`, which holds back vacuum, and outside a transaction it is never "idle in transaction", so `idle_in_transaction_session_timeout` doesn't end it. Bound it with `statementTimeout`.
-- quarry's `select(…).stream()` is this, through `DriverExecutor.stream` ([../EXECUTION.md](../EXECUTION.md#streaming)).
+- quarry's `select(…).stream()` is this, through `DriverExecutor.stream` ([../EXECUTION.md](../EXECUTION.md#streaming)); it takes `readAhead` too.
+- With `telemetry`, a cursor is one span, from the first batch asked for to its end, with the rows read.
 
 Measured in #34 (5M rows of `int4, text, timestamptz`, batch 1000, Node 24, local PG 18): 2,494 → 1,480 ms (2.0M → 3.4M rows/s), peak heap growth 55 → 27 MB, peak RSS growth 107 → 50 MB. 5M rows stream under `--max-old-space-size=32`, where `execute()` of 1M rows runs out of heap. Batch size trades memory for round trips: 100 rows → 3.0 s and 13 MB of heap, 10,000 → 1.5 s and 102 MB.
 
@@ -155,9 +158,28 @@ await conn.copyRows('copy users (id, name) from stdin', [
 
 ### `copyTo(sql)`
 
-`CopyToOp` queues each CopyData's bytes (copied out of the read buffer) for the iterator. **Read backpressure**: once more than `highWaterMark` bytes (default 1 MiB) are queued and unread, it calls `ctx.pause()` (the socket stops reading); when the consumer brings it under half, `resume()`. So a slow consumer slows the server down instead of growing memory.
+`CopyToOp` keeps each CopyData (a row, in text format) as a view of the read buffer until the iterator's `next()`, which copies every message received by then into **one chunk**: one allocation per read, and no view keeps a read buffer alive. **Read backpressure**: once more than `highWaterMark` bytes (default 1 MiB) are queued and unread, it calls `ctx.pause()` (the socket stops reading); the next `next()` takes them all and `resume()`s. So a slow consumer slows the server down instead of growing memory. With `telemetry`, it is one span with the rows copied.
 
 Leaving the loop early is harder than for a cursor: the server is already sending. `return()` marks the op canceled, sends a **cancel request** ([CANCELLATION.md](CANCELLATION.md)), and drains the remaining output until the server stops.
+
+### Node streams
+
+`createCopyFromStream(sql)` (on a connection or pool) returns a Node `Writable` that is a `COPY … FROM STDIN`, and `createCopyToStream(sql)` a `Readable` of a `COPY … TO STDOUT` ([copy-streams.ts](copy-streams.ts)):
+
+```ts
+await pipeline(
+  createReadStream('users.csv'),
+  pool.createCopyFromStream('copy users from stdin (format csv)'),
+);
+await pipeline(
+  pool.createCopyToStream('copy users to stdout (format csv)'),
+  createWriteStream('users.csv'),
+);
+```
+
+- The `Writable` feeds `copyFrom`: each write's callback runs once the COPY has taken the chunk, so the socket's backpressure reaches the source. It finishes once the server confirmed the COPY, with `rowCount` set; destroying it (a failing source in a `pipeline`) sends CopyFail, and the server's error destroys it.
+- The `Readable` is `Readable.from(copyTo(sql))`: destroying it stops the COPY.
+- On a pool, each holds a connection of its own until it ends.
 
 ### COPY through `query()`
 
@@ -189,7 +211,7 @@ await unlisten();
 A pooled connection is lent to different callers for each query, and `LISTEN` is session state: it would be lost, or delivered to the wrong borrower. So `pool.listen(channel, handler)` uses a separate `Listener` with **one dedicated connection**, outside `max`:
 
 - The connection is opened on the first `listen`. Its notifications are dispatched to the handlers of their channel.
-- If it **drops** (server restart, network), the `Listener` reconnects with exponential backoff (100 ms, doubling, up to 5 s) and **re-subscribes every channel**, the `listen` statements pipelined in one round trip. Notifications sent while it was down are lost: Postgres doesn't queue them. Design consumers to re-read state after a reconnect when that matters.
+- If it **drops** (server restart, network), the `Listener` reconnects with exponential backoff (100 ms, doubling, up to 5 s, each delay × 0.5–1.5 so many processes don't reconnect in step) and **re-subscribes every channel**, the `listen` statements pipelined in one round trip. Notifications sent while it was down are lost: Postgres doesn't queue them. `pool.listen(channel, handler, { onGap })` calls `onGap({ from, to })` once the channel is subscribed again, with when the connection dropped and when it was back, so the consumer can re-read what it missed.
 - The returned function removes the handler and `unlisten`s when the channel has none left.
 - `pool.end()` closes it.
 
@@ -199,7 +221,7 @@ A pooled connection is lent to different callers for each query, and `LISTEN` is
 
 Why cursors, streams, COPY and LISTEN/NOTIFY work this way. Each links to its full entry (what it is, why, the alternatives, the cost, measured impact) in [DECISIONS.md](DECISIONS.md):
 
-- [Streams: strict pull](DECISIONS.md#streams-strict-pull): a batch is fetched only when the consumer asks: bounded memory, and no work the consumer may never take.
+- [Streams: strict pull, read-ahead opt-in](DECISIONS.md#streams-strict-pull-read-ahead-opt-in): a batch is fetched only when the consumer asks, unless `readAhead` fetches one ahead: bounded memory, and no work the consumer may never take.
 - [Cursors: describe first for binary from the first run](DECISIONS.md#cursors-describe-first-for-binary-from-the-first-run): an extra round trip that pays for itself on a large result.
 - [Exclusive ops for anything that keeps talking](DECISIONS.md#exclusive-ops-for-anything-that-keeps-talking): one unnamed portal and one COPY state per connection.
 - [Cursors inside a transaction use a named portal](DECISIONS.md#cursors-inside-a-transaction-use-a-named-portal): other queries can run between batches, so the common loop doesn't deadlock.
@@ -207,6 +229,8 @@ Why cursors, streams, COPY and LISTEN/NOTIFY work this way. Each links to its fu
 - [`RowStream`: a hand-written iterator instead of an async generator](DECISIONS.md#rowstream-a-hand-written-iterator-instead-of-an-async-generator): about half the per-row overhead.
 - [A statement timeout bounds the whole stream](DECISIONS.md#a-statement-timeout-bounds-the-whole-stream): from the first batch to the last, without leaking.
 - [COPY with backpressure both ways](DECISIONS.md#copy-with-backpressure-both-ways): never more buffered than the socket and a high-water mark.
+- [`copyTo` chunks: everything received, one copy per read](DECISIONS.md#copyto-chunks-everything-received-one-copy-per-read): not a promise and an allocation per row.
+- [Node stream adapters for COPY](DECISIONS.md#node-stream-adapters-for-copy): `pipeline` straight into and out of COPY.
 - [A NOTIFY fast path and a channel-name cache](DECISIONS.md#a-notify-fast-path-and-a-channel-name-cache): notifications decoded straight from the read buffer.
 - [A dedicated, self-healing LISTEN connection, re-subscribing in one round trip](DECISIONS.md#a-dedicated-self-healing-listen-connection-re-subscribing-in-one-round-trip): subscriptions survive reconnects and never leak into pooled sessions.
 - [`notify` with `pg_notify($1, $2)`](DECISIONS.md#notify-with-pg_notify1-2): payloads can't inject SQL.

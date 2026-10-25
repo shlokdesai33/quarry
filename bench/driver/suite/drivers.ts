@@ -30,6 +30,12 @@ export interface Driver {
 	): Promise<readonly Row[]>;
 	transaction(fn: (tx: Tx) => Promise<void>): Promise<void>;
 	/**
+	 * A transaction whose only statement is marked as its last, so the
+	 * client can send COMMIT behind it (quarry's `commit: true`); clients
+	 * without that run it as a plain transaction.
+	 */
+	transactionCommitting?(sql: string, params: unknown[]): Promise<void>;
+	/**
 	 * quarry's query builder only: three statements (a lookup, an insert,
 	 * an update) run one after another, with `Promise.all`, or with
 	 * `db.batch`, outside or inside a transaction.
@@ -115,7 +121,22 @@ export const DRIVERS: Record<
 	'quarry-db': {
 		describe:
 			"quarry's query builder (`database()` from the built `dist/index.js`) on its default driver pool, for the builder scenarios only (`db.batch`, and builder lookups, inserts and updates under concurrency).",
-		make: (o) => quarryDb(o),
+		make: (o) => quarryDb(o, process.env['QUARRY_DIST']),
+	},
+	'quarry-db-candidate': {
+		describe:
+			'quarry-db from the build at `QUARRY_DIST_CANDIDATE`, for A/B runs of a builder change. Only in the matrix when that variable is set.',
+		make: (o) => quarryDb(o, process.env['QUARRY_DIST_CANDIDATE']),
+	},
+	'quarry-candidate-readahead': {
+		describe:
+			'quarry-candidate with `readAhead: true` on streams (one batch fetched ahead), for the streaming scenarios. Only in the matrix when `QUARRY_DIST_CANDIDATE` is set.',
+		make: (o) =>
+			quarry(
+				o,
+				{ decode: 'compat', readAhead: true },
+				process.env['QUARRY_DIST_CANDIDATE'],
+			),
 	},
 	'quarry-lossless': {
 		describe:
@@ -182,7 +203,7 @@ const quarryTx = (tx: any): Tx => ({
 
 async function quarry(
 	o: DriverOptions,
-	v: { decode: 'compat' | 'lossless'; prepare?: boolean },
+	v: { decode: 'compat' | 'lossless'; prepare?: boolean; readAhead?: boolean },
 	dist = QUARRY_DIST,
 ): Promise<Driver> {
 	if (dist === undefined) throw new Error('QUARRY_DIST_CANDIDATE is not set');
@@ -213,11 +234,16 @@ async function quarry(
 		queryTyped: async (sql, params, paramTypes) =>
 			(await pool.query(sql, params, { paramTypes })).rows,
 		transaction: (fn) => pool.transaction((tx: any) => fn(quarryTx(tx))),
+		transactionCommitting: (sql, params) =>
+			pool.transaction((tx: any) => tx.query(sql, params, { commit: true })),
 		copyFrom: async (sql, chunks) => {
 			await pool.copyFrom(sql, chunks);
 		},
 		stream: async (sql, params, batchSize, onBatch) => {
-			for await (const batch of pool.cursor(sql, params, { batchSize }))
+			for await (const batch of pool.cursor(sql, params, {
+				batchSize,
+				...(v.readAhead === true ? { readAhead: true } : {}),
+			}))
 				await onBatch(batch);
 		},
 		listen: async (channel, handler) =>
@@ -233,11 +259,14 @@ async function quarry(
 	};
 }
 
-async function quarryDb(o: DriverOptions): Promise<Driver> {
+async function quarryDb(
+	o: DriverOptions,
+	dist: string | undefined,
+): Promise<Driver> {
 	const q = await import(
-		process.env['QUARRY_DIST'] === undefined
+		dist === undefined
 			? new URL('../../../dist/index.js', import.meta.url).href
-			: new URL('../index.js', `file://${process.env['QUARRY_DIST']}`).href
+			: new URL('../index.js', `file://${dist}`).href
 	);
 	const users = q.defineTable('bench_users', {
 		columns: {

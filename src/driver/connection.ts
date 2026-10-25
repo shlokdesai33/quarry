@@ -900,9 +900,10 @@ export class Connection implements AsyncDisposable {
 	 * With `named`, SQL is prepared on its `prepareThreshold`th run: before
 	 * that its entry is unnamed, keeping only the columns its runs
 	 * described, so SQL run once never takes a server-side statement or
-	 * pushes a prepared one out. Only runs that succeeded count, so a
-	 * statement isn't prepared in the middle of a pipeline that repeats it,
-	 * behind a statement that may fail and make the server skip its Parse.
+	 * pushes a prepared one out. A run counts once the server parsed it
+	 * (ParseComplete), so a statement isn't prepared in the middle of a
+	 * pipeline that repeats it, behind a statement that may fail and make
+	 * the server skip its Parse.
 	 * It is prepared like new SQL (described, its results in text that
 	 * run): its columns may have changed since. When the cache is full, the
 	 * least recently used unnamed entry goes first.
