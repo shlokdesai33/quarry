@@ -395,13 +395,6 @@ export class Session {
 		return statements.map((_, i) => group.then((results) => results[i]!));
 	}
 
-	/** Sends `sql` without waiting for its answer: the next statement reports its error. */
-	sendDeferred(sql: string): void {
-		const result = this.query(sql);
-		result.catch(noop);
-		this.#deferred = result;
-	}
-
 	cursor<R>(
 		sql: string,
 		params?: readonly unknown[],

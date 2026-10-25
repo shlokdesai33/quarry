@@ -378,6 +378,11 @@ const expectations: Record<string, Table> = {
 	},
 	postgres: {
 		'tests/index.js': {
+			'Copy read': {
+				category: 'intentional',
+				reason:
+					'copyTo hands over every row received by then in one chunk, not one chunk per row (integration/compat.test.ts: hands COPY TO rows over in chunks)',
+			},
 			'Throws on illegal transactions': {
 				category: 'not-applicable',
 				reason:

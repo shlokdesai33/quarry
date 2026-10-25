@@ -145,8 +145,7 @@ class Session {
 - **`transactionStatus`** reports `transaction` from the start, even before BEGIN was sent or answered, so code inside the callback sees what it expects.
 - **`queryGroup(statements)`**: several statements under one Sync, sharing BEGIN's if unsent.
 - **`cursor`, `stream`, `copyTo`** (`#iterate`) wait for BEGIN (and any deferred statement) before starting, since they hold the connection exclusively.
-- **`queue(statements)`**: holds statements (`savepoint`, `release savepoint`, a savepoint's settings) until the next statement, which goes out with them under one Sync (`#group`); `drop` takes them back if nothing followed. A statement that needs a Sync of its own sends them first without waiting (`#sendPrefix`), and the next statement reports their error.
-- **`sendDeferred(sql)`**: send without waiting for the answer; the **next** statement's result waits for it first, and reports its error instead if it failed (`#send` chains on `#deferred`).
+- **`queue(statements)`**: holds statements (`savepoint`, `release savepoint`, a savepoint's settings) until the next statement, which goes out with them under one Sync (`#group`); `drop` takes them back if nothing followed. A statement that needs a Sync of its own sends them first without waiting (`#sendPrefix`): the **next** statement's result waits for their answer first, and reports their error instead if they failed (`#send` chains on `#deferred`).
 - **`commitWith(sql, …)`**: the statement, then COMMIT right behind it, unanswered ([below](#commit-behind-the-last-statement)).
 - **`end()`**: drops BEGIN and anything queued if never sent (a callback that ran no statement costs no round trip at all, and COMMIT then does nothing), waits for BEGIN's outcome, and returns its failure.
 
