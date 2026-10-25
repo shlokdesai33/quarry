@@ -2,7 +2,7 @@
 
 Three methods on the select builder read a result piece by piece, each piece its own query ([select-query-builder.ts](select-query-builder.ts), [pagination.ts](pagination.ts); added in #31). This guide explains pagination from scratch, what SQL each method adds, and the details that make it correct: exact key values, row comparisons, `limit + 1`, cursors.
 
-For reading a big result in one go without holding it in memory, `stream()` is the other tool ([QUERIES.md](QUERIES.md#running-execute-stream-describe-pagination)); the [difference](#pagination-vs-stream) is at the end.
+For reading a big result in one go without holding it in memory, `stream()` is the other tool ([QUERIES.md](QUERIES.md#running-execute-stream-describe-pagination), [EXECUTION.md](EXECUTION.md#streaming)); the [difference](#pagination-vs-stream) is at the end.
 
 ## Contents
 
@@ -16,6 +16,7 @@ For reading a big result in one go without holding it in memory, `stream()` is t
 - [Cursors](#cursors)
 - [Offset pages and `countTotal`](#offset-pages-and-counttotal)
 - [They own order, limit and offset](#they-own-order-limit-and-offset)
+- [How each page runs](#how-each-page-runs)
 - [Concurrency and transactions](#concurrency-and-transactions)
 - [Pagination vs `stream()`](#pagination-vs-stream)
 - [Decisions](#decisions)
@@ -75,11 +76,11 @@ const page = await db.selectFrom(users).select(['users.id', 'users.email'])
 | `paginateByCursor({ perPage, by, direction?, after? })`            | `{ rows, nextCursor, hasMore }`                                        | APIs, infinite scroll        |
 | `paginateByOffset({ page, perPage, by, direction?, countTotal? })` | `{ rows, page, perPage, hasMore }` (+ `total` with `countTotal: true`) | numbered pages               |
 
-Like `stream()`, they run when called (they need the database). None throws because of the rows it gets back; the only data-dependent error is `InvalidCursorError`, for an `after` that isn't a cursor made for the same key and direction.
+Like `stream()`, they run without `execute()`, so they need a query started from a database (`db.selectFrom(…)`; on a standalone `selectFrom` they throw `The query has no database to run on`). `iterateChunks` is an async generator: nothing runs, and nothing is checked, until its first batch is pulled. The two `paginate…` methods are `async`: they run when called, and their errors are rejections. None throws because of the rows it gets back, with two exceptions: `InvalidCursorError`, for an `after` that isn't a cursor made for the same key and direction, and `… can't seek past a null`, for a key column that came back null anyway (a column of a left-joined table, keyed from JavaScript, where the types don't stop it).
 
 ## The SQL they add
 
-Each adds exactly the clauses its name implies, to the query as built (its `where`, joins, `groupBy`/`having`/`distinct`, locks and `tag` are kept). Real `toSQL()` of the seek page `paginateByCursor` sends for the example above, after a first page:
+Each adds exactly the clauses its name implies, to the query as built (its `where`, joins, `groupBy`/`having`/`distinct`, locks and `tag` are kept). The real compiled query (line breaks added) of the seek page `paginateByCursor` sends for the example above, after a first page, with `posts.id` a `bigint` column:
 
 ```sql
 select "posts"."created_at" as "createdAt", "posts"."id" as "id", "posts"."title" as "title"
@@ -97,7 +98,7 @@ limit $4
 | `paginateByCursor(perPage)`       | `order by key limit perPage + 1`                            | with `after`: `where … and key > cursor's key` |
 | `paginateByOffset(page, perPage)` | `order by by limit perPage + 1 offset (page − 1) × perPage` | the same                                       |
 
-With `direction: 'desc'` the comparison is `<` and the order descending. `seekPage(node, keyset, after, limit)` builds the node; `seek(keyset, after)` builds the condition, and-ed onto the existing `where` (flattened into its `and` if it is one).
+With `direction: 'desc'` the comparison is `<` and the order descending. `seekPage(node, keyset, after, limit)` builds the node; `seek(keyset, after)` builds the condition, and-ed onto the existing `where` (flattened into its `and` if it is one). The first page above is the same query without the seek: `where "posts"."published" = $1 order by … limit $2`, with `[true, 21]`. The `limit` is a parameter, like any value.
 
 `iterateChunks` stops after a batch with fewer than `size` rows, or an empty one. When the table's row count is an exact multiple of `size`, that costs one final query returning nothing; `paginateByCursor`'s `limit + 1` avoids that ([below](#hasmore-with-limit--1)).
 
@@ -107,9 +108,9 @@ With `direction: 'desc'` the comparison is `<` and the order descending. `seekPa
 `by` is one column or several, most significant first, that **together are unique**. For `iterateChunks` and `paginateByCursor`, each key column must also be:
 
 - **non-null**: a seek can't continue past a NULL (NULL compares as unknown, so `key > NULL` matches nothing);
-- **selected under its own name**: each page's last row gives the next page's start, so the key has to be in the rows.
+- **selected under its own name**: each page's last row gives the next page's start, so the key has to be in the rows, as a top-level key (a column inside a `nest()` object doesn't count, [QUERIES.md](QUERIES.md#nest-a-tables-columns-as-one-object)).
 
-The types enforce both (`KeyColumn<T, O>`, [TYPES.md](TYPES.md#keyset-keys-keycolumn)); `resolveKeyset` checks them again at run time, for JavaScript callers and for a selected key that came from another table (selecting `id` from `users.id` while keying by `posts.id`). quarry doesn't add a hidden key selection: that would change the SQL and the rows behind your back.
+The types enforce both (`KeyColumn<T, O, N>`, where `N` is the row's `nest` keys, excluded since #44; [TYPES.md](TYPES.md#keyset-keys-keycolumn)); `resolveKeyset` checks them again at run time, for JavaScript callers and for a selected key that came from another table (selecting `id` from `users.id` while keying by `posts.id`). quarry doesn't add a hidden key selection: that would change the SQL and the rows behind your back.
 
 A key that isn't unique skips the rows that tie with the last row of a page; the usual fix is to add the primary key as the last key column (`['posts.createdAt', 'posts.id']`).
 
@@ -131,7 +132,7 @@ The seek parameters are sent as that text with the key column's codec type decla
 
 For a composite key, the seek is a **row comparison**: `(a, b) > ($1, $2)` means "a is greater, or a is equal and b is greater", exactly the lexicographic order of `order by a, b`. Postgres can serve it with a B-tree index on `(a, b)` as one range scan (#31's integration test checks the plan uses the primary-key index). The expanded form, `a > $1 or (a = $1 and b > $2)`, is equivalent but often not planned as one index range.
 
-The row comparison only works when **every key column has the same direction**, which is why `direction` applies to all of them. Mixed directions (`a desc, b asc`) would need the expanded form (what kysely-paginate and Drizzle's guide use); it isn't supported yet.
+The row comparison only works when **every key column has the same direction**, which is why `direction` applies to all of them: with mixed directions (`a desc, b asc`) the tuple order no longer matches the sort, and the seek would have to be the expanded form, which an index serves less well.
 
 ## `hasMore` with `limit + 1`
 
@@ -139,22 +140,46 @@ The row comparison only works when **every key column has the same direction**, 
 
 ## Cursors
 
-`nextCursor` is base64url of JSON: `{ by: ['posts.createdAt', 'posts.id'], direction: 'desc', after: ['2026-…', '42'] }` (`encodeCursor`). It is opaque to clients (they pass it back as `after`), but **not signed or encrypted**. `decodeCursor` checks its structure and that it was made for the same key and direction, rejecting anything else with `InvalidCursorError`. A client who edits the key values gets at most a different starting point within the same query (whose `where` still applies) or a server error for a value that doesn't parse; so cursors don't carry authorization. Signing them is an open question in #31.
+`nextCursor` is base64url of JSON: `{ by: ['posts.createdAt', 'posts.id'], direction: 'desc', after: ['2026-…', '42'] }` (`encodeCursor`). It is opaque to clients (they pass it back as `after`), but **not signed or encrypted**. `decodeCursor` checks its structure and that it was made for the same key and direction, rejecting anything else with `InvalidCursorError`. A client who edits the key values gets at most a different starting point within the same query (whose `where` still applies) or a server error for a value that doesn't parse; so cursors don't carry authorization.
+
+A real cursor for the page after the row keyed `('2026-10-17 03:51:00.123456+00', '42')`, decoded:
+
+```json
+{
+  "by": ["posts.createdAt", "posts.id"],
+  "direction": "desc",
+  "after": ["2026-10-17 03:51:00.123456+00", "42"]
+}
+```
+
+`decodeCursor` accepts only the base64url alphabet, JSON with exactly those three fields, as many `by` and `after` strings as the key has columns, and a `direction` of `asc` or `desc`. The messages are `Invalid cursor: not a cursor paginateByCursor() made` and, for a cursor of another key or direction, `Invalid cursor: made for by posts.id asc, not posts.createdAt, posts.id desc`.
 
 ## Offset pages and `countTotal`
 
 `paginateByOffset` adds `order by by limit perPage + 1 offset (page − 1) × perPage`. `by` should be unique so every row is on exactly one page; it may be any column in scope (it isn't read back).
 
-With `countTotal: true` it also runs a count, **in the same round trip**, through `executor.batch` (two statements, each with its own Sync, in one write):
+With `countTotal: true` it also runs a count, **in the same round trip**, through `executor.batch` (a default batch: two statements, each with its own Sync, in one write, on one of the pool's shared connections; [EXECUTION.md](EXECUTION.md#batches)). Captured:
 
-- normally `select count(*) as "count"` over the same `from`, joins and `where`, without locks;
-- over a query with `groupBy`, `having` or `distinct`, `select count(*) from (<the query>) as "quarry_rows"`, since the number of rows is the number of groups.
+- normally the same `from`, joins and `where` with one selection, without locks: for `selectFrom(posts).select(['posts.id']).forUpdate().skipLocked()`, the page is `select "posts"."id" as "id" from "posts" order by "posts"."id" asc limit $1 offset $2 for update skip locked` and the count `select count(*) as "count" from "posts"`;
+- over a query with `groupBy`, `having` or `distinct`, the query itself (without locks) as a subquery, since the number of rows is the number of groups: `select count(*) as "count" from (select "posts"."author_id" as "authorId" from "posts" group by "posts"."author_id") as "quarry_rows"`.
+
+The count is read in array row mode and turned into a number (`total`). If either statement fails, the method rejects with that statement's error (not a `BatchError`: it reads `executor.batch`'s settled outcomes itself).
 
 No pagination method counts by default: counting reads every matching row, which on a large table costs more than the page itself.
 
 ## They own order, limit and offset
 
-Each method sets `order by`, `limit` and `offset` itself. If the query already has `orderBy()`, `limit()` or `offset()`, it throws **before running anything**, naming the clauses to remove: `` iterateChunks() sets the query's order by, limit and offset itself: remove orderBy(), and order with `by` and `direction` ``. Combining them would silently produce a different order than the seek assumes. This is a run-time check: tracking these clauses in the builder's type parameters would touch every method's signature.
+Each method sets `order by`, `limit` and `offset` itself. If the query already has `orderBy()`, `limit()` or `offset()`, it throws **before running anything** (for `iterateChunks`, at the first pull; the `paginate…` methods reject), naming the clauses to remove: `` iterateChunks() sets the query's order by, limit and offset itself: remove orderBy(), and order with `by` and `direction` ``. Combining them would silently produce a different order than the seek assumes. This is a run-time check: tracking these clauses in the builder's type parameters would touch every method's signature.
+
+## How each page runs
+
+Each page or batch is one `executor.execute` of a freshly compiled query (with `countTotal`, one `executor.batch` of two), exactly as `execute()` would run it ([EXECUTION.md](EXECUTION.md#execute-step-by-step)):
+
+- **Options.** Every method's options include `signal` and `timeout` (`RunOptions`), passed to each query it runs. For `iterateChunks`, that means each batch: a `timeout` bounds every batch's query on its own, not the whole iteration, and an aborted `signal` fails the batch in flight, or the next one to start.
+- **Sizes.** `size` and `perPage` must be whole numbers from 1, and `page` too: a `RangeError` otherwise (`iterateChunks() takes a whole number of rows, at least 1, as size, not 0`, `paginateByOffset() takes a page from 1, not 0`).
+- **Connections.** On a pool, each query runs on the pool's shared, pipelined connections, like any plain query ([EXECUTION.md](EXECUTION.md#connections-shared-or-exclusive)); between batches nothing is held, so leaving an `iterateChunks` loop early (`break`, a throw) has nothing to close. Built from `tx`, every query runs on the transaction's connection.
+- **Events.** Each query reports its own `onQuery` event of kind `'execute'` and, with a tracer, its own span, carrying the query's `tag` ([EXECUTION.md](EXECUTION.md#onquery-events)).
+- **Rows.** Rows are decoded as `execute()` decodes them; the key columns, read as text, are decoded by their codecs before the rows are returned ([above](#exact-keys-why-the-key-columns-are-read-as-text)).
 
 ## Concurrency and transactions
 

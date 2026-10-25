@@ -4,9 +4,26 @@ A PostgreSQL driver with no runtime dependencies, written for quarry but usable 
 
 It requires PostgreSQL 18 or later (connecting to an older server fails with a clear error; a pooler that hides the version is assumed to front 18+). Newer releases are expected to work: unknown messages, fields, parameters and types are tolerated. `connection.capabilities` reports what poolers and proxies may change, such as the negotiated protocol version.
 
+This file documents the API; [ARCHITECTURE.md](ARCHITECTURE.md) explains how the driver works and links the other guides.
+
+## Contents
+
+- [Runtime](#runtime)
+- [Connecting](#connecting)
+- [Queries](#queries)
+- [Transactions](#transactions)
+- [Pool](#pool)
+- [Poolers and proxies](#poolers-and-proxies)
+- [Errors](#errors)
+- [Observability](#observability)
+- [With quarry](#with-quarry)
+- [Development](#development)
+- [Decisions](#decisions)
+- [Glossary](#glossary)
+
 ## Runtime
 
-The driver runs on Node 24.11 or later, over `node:net`/`node:tls`, and nowhere else: Bun, Deno and edge runtimes aren't supported ([Node only](DECISIONS.md#node-only)). To use your own transport (a test double, a tunnel), pass `socket` (a `SocketFactory`).
+The driver runs on Node 24.11 or later, over `node:net`/`node:tls` ([Node only](DECISIONS.md#node-only)). To use your own transport (a test double, a tunnel), pass `socket` (a `SocketFactory`); it opens the connections that carry cancel requests too ([ARCHITECTURE.md](ARCHITECTURE.md#part-11-sockets)).
 
 ## Connecting
 
@@ -20,7 +37,39 @@ const pool = createPool({
 });
 ```
 
-Options come from the argument, then the connection string (URL or `key=value`), then `PG*` environment variables, then `.pgpass`. They follow libpq: `host` (comma-separated for failover, or a Unix-socket directory), `port`, `user`, `password`, `database`, `applicationName`, `targetSessionAttrs`, `connectTimeout` (30 s by default), `params` (startup settings such as `search_path`), `options`.
+Options come from the argument, then the connection string (URL or `key=value`), then `PG*` environment variables, then `.pgpass`. They follow libpq ([auth/README.md](auth/README.md#configuration)):
+
+| Option                                     | Default                                 | Meaning                                                                                                   |
+| ------------------------------------------ | --------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `connectionString`                         |                                         | a `postgres://` URL or `key=value` string; explicit options override it                                   |
+| `host`                                     | `localhost`                             | host name, IP address or Unix-socket directory (starting with `/`); comma-separated for failover          |
+| `port`                                     | 5432                                    | one, or one per host                                                                                      |
+| `user`                                     | `USER` (or `USERNAME`), else `postgres` |                                                                                                           |
+| `password`                                 | from `.pgpass`                          | a string, or a function called for every new connection                                                   |
+| `database`                                 | the user name                           |                                                                                                           |
+| `applicationName`                          |                                         | shown in `pg_stat_activity`                                                                               |
+| `ssl`                                      | `verify-full` remote, `prefer` local    | an `sslmode`, or `SslOptions` ([TLS](#tls))                                                               |
+| `channelBinding`                           | `prefer`                                | SCRAM channel binding: `disable`, `prefer`, `require`                                                     |
+| `requireAuth`                              | any method                              | the authentication methods to accept ([Authentication](#authentication))                                  |
+| `connectTimeout`                           | 30 s                                    | to connect and authenticate, in milliseconds (0: none)                                                    |
+| `keepAlive`, `keepAliveInitialDelay`       | on, 0                                   | TCP keepalive (`keepalives`, `keepalives_idle`)                                                           |
+| `protocol`                                 | `auto`                                  | `auto` asks for 3.2 and accepts what is negotiated; `3.x` insists on that version                         |
+| `minProtocolVersion`, `maxProtocolVersion` | `3.0`, `latest`                         | the range `auto` accepts                                                                                  |
+| `targetSessionAttrs`                       | `any`                                   | which of several hosts to accept: `read-write`, `read-only`, `primary`, `standby`, `prefer-standby`       |
+| `params`                                   |                                         | startup settings, e.g. `{ search_path: 'app' }`                                                           |
+| `options`                                  |                                         | command-line options for the server, as `PGOPTIONS` (`-c statement_timeout=5s`)                           |
+| `passfile`                                 | `PGPASSFILE`, else `~/.pgpass`          | a password file                                                                                           |
+| `codecs`                                   | `defaultCodecs`                         | codecs for result columns, over the defaults, or a registry ([Codecs and decoding](#codecs-and-decoding)) |
+| `prepare`                                  | true                                    | cache named prepared statements per connection                                                            |
+| `statementCacheSize`                       | 100                                     | prepared statements kept per connection                                                                   |
+| `preparePipelined`                         | detected at login                       | name statements pipelined with others too ([Queries](#queries))                                           |
+| `binaryResults`                            | true                                    | receive columns in binary where their codec reads them so                                                 |
+| `telemetry`                                |                                         | `{ tracer, queryText? }`: a span per statement ([Observability](#observability))                          |
+| `captureStack`                             | false                                   | append the issuing code's stack to query errors                                                           |
+| `onNotice`, `onNotification`               |                                         | listeners for server notices and `NOTIFY`s ([Observability](#observability))                              |
+| `socket`                                   | `nodeSockets`                           | a `SocketFactory` for a custom transport                                                                  |
+| `maxMessageSize`                           | 1 GiB                                   | the largest message accepted from the server                                                              |
+| `env`                                      | `process.env`                           | where `PG*` variables are read from                                                                       |
 
 ### TLS
 
@@ -31,7 +80,7 @@ connect({ host: 'db.example.com', ssl: { mode: 'verify-full', ca: pem } });
 connect({
   host: 'db.example.com',
   ssl: { mode: 'require', negotiation: 'direct' },
-}); // PG 17+, no SSLRequest round trip
+}); // direct TLS: no SSLRequest round trip
 connect({
   host: 'db.example.com',
   ssl: { mode: 'verify-full', rootCertFile: 'system' },
@@ -45,7 +94,7 @@ Verify modes use `ca`, `rootCertFile`, `~/.postgresql/root.crt`, or the platform
 - **Passwords:** SCRAM-SHA-256 (with `tls-server-end-point` channel binding over TLS), md5 and cleartext. `password` can be a function, called for every new connection; use this for short-lived cloud IAM tokens.
 - **`requireAuth`:** refuses methods the server shouldn't ask for, e.g. `'scram-sha-256'` or `'!password,!md5,!none'`. `channelBinding: 'require'` insists on SCRAM-SHA-256-PLUS.
 - **Client certificates** (`cert` auth): `ssl: { cert, key }` (PEM) or `certFile`/`keyFile`, with `passphrase` for encrypted keys. Also `sslcert`/`sslkey`/`sslpassword`, `PGSSLCERT`/`PGSSLKEY`, or `~/.postgresql/postgresql.crt`/`.key`.
-- **Not supported:** OAuth (PG 18 `OAUTHBEARER`), GSSAPI, SSPI and Kerberos. A server or pooler that offers only one of these fails with a `ConnectionError` (`code: 'EAUTHMETHOD'`) naming the method, and `requireAuth: 'oauth'` is rejected as unsupported.
+- **Other methods:** the driver authenticates with the methods above and certificates. A server or pooler that asks for OAuth (`OAUTHBEARER`), GSSAPI, SSPI or Kerberos fails the connection with a `ConnectionError` (`code: 'EAUTHMETHOD'`) naming the method, and `requireAuth: 'oauth'` throws a `DriverError` when the options are resolved (`'!oauth'` is accepted: it excludes a method that is never used).
 
 ## Queries
 
@@ -63,6 +112,27 @@ await conn.query(sql, params, {
 const results = await conn.simpleQuery('select 1; select 2'); // multi-statement, no parameters
 const { paramTypes, fields } = await conn.describe(sql); // without running it
 ```
+
+`query`'s options (`QueryOptions`):
+
+| Option             | Default                          | Meaning                                                                                                        |
+| ------------------ | -------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `rowMode`          | `'object'`                       | rows keyed by column name (the last wins on duplicates), or positional `'array'` rows                          |
+| `codecs`           | the connection's                 | codecs for result columns by type: a list over the connection's registry, or a registry                        |
+| `paramCodecs`      |                                  | a codec per parameter position                                                                                 |
+| `resultCodecs`     |                                  | the codec each result column is expected in, by position, used while the column has that type                  |
+| `paramTypes`       |                                  | parameter type OIDs; 0 or missing entries let the server infer                                                 |
+| `prepare`          | the connection's                 | use a cached named prepared statement                                                                          |
+| `binary`           | the connection's `binaryResults` | ask for binary results where the codec reads them so                                                           |
+| `signal`           |                                  | an `AbortSignal` that cancels the query                                                                        |
+| `timeout`          |                                  | a client-side deadline in milliseconds, which cancels                                                          |
+| `statementTimeout` |                                  | a server-side `statement_timeout` for this query alone (milliseconds, or an interval such as `'2s'`)           |
+| `keepRows`         | all                              | keep only the first n rows, without decoding the others; `rowCount` still counts every row                     |
+| `nested`           |                                  | columns read into objects of the row, `null` where the marker is false ([CODECS.md](CODECS.md#nested-objects)) |
+| `onTiming`         |                                  | receives `{ queuedMs, execMs }` once the query settles                                                         |
+| `tag`              |                                  | a label for telemetry: the span name and `db.query.summary`                                                    |
+
+`cursor` and `stream` take the same options except `keepRows`, plus `batchSize` (1000 rows per round trip). On a connection, `simpleQuery` takes `rowMode`, `codecs`, `signal`, `timeout` and `tag`, and `describe` takes `paramTypes`, `signal` and `timeout`.
 
 Parameters:
 
@@ -91,7 +161,7 @@ Behind PgBouncer in transaction mode, a query pipelined with others on its conne
 - **Detection:** PgBouncer 1.26+ reports itself at login (`connection.capabilities.pgbouncer`). For 1.21–1.25, set `preparePipelined: false`; `true` keeps pipelined queries named. With `max_prepared_statements = 0`, no statement is named.
 - **Schema changes:** a pipelined query whose columns changed since they were cached is decoded by what the server sent, and the cache entry is dropped. If a column asked for in binary changed to a type without a binary decoder, that query fails with a `DecodeError` after running.
 
-Columns are received in binary where their codec reads them so, which is cheaper to decode and gives identical values: int2/int4/oid, int8 as a `bigint`, float8, bool, bytea, timestamptz as a `Date`, pgvector's `vector`, and arrays of those, of text-like types and of json/jsonb. A format is only asked for once the server has described the statement's columns, from a cached statement's second run; each column is then read with the codec the query expects for it (`resultCodecs`) when its type matches, and with the registry's codec for its type otherwise. Turn it off with `binaryResults: false`.
+Columns are received in binary where their codec reads them so, which is cheaper to decode and gives identical values: int2/int4/oid, int8 as a `bigint`, float8, bool, bytea, timestamptz as a `Date` (`codecs.timestamptz`), pgvector's `vector` (`codecs.vector`), and arrays of those, of text-like types and of json/jsonb. A format is only asked for once the server has described the statement's columns, from a cached statement's second run; each column is then read with the codec the query expects for it (`resultCodecs`) when its type matches, and with the registry's codec for its type otherwise. Turn it off with `binaryResults: false`.
 
 `codecs.vector` returns the float32 values stored, on every path: `[0.1]` reads as `[0.10000000149011612]`, the value pgvector holds and the value its binary format carries.
 
@@ -99,10 +169,11 @@ Columns are received in binary where their codec reads them so, which is cheaper
 
 The driver owns the codecs: one object per type with `name`, `oid` (0 to look it up by name), `paramFormat`, `resultFormat`, `encode`, `decodeText` and an optional `decodeBinary`. `codecs` has the built-in ones, `arrayOf(codec)` the codec of a type's arrays, `defineCodec({ name, encode, decodeText })` one of your own. Each result column is read with the codec the query expects for it (checked against the column's type OID at RowDescription), or the registry's codec for its type:
 
-- **`defaultCodecs`** (the default, lossless): int2/int4/float become numbers, int8 a `bigint`, bool, json/jsonb parsed, bytea a `Uint8Array`, and arrays of those and of the text types. numeric, dates and times stay as text.
-- **`codecs: [...]`** on the pool, or per query: registered over the defaults, each for its type (and its arrays), e.g. `[codecs.int8AsString, codecs.timestamptz]`; or a registry built once with `createCodecRegistry(list, base?)` (`null` base: every other value as text).
+- **`defaultCodecs`** (the default, lossless): int2/int4/oid/float4/float8 become numbers, int8 a `bigint`, bool a boolean, json/jsonb are parsed, bytea becomes a `Uint8Array`, and arrays of those become arrays. Arrays of the text types, uuid, numeric, dates, times, timestamps, intervals, inet/cidr, point, box and the date and timestamptz ranges become arrays of the server's text. Everything else (numeric, uuid, dates and times themselves) stays the server's text.
+- **`codecs: [...]`** on the connection or pool: registered over the defaults, each for its type (and its arrays), e.g. `[codecs.int8AsString, codecs.timestamptz]`. Per query, a list is registered over the connection's codecs. Or pass a registry built once with `createCodecRegistry(list, base?)` (`null` base: every other value as text).
+- **Per column**: `resultCodecs` gives the codec a column is expected in (quarry's builder sets it from the column's type); it is used while the column has that type.
 
-Enums, domains and extension types have no fixed OIDs. A codec for one (`oid: 0`) is resolved through `pg_type` once per pool: behind the first query that needs it, or up front with `loadTypes()`; `reloadTypes()` looks them up again for types created since.
+Enums, domains and extension types have no fixed OIDs. A codec for one (`oid: 0`) is resolved through `pg_type` once per pool: behind the first query that needs it, or up front with `loadTypes()`; `reloadTypes()` looks them up again for types created since. A lookup that fails doesn't reject: named types are then inferred and read as text, and the next query that needs them tries again ([CODECS.md](CODECS.md#types-looked-up-by-name-the-catalog)).
 
 ### Cancelling and timeouts
 
@@ -144,18 +215,21 @@ await pool.transaction(async (tx) => {
 
 ## Pool
 
-`createPool` takes these options:
+`createPool(options | connectionString)` takes the connection options and these ([POOL.md](POOL.md#options)):
 
-- `max`, `min`
-- `idleTimeout` (30 s), `maxLifetime` (1 h, with jitter)
-- `acquireTimeout` (30 s), `maxWaiting`
+- `max` (10; below 1 throws), `min` (0, at most `max`)
+- `idleTimeout` (30 s), `maxLifetime` (1 h, with up to 10% jitter); 0 for never
+- `acquireTimeout` (30 s; 0 waits forever; then a `ConnectionError` with `code: 'ETIMEDOUT'`), `maxWaiting` (unlimited; past it, waiting for a connection or a pipeline slot fails at once with a `DriverError`)
 - `pipeline`: once every connection is busy, `query`, `simpleQuery` and `describe` are pipelined onto shared connections. Further queries wait in line and take the next free slot.
-  - By default the depth adapts per connection. It starts at 100 queries in flight. While queries are waiting and finish nearly as fast as the round trip allows, so the network rather than the server is the limit, it grows by half each round trip, up to 1000. Once queries queue on the server, more depth would only line them up behind each other, so it shrinks back towards 100. At 0 ms it stays at 100; at 5 ms with 1000 callers on one connection it reaches the server's throughput instead of 100 per round trip.
-  - A number fixes the depth; `false` gives every query a connection to itself.
+  - By default the depth adapts per connection. It starts at 100 queries in flight. While queries are waiting and finish nearly as fast as the round trip allows, so the network rather than the server is the limit, it grows by half each round of about that many queries, up to 1000. Once queries queue on the server, more depth would only line them up behind each other, so it shrinks back towards 100. At 0 ms it stays at 100; at 5 ms with 1000 callers on one connection it reaches the server's throughput instead of 100 per round trip.
+  - By default the **width**, how many connections queries are spread over, adapts too ([POOL.md](POOL.md#adaptive-width)). It starts at `max`. When pipelined connections keep stalling (completing nothing while the rest of the pool completes everything in flight), which is what a server with fewer CPUs than busy backends does to them, it narrows towards the number the server runs at once, judges the change and undoes it if it didn't help; with no stalls and queries waiting, it widens again one connection at a time. Exclusive callers still get up to `max`.
+  - A number fixes the depth and spreads queries over all `max` connections; `false`, `0` or `1` gives every query a connection to itself.
   - Reserved clients, transactions, cursors and COPY always get a connection of their own. While one waits, one shared connection per waiter takes no new queries, and it is handed over once the queries already in flight on it finish, so a steady stream of queries can't hold it back.
-- `onConnect`
+- `onConnect(connection)`: runs on each new connection before its first use (to `SET` session state); if it throws, the connection is destroyed and the waiter gets the error.
 
-`pool.acquire()` reserves a client; release it with `release()` or `await using`. Connections that die, or are released mid-transaction, are discarded. `maxLifetime` also recycles idle connections, including those kept open by `min`.
+`pool.acquire()` reserves a client (`query`, `cursor`, `stream`, `describe`, `transaction`, `connection`, `pool`); release it with `release()` (`release(true)` or `release(error)` closes it instead) or `await using`. Connections that die, or are released mid-transaction, are discarded. `maxLifetime` also recycles idle connections, including those kept open by `min`.
+
+`pool.stats` is `{ total, idle, busy, waiting }`, and `pool.ended` tells whether `end()` was called. `pool.loadTypes()` and `pool.reloadTypes()` look named types up once for every connection of the pool.
 
 `pool.end()` stops new work and closes the pool once the work already issued is done: queries and callers already waiting get a connection, and reserved clients and transactions keep theirs until released. `end({ timeout })` fails whatever is still waiting or running after that long.
 
@@ -169,10 +243,18 @@ await pool.transaction(async (tx) => {
 
 ## Errors
 
-- Server errors are `PostgresError`s carrying every field the server sent, plus `query` (non-enumerable, so parameters don't leak into logs).
-- Common SQLSTATEs have their own classes: `UniqueViolation`, `ForeignKeyViolation`, `NotNullViolation`, `CheckViolation`, `ExclusionViolation` (with `columns`), `SerializationFailure`, `DeadlockDetected` (`isRetryable`), `QueryCanceled`, `LockNotAvailable`, `ReadOnlyTransaction`, `UndefinedTable`, `UndefinedColumn`.
-- Client-side failures are `ConnectionError`, `ProtocolError` or `AbortError`.
+- Server errors are `PostgresError`s carrying every field the server sent (`code` is the SQLSTATE), plus `fields` and `query` (`{ sql, params, tag? }`), both non-enumerable, so parameters don't leak into logs. `isRetryable` is true for serialization failures and deadlocks, `isFatal` for errors that end the session.
+- Common SQLSTATEs have their own classes ([ARCHITECTURE.md](ARCHITECTURE.md#errors) has the table): `IntegrityConstraintViolation` (any class 23 code, with `columns`) and its subclasses `UniqueViolation`, `ForeignKeyViolation`, `NotNullViolation`, `CheckViolation`, `ExclusionViolation`; `SerializationFailure`, `DeadlockDetected`, `LockNotAvailable`, `ReadOnlyTransaction`, `TransactionTimeout`, `IdleInTransactionTimeout`, `UndefinedTable`, `UndefinedColumn`, and `QueryCanceled` (with a `reason`).
+- Errors raised by the driver itself extend `DriverError`: `ConnectionError` (with a `code`: a system error, or `ETIMEDOUT`, `EAUTHMETHOD`, `EPROTOCOL`, `EVERSION`), `ProtocolError`, `AbortError`, `DecodeError`, `UndefinedParameterError` (`undefined` as a parameter or array element, with its `position`) and `TransactionRolledBack`. Misuse it detects (a pool that has ended, a released client used again, a value a codec can't send) throws a plain `DriverError`.
 - A result value whose parser throws fails only that query, with a `DecodeError` naming the column and type (never the value); the connection stays usable.
+
+## Observability
+
+- **Spans:** `telemetry: { tracer }` reports each statement as an OpenTelemetry client span; pass `trace.getTracer('app')` from `@opentelemetry/api`, which the driver doesn't depend on. Spans carry the database, the operation (`SELECT`), the server address and port, the SQL text (unless `queryText: false`), the query's `tag` as span name and `db.query.summary`, the rows returned, and on error the SQLSTATE. Parameters are never recorded. The attributes and which calls make spans are in [ARCHITECTURE.md](ARCHITECTURE.md#spans).
+- **Stacks:** `captureStack: true` appends the stack of the code that issued a query to its error, under `--- query issued at ---`.
+- **Timing:** a query's `onTiming` receives `{ queuedMs, execMs }`: time waiting behind other queries on the connection, then from being sent to finishing.
+- **Notices:** `onNotice` (an option, or `connection.onNotice(listener)`, which returns an unsubscribe function) receives the server's warnings and notices as `Notice`s (`severity`, `code`, `message`, `detail`, `hint`, `where`, `fields`). `onNotification` receives every `NOTIFY` this session listens for (`pid`, `channel`, `payload`). A listener that throws doesn't break the connection; its error is rethrown in a microtask.
+- **What the connection learned:** `connection.capabilities` (protocol version, server version, SASL mechanisms offered, PgBouncer and its pool mode), `connection.parameters` (`server_version`, `TimeZone`, `in_hot_standby`, …), `processId`, `transactionStatus` ([ARCHITECTURE.md](ARCHITECTURE.md#capabilities-and-server-parameters)).
 
 ## With quarry
 
@@ -198,6 +280,40 @@ await db.transaction(async (tx) => {
 
 ## Development
 
-- `pnpm test` starts a throwaway cluster (TLS, a role per auth method, PgBouncer) when PostgreSQL is installed; otherwise the integration tests skip. `PG_VERSION=17`, `PG_BIN` and `PGBOUNCER_BIN` pick other versions.
+- `pnpm test` starts a throwaway cluster (TLS, a role per auth method, PgBouncer) when PostgreSQL is installed; otherwise the integration tests skip. `PG_VERSION` (an installed major version, 18 or later), `PG_BIN` and `PGBOUNCER_BIN` pick other binaries.
 - `pnpm bench:driver` is a quick comparison with `pg` and postgres.js. `bench/driver/suite` is the full, reproducible comparison: every client on Node, PgBouncer, simulated network latency, resources and footprint (see its README).
 - `pnpm test:compat` runs node-postgres's and postgres.js's own test suites against this driver, through test-only shims in `test/driver/compat`, on PostgreSQL 18 (add `--bouncer` for a second pass through PgBouncer in transaction mode). It clones the pinned upstream releases into `.compat/`; `test/driver/compat/expectations.ts` lists every test allowed to fail and why.
+
+## Decisions
+
+Why the API looks this way. Each links to its full entry in [DECISIONS.md](DECISIONS.md); the guides' own Decisions sections list the rest:
+
+- [libpq-compatible configuration](DECISIONS.md#libpq-compatible-configuration): the same options, connection strings and `PG*` variables as every other PostgreSQL client.
+- [`verify-full` by default, and strict TLS and SCRAM checks](DECISIONS.md#verify-full-by-default-and-strict-tls-and-scram-checks): a remote connection is verified unless you say otherwise.
+- [Prepared statements by default, named per connection](DECISIONS.md#prepared-statements-by-default-named-per-connection) and [Detect poolers at login rather than configure them](DECISIONS.md#detect-poolers-at-login-rather-than-configure-them): fast by default, and right behind PgBouncer without configuration.
+- [Pipelining, with one Sync per query](DECISIONS.md#pipelining-with-one-sync-per-query): concurrent queries share writes, never failures.
+- [Pipelining onto busy connections, only once the pool is full](DECISIONS.md#pipelining-onto-busy-connections-only-once-the-pool-is-full) and [Adaptive width](DECISIONS.md#adaptive-width-no-more-pipelined-backends-than-the-server-runs-at-once): what `pipeline` controls.
+- [`undefined` is refused, never sent as NULL](DECISIONS.md#undefined-is-refused-never-sent-as-null): `UndefinedParameterError`.
+- [Errors carry everything and leak nothing](DECISIONS.md#errors-carry-everything-and-leak-nothing) and [Typed error classes per SQLSTATE](DECISIONS.md#typed-error-classes-per-sqlstate).
+- [OpenTelemetry spans through a structural tracer, without parameters](DECISIONS.md#opentelemetry-spans-through-a-structural-tracer-without-parameters): `telemetry` without a dependency.
+- [Node only](DECISIONS.md#node-only) and [PostgreSQL 18 or later only](DECISIONS.md#postgresql-18-or-later-only).
+
+## Glossary
+
+**Capabilities**: what a connection learned at startup about the other end (protocol version, server version, PgBouncer).
+
+**Codec**: the object that encodes and decodes one PostgreSQL type ([CODECS.md](CODECS.md)).
+
+**Notice**: a warning or informational message from the server, delivered to `onNotice`.
+
+**Pipeline slot**: one query's place on a shared connection's pipeline; the pool hands free slots to queued queries in order.
+
+**Registry**: which codec reads result columns of each type, where the query doesn't say.
+
+**Shared connection**: a pool connection lent for single queries, several pipelined on it at once ([POOL.md](POOL.md#two-ways-to-use-a-connection)).
+
+**Span**: one statement's entry in a trace, made when `telemetry` is set.
+
+**Sync**: the protocol message that ends a query's group of messages; after an error, the server skips to it.
+
+**Width**: how many connections the pool spreads pipelined queries over; adaptive by default.

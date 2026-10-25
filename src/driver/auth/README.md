@@ -152,9 +152,9 @@ The driver defaults to **`verify-full` for remote hosts** (libpq defaults to `pr
 | `prefer`                                          | `tls-optional`, then `plain` (only after a connection-level failure, not a server error)                   |
 | `require`, `verify-ca`, `verify-full`             | `tls`, or `direct` with `sslnegotiation=direct`                                                            |
 
-`attempt(config, host, plan, version)` runs one plan:
+`attempt(config, host, plan, version, state)` runs one plan (`state` holds the attempt's socket, so a timeout or abort can destroy it):
 
-1. **Certificates are read in parallel** with the TCP connection: `tlsOptions()` loads the CA (from `ssl.ca`, then `rootCertFile`, then `~/.postgresql/root.crt` for verify modes; otherwise the platform's store), the client certificate and key (from `cert`/`key`, `certFile`/`keyFile`, or `~/.postgresql/postgresql.crt`/`.key` when both exist), and the passphrase. A certificate without a key, or the reverse, is an error. The SNI server name (`servername`) is the host unless it is an IP address.
+1. **Certificates are read in parallel** with the TCP connection and the SSLRequest (for `direct`, they are awaited before connecting, since the handshake starts at once): `tlsOptions()` loads the CA (from `ssl.ca`, then `rootCertFile`, then `~/.postgresql/root.crt` for verify modes; otherwise the platform's store), the client certificate and key (from `cert`/`key`, `certFile`/`keyFile`, or `~/.postgresql/postgresql.crt`/`.key` when both exist), and the passphrase. A certificate without a key, or the reverse, is an error. The SNI server name (`servername`) is the host unless it is an IP address.
 2. **TCP connect** through the socket factory. On Node, `node:tls` is preloaded while the TCP handshake is in flight (~3 ms saved on a cold start).
 3. **`tls` / `tls-optional`**: send an **SSLRequest** and read the one-byte answer (`requestSsl`). `S` → `socket.startTls(options)`; `N` → `tls` fails ("the server does not support TLS"), `tls-optional` continues in plain text. If **more than one byte** arrives, the connection is refused: the server sends exactly one byte, so extra bytes can only have been injected by someone in the middle, hoping the client will read them as if they came over TLS.
 4. **`direct`** (PostgreSQL 17+): the TLS handshake starts immediately, with ALPN protocol `postgresql`, saving the SSLRequest round trip.
@@ -188,12 +188,12 @@ What changes with the version is the length of the cancel key (`BackendKeyData`:
 | Message                         | Action                                                                                                                                                                               |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | AuthenticationCleartextPassword | check `requireAuth` allows `password` and channel binding isn't required; send the password                                                                                          |
-| AuthenticationMD5Password       | check `md5` is allowed; send `md5Password(user, password, salt)`                                                                                                                     |
+| AuthenticationMD5Password       | check `md5` is allowed and channel binding isn't required; send `md5Password(user, password, salt)`                                                                                  |
 | AuthenticationSASL              | if no `SCRAM-SHA-256*` mechanism is offered (e.g. only `OAUTHBEARER`), fail with `EAUTHMETHOD`; else check `scram-sha-256` is allowed, build a `ScramClient`, send its first message |
 | AuthenticationSASLContinue      | send `scram.final(serverFirst)`                                                                                                                                                      |
 | AuthenticationSASLFinal         | `scram.verify(serverFinal)`: the server must prove it knows the password too                                                                                                         |
 | AuthenticationOk                | if SCRAM ran but wasn't verified, fail; if no method ran (trust), check `none` is allowed and binding isn't required                                                                 |
-| AuthenticationUnsupported       | GSSAPI, SSPI, Kerberos: fail with `EAUTHMETHOD`, naming the method                                                                                                                   |
+| AuthenticationUnsupported       | GSSAPI, SSPI, Kerberos: check `requireAuth` (`gss`, `sspi`), then fail with `EAUTHMETHOD`, naming the method; an unknown request code fails the same way, quoting the code           |
 | NegotiateProtocolVersion        | [above](#protocol-version-negotiation)                                                                                                                                               |
 | BackendKeyData                  | keep pid and secret key, for cancel requests                                                                                                                                         |
 | ErrorResponse                   | throw it (wrong password, unknown database, too many connections)                                                                                                                    |
@@ -212,9 +212,9 @@ The server decides the method (from its `pg_hba.conf` rules for this user, datab
 | `md5`                         | `"md5" + md5(md5(password + user) + salt)`            | legacy: the stored hash `md5(password + user)` is enough to log in, and MD5 is weak |
 | `scram-sha-256`               | a proof derived from the password; never the password | the default since PostgreSQL 14; the server proves itself too                       |
 | `cert`                        | a client certificate during TLS                       | no password message at all                                                          |
-| GSSAPI, SSPI, Kerberos, OAuth |                                                       | not supported: a clear `ConnectionError` with code `EAUTHMETHOD`                    |
+| GSSAPI, SSPI, Kerberos, OAuth |                                                       | refused: a `ConnectionError` with code `EAUTHMETHOD` naming the method              |
 
-[md5.ts](md5.ts) implements MD5 in plain JavaScript. It was written when the driver also ran where only WebCrypto, which has no MD5, was available.
+[md5.ts](md5.ts) implements MD5 in plain JavaScript, so the MD5 exchange needs no crypto module: `md5Password` hashes `password + user`, then the hex digest plus the 4-byte salt, and prefixes `md5`.
 
 ## SCRAM-SHA-256
 
@@ -282,7 +282,7 @@ Postgres implements `tls-server-end-point` (RFC 5929): the binding data is a has
 
 The server picks the method, so a malicious server (or an impostor) could ask for `password` to receive your password in clear. Two options let the client refuse:
 
-- **`requireAuth`** (libpq's `require_auth`): a list of allowed methods (`'scram-sha-256'`, `['scram-sha-256', 'none']`) or of forbidden ones (`'!password,!md5'`), never mixed. Methods: `password`, `md5`, `scram-sha-256`, `gss`, `sspi`, `none`. `#allow(method)` checks each request against it and fails with `EAUTHMETHOD` before sending anything. `oauth` is rejected at configuration time, since it isn't supported (`!oauth` is accepted and harmless).
+- **`requireAuth`** (libpq's `require_auth`): a list of allowed methods (`'scram-sha-256'`, `['scram-sha-256', 'none']`) or of forbidden ones (`'!password,!md5'`), never mixed. Methods: `password`, `md5`, `scram-sha-256`, `gss`, `sspi`, `none`. `#allow(method)` checks each request against it and fails with `EAUTHMETHOD` before sending anything. `oauth` in the list fails at configuration time with a `DriverError`, since the driver never authenticates with OAuth (OAUTHBEARER); `!oauth` excludes a method that is never used anyway, so it is accepted.
 - **`channelBinding: 'require'`**: authentication must be SCRAM-SHA-256-PLUS. Any other method (`#refuseWithoutBinding`) or SCRAM without binding fails.
 
 ## Passwords: strings, functions, `.pgpass`, IAM tokens

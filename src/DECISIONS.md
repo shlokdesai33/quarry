@@ -14,16 +14,89 @@ The driver's decisions are in [driver/DECISIONS.md](driver/DECISIONS.md), which 
 ## Contents
 
 - [The shape of the API](#the-shape-of-the-api)
+  - [Table objects at run time, references as strings](#table-objects-at-run-time-references-as-strings)
+  - [Types follow PostgreSQL, not JavaScript](#types-follow-postgresql-not-javascript)
+  - [Comparisons are methods, typed per SQL kind](#comparisons-are-methods-typed-per-sql-kind)
+  - [Immutable builders](#immutable-builders)
+  - [Reusable pieces are functions: `fragment`, `pipe` and `when`](#reusable-pieces-are-functions-fragment-pipe-and-when)
+  - [What a builder still needs, in its type: `M` and `this` gating](#what-a-builder-still-needs-in-its-type-m-and-this-gating)
+  - [Row locks: a method per strength, several clauses, checked when compiling](#row-locks-a-method-per-strength-several-clauses-checked-when-compiling)
+  - [The locking clause as a state machine: `L`](#the-locking-clause-as-a-state-machine-l)
+  - [No `orWhere`: precedence is always explicit](#no-orwhere-precedence-is-always-explicit)
+  - [`set` merges, `values` replaces](#set-merges-values-replaces)
 - [Running queries](#running-queries)
+  - [Lazy result shapes, and `execute()` as the one way to run](#lazy-result-shapes-and-execute-as-the-one-way-to-run)
+  - [Awaiting a builder rejects](#awaiting-a-builder-rejects)
+  - [Throwing is in the name: the `take…` and `expect…` split](#throwing-is-in-the-name-the-take-and-expect-split)
+  - [No implicit LIMIT in result shapes](#no-implicit-limit-in-result-shapes)
+  - [`keepRows` instead of `limit`](#keeprows-instead-of-limit)
+  - [A write's `execute()` with `returning` resolves to the rows](#a-writes-execute-with-returning-resolves-to-the-rows)
+  - [`db.batch`: two modes with names](#dbbatch-two-modes-with-names)
+  - [`stream()`: only for every-row reads, run by iterating it](#stream-only-for-every-row-reads-run-by-iterating-it)
 - [Compiling to SQL](#compiling-to-sql)
+  - [A node tree, and one compiler](#a-node-tree-and-one-compiler)
+  - [References resolved before compiling](#references-resolved-before-compiling)
+  - [Columns resolved and quoted once per table](#columns-resolved-and-quoted-once-per-table)
+  - [SQL rendered through a trie of its pieces](#sql-rendered-through-a-trie-of-its-pieces)
+  - [Every identifier quoted](#every-identifier-quoted)
+  - [Parameters everywhere, literals only where Postgres refuses a parameter](#parameters-everywhere-literals-only-where-postgres-refuses-a-parameter)
+  - [Parameters numbered in text order; `in` takes a list, or one array as `= any($1)`](#parameters-numbered-in-text-order-in-takes-a-list-or-one-array-as--any1)
+  - [Every operation operand bracketed](#every-operation-operand-bracketed)
+  - [Codecs as getters on the compiled query](#codecs-as-getters-on-the-compiled-query)
 - [Values, codecs and types](#values-codecs-and-types)
+  - [The driver owns the codecs; the builder only chooses them](#the-driver-owns-the-codecs-the-builder-only-chooses-them)
+  - [TypeScript types derived from codecs](#typescript-types-derived-from-codecs)
+  - [Codecs chosen per column: `useCodec` and `defineType`, not a global type table](#codecs-chosen-per-column-usecodec-and-definetype-not-a-global-type-table)
+  - [`DataType` separate from the column](#datatype-separate-from-the-column)
+  - [Enums and custom types keyed by name in their type](#enums-and-custom-types-keyed-by-name-in-their-type)
+  - [`undefined` is refused; optional filters use `when()`](#undefined-is-refused-optional-filters-use-when)
+  - [`eb.val` declares a type from its JavaScript type](#ebval-declares-a-type-from-its-javascript-type)
+  - [Function value arguments are sent with a declared type](#function-value-arguments-are-sent-with-a-declared-type)
+  - [`= any($1)` gets a declared type only for integer and boolean columns](#-any1-gets-a-declared-type-only-for-integer-and-boolean-columns)
+  - [Arithmetic follows Postgres's result types](#arithmetic-follows-postgress-result-types)
+  - [`case`: the first result fixes the SQL type](#case-the-first-result-fixes-the-sql-type)
+  - [The type catalog loaded before the first query](#the-type-catalog-loaded-before-the-first-query)
+  - [Raw SQL only through the `sql` template tag](#raw-sql-only-through-the-sql-template-tag)
 - [Bulk writes](#bulk-writes)
+  - [Many rows through `unnest`, one array per column](#many-rows-through-unnest-one-array-per-column)
+  - [`unnest` casts without type modifiers](#unnest-casts-without-type-modifiers)
+  - [`setEach`: one method for the source, the assignments and the key match](#seteach-one-method-for-the-source-the-assignments-and-the-key-match)
+  - [Rows that set different columns: flag columns and `case`](#rows-that-set-different-columns-flag-columns-and-case)
+  - [`setEach` rows are typed by the table, and duplicate keys are refused](#seteach-rows-are-typed-by-the-table-and-duplicate-keys-are-refused)
 - [Joins and selections](#joins-and-selections)
+  - [Outer joins make the joined side nullable: `NullableTable`](#outer-joins-make-the-joined-side-nullable-nullabletable)
+  - [A table joined twice, or a key selected twice, is refused](#a-table-joined-twice-or-a-key-selected-twice-is-refused)
+  - [`selectAll` lists the columns, never `*`](#selectall-lists-the-columns-never-)
+  - [`selectAll` takes the name a table goes by](#selectall-takes-the-name-a-table-goes-by)
+  - [Ordering by a selected key uses the bare key](#ordering-by-a-selected-key-uses-the-bare-key)
+  - [`nest` marks a joined row with `ctid`](#nest-marks-a-joined-row-with-ctid)
+  - [`nest`'s object keys in the builder's type: `K`](#nests-object-keys-in-the-builders-type-k)
 - [Pagination](#pagination)
+  - [Keyset seek with a row comparison](#keyset-seek-with-a-row-comparison)
+  - [Exact text keyset keys](#exact-text-keyset-keys)
+  - [`limit + 1` for `hasMore`, no count by default](#limit--1-for-hasmore-no-count-by-default)
+  - [Pagination owns order, limit and offset](#pagination-owns-order-limit-and-offset)
+  - [Key rules in the types: non-null and selected under its own name](#key-rules-in-the-types-non-null-and-selected-under-its-own-name)
+  - [Unsigned base64url JSON cursors](#unsigned-base64url-json-cursors)
+  - [`iterateChunks` alongside `stream()`](#iteratechunks-alongside-stream)
 - [Execution and errors](#execution-and-errors)
+  - [One small `Executor` interface between the builder and the driver](#one-small-executor-interface-between-the-builder-and-the-driver)
+  - [Plain queries share the pool's pipelined connections](#plain-queries-share-the-pools-pipelined-connections)
+  - [Errors carry the query (hidden) and the code awaiting it](#errors-carry-the-query-hidden-and-the-code-awaiting-it)
+  - [`onQuery`: one event per settled query, with its phases; `tag()` stays out of the SQL](#onquery-one-event-per-settled-query-with-its-phases-tag-stays-out-of-the-sql)
+  - [Nested `durable` transactions throw](#nested-durable-transactions-throw)
 - [Type-level tricks](#type-level-tricks)
+  - [Phantom types: what a column reads and writes](#phantom-types-what-a-column-reads-and-writes)
+  - [A class per column modifier state](#a-class-per-column-modifier-state)
+  - [Errors as an impossible extra argument](#errors-as-an-impossible-extra-argument)
+  - [`takeValue` needs a one-column row](#takevalue-needs-a-one-column-row)
 - [Type-checking speed](#type-checking-speed)
+  - [Speed is a design constraint, measured](#speed-is-a-design-constraint-measured)
 - [Schema, verify and the CLI](#schema-verify-and-the-cli)
+  - [Declarations, not migrations](#declarations-not-migrations)
+  - [`verify` instead of trusting that code and database agree](#verify-instead-of-trusting-that-code-and-database-agree)
+  - [Call sites captured eagerly, formatted lazily](#call-sites-captured-eagerly-formatted-lazily)
+  - [The CLI: config as code, re-launched for TypeScript, distinct exit codes](#the-cli-config-as-code-re-launched-for-typescript-distinct-exit-codes)
 
 ## The shape of the API
 
@@ -50,7 +123,7 @@ The driver's decisions are in [driver/DECISIONS.md](driver/DECISIONS.md), which 
 
 **Alternatives.** Kysely and Drizzle type operators by TypeScript type: `uuid = text` compiles and fails in the database.
 
-**Cost.** Each SQL kind needs its own entry in `MethodsByKind` ([operators.ts](operators.ts)), and types outside the built-in kinds go through `defineType` with an explicit operator set.
+**Cost.** Each SQL kind needs its own entry in `MethodsByKind` ([operators.ts](operators.ts)). quarry doesn't know the operators of a type declared with `defineType`, so its columns get every method, against values or expressions of the same type, and Postgres decides which apply ([codecs chosen per column](#codecs-chosen-per-column-usecodec-and-definetype-not-a-global-type-table)).
 
 **Code.** [operators.ts](operators.ts), [data-type/](data-type/).
 
@@ -78,6 +151,18 @@ The driver's decisions are in [driver/DECISIONS.md](driver/DECISIONS.md), which 
 
 **Code.** each `*-query-builder.ts`.
 
+### Reusable pieces are functions: `fragment`, `pipe` and `when`
+
+**What it is.** A reusable piece of a select is a function from a builder to a builder. `fragment(tables, build)` returns `build` unchanged and only fixes its type: it receives a `Fragment<T>`, a builder over exactly the tables it names with nothing selected. `pipe(piece)` applies it to any query those tables are in, in any position, adding its conditions, joins, columns and locking clauses. `when(condition, build)` applies a piece only if `condition` holds ([QUERIES.md](QUERIES.md#fragment-and-pipe-reusable-pieces)).
+
+**Why.** "Active users" or "with the primary contact" is shared by many queries, and optional input (a filter only when a value is given) shouldn't need `let q = …; if (x) q = q.where(…)`. A piece typed by the tables it needs can be written once, outside any query, and the compiler checks every use: a piece over a table the query doesn't have is a type error naming the table (`InScope`, [an impossible extra argument](#errors-as-an-impossible-extra-argument)), the tables a piece joins are added to the query's scope (`JoinedBy`), and the columns it selects to the row. With `when`, those columns become optional in the row, since the piece may not have run.
+
+**Alternatives.** Kysely's `$call(fn)` and `$if(cond, fn)`: the function receives the builder typed with the whole query, so a helper shared by several queries has to be a generic function over the builder type. Reassigning a mutable builder in `if` statements ([Immutable builders](#immutable-builders)).
+
+**Cost.** A table counts as in scope by its type, so a fragment over `users` doesn't apply to a query that has it as `users.as('u')`. `when` can't join (its callback returns a builder over the same tables) and can't satisfy a write's required clause ([`M` and `this` gating](#what-a-builder-still-needs-in-its-type-m-and-this-gating)). A locking clause added by a piece closes the lock state ([`L`](#the-locking-clause-as-a-state-machine-l)).
+
+**Code.** `fragment`, `pipe`, `when`, `InScope`, `JoinedBy`, `WhenRow` in [select-query-builder.ts](select-query-builder.ts); `when` on each write builder.
+
 ### What a builder still needs, in its type: `M` and `this` gating
 
 **What it is.** Write builders carry a type parameter `M` listing what they still need: `'values'` for an insert, `'set' | 'where'` for an update, `'where'` for a delete. Each method removes what it provides (`set` returns `Exclude<M, 'set'>`), and `execute()` declares `this: WriteQueryBuilder<O, never>`, so it only exists once `M` is empty ([TYPES.md](TYPES.md#what-a-write-query-still-needs-m)).
@@ -90,13 +175,33 @@ The driver's decisions are in [driver/DECISIONS.md](driver/DECISIONS.md), which 
 
 **Code.** [write-query.ts](write-query.ts), [update-query-builder.ts](update-query-builder.ts), [delete-query-builder.ts](delete-query-builder.ts), [insert-query-builder.ts](insert-query-builder.ts); `Missing<M>` in [query.ts](query.ts).
 
+### Row locks: a method per strength, several clauses, checked when compiling
+
+**What it is.** `forUpdate()`, `forNoKeyUpdate()`, `forShare()` and `forKeyShare()` each append a locking clause (a `LockNode`) to a select; `of(...)`, `skipLocked()` and `noWait()` modify the latest one. A query can have several clauses, usually each `of` different tables, and they render last, after `limit`: `… limit $2 for update of "jobs" skip locked for share of "users"`. `of` takes a table in scope or the name it goes by. The compiler throws for a locking clause on a query that selects an aggregate ([QUERIES.md](QUERIES.md#row-locking), [COMPILER.md](COMPILER.md#locking-clauses)).
+
+**Why.**
+
+- _The same words and order as the SQL._ One method per strength reads as the clause it writes, and its doc comment explains what that strength blocks. Several clauses are what Postgres allows (`for update of jobs for share of users`), and a job queue that claims a job while share-locking its owner needs two.
+- _Every returned row is locked._ No result shape adds a `limit` ([no implicit LIMIT](#no-implicit-limit-in-result-shapes)), so what a lock query locks is what its SQL says: `.limit(1)` locks one row, whether it is read with `takeFirst()` or `expectOne()`.
+- _Aggregates refused before the round trip._ A row of `count(*)` is no table row to lock, and Postgres refuses the query. The compiler finds the aggregates `eb.fn` builds in the select list (not in subqueries) and throws with the method named (`forUpdate() and the like`).
+
+**Alternatives.**
+
+- One method with an options object, `forUpdate({ of, skipLocked })` (Drizzle's `.for('update', { of, skipLocked })`, and a question in #22): the order rules of the type-level state machine would become rules about which option combinations are valid, and several clauses would need an array of objects.
+- One clause per query: loses the claim-and-share pattern.
+- Refusing a lock outside a transaction (a question in #22): a locking read outside one is valid SQL, and occasionally what is meant (a `noWait()` probe). The doc comment says to run locking reads in `db.transaction` instead.
+
+**Cost.** `of` takes a table or its name, two spellings for one thing. Only the aggregates `eb.fn` builds are found; `distinct`, `group by` or `having` with a lock, and an aggregate in a raw fragment's text, are refused by Postgres, one round trip later.
+
+**Code.** `forUpdate`, `forNoKeyUpdate`, `forShare`, `forKeyShare`, `of`, `skipLocked`, `noWait`, `#lock`, `#modifyLock` in [select-query-builder.ts](select-query-builder.ts); `renderLock`, `hasAggregate` in [compile.ts](compile.ts).
+
 ### The locking clause as a state machine: `L`
 
 **What it is.** A select's third type parameter records what its latest locking clause still accepts: `'none'`, `'strength'` (after `forUpdate()`), `'of'`, `'done'`. `of()` and `skipLocked()`/`noWait()` are gated with `this` parameters, so `.forUpdate().skipLocked().of(jobs)` is a type error ([TYPES.md](TYPES.md#the-locking-clause-l), [QUERIES.md](QUERIES.md#row-locking)).
 
 **Why.** The order of the modifiers is fixed by SQL (`for update of t skip locked`), and getting it wrong is a syntax error at run time.
 
-**Alternatives.** One options object, `forUpdate({ of, skipLocked })` (considered in #22's open questions); run-time checks only.
+**Alternatives.** One options object, `forUpdate({ of, skipLocked })` (considered in #22; [above](#row-locks-a-method-per-strength-several-clauses-checked-when-compiling)); run-time checks only.
 
 **Cost.** A type parameter on every select. `when` and `pipe` can only say "a piece may have added a clause", so after one the state becomes `'done'`. The run-time methods check the same rules again for code that casts around the types.
 
@@ -144,7 +249,7 @@ The driver's decisions are in [driver/DECISIONS.md](driver/DECISIONS.md), which 
 
 **Why.** Once shapes stopped running queries (#23), `await db.insertInto(t).values(v)` would otherwise silently do nothing: `await` on a non-promise just returns it.
 
-**Alternatives.** Make builders real thenables that run when awaited (Drizzle does this): the query then runs whenever anything awaits it, including code that only meant to pass it along. A dev-only warning. Detecting never-executed builders with a `FinalizationRegistry` (not implemented).
+**Alternatives.** Make builders real thenables that run when awaited (Drizzle does this): the query then runs whenever anything awaits it, including code that only meant to pass it along. A dev-only warning. Detecting never-executed builders with a `FinalizationRegistry`: it reports late, whenever the garbage collector runs, if ever.
 
 **Cost.** Code that treats any thenable as a promise (returning a builder from an `async` function, for example) gets a rejection; that's intended, but surprising. Lint's `no-floating-promises` doesn't see the guard.
 
@@ -158,7 +263,7 @@ The driver's decisions are in [driver/DECISIONS.md](driver/DECISIONS.md), which 
 
 **Alternatives.** The earlier names `one`, `first`, `maybeOne`, `all` (#23): `first` and `one` both sound safe. Kysely's `executeTakeFirst` / `executeTakeFirstOrThrow`: the same idea with a suffix, which is how quarry arrived at the prefix rule.
 
-**Cost.** Ten shape names to learn. `expectRows(n)` became a final shape (it had been a builder modifier), so it must come after `returning`.
+**Cost.** Eight shape names to learn (`takeFirst`, `takeValue`, `expectNonEmpty`, `expectFirst`, `expectOne`, `expectAtMostOne`, `expectValue`, and `expectRows` on writes). `expectRows(n)` became a final shape (it had been a builder modifier), so it must come after `returning`.
 
 **Code.** [shape.ts](shape.ts); errors in [executor.ts](executor.ts).
 
@@ -170,7 +275,7 @@ The driver's decisions are in [driver/DECISIONS.md](driver/DECISIONS.md), which 
 
 - The SQL you see in `toSQL()` and `onQuery` is what runs.
 - The statement cache sees one statement per query, not one per shape.
-- `forUpdate()` locks exactly the rows the query returns. With `limit 2` added by `expectOne()`, a lock query locked up to two rows; with `limit 1` added by `first()`, "the job I claimed" was an accident of the shape.
+- `forUpdate()` locks exactly the rows the query returns. With `limit 2` added by `expectOne()`, a lock query locked up to two rows; with `limit 1` added by `takeFirst()`, "the job I claimed" was an accident of the shape.
 - `TooManyRowsError.count` is the real number of rows (5, not "at least 2"), because the count comes from the command tag over the whole result.
 
 **Alternatives.** Add the limit, as quarry did before #27 and as most ORMs do (Prisma's `findFirst` adds `LIMIT 1`). Fewer rows travel, but the SQL depends on how you read it.
@@ -203,19 +308,21 @@ The driver's decisions are in [driver/DECISIONS.md](driver/DECISIONS.md), which 
 
 **Why.** "Run these together" and "run these atomically" fail differently: in the first, the others still commit and you get a `BatchError` with each position's outcome; in the second, nothing commits. The API names which one you meant.
 
-**Alternatives.** `Promise.all` over the pool (several connections; several round trips for a transaction). An opt-in `{ settle: true }` that resolves to settled results instead of rejecting (an open question from #23).
+**Alternatives.** `Promise.all` over the pool (several connections; several round trips for a transaction). An opt-in `{ settle: true }` that resolves to settled results instead of rejecting (raised in #23): the `BatchError` already carries every position's outcome in `results`, and a batch that resolves means every query succeeded.
 
 **Cost.** In the one-round-trip atomic form, COMMIT is sent before results are decoded, so a decode failure surfaces after the commit. Any `expect…` shape makes COMMIT wait for its check, costing a second round trip.
 
 **Code.** [batch.ts](batch.ts), [database.ts](database.ts), [driver-executor.ts](driver-executor.ts) `batch`.
 
-### `stream()`: only for every-row reads, and it runs immediately
+<a id="stream-only-for-every-row-reads-and-it-runs-immediately"></a>
+
+### `stream()`: only for every-row reads, run by iterating it
 
 **What it is.** `stream()` exists on select builders, not on shaped queries (`q.expectOne().stream()` is a type error), returns a `RowStream`, and starts when iterated rather than through `execute()` ([EXECUTION.md](EXECUTION.md#streaming)). Its `timeout` is refused inside a transaction.
 
 **Why.** A shape reads a handful of rows; streaming is for results too large to hold. A stream is consumed by iteration, so there is nothing for `execute()` to resolve to. The timeout is set before the cursor and restored before its Sync, so it holds the connection between batches, which a transaction, whose other queries run between them, can't allow ([driver/DECISIONS.md](driver/DECISIONS.md#a-statement-timeout-bounds-the-whole-stream)).
 
-**Alternatives.** An async generator (slower per row: [driver/DECISIONS.md](driver/DECISIONS.md#rowstream-a-hand-written-iterator-instead-of-an-async-generator)); a timeout inside a transaction by saving and restoring `statement_timeout` (an open question).
+**Alternatives.** An async generator (slower per row: [driver/DECISIONS.md](driver/DECISIONS.md#rowstream-a-hand-written-iterator-instead-of-an-async-generator)). Inside a transaction, a `timeout` that saves and restores `statement_timeout` around the stream: the refusal's message points to `tx.setLocal('statement_timeout', …)` instead, which bounds every statement after it in the transaction.
 
 **Cost.** Over a pool, a stream holds one connection from its first batch until it ends (released on `break`, `return`, a throw or an abort).
 
@@ -245,7 +352,7 @@ The driver's decisions are in [driver/DECISIONS.md](driver/DECISIONS.md), which 
 
 ### Columns resolved and quoted once per table
 
-**What it is.** Each table's column is resolved once into a shared, immutable reference node, typed expression and selection node, and the compiler renders their SQL (`"users"."email"`, `"users"."email" as "email"`) once, when the column is first resolved. A single table's expression builder is made once. Quoted identifiers are memoised in a bounded map. There is no cache of whole compiled queries ([COMPILER.md](COMPILER.md#what-is-rendered-once)).
+**What it is.** Each table's column is resolved once into a shared, immutable reference node, typed expression and selection node, and the compiler renders their SQL (`"users"."email"`, `"users"."email" as "email"`) once, when the column is first resolved. A single table's expression builder is made once. Quoted identifiers are memoised in a bounded map. There is no cache of whole compiled queries; the [trie](#sql-rendered-through-a-trie-of-its-pieces) reuses only SQL strings ([COMPILER.md](COMPILER.md#what-is-rendered-once)).
 
 **Why.** Once #37 let builder queries pipeline, the builder became client-CPU bound: about 19 µs per point lookup against 4.4 µs for the driver's own `pool.query`. Its profile had a quarter of the time in capturing the call site ([above](#errors-carry-the-query-hidden-and-the-code-awaiting-it)), 15% in quoting names, and more in making an expression builder per query (with its `fn` and `json` closures), a `WeakMap` entry per column reference per query (for the `undefined`-comparison error), a `Set` per `select`, and the garbage collection all of that caused. A query's names are the same every time it runs; only its values change.
 
@@ -366,15 +473,18 @@ In one process (the sources run directly, 100 callers, 0 ms, one core), a lookup
 
 **Code.** [comparison.ts](comparison.ts), [json.ts](json.ts), [functions.ts](functions.ts), `stringLiteral` in [compile.ts](compile.ts), [sql.ts](sql.ts).
 
-### Parameters numbered in text order, and `in` as `= any($1)`
+### Parameters numbered in text order; `in` takes a list, or one array as `= any($1)`
 
-**What it is.** `$1, $2, …` follow their position in the SQL text. `in` over a JavaScript array compiles to `= any($1)` with one array parameter, not `in ($1, $2, …)`.
+<a id="parameters-numbered-in-text-order-and-in-as--any1"></a>
+**What it is.** `$1, $2, …` follow their position in the SQL text. `in` over a JavaScript array writes a list, one parameter per value: `.in([1, 2, 3])` is `"users"."age" in ($1, $2, $3)`, and an empty list is the literal `false` (`true` for `notIn`). Given one array instead, a parameter (`.in(eb.val(ids))`) or an array column, it writes the equivalent `= any($1)` (`<> all($1)` for `notIn`) with a single array parameter ([EXPRESSIONS.md](EXPRESSIONS.md#lowering-a-comparison-comparison)).
 
-**Why.** Identical queries give identical SQL, whatever order the builder methods were called in and however long the list is, so the statement cache sees one statement. One array parameter also avoids Postgres's limit of 65,535 parameters.
+**Why.** Identical queries give identical SQL, whatever order the builder methods were called in, so the statement cache sees one statement. Postgres's `in` only takes a list, so a list reads as the SQL a reader expects and each value is encoded by the column's codec. For lists whose length varies from call to call, or that run into the thousands, `eb.val(array)` keeps one statement for every length and stays far from Postgres's limit of 65,535 parameters; the array is encoded once by `arrayOf` the column's codec, in binary where the driver can ([driver/DECISIONS.md](driver/DECISIONS.md#binary-array-parameters-with-a-per-array-fallback)).
 
-**Alternatives.** `in ($1, …, $n)` (most builders): a different statement per list length.
+**Alternatives.** Always `= any($1)` for a JavaScript array: one statement per query whatever the length, but `in (…)` written in the builder would not be `in (…)` in the SQL. Numbering parameters in the order the builder methods were called: the same query built in a different order would be a different statement.
 
-**Code.** [compile.ts](compile.ts); [comparison.ts](comparison.ts).
+**Cost.** An `in` list of a new length is a new statement for the driver's cache (and a new prefix in the compiler's trie); a caller with varying lengths has to choose `eb.val(array)`.
+
+**Code.** `param` in [compile.ts](compile.ts); `comparison`, `arrayNode` in [comparison.ts](comparison.ts).
 
 ### Every operation operand bracketed
 
@@ -388,11 +498,13 @@ In one process (the sources run directly, 100 callers, 0 ms, one core), a lookup
 
 ### Codecs as getters on the compiled query
 
-**What it is.** `CompiledQuery.paramCodecs` and `resultCodecs` are getters, not own properties.
+**What it is.** `CompiledQuery.paramCodecs`, `resultCodecs` and `nested` (the objects `nest` builds) are getters of the `Compiled` class, not own properties; the mark `isDataStatement` reads is a private field of the same class.
 
 **Why.** A compiled query prints, logs and compares as `{ sql, params }` (in `toSQL()`, test snapshots and `toEqual`), while the executor can still read the codecs.
 
-**Code.** [compile.ts](compile.ts).
+**Cost.** A copy made by spreading (`{ ...query }`) keeps only `sql`, `params` and `tag`: its values go to the driver's default codecs, and the executor treats it as SQL written by hand.
+
+**Code.** `Compiled` in [compile.ts](compile.ts).
 
 ## Values, codecs and types
 
@@ -414,6 +526,18 @@ In one process (the sources run directly, 100 callers, 0 ms, one core), a lookup
 
 **Code.** [kind-codecs.ts](kind-codecs.ts), [column/](column/README.md).
 
+### Codecs chosen per column: `useCodec` and `defineType`, not a global type table
+
+**What it is.** Each column factory has a codec (`kindCodecs`: `bigint()` reads as a string, `timestamptz()` as a `Date`, …). A column that should read differently swaps it, `.useCodec(codecs.int8)` or `.useCodec(codecs.raw)`, and its select, insert and update types follow the new codec's types. A SQL type quarry has no factory for (an extension's, a domain, your own) is declared once with `defineType({ sql, codec })`, which returns a column factory. `DatabaseOptions.codecs` only decides how columns no query types are read: raw SQL and expressions of unknown type ([column/README.md](column/README.md#swapping-a-columns-codec-usecodec), [column/README.md](column/README.md#custom-types-definetype)).
+
+**Why.** How a value is decoded is a property of the column, and the column's TypeScript type has to match it. A table keyed by type OID (node-postgres's `types.setTypeParser`, quarry's own `types` option until #28) changes every query's results at once, can't tell one `bigint` column from another, and leaves the declared types claiming what they claimed before. Per column, the choice is local, visible in the schema, and typed. A custom type keeps its name in its type (`CustomType<'citext'>`), so its columns compare only with each other ([below](#enums-and-custom-types-keyed-by-name-in-their-type)), and `db.verify` checks the name against the database.
+
+**Alternatives.** A global parser registry (above). Drizzle's `customType({ dataType, toDriver, fromDriver })`: the same idea per type, with conversion functions around the driver's own decoding. Kysely: types only, decoding left to the driver's global parsers.
+
+**Cost.** A `defineType` type's operators are unknown to quarry: its columns get every method, against values or expressions of the same type, and Postgres refuses what doesn't apply. Its OID comes from the [type catalog](#the-type-catalog-loaded-before-the-first-query), not from the code.
+
+**Code.** `useCodec` in [column/](column/README.md); [define-type.ts](define-type.ts), [data-type/custom.ts](data-type/custom.ts); `kindCodecs`, `quarryRegistry` in [kind-codecs.ts](kind-codecs.ts); `codecs` in [driver-executor.ts](driver-executor.ts) `DatabaseOptions`.
+
 ### `DataType` separate from the column
 
 **What it is.** A column (`Column`) holds nullability, write rules and its TypeScript types; its SQL type is a separate `DataType` object (`kind`, codec, modifiers such as `varchar(320)`) ([data-type/README.md](data-type/README.md)).
@@ -426,7 +550,7 @@ In one process (the sources run directly, 100 callers, 0 ms, one core), a lookup
 
 ### Enums and custom types keyed by name in their type
 
-**What it is.** An enum's `DataType` carries its Postgres name as a type parameter (`EnumType<'order_status'>`); `defineType` codecs carry theirs.
+**What it is.** An enum's `DataType` carries its Postgres name as a type parameter (`EnumType<'order_status'>`); a `defineType` type carries its own (`CustomType<'citext'>`).
 
 **Why.** Two enums never compare in Postgres, even with the same labels, so they mustn't in quarry: different names make different types.
 
@@ -448,7 +572,7 @@ In one process (the sources run directly, 100 callers, 0 ms, one core), a lookup
 
 ### `eb.val` declares a type from its JavaScript type
 
-**What it is.** A bare `eb.val(x)` (not compared with a column) is sent with a declared type chosen from its JavaScript type: a string as `text`, an integer as `integer`, other numbers as `double precision`, a boolean, a `bigint`, a `Date` as `timestamptz` ([EXPRESSIONS.md](EXPRESSIONS.md#parameters-ebval)). Compared with a column, it uses the column's codec instead.
+**What it is.** A bare `eb.val(x)` (not compared with a column) is sent with a declared type chosen from its JavaScript type: a string as `text`, a whole number within `integer`'s range as `integer`, other numbers as `double precision`, a boolean as `boolean`, a `bigint` as `bigint`, a `Date` as `timestamptz` ([EXPRESSIONS.md](EXPRESSIONS.md#parameters-ebval)). Compared with a column, it uses the column's codec instead.
 
 **Why.** `fn.concat('…', eb.val(' / '))` failed with "could not determine data type of parameter": in a function call there is no column to infer from (bug 6 of #32). And `eb.val(1).as('one')` arrived as the string `'1'`, contradicting its type `number` (bug 7).
 
@@ -456,13 +580,27 @@ In one process (the sources run directly, 100 callers, 0 ms, one core), a lookup
 
 **Code.** `codecOfValue` in [expression.ts](expression.ts).
 
+### Function value arguments are sent with a declared type
+
+**What it is.** A plain value (or an `eb.val` without its own codec) passed as a function's value argument is sent with the type that argument has in Postgres, declared: the start and length of `substring`, `left` and `right`, and `splitPart`'s field number as `integer`; `replace`'s strings, `strpos`'s search, `splitPart`'s delimiter, `toChar`'s format and `stringAgg`'s delimiter as `text`; `round`'s places as `integer`; the second argument of `nullif` and the fallbacks of `greatest` and `least` with the first argument's codec. An expression argument is used as is, and `undefined` throws ([EXPRESSIONS.md](EXPRESSIONS.md#functions-ebfn)).
+
+**Why.** Postgres can't always infer a function argument's type from its position: `substring` has several signatures (`text, int, int`, `text, text`, `text, text, text`), so `substring("title", $1, $2)` with untyped parameters can resolve to the wrong one or fail with "could not determine data type of parameter". Declaring the type picks the signature, and also gives the value the codec the server will read it with (`toSQL()` of `eb.fn.substring('posts.title', 1, 3)` sends `int4`, `int4`).
+
+**Alternatives.** Leave the arguments untyped and rely on inference (fails where the signature is ambiguous); a cast in the SQL text (`$1::int`, more text per call and the same effect); `codecOfValue` from the JavaScript type, as a bare `eb.val` does (a `double precision` for a fractional number, which no `substring` signature takes).
+
+**Cost.** Each function lists its arguments' types in [functions.ts](functions.ts).
+
+**Code.** `valueArg` in [functions.ts](functions.ts); `declareParamType` in [driver/codec.ts](driver/codec.ts); [#32](https://github.com/shlokdesai33/quarry/pull/32).
+
 ### `= any($1)` gets a declared type only for integer and boolean columns
+
+**Superseded** by [Exact parameter OIDs, except for text-like types](driver/DECISIONS.md#exact-parameter-oids-except-for-text-like-types) (#28). Since unified codecs, an array parameter is encoded by `arrayOf` the other side's codec and declares its type unless that codec is text-like: `uuid[]`, `float8[]` and `timestamptz[]` are declared, `text[]` and `varchar[]` are left for the server to infer, and the left side no longer has to be a plain column. What follows is the rule as #19 introduced it.
 
 **What it is.** For `column = any($1)`, the parameter's array type is declared (so it can be sent in binary) only for `smallint`, `integer`, `bigint` and `boolean` columns, and only when the left side is a plain column ([#19](https://github.com/shlokdesai33/quarry/pull/19)).
 
 **Why.** Declaring text, uuid, float8 or timestamptz could change the comparison, or fail, if the real column differs from the schema (a `citext` column declared as `text`, `real` declared as `double precision`, `timestamp` declared as `timestamptz`). Integers and booleans can't be misread that way.
 
-**Measured.** `id = any($1)` with 1,000 ids: 479 → 514 queries/s on Node ([#19](https://github.com/shlokdesai33/quarry/pull/19)).
+**Measured.** `id = any($1)` with 1,000 ids: 479 → 514 queries/s ([#19](https://github.com/shlokdesai33/quarry/pull/19)).
 
 **Code.** [comparison.ts](comparison.ts); [driver/DECISIONS.md](driver/DECISIONS.md#binary-array-parameters-with-a-per-array-fallback).
 
@@ -524,7 +662,7 @@ In one process (the sources run directly, 100 callers, 0 ms, one core), a lookup
 
 **Cost.** Array columns can't go through `unnest` (it flattens them), nor can expressions or `default` holes, so such inserts fall back to a `values` list (`unnestable` in [compile.ts](compile.ts)). The SQL is less familiar to read.
 
-**Measured.** With binary arrays ([#19](https://github.com/shlokdesai33/quarry/pull/19)): bulk insert of 1k rows 514 → 674 queries/s, 10k rows 58 → 75 (Bun.sql: 611 and 63); through the builder, 1,000 rows × 8 columns 5.83 → 3.94 ms.
+**Measured.** With binary arrays ([#19](https://github.com/shlokdesai33/quarry/pull/19)): bulk insert of 1k rows 514 → 674 queries/s, 10k rows 58 → 75; through the builder, 1,000 rows × 8 columns 5.83 → 3.94 ms.
 
 **Code.** `renderInsert` in [compile.ts](compile.ts); [insert-query-builder.ts](insert-query-builder.ts).
 
@@ -544,7 +682,7 @@ In one process (the sources run directly, 100 callers, 0 ms, one core), a lookup
 
 **Alternatives.** Kysely's `from(values(rows))` + `set` + `whereRef` (one parameter per cell; different SQL per row count; types inferred from the first row). A separate `updateMany` builder (quarry before #30): a second builder to keep in step with `update`.
 
-**Cost.** Array columns and expression values are rejected at compile time (the `unnest` limitation, with no `values` fallback for updates yet). Zero rows throw at build time rather than doing nothing, as inserts do, which forces an `if (rows.length)` guard in sync jobs (an open question).
+**Cost.** Array columns and expression values are rejected when compiling: `unnest` flattens arrays, and `setEach` always sends its rows through `unnest`, where an insert falls back to a `values` list. Zero rows throw when `setEach` is called rather than doing nothing (an insert of zero rows throws too, when compiled), which forces an `if (rows.length)` guard in sync jobs.
 
 **Measured.** 1,000 rows × 8 columns through the builder, with binary arrays: 7.00 → 4.96 ms ([#19](https://github.com/shlokdesai33/quarry/pull/19), as `updateMany`).
 
@@ -558,7 +696,7 @@ In one process (the sources run directly, 100 callers, 0 ms, one core), a lookup
 
 **Alternatives.** Group rows by which columns they set and run a statement per group (more round trips and statements); `coalesce(row.col, t.col)` (can't set a column to NULL).
 
-**Cost.** One extra array parameter and a `case` per varying column. The flag names (`set:<column>`) and the default alias `row` are reserved by convention (an open question in #30), and `as` can't equal the table's name.
+**Cost.** One extra array parameter and a `case` per varying column. The flag names (`set:<column>`) and the default alias `row` are reserved by convention, and `as` can't equal the table's name.
 
 **Code.** [update-query-builder.ts](update-query-builder.ts); the `case` node from [case.ts](case.ts).
 
@@ -614,29 +752,42 @@ In one process (the sources run directly, 100 callers, 0 ms, one core), a lookup
 
 ### Ordering by a selected key uses the bare key
 
-**What it is.** `orderBy('postCount')` orders by a key of the row (rendered as the quoted alias); `orderBy('posts.createdAt')` by a column. A string with a dot is always a column reference.
+**What it is.** `orderBy('postCount')` orders by a key of the row (rendered as the quoted alias); `orderBy('posts.createdAt')` by a column. A string with a dot is always a column reference. The same holds for `groupBy` and `distinctOn`. A key holding a `nest` object isn't one of them: it is no single column to order or group by.
 
 **Why.** Ordering and grouping by a computed, aliased value is common, and repeating the expression is noisy. The dot rule makes the two readings unambiguous.
 
-**Code.** `renderKey`, `AliasNode` in [compile.ts](compile.ts).
+**Code.** `Key`, `#keys` in [select-query-builder.ts](select-query-builder.ts); `renderKey` in [compile.ts](compile.ts); `AliasNode` in [node.ts](node.ts).
 
 ### `nest` marks a joined row with `ctid`
 
-<a id="nest-marks-a-joined-row-with-ctid"></a>
 **What it is.** `nest('bookings', ['id', 'name'])` selects flat columns, `"bookings"."id" as "bookings.id"`, after one hidden marker per nested table, `("bookings".ctid is not null) as "bookings"`. The row decoder builds `{ id, name }` from them, or `null` where the marker is false. The marker is always `ctid`, for every table and join kind, with no fallback. `toSQL()` shows it; the row and its type don't.
 
 **Why.**
 
 - _A marker at all._ Without one, a left join's missing row and a matched row whose picked columns are all null look the same: every column NULL. Only a column that is never null in a row the table has can tell them apart.
-- _`ctid`, not a join column._ The join column (`bookings.user_id` in `on bookings.user_id = users.id`) works only for the two-column `on` shorthand, and only if that column isn't nullable. An `on` callback (`or`, an expression, `is not distinct from`) has no single column that a match guarantees non-null. The primary key would do, but quarry doesn't declare keys yet. Every row of a real table has a `ctid`, whatever the join and its condition, so one rule covers every case and needs nothing from the schema.
+- _`ctid`, not a join column._ The join column (`bookings.user_id` in `on bookings.user_id = users.id`) works only for the two-column `on` shorthand, and only if that column isn't nullable. An `on` callback (`or`, an expression, `is not distinct from`) has no single column that a match guarantees non-null. The primary key would do, but table definitions don't declare keys. Every row of a real table has a `ctid`, whatever the join and its condition, so one rule covers every case and needs nothing from the schema.
 - _Flat columns, not `json_build_object`._ JSON would turn every value into JSON text: bigints and numerics as JSON numbers, timestamps as strings, bytea as hex. It would also lose each column's codec and binary format. Flat columns are decoded exactly like any other selected column.
 - _Built in the decoder._ The driver takes the objects as the query's `nested` option. The generated row decoder stores a fresh object of nulls when the marker is true and stores each column straight into it, so there is no second pass over the rows and no per-row allocation for a missing row.
 
 **Alternatives.** The join column, or a non-null column of the table, as the marker: depends on the `on` form and the schema. `json_build_object`/`row_to_json`: loses codecs and exactness. Grouping after decoding (`rowMode: 'array'` then reshaping): a second pass and an extra array per row.
 
-**Cost.** One more boolean column per nested table. `ctid` exists only on real tables: a view has none, and a query nesting one fails in postgres. The table must be a real table.
+**Cost.** One more boolean column per nested table. `ctid` exists only on real tables: a view has none, and Postgres rejects a query nesting one.
 
 **Code.** `nest`/`Nested` in [nest.ts](nest.ts); `nestedNodes` in [row.ts](row.ts); `nestedObjects` in [compile.ts](compile.ts); `NestedObject` and the generated decoder in [driver/rows.ts](driver/rows.ts).
+
+### `nest`'s object keys in the builder's type: `K`
+
+**What it is.** The select builder has a fourth type parameter, `K` (default `never`), holding the keys of the row that are `nest` objects. `select` adds its new object keys, `when` and `pipe` add their piece's, and the joins carry it. The key types of `orderBy`, `groupBy` and `distinctOn` (`Key<R, O, K>`) and of `iterateChunks` and `paginateByCursor` (`KeyColumn<T, O, K>`) exclude it, so naming an object's key there is a type error ([TYPES.md](TYPES.md#nest-an-object-per-table)).
+
+**Why.** An object's key holds no column: `order by "bookings"` would sort by the hidden marker (whether the join found a row), and a keyset can't read a seek value back from an object. Neither the row type nor its values tell a `nest` object from a `jsonb` column, so the builder has to remember which keys are objects.
+
+**Alternatives.** Check only at run time: `orderBy`, `groupBy` and `distinctOn` also throw (`"bookings" is a nested object: name one of its columns as 'table.column'`), and a keyset `by` fails because the column isn't selected under its own name; these stay as the backstop for JavaScript callers, but alone they would let the mistake type-check.
+
+**Cost.** One more type parameter on every select and join builder.
+
+**Measured.** +0.8% instantiations on the existing type tests, with check time unchanged ([#44](https://github.com/shlokdesai33/quarry/pull/44)).
+
+**Code.** `Key`, `KeyArg`, `#keys` in [select-query-builder.ts](select-query-builder.ts); `KeyColumn` in [pagination.ts](pagination.ts); `NestedKey` in [nest.ts](nest.ts).
 
 ## Pagination
 
@@ -650,7 +801,7 @@ The mechanisms are in [PAGINATION.md](PAGINATION.md).
 
 **Alternatives.** The expanded form `a > x or (a = x and b > y)` (kysely-paginate, Drizzle's guide): supports mixed directions, but is harder for the planner. Offset paging, kept as `paginateByOffset` for "page 7 of 20" interfaces.
 
-**Cost.** No mixed per-column directions (`a desc, b asc`), and no backwards pagination yet.
+**Cost.** One direction for every key column: `a desc, b asc` can't be expressed as one row comparison. Pages are read forwards, from `after`.
 
 **Code.** [pagination.ts](pagination.ts).
 
@@ -706,9 +857,9 @@ The mechanisms are in [PAGINATION.md](PAGINATION.md).
 
 **Why.** Opaque enough to put in a URL, and decodable without a secret (Laravel works the same way).
 
-**Alternatives.** HMAC-signed cursors with a database-level secret (an open question): a client could otherwise edit the key text, which passes the structural check and then fails in Postgres with `invalid_text_representation`.
+**Alternatives.** HMAC-signed cursors: they need a secret configured for each database, for protection against a client editing the key text, which passes the structural check and then fails in Postgres with `invalid_text_representation`.
 
-**Cost.** Cursors aren't tamper-proof; they are not an authorization mechanism. `InvalidCursorError` is a data-dependent throw from methods named without `expect` (another open question).
+**Cost.** Cursors aren't tamper-proof; they are not an authorization mechanism. `InvalidCursorError` is a data-dependent throw from methods named without `expect`.
 
 **Code.** [pagination.ts](pagination.ts).
 
@@ -716,7 +867,7 @@ The mechanisms are in [PAGINATION.md](PAGINATION.md).
 
 **What it is.** Two ways to read a large result batch by batch: `stream()` (one query, a server-side cursor, one connection held throughout) and `iterateChunks()` (one short keyset query per batch).
 
-**Why.** They fail differently. A stream sees one snapshot and is fastest, but holds a connection and, inside a transaction, the transaction. Chunks hold no connection between batches, and each batch is a short query that sees the latest committed rows, and a crashed job can restart from the last key it processed, at the cost of one query per batch (a built-in `after` option to resume from a saved key is an open question) ([PAGINATION.md](PAGINATION.md#pagination-vs-stream)).
+**Why.** They fail differently. A stream sees one snapshot and is fastest, but holds a connection and, inside a transaction, the transaction. Chunks hold no connection between batches, and each batch is a short query that sees the latest committed rows, and a crashed job can restart from the last key it processed (with a `where` on the key), at the cost of one query per batch ([PAGINATION.md](PAGINATION.md#pagination-vs-stream)).
 
 **Code.** [pagination.ts](pagination.ts); `stream` in [select-query-builder.ts](select-query-builder.ts).
 
@@ -726,7 +877,7 @@ The mechanisms are in [PAGINATION.md](PAGINATION.md).
 
 **What it is.** The builder talks to [executor.ts](executor.ts)'s interface (`execute`, `stream`, `describe`, `batch`, `transaction`, `close`). The real one is `DriverExecutor`; tests use in-memory ones ([EXECUTION.md](EXECUTION.md#the-executor-interface)).
 
-**Why.** The builder is testable without a database, and the driver integration is one file. Future backends (HTTP, PGlite) would only implement the interface.
+**Why.** The builder is testable without a database, and the driver integration is one file. Anything that implements the interface (a mock, a recorder of SQL snapshots) runs the builder's queries through `databaseWith`, which is internal.
 
 **Alternatives.** A public adapter for other drivers (quarry had `pgExecutor` before #3): the builder's features (codecs, binary, `keepRows`, batches) depend on this driver.
 
@@ -742,7 +893,7 @@ The mechanisms are in [PAGINATION.md](PAGINATION.md).
 
 - Keep a connection per operation (the previous design): a query's `queuedMs` was its own, at the cost of every builder query beyond `max` waiting a whole round trip per connection.
 - Send a batch's statements through `pool.query` one by one: on an idle pool they would spread over several connections, and the batch would no longer go out in one write on one connection.
-- Give queries with a `timeout` a connection of their own (#37, until #38): the driver chose a timeout's framing from the connection's last reported transaction status, which other callers' pipelined queries change, so the setting could silently not apply. Since #38 the framing is the query's own Sync group, and a timed builder query at a 5 ms round trip went from 1,738 to 14,640 ops/s with 100 callers (1,729 to 48,548 with 500; at 0 ms, 33,233 to 57,208), 10 connections, the setup of the table below on one 4-core VM.
+- Give queries with a `timeout` a connection of their own (#37, until #38): the driver chose a timeout's framing from the connection's last reported transaction status, which other callers' pipelined queries change, so the setting could silently not apply. Since #38 the framing is the query's own Sync group, and a timed builder query at a 5 ms round trip went from 1,738 to 14,640 ops/s with 100 callers (1,729 to 48,548 with 500; at 0 ms, 33,233 to 57,208): 10 connections on one 4-core VM, median of 3 interleaved runs, the round trip simulated in the socket ([driver/DECISIONS.md](driver/DECISIONS.md#a-statement-timeout-is-framed-under-the-querys-sync-whatever-the-transaction-status)).
 - Refuse session statements in `db.sql` on a pool (postgres.js refuses `begin` outside `sql.begin`): it breaks code that worked, where giving them a connection of their own keeps their old behaviour and keeps other callers out of their state.
 
 **Cost.** A slow query delays the queries pipelined behind it on its connection (head-of-line blocking, bounded by the pipeline depth), and `queuedMs` includes them. The session check is a heuristic on the first keyword: state a `select` sets (`set_config(…, false)`, `pg_advisory_lock`) isn't seen, and lands on an arbitrary connection, as before. One anchored regular expression test per hand-written statement on a pool. The builders' selects and writes skip it: `compile` marks the queries it makes from a select, insert, update or delete node (`isDataStatement`), which can't start with a session keyword. The test had been 4–5% of a builder point lookup's client CPU.
@@ -770,7 +921,7 @@ Before, throughput was capped at `max` lookups per round trip (10 per 6 ms at 5 
 
 **Alternatives.**
 
-- A stack captured when the query is issued (the previous design): it also names a synchronous wrapper between the awaiting code and `execute()`, and the line that issued a query awaited later. About 2 µs per query on V8 (0.3 µs on Bun).
+- A stack captured when the query is issued (the previous design): it also names a synchronous wrapper between the awaiting code and `execute()`, and the line that issued a query awaited later. About 2 µs per query on V8.
 - A shallower stack captured up front (`Error.captureStackTrace` with a small `stackTraceLimit`): measured, the fixed cost of walking the stack dominates, so it saves almost nothing.
 - Capturing only for slow queries, or when `onQuery` asks: errors are what call sites are for, and a failing query is rarely slow.
 - The driver error's own async stack: it is created in the socket's data handler, so it has no frames of yours. The stack has to be captured in the executor's continuation.
@@ -781,6 +932,23 @@ Before, throughput was capped at `max` lookups per round trip (10 per 6 ms at 5 
 
 **Code.** `issuedAt`, `decorate`, `#callsite` in [driver-executor.ts](driver-executor.ts); [test/driver/integration/call-sites.test.ts](../test/driver/integration/call-sites.test.ts).
 
+### `onQuery`: one event per settled query, with its phases; `tag()` stays out of the SQL
+
+**What it is.** `database(source, { onQuery })` calls one function per query when it settles (each `execute`, each query of a batch, and each stream once, when it ends; `describe` reports none) with a `QueryEvent`: `kind`, `sql`, `params`, `tag`, `command`, `rowCount`, `durationMs`, `error`, and `phases`: `acquireMs` (waiting for a connection or a pipeline slot), `queuedMs` (waiting on the connection behind other pipelined queries) and `execMs` (sent until finished, decoding included). `tag(name)` labels a query for these events, the driver's telemetry spans and the `query` an error carries; it is never written into the SQL ([EXECUTION.md](EXECUTION.md#onquery-events)).
+
+**Why.**
+
+- _One hook, three waits told apart._ Logging, metrics and slow-query alerts all hang off one callback. On the pool's shared connections, a slow query can come from the pool (no connection free), from head-of-line blocking (a slow query ahead on the same connection) or from the server, and each has a different fix; `queuedMs` and `execMs` come from the driver's `onTiming`, which times the operation on its connection.
+- _Free when unused._ Without `onQuery`, an `execute` or a batch isn't timed: no `performance.now()` and no `onTiming` callback per query (a stream reads the clock at its start and once it has a connection either way).
+- _A listener can't fail a query._ `#emit` catches what a listener throws and rethrows it in a microtask, where it surfaces as an uncaught exception instead of rejecting the query it reported.
+- _A tag isn't SQL._ A label written as a comment in the SQL would make each label a different statement, for the driver's statement cache and for `pg_stat_statements`. It travels next to the SQL in the compiled query instead.
+
+**Alternatives.** Start and end events per query (a tracing channel): two calls to pair up for what one settled event says. Tags as SQL comments (sqlcommenter): readable in the server's logs, but one statement per label. OpenTelemetry built into the builder: the driver already takes a tracer through its `telemetry` option (`TracerLike`, without depending on `@opentelemetry/api`), records the tag and never the parameters.
+
+**Cost.** The event holds the parameter values, unlike an error's non-enumerable `query`: a listener that logs events whole logs them. In a batch, every query's event carries the batch's timings (no `queuedMs` of its own); a stream's covers it from its first batch to its end, the loop's time included.
+
+**Code.** `QueryEvent`, `DatabaseOptions`, `#emit`, `#report` in [driver-executor.ts](driver-executor.ts); `tag` in [select-query-builder.ts](select-query-builder.ts) and the write builders; `OpTiming` in [driver/ops.ts](driver/ops.ts); [driver/telemetry.ts](driver/telemetry.ts).
+
 ### Nested `durable` transactions throw
 
 **What it is.** `tx.transaction(fn, { durable: true })` throws `A durable transaction cannot run inside another transaction`.
@@ -789,7 +957,7 @@ Before, throughput was capped at `max` lookups per round trip (10 per 6 ms at 5 
 
 **Cost.** It can't detect an outer transaction held on another pooled connection (`db` used inside `db.transaction`); that would need `AsyncLocalStorage`.
 
-**Code.** [driver-executor.ts](driver-executor.ts) `transaction`.
+**Code.** `transaction` in [driver-executor.ts](driver-executor.ts), which passes `durable` to the driver; the check in [driver/transaction.ts](driver/transaction.ts).
 
 ## Type-level tricks
 
@@ -805,7 +973,7 @@ Before, throughput was capped at `max` lookups per round trip (10 per 6 ms at 5 
 
 ### A class per column modifier state
 
-**What it is.** `Column`, `DefaultColumn`, `GeneratedColumn`, `IdentityColumn` and their nullable variants are separate classes; each has only the modifiers valid in its state ([column/README.md](column/README.md)).
+**What it is.** `Column`, `IntegerColumn`, `DefaultColumn`, `GeneratedColumn` and `IdentityColumn` are separate classes; each has only the modifiers valid in its state, and each modifier returns the class of the next state. Nullability isn't a state of its own: it changes the value types, and `nullable()` keeps the class (`IntegerColumn`'s returns a plain `Column`, so a nullable column can't become an identity) ([column/README.md](column/README.md#the-modifier-state-machine)).
 
 **Why.** Invalid combinations (`identity().nullable()`, `default().generated()`) can't be written, and autocomplete shows what's valid. Columns are not null by default.
 
@@ -889,19 +1057,19 @@ The report is plain data (`report.diagnostics`, `report.summary`), and renderers
 
 ### Call sites captured eagerly, formatted lazily
 
-**What it is.** `defineTable` and the column factories record where they were called (`Error.captureStackTrace` into an object), and the stack is only turned into a file and line when a diagnostic needs it.
+**What it is.** `defineTable` and the column factories record where they were called (`Error.captureStackTrace` into an object, with `stackTraceLimit` set to 1 so a single frame is captured), and the stack is only turned into a file and line when a diagnostic needs it ([column/README.md](column/README.md#call-sites-remembering-where-things-were-declared)).
 
 **Why.** Diagnostics can point at the exact declaration, while a program that never runs `verify` pays only for an unformatted capture.
 
-**Cost.** Unavailable on engines without `Error.captureStackTrace`; then diagnostics show no location.
+**Cost.** A capture on every declaration, used or not. The location is the generated file's unless Node has loaded a source map for it (`findSourceMap`), in which case it is mapped back to the source.
 
 **Code.** [call-site.ts](call-site.ts).
 
 ### The CLI: config as code, re-launched for TypeScript, distinct exit codes
 
-**What it is.** `quarry verify` loads a `quarry.config.ts` that exports a real `Database`; to load TypeScript on older Node versions it re-launches itself with Node's type stripping; it exits with different codes for "schema differs" and "couldn't check" ([cli/README.md](cli/README.md)).
+**What it is.** `quarry verify` loads a `quarry.config.ts` that exports a real `Database`; Node (24.11 and later, per `engines`) strips TypeScript types by default, and only when `process.features.typescript` is false does the CLI re-launch itself with `--experimental-strip-types`; it exits with different codes for "schema differs" and "couldn't check" ([cli/README.md](cli/README.md)).
 
-**Why.** The CLI connects exactly as your application does, with no second way to configure a connection; re-launching avoids bundling a TypeScript loader (and on current Node versions does nothing); CI can tell a drifted schema from a broken pipeline.
+**Why.** The CLI connects exactly as your application does, with no second way to configure a connection; Node's own type stripping avoids bundling a TypeScript loader; CI can tell a drifted schema from a broken pipeline.
 
 The command itself is a function, `runCli(argv, io)`, taking its output streams, working directory, environment and config loader through an `Io` object, so it is tested without spawning processes.
 

@@ -6,17 +6,17 @@ It assumes basic TypeScript and nothing about databases or networking. [Part 1](
 
 The driver documentation:
 
-| Document                                 | Covers                                                                                                                                                      |
-| ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| this file                                | foundations, layers, files, the connection and its operations, the statement cache, pipelining and backpressure, PgBouncer, memory, timing, sockets, errors |
-| [protocol/README.md](protocol/README.md) | the wire protocol: message formats, the extended query protocol, the reader and the writer                                                                  |
-| [auth/README.md](auth/README.md)         | connecting: configuration, hosts and failover, TLS and certificates, startup, protocol negotiation, SCRAM, channel binding, md5, IAM passwords              |
-| [CODECS.md](CODECS.md)                   | codecs, built-ins, `arrayOf`, the registry, parameter OIDs, binary after describe, the type catalog                                                         |
-| [POOL.md](POOL.md)                       | the pool: slots, waiters, pipelining onto busy connections, adaptive depth, draining for exclusive callers, lifetimes, ending                               |
-| [TRANSACTIONS.md](TRANSACTIONS.md)       | transactions, savepoints, retries, and how BEGIN, COMMIT and batches are framed on the wire                                                                 |
-| [STREAMING.md](STREAMING.md)             | cursors and streams, COPY in and out, LISTEN/NOTIFY                                                                                                         |
-| [CANCELLATION.md](CANCELLATION.md)       | `AbortSignal`, client timeouts, cancel requests, statement and transaction timeouts                                                                         |
-| [DECISIONS.md](DECISIONS.md)             | every design decision and optimisation in the driver: what it is, why, the alternatives, the cost, the measured impact                                      |
+| Document                                 | Covers                                                                                                                                                                                           |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| this file                                | foundations, layers, files, the connection and its operations, notices, capabilities, the statement cache, pipelining and backpressure, PgBouncer, memory, timing and telemetry, sockets, errors |
+| [protocol/README.md](protocol/README.md) | the wire protocol: message formats, the extended query protocol, the reader and the writer                                                                                                       |
+| [auth/README.md](auth/README.md)         | connecting: configuration, hosts and failover, TLS and certificates, startup, protocol negotiation, SCRAM, channel binding, md5, IAM passwords                                                   |
+| [CODECS.md](CODECS.md)                   | codecs, built-ins, `arrayOf`, the registry, parameter OIDs, binary after describe, row decoders and nested objects, the type catalog                                                             |
+| [POOL.md](POOL.md)                       | the pool: slots, waiters, pipelining onto busy connections, adaptive depth and width, draining for exclusive callers, lifetimes, ending                                                          |
+| [TRANSACTIONS.md](TRANSACTIONS.md)       | transactions, savepoints, retries, and how BEGIN, COMMIT and batches are framed on the wire                                                                                                      |
+| [STREAMING.md](STREAMING.md)             | cursors and streams, COPY in and out, LISTEN/NOTIFY                                                                                                                                              |
+| [CANCELLATION.md](CANCELLATION.md)       | `AbortSignal`, client timeouts, cancel requests, statement and transaction timeouts                                                                                                              |
+| [DECISIONS.md](DECISIONS.md)             | every design decision and optimisation in the driver: what it is, why, the alternatives, the cost, the measured impact                                                                           |
 
 ## Contents
 
@@ -24,12 +24,16 @@ The driver documentation:
 - [Part 2: Layers](#part-2-layers)
 - [Part 3: Every file in `src/driver/`](#part-3-every-file-in-srcdriver)
 - [Part 4: The connection](#part-4-the-connection)
+  - [The op queue](#the-op-queue)
+  - [Notices and notifications](#notices-and-notifications)
+  - [Capabilities and server parameters](#capabilities-and-server-parameters)
 - [Part 5: Operations](#part-5-operations)
 - [Part 6: The prepared-statement cache](#the-prepared-statement-cache)
 - [Part 7: Pipelining](#pipelining)
 - [Part 8: Behind PgBouncer](#part-8-behind-pgbouncer)
 - [Part 9: Memory and allocation](#part-9-memory-and-allocation)
 - [Part 10: Timing and telemetry](#timing)
+  - [Spans](#spans)
 - [Part 11: Sockets](#part-11-sockets)
 - [Part 12: Errors](#errors)
 - [Part 13: The driver knows nothing about quarry](#the-driver-knows-nothing-about-quarry)
@@ -102,7 +106,7 @@ flowchart TD
     Sock <--> PG
 ```
 
-- **Socket**: moves bytes. The rest of the driver only uses the small `DriverSocket` interface, so it runs anywhere a socket can be provided.
+- **Socket**: moves bytes. The rest of the driver only uses the small `DriverSocket` interface: Node's `net`/`tls` by default, or a custom transport or test double passed as the `socket` option ([Part 11](#part-11-sockets)).
 - **Protocol**: turns messages into bytes (`Writer`, `frontend.ts`) and bytes into messages (`Reader`).
 - **Codecs**: turn JavaScript values into parameter bytes and result bytes into JavaScript values.
 - **Ops**: one queued request each (a query, a cursor, a COPY): what it writes, and how it reacts to each reply message.
@@ -111,36 +115,36 @@ flowchart TD
 
 ## Part 3: Every file in `src/driver/`
 
-| File                               | What it does                                                                                                                                                                                                |
-| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [index.ts](index.ts)               | The public API of `quarry/driver`.                                                                                                                                                                          |
-| [connect.ts](connect.ts)           | `connect()`, `openConnection()`: hosts in turn, TLS plans, protocol-version retry, connect timeout, cancel requests. [auth/README.md](auth/README.md)                                                       |
-| [config.ts](config.ts)             | `ConnectionOptions`, connection-string parsing, `PG*` environment variables, `resolveConfig`, `.pgpass`. [auth/README.md](auth/README.md#configuration)                                                     |
-| [connection.ts](connection.ts)     | `Connection`: startup and authentication, the op queue, flushing, dispatching replies, the statement cache, `query`/`queryGroup`/`simpleQuery`/`describe`/`cursor`/`copy*`/`listen`, cancellation, closing. |
-| [ops.ts](ops.ts)                   | The operations: `Op`, `QueryOp`, `SyncGroupOp`, `SimpleQueryOp`, `DescribeOp`, `CursorOp`, `FetchOp`, `ClosePortalOp`, `CopyFromOp`, `CopyToOp`; `QueryResult`, `OpTiming`, `Statement`.                    |
-| [cursor.ts](cursor.ts)             | `CursorIterator`: one run of a cursor (opening, serialised `next()`, `return()`, `statementTimeout`, aborts). [STREAMING.md](STREAMING.md#cursors)                                                          |
-| [row-stream.ts](row-stream.ts)     | `RowStream`: rows one at a time over a cursor's batches; async iterable and disposable.                                                                                                                     |
-| [queue.ts](queue.ts)               | `Queue<T>`: a FIFO that keeps its array's capacity.                                                                                                                                                         |
-| [pool.ts](pool.ts)                 | `Pool`, `PoolClient`, `createPool`, the adaptive `Depth`, the pool's LISTEN connection. [POOL.md](POOL.md)                                                                                                  |
-| [transaction.ts](transaction.ts)   | `Transaction`, `Session`, `TransactionRolledBack`, `Transaction.run`/`batch`. [TRANSACTIONS.md](TRANSACTIONS.md)                                                                                            |
-| [protocol/](protocol/README.md)    | `frontend.ts` (client messages), `writer.ts`, `reader.ts`, `messages.ts` (server message types), `text.ts` (UTF-8 helpers).                                                                                 |
-| [auth/](auth/README.md)            | `scram.ts` (SCRAM-SHA-256, channel binding, SASLprep), `md5.ts`, `encoding.ts` (base64, UTF-8, hex).                                                                                                        |
-| [codec.ts](codec.ts)               | The `Codec` interface, `defineCodec`, `arrayOf`, `declareParamType`, `typed`/`TypedValue`. [CODECS.md](CODECS.md)                                                                                           |
-| [codecs.ts](codecs.ts)             | The built-in codecs (`codecs`) and `defaultCodecs`.                                                                                                                                                         |
-| [registry.ts](registry.ts)         | `CodecRegistry` (codec by type OID), `TypeCatalog` (types looked up by name), `catalogQuery`.                                                                                                               |
-| [params.ts](params.ts)             | `encodeParams`, `paramOids`: encoding a query's parameters and choosing the OIDs to declare.                                                                                                                |
-| [results.ts](results.ts)           | Result plans: which codec and format each column is read with, cached per statement.                                                                                                                        |
-| [rows.ts](rows.ts)                 | Row decoders: generated JavaScript per result shape, and a fallback.                                                                                                                                        |
-| [binary.ts](binary.ts)             | Binary-format decoders (`int4`, `float8`, `timestamptz`, `numeric`, `uuid`, `jsonb`, `vector`, arrays).                                                                                                     |
-| [array-params.ts](array-params.ts) | `binaryArray`: encoding arrays of common types in binary.                                                                                                                                                   |
-| [types.ts](types.ts)               | Text helpers: OID tables, `parseArray`, `parseBytea`, `formatTimestamp`, `encodeParam`, COPY text format.                                                                                                   |
-| [parsers.ts](parsers.ts)           | Text parsers: `parseTimestamptz`, `parseRange`, `vectorValues`.                                                                                                                                             |
-| [capabilities.ts](capabilities.ts) | `Capabilities`, PgBouncer detection, `statementNames`, the PostgreSQL 18 check.                                                                                                                             |
-| [errors.ts](errors.ts)             | Every error class and `postgresError()`.                                                                                                                                                                    |
-| [notice.ts](notice.ts)             | `Notice` and `Notification` shapes.                                                                                                                                                                         |
-| [telemetry.ts](telemetry.ts)       | OpenTelemetry-compatible spans, without depending on OpenTelemetry.                                                                                                                                         |
-| [socket.ts](socket.ts)             | The `DriverSocket` and `SocketFactory` interfaces.                                                                                                                                                          |
-| [node-socket.ts](node-socket.ts)   | Sockets on `node:net`/`node:tls`.                                                                                                                                                                           |
+| File                               | What it does                                                                                                                                                                                                                                          |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [index.ts](index.ts)               | The public API of `quarry/driver`.                                                                                                                                                                                                                    |
+| [connect.ts](connect.ts)           | `connect()`, `openConnection()`: hosts in turn, TLS plans, protocol-version retry, connect timeout, cancel requests. [auth/README.md](auth/README.md)                                                                                                 |
+| [config.ts](config.ts)             | `ConnectionOptions`, connection-string parsing, `PG*` environment variables, `resolveConfig`, `.pgpass`. [auth/README.md](auth/README.md#configuration)                                                                                               |
+| [connection.ts](connection.ts)     | `Connection`: startup and authentication, the op queue, flushing, dispatching replies, the statement cache, `query`/`queryGroup`/`simpleQuery`/`describe`/`cursor`/`copy*`/`listen`, notices, `capabilities`, telemetry spans, cancellation, closing. |
+| [ops.ts](ops.ts)                   | The operations: `Op`, `QueryOp`, `SyncGroupOp`, `SimpleQueryOp`, `DescribeOp`, `CursorOp`, `FetchOp`, `ClosePortalOp`, `CopyFromOp`, `CopyToOp`; `QueryResult`, `OpTiming`, `Statement`, `Description`, `parseTag`, `STATEMENT_TIMEOUT`.              |
+| [cursor.ts](cursor.ts)             | `CursorIterator`: one run of a cursor (opening, serialised `next()`, `return()`, `statementTimeout`, aborts). [STREAMING.md](STREAMING.md#cursors)                                                                                                    |
+| [row-stream.ts](row-stream.ts)     | `RowStream`: rows one at a time over a cursor's batches; async iterable and disposable.                                                                                                                                                               |
+| [queue.ts](queue.ts)               | `Queue<T>`: a FIFO that keeps its array's capacity ([the op queue](#the-op-queue)).                                                                                                                                                                   |
+| [pool.ts](pool.ts)                 | `Pool`, `PoolClient`, `createPool`, the adaptive `Depth` and `Width`, the pool's LISTEN connection. [POOL.md](POOL.md)                                                                                                                                |
+| [transaction.ts](transaction.ts)   | `Transaction`, `Session`, `TransactionRolledBack`, `Transaction.run`/`batch`. [TRANSACTIONS.md](TRANSACTIONS.md)                                                                                                                                      |
+| [protocol/](protocol/README.md)    | `frontend.ts` (client messages), `writer.ts`, `reader.ts`, `messages.ts` (server message types), `text.ts` (UTF-8 helpers).                                                                                                                           |
+| [auth/](auth/README.md)            | `scram.ts` (SCRAM-SHA-256, channel binding, SASLprep), `md5.ts`, `encoding.ts` (base64, UTF-8, hex).                                                                                                                                                  |
+| [codec.ts](codec.ts)               | The `Codec` interface, `defineCodec`, `arrayOf`, `declareParamType`, `typed`/`TypedValue`. [CODECS.md](CODECS.md)                                                                                                                                     |
+| [codecs.ts](codecs.ts)             | The built-in codecs (`codecs`) and `defaultCodecs`.                                                                                                                                                                                                   |
+| [registry.ts](registry.ts)         | `CodecRegistry` (codec by type OID), `TypeCatalog` (types looked up by name), `catalogQuery`.                                                                                                                                                         |
+| [params.ts](params.ts)             | `encodeParams`, `paramOids`: encoding a query's parameters and choosing the OIDs to declare.                                                                                                                                                          |
+| [results.ts](results.ts)           | Result plans: which codec and format each column is read with, cached per statement.                                                                                                                                                                  |
+| [rows.ts](rows.ts)                 | Row decoders: generated JavaScript per result shape, and a fallback.                                                                                                                                                                                  |
+| [binary.ts](binary.ts)             | Binary-format decoders (`int4`, `float8`, `timestamptz`, `numeric`, `uuid`, `jsonb`, `vector`, arrays).                                                                                                                                               |
+| [array-params.ts](array-params.ts) | `binaryArray`: encoding arrays of common types in binary.                                                                                                                                                                                             |
+| [types.ts](types.ts)               | Text helpers: OID tables, `parseArray`, `parseBytea`, `formatTimestamp`, `encodeParam`, COPY text format.                                                                                                                                             |
+| [parsers.ts](parsers.ts)           | Text parsers: `parseTimestamptz`, `parseRange`, `vectorValues`.                                                                                                                                                                                       |
+| [capabilities.ts](capabilities.ts) | `Capabilities`, PgBouncer detection, `statementNames`, the PostgreSQL 18 check.                                                                                                                                                                       |
+| [errors.ts](errors.ts)             | Every error class and `postgresError()`.                                                                                                                                                                                                              |
+| [notice.ts](notice.ts)             | `Notice` and `Notification` shapes, `toNotice`. [Notices and notifications](#notices-and-notifications)                                                                                                                                               |
+| [telemetry.ts](telemetry.ts)       | OpenTelemetry-compatible spans (`startQuerySpan`, `TracerLike`, `SpanLike`, `TelemetryOptions`), without depending on OpenTelemetry. [Part 10](#timing)                                                                                               |
+| [socket.ts](socket.ts)             | The `DriverSocket` and `SocketFactory` interfaces, `SocketConnectOptions`, `TlsConnectOptions`.                                                                                                                                                       |
+| [node-socket.ts](node-socket.ts)   | `nodeSockets`, the default `SocketFactory` on `node:net`/`node:tls`, and `preloadNodeSockets`.                                                                                                                                                        |
 
 ## Part 4: The connection
 
@@ -207,13 +211,28 @@ sequenceDiagram
 
 `query()` → `#query()`:
 
-1. A server-side `statementTimeout` takes a separate path ([CANCELLATION.md](CANCELLATION.md#statement-timeouts)).
+1. A server-side `statementTimeout` takes a separate path, `#queryWithTimeout`: three statements under one Sync, as one `SyncGroupOp` (set the timeout with `STATEMENT_TIMEOUT`, the query, restore it with the same statement), so the setting bounds this query alone, in a transaction or not ([CANCELLATION.md](CANCELLATION.md#statement-timeouts)).
 2. `invalidSql(sql)`: the SQL must be a string without NUL bytes (Postgres text can't contain them).
 3. `encodeParams` and `paramOids` ([CODECS.md](CODECS.md#encoding-a-querys-parameters)).
 4. A `QueryOp` is built and `#enqueue`d. `#enqueue` fails it at once if the connection is closed or the signal is already aborted; otherwise it pushes it, schedules a flush, and wires the signal and the client timeout ([CANCELLATION.md](CANCELLATION.md)).
 5. If the type catalog isn't loaded yet and this query needs it, `#loadTypesAfter` starts loading it, queued **behind** this query ([CODECS.md](CODECS.md#types-looked-up-by-name-the-catalog)).
 
-A performance detail: `#query` creates its promise with a **shared executor function** (`capture`) that stores `resolve`/`reject` in module variables, rather than an arrow function closing over the op. A closure per query would allocate a function and its context every time; this allocates neither. The same care (no closures, no spreads, index loops) shows in other per-query code; comments mark it.
+A performance detail: `#query` creates its promise with a **shared executor function** (`capture`) that stores `resolve`/`reject` in module variables, rather than an arrow function closing over the op. A closure per query would allocate a function and its context every time; this allocates neither. `#query` reads the two variables right after and **resets them to a no-op** (#36): left set, they kept the latest query's promise, and with it its result rows, reachable until the next query, which on a connection that then sits idle holds the last big result in memory for nothing.
+
+```ts
+const promise = new Promise<QueryResult<unknown>>(capture);
+const resolve = capturedResolve;
+const reject = capturedReject;
+capturedResolve = noop;
+capturedReject = noop;
+```
+
+The same care (no closures, no spreads, index loops) shows in other per-query code; comments mark it.
+
+### The op queue
+
+<a id="the-op-queue"></a>
+The connection's ops wait in a `Queue<Op>` ([queue.ts](queue.ts)), not a plain array: `push` and then `shift` on a short array makes V8 reallocate its storage each time, so a connection running one query at a time would make garbage on every query. `Queue` keeps one array with a head and a tail index: `shift` clears the slot and moves the head; when the queue empties, both go back to 0, and in a pipeline that never empties, the items are moved down once the head passes 1024 and half the array. `at(i)` is how the connection reads the op at the head and the next one to write (`#written`); `indexOf` and `removeAt` drop an op aborted before it was written (or one that couldn't be encoded), `find` picks the next aborted op to hold writes for, and `drain()` empties the queue when the connection fails.
 
 ### Writing: the flush
 
@@ -258,7 +277,7 @@ A performance detail: `#query` creates its promise with a **shared executor func
 ### Backpressure
 
 <a id="backpressure"></a>
-`#send(bytes)` calls `socket.write`, which returns `false` when the runtime's send buffer is over its high-water mark. The connection then sets `#backpressure`, and `#flush` encodes nothing more: queued ops stay as objects, **not yet encoded**, so a burst of ten thousand queries (or a few with huge parameters) doesn't become ten thousand encoded buffers in memory. When the socket emits `drain`, `onDrain` clears the flag, wakes ops waiting on `ctx.drain()` (COPY), and reschedules the flush.
+`#send(bytes)` calls `socket.write`, which returns `false` when the socket's send buffer is over its high-water mark. The connection then sets `#backpressure`, and `#flush` encodes nothing more: queued ops stay as objects, **not yet encoded**, so a burst of ten thousand queries (or a few with huge parameters) doesn't become ten thousand encoded buffers in memory. When the socket emits `drain`, `onDrain` clears the flag, wakes ops waiting on `ctx.drain()` (COPY), and reschedules the flush.
 
 ### Reading replies
 
@@ -297,6 +316,34 @@ A message with no op in flight is either an error the server sends on its own (a
 
 `onDone` is how the pool learns a query finished without a promise of its own per query: the connection calls it **before** callbacks on the query's promise run, so a pool can lend the connection to the next query before the caller's continuation issues its own.
 
+### Notices and notifications
+
+<a id="notices-and-notifications"></a>
+The server sends two kinds of message that answer no request:
+
+- **NoticeResponse**: a warning or an informational message (`RAISE NOTICE` in a function, "there is no transaction in progress" for a stray `commit`). It has the same fields as an error. [notice.ts](notice.ts) `toNotice` turns them into a `Notice`: `severity` (the non-localized `V` field, else `S`, else `NOTICE`), `code` (the SQLSTATE, `00000` when absent), `message`, `detail`, `hint`, `where`, and every field as sent in `fields`.
+- **NotificationResponse**: a `NOTIFY` on a channel this session listens to, as a `Notification`: `pid` (the notifying backend), `channel`, `payload`.
+
+Either can arrive in the middle of any op's replies, so `#dispatch` and the fast path in `#onData` hand them to listeners **before** looking at the head of the queue, and the op never sees them. Listeners subscribe two ways: the `onNotice` and `onNotification` connection options (on a pool: every connection it opens), or `connection.onNotice(listener)` and `connection.onNotification(listener)`, which return a function that unsubscribes. `listen(channel, listener)` adds a listener for one channel ([STREAMING.md](STREAMING.md#listen-and-notify)). A listener that throws doesn't break the connection: the error is rethrown in a microtask (`queueMicrotask`), where it surfaces as an uncaught exception rather than inside the reader's loop. Without listeners, notices are dropped.
+
+### Capabilities and server parameters
+
+<a id="capabilities-and-server-parameters"></a>
+What a connection learned at startup stays readable on it:
+
+| Getter                        | What                                                                                                                                             |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `capabilities`                | `Capabilities` ([capabilities.ts](capabilities.ts)): `protocol` (`3.2`), `protocolMinor`, `serverVersion`, `saslMechanisms` offered, `pgbouncer` |
+| `parameters`                  | every ParameterStatus the server reported (`server_version`, `TimeZone`, `in_hot_standby`, …), kept up to date after startup                     |
+| `protocol`                    | the negotiated protocol version                                                                                                                  |
+| `unrecognizedProtocolOptions` | `_pq_.*` options the server didn't recognize (from NegotiateProtocolVersion)                                                                     |
+| `processId`                   | the backend's process ID (from BackendKeyData)                                                                                                   |
+| `host`                        | the host this connection reached                                                                                                                 |
+| `transactionStatus`           | `idle`, `transaction` or `failed`, from the last ReadyForQuery                                                                                   |
+| `pending`, `closed`           | ops queued or in flight; whether it is closed or closing                                                                                         |
+
+`capabilities` is computed once, at the startup ReadyForQuery, right after the PostgreSQL 18 check (`checkServerVersion`, `EVERSION` below 18; a version a pooler hides passes), and is a snapshot: later ParameterStatus messages update `parameters` but not it. `pgbouncer` (`PgBouncerInfo`: `version`, `poolMode`, `maxPreparedStatements`) is read from the parameters PgBouncer 1.26+ reports, and decides how statements are named ([Part 8](#part-8-behind-pgbouncer)). The sequence is in [auth/README.md](auth/README.md#after-startup-version-check-and-capabilities).
+
 ### Closing
 
 `close()` sets `#ending` (no new work), waits until the queue is empty (`idle()`), writes **Terminate**, and ends the socket. Like libpq, it doesn't wait for the server to close its side (that would wait for the backend process to exit, about a millisecond). `close({ timeout })` fails what's still running after the timeout. `destroy()` fails everything immediately.
@@ -309,13 +356,14 @@ A message with no op in flight is either an error the server sends on its own (a
 abstract class Op {
   written = false;
   done = false;
-  readonly exclusive: boolean = false;
+  exclusive = false; // later ops wait until it completes; read once it is written
   canceledBy: 'abort' | 'timeout' | undefined;
   onTiming;
   onDone;
   queuedAt;
   writtenAt;
   dataRow(bytes, start, end): boolean; // the DataRow fast path; false if not accepted
+  interrupt(reason, cause): boolean; // stop a written op the server isn't running, without a cancel request
   get prepares(): number; // statements it may write named
   abstract write(ctx: OpContext): void; // append its messages to ctx.writer
   abstract handle(msg, ctx): boolean; // true when complete (its ReadyForQuery)
@@ -323,7 +371,7 @@ abstract class Op {
 }
 ```
 
-`OpContext` is what an op may use on its connection: the writer, the registry and catalog, the statement cache (`statement`, `forget`, `unprepare`, `preparable`), the naming decision (`named`), `send` and `drain` for ops that talk after being written, `pause`/`resume` for COPY backpressure, and `retry` to requeue a replacement op.
+`OpContext` is what an op may use on its connection: the writer, the registry and catalog, `specs` (how results are read where a query names no codecs, with and without binary), the statement cache (`statement`, `forget`, `unprepare`, `preparable`), the naming decision (`named`), `send` and `drain` for ops that talk after being written, `pause`/`resume` for COPY backpressure, and `retry` to requeue a replacement op.
 
 | Op                         | Messages written                                                                                                                                                             | Used by                                                             |
 | -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
@@ -377,7 +425,7 @@ flowchart TD
 ### Nested objects
 
 <a id="nested-objects"></a>
-With a query's `nested` option (quarry's `nest`), the generated decoder writes some columns into an object of the row instead of the row itself. The object takes the place of its marker column. The row literal starts it as `null`; a `true` marker stores a fresh literal of nulls (`{ "id": null, "name": null }`), and each of the object's non-NULL columns is stored into it (`row["bookings"]["id"] = …`). A missing row (marker false, every column NULL) allocates nothing. The marker must come before its columns (`checkNested`). The decoder is cached on the plan per row mode and nesting, and without generated code the same layout is built from the values array.
+With a query's `nested` option (quarry's `nest`, #44), the generated decoder writes some columns into an object of the row instead of the row itself. The object takes the place of its marker column. The row literal starts it as `null`; a `true` marker stores a fresh literal of nulls (`{ "id": null, "name": null }`), and each of the object's non-NULL columns is stored into it (`row["bookings"]["id"] = …`). A missing row (marker false, every column NULL) allocates nothing. The marker must come before its columns (`checkNested`, when the query is issued). The decoder is cached on the plan per row mode and nesting, and without generated code the same layout is built from the values array. [CODECS.md](CODECS.md#nested-objects) shows the generated code.
 
 ### Decode errors
 
@@ -419,7 +467,7 @@ The same SQL with different declared parameter types is a different server-side 
 ### Errors and stale statements
 
 - **Parse failed** (a syntax error): the statement records its error and is dropped from the cache. If other queries with the same SQL were pipelined behind it, their Binds reference a statement that doesn't exist and get "prepared statement does not exist" (`26000`); `#onError` reports the original Parse error to them instead, which is the error you'd want to see.
-- **Stale statement** (`staleStatement` in [ops.ts](ops.ts)): a schema change made the cached plan invalid, reported as `0A000` from `RevalidateCachedQuery` ("cached plan must not change result type"), a `42804` from `transformAssignedExpr` (a parameter type inferred from a column that changed type), or `26000` from `FetchPreparedStatement` (the server no longer has it: `DEALLOCATE`, `DISCARD ALL`). Outside a transaction (`status === 'I'`, since inside one the error has already failed the transaction), the op drops the statement and **retries once unprepared**, transferring its `onDone` to the retry so the caller sees one query. Inside a transaction the error is reported.
+- **Stale statement** (`staleStatement` in [ops.ts](ops.ts)): a schema change made the cached plan invalid, reported as `0A000` from `RevalidateCachedQuery` ("cached plan must not change result type"), a `42804` from `transformAssignedExpr` (a parameter type inferred from a column that changed type), or `26000` from `FetchPreparedStatement` (the server no longer has it: `DEALLOCATE`, `DISCARD ALL`). Outside a transaction (`status === 'I'`, since inside one the error has already failed the transaction), the op drops the statement and **retries once unprepared**, transferring its `onDone` to the retry so the caller sees one query. Inside a transaction the error is reported. So is it for a statement of a group (`queryGroup`: a BEGIN with its first statement, a batch, a statement timeout's three statements), whose later statements the server skipped after the error, and for one already sent unnamed.
 - **Unprepare**: if even a **fresh** Parse of the SQL got a stale plan, a pooler is mapping it back to a server-side statement prepared before the schema change (PgBouncer does this). The SQL is added to `#unprepared` and is never named again on this connection.
 
 ## Part 7: Pipelining
@@ -474,23 +522,24 @@ Other poolers and proxies (RDS Proxy, Supavisor, Neon) follow the same rules; [R
 
 A driver runs the same code millions of times; small allocations per query or per row become **garbage collection** (GC) pauses, which show up as tail latency (p99). The driver is written to allocate little:
 
-| Where                                           | What                                                                                                                                                                      | Why                                                                                                                                                        |
-| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [protocol/reader.ts](protocol/reader.ts)        | Messages are read **in place** from the received chunk; only a message split across two chunks is copied, into a buffer of exactly its size; consumed chunks are released | no re-copying when joining chunks, so large rows and COPY data stay linear, and an idle connection holds no old buffer                                     |
-| [protocol/writer.ts](protocol/writer.ts)        | One growable buffer per connection; a buffer that grew past 1 MiB for one message is handed to the socket and replaced, not copied or kept                                | big parameters don't pin a large buffer for the connection's lifetime                                                                                      |
-| [protocol/writer.ts](protocol/writer.ts) `take` | Small writes are copied into a Node `Buffer` from its shared pool                                                                                                         | Node's socket takes a `Buffer` without wrapping it                                                                                                         |
-| [protocol/reader.ts](protocol/reader.ts)        | Messages without fields (ParseComplete, BindComplete, …) and ReadyForQuery are shared constant objects; the last command tag string is reused                             | several messages per query, none allocated                                                                                                                 |
-| [rows.ts](rows.ts)                              | Rows decoded straight into an object literal by generated code; no intermediate values array                                                                              | one allocation per row, and every row has the same hidden class                                                                                            |
-| [rows.ts](rows.ts)                              | Generated functions of at most 8 columns each; the cache of generated sources dropped past 4 M characters                                                                 | V8's optimizing compiler needs memory superlinear in function size: one function for 100 columns cost ~70 MB of native memory, 8-column pieces under 10 MB |
-| [queue.ts](queue.ts)                            | A FIFO that keeps its array (head/tail indexes)                                                                                                                           | `push` then `shift` on a short array reallocates its storage every time                                                                                    |
-| [connection.ts](connection.ts)                  | Shared promise executor; default query options computed once; no closures per query                                                                                       | no function contexts per query                                                                                                                             |
-| [pool.ts](pool.ts)                              | Slot state in fields, not sets of busy connections; per-connection callbacks made once                                                                                    | adding/removing from a set on every query rehashes it                                                                                                      |
-| [connection.ts](connection.ts)                  | Statement cache uses use stamps, not reordering                                                                                                                           | no `Map` rehash per hit                                                                                                                                    |
-| [binary.ts](binary.ts), [rows.ts](rows.ts)      | `bytea` values and undecoded binary columns are **copied** out of the read buffer                                                                                         | a row must never keep the whole read buffer alive or alias it                                                                                              |
-| [connection.ts](connection.ts) flush            | Queued ops stay unencoded while the socket is full                                                                                                                        | memory bounded by the socket, not by the queue length                                                                                                      |
-| [ops.ts](ops.ts) `CopyToOp`                     | Pauses the socket past a high-water mark                                                                                                                                  | COPY output can't outrun the consumer                                                                                                                      |
-| [ops.ts](ops.ts) `CursorOp`                     | Fetches `batchSize` rows at a time, only when the consumer asks                                                                                                           | a large result never sits in memory at once                                                                                                                |
-| [protocol/reader.ts](protocol/reader.ts)        | `maxMessageSize` (default 1 GiB, Postgres's own field limit)                                                                                                              | a corrupt length can't make the driver allocate without bound                                                                                              |
+| Where                                           | What                                                                                                                                                                                             | Why                                                                                                                                                        |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [protocol/reader.ts](protocol/reader.ts)        | Messages are read **in place** from the received chunk; only a message split across two chunks is copied, into a buffer of exactly its size; consumed chunks are released                        | no re-copying when joining chunks, so large rows and COPY data stay linear, and an idle connection holds no old buffer                                     |
+| [protocol/writer.ts](protocol/writer.ts)        | One growable buffer per connection; a buffer that grew past 1 MiB for one message is handed to the socket and replaced, not copied or kept                                                       | big parameters don't pin a large buffer for the connection's lifetime                                                                                      |
+| [protocol/writer.ts](protocol/writer.ts) `take` | Small writes are copied into a Node `Buffer` from its shared pool                                                                                                                                | Node's socket takes a `Buffer` without wrapping it                                                                                                         |
+| [protocol/reader.ts](protocol/reader.ts)        | Messages without fields (ParseComplete, BindComplete, …) and ReadyForQuery are shared constant objects; the last command tag string is reused                                                    | several messages per query, none allocated                                                                                                                 |
+| [rows.ts](rows.ts)                              | Rows decoded straight into an object literal by generated code; no intermediate values array                                                                                                     | one allocation per row, and every row has the same hidden class                                                                                            |
+| [protocol/text.ts](protocol/text.ts) `utf8`     | Text values decoded with `Buffer#utf8Slice` straight from the read buffer (#45); a plain `Uint8Array` builds short ASCII runs (up to 24 bytes) in JavaScript and uses `TextDecoder` for the rest | `toString('utf8', start, end)` checks its arguments and looks up the encoding before making the same native call, on every value                           |
+| [rows.ts](rows.ts)                              | Generated functions of at most 8 columns each; the cache of generated sources dropped past 4 M characters                                                                                        | V8's optimizing compiler needs memory superlinear in function size: one function for 100 columns cost ~70 MB of native memory, 8-column pieces under 10 MB |
+| [queue.ts](queue.ts)                            | A FIFO that keeps its array (head/tail indexes)                                                                                                                                                  | `push` then `shift` on a short array reallocates its storage every time                                                                                    |
+| [connection.ts](connection.ts)                  | Shared promise executor, whose captured resolvers are reset after each query (#36); default query options computed once; no closures per query                                                   | no function contexts per query, and no finished result kept alive by the executor                                                                          |
+| [pool.ts](pool.ts)                              | Slot state in fields, not sets of busy connections; per-connection callbacks made once                                                                                                           | adding/removing from a set on every query rehashes it                                                                                                      |
+| [connection.ts](connection.ts)                  | Statement cache uses use stamps, not reordering                                                                                                                                                  | no `Map` rehash per hit                                                                                                                                    |
+| [binary.ts](binary.ts), [rows.ts](rows.ts)      | `bytea` values and undecoded binary columns are **copied** out of the read buffer                                                                                                                | a row must never keep the whole read buffer alive or alias it                                                                                              |
+| [connection.ts](connection.ts) flush            | Queued ops stay unencoded while the socket is full                                                                                                                                               | memory bounded by the socket, not by the queue length                                                                                                      |
+| [ops.ts](ops.ts) `CopyToOp`                     | Pauses the socket past a high-water mark                                                                                                                                                         | COPY output can't outrun the consumer                                                                                                                      |
+| [ops.ts](ops.ts) `CursorOp`                     | Fetches `batchSize` rows at a time, only when the consumer asks                                                                                                                                  | a large result never sits in memory at once                                                                                                                |
+| [protocol/reader.ts](protocol/reader.ts)        | `maxMessageSize` (default 1 GiB, Postgres's own field limit)                                                                                                                                     | a corrupt length can't make the driver allocate without bound                                                                                              |
 
 The benchmarks behind these choices live in `bench/driver` (`pnpm bench:driver`).
 
@@ -499,8 +548,34 @@ The benchmarks behind these choices live in `bench/driver` (`pnpm bench:driver`)
 <a id="timing"></a>
 
 - **`onTiming`** (a query option): when set, the op records `queuedAt` when queued and `writtenAt` when written, and on settling reports `{ queuedMs, execMs }`: time waiting behind other ops on the connection, and time from being written to finishing (server work, transfer and decoding). quarry's `onQuery` uses it ([../EXECUTION.md](../EXECUTION.md#onquery-events)). Unset, nothing is timed.
-- **`telemetry: { tracer }`** ([telemetry.ts](telemetry.ts)): each query becomes an OpenTelemetry-style client span (kind client, `db.system.name: postgresql`, the operation name from the SQL's first keyword, `db.query.summary` from the tag, the SQL text unless `queryText: false`, the row count, the SQLSTATE on error). The driver defines the few interfaces it calls (`TracerLike`, `SpanLike`) instead of depending on `@opentelemetry/api`. Parameters are never recorded.
+- **`telemetry: { tracer, queryText? }`** ([telemetry.ts](telemetry.ts)): each statement becomes an OpenTelemetry client span, described below.
 - **`captureStack`**: appends the issuing code's stack to errors ("--- query issued at ---"). Off by default because quarry's executor does its own.
+
+With neither `telemetry` nor `captureStack` set, `query`, `queryThen`, `queryGroup`, `simpleQuery` and `copyFrom` go straight to their implementation; with either, they go through `#observe`, which takes the stack (an `Error` made before the query is issued), starts the span, and finishes both when the result settles.
+
+### Spans
+
+<a id="spans"></a>
+The connection option `telemetry` takes a `tracer` (`TracerLike`: `startSpan(name, { kind, attributes })` returning a `SpanLike` with `setAttribute`, `setStatus`, `recordException` and `end`). These are the parts of OpenTelemetry's `Tracer` and `Span` the driver calls, so `trace.getTracer('…')` from `@opentelemetry/api` fits without the driver depending on it. `startQuerySpan` follows OpenTelemetry's database conventions:
+
+| Attribute                   | Value                                                                                                                   |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| span name                   | the query's `tag` option (quarry's `tag()`), else `` `${operation} ${database}` `` (`SELECT app`)                       |
+| span kind                   | client (2)                                                                                                              |
+| `db.system.name`            | `postgresql`                                                                                                            |
+| `db.namespace`              | the database name                                                                                                       |
+| `db.operation.name`         | the SQL's first keyword, upper-cased, after any leading comments (`SELECT`, `INSERT`, `WITH`); `QUERY` if there is none |
+| `server.address`            | the host reached (a socket directory for a Unix socket)                                                                 |
+| `server.port`               | the port; omitted for a Unix socket                                                                                     |
+| `db.query.text`             | the SQL, with its placeholders; omitted with `queryText: false`                                                         |
+| `db.query.summary`          | the `tag` option, when there is one                                                                                     |
+| `db.response.returned_rows` | on success, the command tag's row count (for `simpleQuery`, the last statement's; for COPY FROM, the rows copied)       |
+| `db.response.status_code`   | on a server error, its SQLSTATE                                                                                         |
+| `error.type`                | on error, the SQLSTATE of a `PostgresError`, else the error's `name` (`ConnectionError`, `AbortError`, …)               |
+
+On error the span also records the exception and sets an error status with its message. **Parameters are never recorded**: they are where personal data and secrets go, and the SQL with placeholders already says what ran; `queryText: false` drops the SQL too, for applications whose SQL embeds literal values.
+
+What gets a span: `query` (also through `pool.query`; a query with a `statementTimeout` is one span, for its own SQL, not three), each statement of a `queryGroup` (a transaction sends its BEGIN, COMMIT and savepoint statements and its batches through `query` and `queryGroup`, so each statement gets one), `simpleQuery` (one span for the whole script), and `copyFrom`/`copyRows`. Cursors and streams, `copyTo`, `describe` and the catalog lookup aren't spanned.
 
 ## Part 11: Sockets
 
@@ -537,7 +612,7 @@ interface SocketFactory {
 
 ### Anything else
 
-Pass `socket: { connect(options) { … } }` to use your own transport (a test double, an SSH tunnel). The walkthrough's captures were made exactly this way ([../WALKTHROUGH.md](../WALKTHROUGH.md)).
+Pass `socket: { connect(options) { … } }` (a `SocketFactory`) to use your own transport (a test double, an SSH tunnel). `connect` receives `SocketConnectOptions`: the `target` (`{ kind: 'tcp', host, port }` or `{ kind: 'unix', path }`), `tls` for direct TLS (else `undefined`; `startTls` upgrades later), and the keepalive settings. The same factory opens the short connections that carry **cancel requests** ([CANCELLATION.md](CANCELLATION.md#the-cancel-request)), so cancellation goes through your transport too; and with a custom factory, `preloadSockets` loads nothing. `nodeSockets` (the default) is exported, so a factory can wrap it. The walkthrough's captures were made exactly this way ([../WALKTHROUGH.md](../WALKTHROUGH.md)).
 
 ## Part 12: Errors
 
@@ -572,15 +647,35 @@ classDiagram
 
 [errors.ts](errors.ts):
 
-- **`PostgresError`**: an error the **server** reported (ErrorResponse). It carries every field the server sent (`severity`, `code` (the five-character **SQLSTATE**, e.g. `23505`), `detail`, `hint`, `position`, `schema`, `table`, `column`, `constraint`, `routine`, …), all of them in `fields` keyed by protocol code, and the failing `query` (`{ sql, params }`), **non-enumerable** so logs don't print parameter values. `isRetryable` is true for `40001` and `40P01`; `isFatal` for FATAL/PANIC (the server ends the session).
-- `postgresError(fields)` picks the subclass by SQLSTATE (the `classes` table), falling back to `IntegrityConstraintViolation` for any class-23 code, then to `PostgresError`. `IntegrityConstraintViolation.columns` reads the column from the `column` field, or parses it from a `Key (a, b)=(…)` detail.
-- **`QueryCanceled`** (`57014`) has a `reason`: `'abort'` or `'timeout'` when this client asked for the cancel (the op recorded `canceledBy`), otherwise `'statement_timeout'` (the message says so) or `'user'` ([CANCELLATION.md](CANCELLATION.md)).
-- **`ConnectionError`**: the connection couldn't be opened, TLS or authentication failed on the client's side, or the socket closed. `code` carries the system error (`ECONNREFUSED`, `ETIMEDOUT`) or the driver's own (`EAUTHMETHOD`, `EPROTOCOL`, `EVERSION`).
+- **`PostgresError`**: an error the **server** reported (ErrorResponse). It carries every field the server sent (`severity`, `code` (the five-character **SQLSTATE**, e.g. `23505`), `detail`, `hint`, `position`, `internalPosition`, `internalQuery`, `where`, `schema`, `table`, `column`, `dataType`, `constraint`, `file`, `line`, `routine`), all of them in `fields` keyed by protocol code, and the failing `query` (`ErrorQuery`: `{ sql, params, tag? }`, the `tag` being the query's label), both **non-enumerable** so logs don't print parameter values. `isRetryable` is true for `40001` and `40P01`; `isFatal` for FATAL/PANIC (the server ends the session).
+- `postgresError(fields, query)` picks the subclass by SQLSTATE (the `classes` table), falling back to `IntegrityConstraintViolation` for any class-23 code, then to `PostgresError`. `IntegrityConstraintViolation.columns` reads the column from the `column` field, or parses the columns from a `Key (a, b)=(…)` detail (unquoting quoted names).
+
+| Class                          | SQLSTATE          | When                                                                                          |
+| ------------------------------ | ----------------- | --------------------------------------------------------------------------------------------- |
+| `IntegrityConstraintViolation` | any other `23xxx` | a constraint check failed; base of the five below                                             |
+| `UniqueViolation`              | `23505`           | a unique or primary-key constraint                                                            |
+| `ForeignKeyViolation`          | `23503`           | a foreign-key constraint                                                                      |
+| `NotNullViolation`             | `23502`           | a NOT NULL constraint                                                                         |
+| `CheckViolation`               | `23514`           | a CHECK constraint                                                                            |
+| `ExclusionViolation`           | `23P01`           | an exclusion constraint                                                                       |
+| `SerializationFailure`         | `40001`           | a serializable transaction conflicted with another; retry it                                  |
+| `DeadlockDetected`             | `40P01`           | this transaction was chosen to abort a deadlock; retry it                                     |
+| `LockNotAvailable`             | `55P03`           | a lock could not be taken (`nowait`, `lock_timeout`)                                          |
+| `ReadOnlyTransaction`          | `25006`           | a write in a read-only transaction                                                            |
+| `TransactionTimeout`           | `25P04`           | the transaction ran past `transaction_timeout`; the server ends the session                   |
+| `IdleInTransactionTimeout`     | `25P03`           | idle in a transaction past `idle_in_transaction_session_timeout`; the server ends the session |
+| `UndefinedTable`               | `42P01`           | the table does not exist                                                                      |
+| `UndefinedColumn`              | `42703`           | the column does not exist                                                                     |
+| `QueryCanceled`                | `57014`           | the statement was canceled, with a `reason` (below)                                           |
+
+- **`QueryCanceled`** (`57014`) has a `reason` (`CancelReason`): `'abort'` or `'timeout'` when this client asked for the cancel (the op recorded `canceledBy`), otherwise `'statement_timeout'` (the message says so) or `'user'` ([CANCELLATION.md](CANCELLATION.md#querycanceled-and-its-reason)).
+- **`DriverError`**: the base of every error the driver raises itself, and thrown as such for misuse it detects: a pool that has ended, a released client used again, `max` below 1, an invalid `nested` list, a value a codec can't send (`Cannot send a … as …`), too many callers waiting (`maxWaiting`).
+- **`ConnectionError`**: the connection couldn't be opened, TLS or authentication failed on the client's side, or the socket closed. `code` carries the system error (`ECONNREFUSED`, `ENOTFOUND`, …) or the driver's own: `ETIMEDOUT` (the connect timeout, or a pool's `acquireTimeout`), `EAUTHMETHOD` (an authentication method `requireAuth` doesn't allow, or one the driver doesn't implement), `EPROTOCOL` (protocol negotiation failed), `EVERSION` (a server older than PostgreSQL 18).
 - **`ProtocolError`**: the server sent bytes that aren't valid protocol. The connection is closed: once framing is lost, nothing after it can be trusted.
-- **`DecodeError`**: a value couldn't be decoded (column and type OID, never the value). Only that query fails.
+- **`DecodeError`**: a value couldn't be decoded (`column` and `typeOid`, never the value; the codec's error is the `cause`). Only that query fails ([Decode errors](#decode-errors)).
 - **`AbortError`**: aborted by a signal or a client-side timeout before reaching the server (or while acquiring a connection).
-- **`UndefinedParameterError`**: `undefined` as a parameter or inside an array parameter, with its position (`$2[3]`) and the SQL (truncated to 500 characters).
-- **`TransactionRolledBack`**: COMMIT answered ROLLBACK ([TRANSACTIONS.md](TRANSACTIONS.md#commit-that-rolled-back)).
+- **`UndefinedParameterError`**: `undefined` as a parameter or inside an array parameter, with its `position` (1-based), the `element` indexes inside an array (the message shows `$2[3]`), and the `sql` (truncated to 500 characters in the message).
+- **`TransactionRolledBack`** ([transaction.ts](transaction.ts)): COMMIT answered ROLLBACK ([TRANSACTIONS.md](TRANSACTIONS.md#commit-that-rolled-back)).
 
 ## Part 13: The driver knows nothing about quarry
 
@@ -609,11 +704,20 @@ Why the driver is built this way. Each links to its full entry (what it is, why,
 - [Prepared statements by default, named per connection](DECISIONS.md#prepared-statements-by-default-named-per-connection): each distinct statement is parsed and planned once per connection.
 - [Binary only after describe](DECISIONS.md#binary-only-after-describe): no column is requested in a format before its type is known.
 - [Zero-copy reads: messages decoded in place](DECISIONS.md#zero-copy-reads-messages-decoded-in-place): and [generated row decoders](DECISIONS.md#generated-monomorphic-row-decoders): the most frequent work is the cheapest.
+- [Text decoded with `Buffer#utf8Slice`](DECISIONS.md#text-decoded-with-bufferutf8slice): the native call without `toString`'s checks, on every text value.
+- [Nested objects built by the generated row decoder](DECISIONS.md#nested-objects-built-by-the-generated-row-decoder): a joined table's columns as one object, built while the row is decoded.
+- [Retry a stale statement once, unprepared](DECISIONS.md#retry-a-stale-statement-once-unprepared): a schema change under a cached statement costs one retry, not an error.
 - [Allocation cuts for the small-query tail](DECISIONS.md#allocation-cuts-for-the-small-query-tail): less garbage, fewer GC pauses in the tail.
-- [Node only](DECISIONS.md#node-only): Bun, Deno and edge runtimes aren't supported, so there are no code paths for them.
-- [One small socket interface](DECISIONS.md#one-small-socket-interface): custom transports and test doubles plug in through one small interface.
+- [The shared promise executor lets go of each query's resolvers](DECISIONS.md#the-shared-promise-executor-lets-go-of-each-querys-resolvers): the allocation cut without keeping the latest result alive.
+- [Node only](DECISIONS.md#node-only): the driver runs on Node only, so it has one socket adapter and no per-runtime code paths.
+- [One small socket interface](DECISIONS.md#one-small-socket-interface) (superseded in part by Node only): the interface stays, for custom transports and test doubles.
 - [PostgreSQL 18 or later only](DECISIONS.md#postgresql-18-or-later-only): no compatibility code for old servers.
+- [Detect poolers at login rather than configure them](DECISIONS.md#detect-poolers-at-login-rather-than-configure-them): what `capabilities.pgbouncer` is for.
+- [OpenTelemetry spans through a structural tracer, without parameters](DECISIONS.md#opentelemetry-spans-through-a-structural-tracer-without-parameters): spans without a dependency, at no cost when unset, never with parameters.
+- [Server notices go to listeners, and a listener can't break the connection](DECISIONS.md#server-notices-go-to-listeners-and-a-listener-cant-break-the-connection): messages that answer no request never reach an op.
 - [Errors carry everything and leak nothing](DECISIONS.md#errors-carry-everything-and-leak-nothing): every server field kept; parameters stay out of logs.
+- [Typed error classes per SQLSTATE](DECISIONS.md#typed-error-classes-per-sqlstate): `instanceof UniqueViolation` rather than comparing codes.
+- [A decode failure fails one query, not the connection](DECISIONS.md#a-decode-failure-fails-one-query-not-the-connection): the protocol is intact, so only that query's values were unreadable.
 
 ## Glossary
 
@@ -635,6 +739,10 @@ Why the driver is built this way. Each links to its full entry (what it is, why,
 
 **Message**: one unit of the wire protocol: a type byte, a length, a body.
 
+**Notice**: a warning or informational message from the server (NoticeResponse), delivered to `onNotice` listeners ([Notices and notifications](#notices-and-notifications)).
+
+**Notification**: a `NOTIFY` delivered on a channel the session listens to (NotificationResponse).
+
 **Op**: the driver's object for one queued request ([ops.ts](ops.ts)).
 
 **PgBouncer**: a connection pooler (proxy) commonly placed in front of Postgres.
@@ -648,6 +756,8 @@ Why the driver is built this way. Each links to its full entry (what it is, why,
 **Round trip**: a request and its answer; the unit of network latency.
 
 **Session**: the state a connection carries (settings, prepared statements, an open transaction).
+
+**Span**: one timed operation in a trace (OpenTelemetry); the driver makes one per statement when `telemetry` is set ([Spans](#spans)).
 
 **SQLSTATE**: Postgres's five-character error code (`23505` unique violation, `40001` serialization failure).
 

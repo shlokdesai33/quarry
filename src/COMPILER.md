@@ -7,6 +7,7 @@ Background: builders produce nodes ([QUERIES.md](QUERIES.md)); expressions produ
 ## Contents
 
 - [Input and output](#input-and-output)
+  - [Data statements (`isDataStatement`)](#data-statements-isdatastatement)
 - [The parameter list](#the-parameter-list)
 - [Rendering expressions: `render()`](#rendering-expressions-render)
 - [Identifiers and literals](#identifiers-and-literals)
@@ -19,6 +20,7 @@ Background: builders produce nodes ([QUERIES.md](QUERIES.md)); expressions produ
 - [Delete](#delete)
 - [`returning`](#returning)
 - [Result codecs](#result-codecs)
+- [Nested objects (`nest`)](#nested-objects-nest)
 - [Errors the compiler raises](#errors-the-compiler-raises)
 - [`toSQL()` and when compiling happens](#tosql-and-when-compiling-happens)
 - [What is rendered once](#what-is-rendered-once)
@@ -37,11 +39,12 @@ interface CompiledQuery {
   readonly params: readonly unknown[]; // values, as given (not encoded)
   readonly paramCodecs?: readonly (Codec | undefined)[]; // per parameter
   readonly resultCodecs?: readonly (Codec | null)[]; // per result column
+  readonly nested?: readonly NestedObject[]; // the row's nest() objects
   readonly tag?: string;
 }
 ```
 
-A `SelectNode` is an `OperationNode` (a select can appear inside expressions in principle), so `compile` dispatches on `node.kind`: `insert`, `update`, `delete`, or anything else through `render`.
+A `SelectNode` is an `OperationNode` (a select can appear inside expressions in principle), so `compile` dispatches on `node.kind`: `insert`, `update`, `delete`, or anything else through `render`. A `raw` node (a whole `db.sql` statement) goes through `render` too.
 
 The returned object is a `Compiled` instance whose codecs are **getters over private fields**, not own properties:
 
@@ -49,18 +52,49 @@ The returned object is a `Compiled` instance whose codecs are **getters over pri
 class Compiled implements CompiledQuery {
   readonly sql: string;
   readonly params: readonly unknown[];
+  declare readonly tag?: string;
   readonly #paramCodecs;
   readonly #resultCodecs;
+  readonly #data: boolean; // compiled from a select, insert, update or delete
+  readonly #nested;
+
+  static isDataStatement(query: CompiledQuery): boolean {
+    return #data in query && query.#data;
+  }
+
   get paramCodecs() {
     return this.#paramCodecs;
   }
   get resultCodecs() {
     return this.#resultCodecs;
   }
+  get nested() {
+    return this.#nested;
+  }
 }
 ```
 
-So `console.log(query.toSQL())`, `JSON.stringify`, and `expect(compiled).toEqual({ sql, params })` in tests see only `sql`, `params` (and `tag`), not a wall of codec objects. A copy made with `{ ...compiled }` drops the codecs, and the driver falls back to encoding values by their JavaScript type. `tag` is set with `Object.assign` only when present, so it is absent rather than `undefined` in comparisons.
+So `console.log(query.toSQL())`, `JSON.stringify`, and `expect(compiled).toEqual({ sql, params })` in tests see only `sql`, `params` (and `tag`), not a wall of codec objects. Captured:
+
+```
+Compiled {
+  sql: 'select "users"."id" as "id", "users"."name" as "name", "users"."created_at" as "createdAt" from "users" where "users"."email" = $1',
+  params: [ 'ada@example.com' ]
+}
+```
+
+A copy made with `{ ...compiled }` drops the codecs, `nested` and the data flag: the driver falls back to encoding values by their JavaScript type and reading columns by the types the server reports, and the executor treats the copy as SQL written by hand ([below](#data-statements-isdatastatement)). `tag` is set with `Object.assign` only when present, so it is absent rather than `undefined` in comparisons.
+
+### Data statements (`isDataStatement`)
+
+`isDataStatement(query)` (exported from [compile.ts](compile.ts)) is true only for a `Compiled` that `compile` made from a select, insert, update or delete node. Such a statement can't begin with `begin`, `set` or `listen`, so it can't leave session or transaction state on a connection. The executor uses it to skip its session-statement regular expression for every builder query, and tests only SQL written by hand (`db.sql`, compiled from a `raw` node, so not a data statement) ([EXECUTION.md](EXECUTION.md#connections-shared-or-exclusive)):
+
+```ts
+const changesSession = (query: CompiledQuery): boolean =>
+  !isDataStatement(query) && SESSION_STATEMENT.test(query.sql);
+```
+
+The flag is a private field checked with `#data in query`, so neither an object literal that looks like a compiled query nor a spread copy can claim it. Until #43, the regular expression ran over every builder query's SQL, about 4% of a point lookup's client CPU ([DECISIONS.md](DECISIONS.md#sql-rendered-through-a-trie-of-its-pieces)).
 
 ## The parameter list
 
@@ -104,7 +138,10 @@ Values are passed through **as given**. The compiler never encodes them: the dri
 | `raw`        | fragments interleaved with rendered nodes                       | `cast(count(*) as integer)`, `x between $1 and $2`    |
 | `select`     | a whole select ([below](#select))                               |                                                       |
 
-`raw` nodes are internal only: `fragments` has one more element than `nodes`, and they alternate starting with a fragment. The fragments are fixed strings from quarry's own code (`'cast('`, `' as integer)'`, `' and '`, `'*'`), never user input.
+In a `raw` node, `fragments` has one more element than `nodes`, and they alternate starting with a fragment; each fragment is written as is. They come from:
+
+- quarry's own code: `'cast('` and `' as integer)'` (the type checked against a fixed list), `extract(year from `, `current_date`, `'*'` in `count(*)`, `' and '` in `between`, and the `nest` marker `("posts".ctid is not null)` ([below](#nested-objects-nest));
+- the strings of a `sql` template, which the programmer wrote in the source ([EXPRESSIONS.md](EXPRESSIONS.md#raw-sql-fragments)). `sql` refuses to be called with anything but a template literal, so a string built at run time can't become SQL text; interpolated values become `value` nodes (parameters), and `sql.id(...)` and interpolated tables become raw text only after `identifier` quotes them.
 
 `renderOperand` wraps an operand in parentheses when it is itself an operation (`rendersAsOperation`: a `binary` node, which covers comparisons and arithmetic, or a `not`), so Postgres's operator precedence can't regroup it: `(a = b) = true`, `("users"."settings" -> 'beta') = $1`, `("posts"."views" + $1) * $2`, `(not (…)) is null`. The `not` case was a bug found by the SQL coverage audit (#32): `not` binds looser than `is`, so `not (a) is null` reads as `not ((a) is null)`. A single-operand `and`/`or` renders as its operand, so it is treated as what it contains.
 
@@ -151,11 +188,27 @@ Single quotes are doubled. If the string contains a backslash, it is written as 
 ## `and`, `or` and precedence
 
 ```ts
-function renderLogical(operands, operator, empty, params) {
-  const [first, ...rest] = operands;
-  if (first === undefined) return empty; // 'true' for and, 'false' for or
-  if (rest.length === 0) return render(first, params);
-  return `(${operands.map((o) => render(o, params)).join(` ${operator} `)})`;
+function renderLogical(
+  operands: readonly OperationNode[],
+  operator: ' and ' | ' or ',
+  empty: 'true' | 'false',
+  out: Output,
+): void {
+  const [first] = operands;
+  if (first === undefined) {
+    write(out, empty);
+    return;
+  }
+  if (operands.length === 1) {
+    render(first, out);
+    return;
+  }
+  write(out, '(');
+  for (let i = 0; i < operands.length; i++) {
+    if (i > 0) write(out, operator);
+    render(operands[i]!, out);
+  }
+  write(out, ')');
 }
 ```
 
@@ -241,7 +294,7 @@ function renderLock(lock) {
 
 `for update of "posts" skip locked` locks the matched rows of `posts` until the transaction ends, skipping rows another transaction already locked: the standard way for workers to claim jobs from a queue table without blocking each other. ([QUERIES.md](QUERIES.md#row-locking) explains the strengths.)
 
-Postgres rejects a locking clause on a query with aggregates. The compiler checks first, so the error is clear: `hasAggregate` walks each selection's node (through functions, operations, lists, `case` branches and raw nodes) looking for a `function` node named `count`, `min`, `max`, `sum`, `avg`, `array_agg`, `string_agg`, `bool_and` or `bool_or` (the aggregates `eb.fn` builds), and throws "A locking clause (forUpdate() and the like) cannot be used with aggregate functions".
+Postgres rejects a locking clause on a query with aggregates. The compiler checks first, so the error is clear: `hasAggregate` walks each selection's node (through functions, operations, lists, `case` branches and raw nodes) looking for a `function` node named `count` (which `countDistinct` builds too), `min`, `max`, `sum`, `avg`, `array_agg`, `string_agg`, `bool_and` or `bool_or`, and throws "A locking clause (forUpdate() and the like) cannot be used with aggregate functions".
 
 ## Insert
 
@@ -274,14 +327,14 @@ The casts (`$1::varchar[]`) pin each array's type, so the server knows it withou
 ## Upserts: `on conflict`
 
 ```sql
-insert into "users" ("email", "name") values ($1, $2)
-on conflict ("email") do update set "name" = "excluded"."name"
+insert into "products" ("sku", "price") values ($1, $2)
+on conflict ("sku") do update set "price" = excluded."price"
 ```
 
 - `on conflict (target)` names the unique columns; `where …` after it names a partial unique index's predicate.
 - `do nothing` keeps the existing row.
-- `merge(columns?)` sets each listed column (by default, every inserted column) from `excluded`, the row the insert proposed: `"email" = excluded."email", "name" = excluded."name"`.
-- `doUpdate((excluded) => ({ … }))` sets what you return; `excluded.name` is a reference node to table `excluded` (rendered `"excluded"."name"`).
+- `merge(columns?)` sets each listed column (by default, every inserted column) from `excluded`, the row the insert proposed, as above: `"price" = excluded."price"`, with `excluded` written as a keyword.
+- `doUpdate((excluded) => ({ … }))` sets what you return; `excluded.price` is a reference node to table `excluded`, rendered like any other reference: `do update set "price" = "excluded"."price"`. Both spellings name the same row.
 - An upsert that would set nothing throws ("An upsert that merges needs columns to set").
 
 ## Update and `setEach`
@@ -328,7 +381,55 @@ for (let i = 0; i < selections.length; i++) {
 }
 ```
 
-A selection's codec comes from `selectionNodes` in [row.ts](row.ts): a column's `DataType.codec`, a typed expression's, a `Param`'s own codec, or none (`null` here) for an expression of unknown SQL type. The driver reads column _i_ with `resultCodecs[i]` as long as the column has that codec's type, and with its registry otherwise ([EXECUTION.md](EXECUTION.md#how-the-builder-picks-codecs)). `resultCodecs` is absent when no entry has a codec.
+A selection's codec comes from `selectionNodes` in [row.ts](row.ts): a column's `DataType.codec`, a typed expression's, a `Param`'s own codec (`eb.val(1).as('one')` is read with `int4`), `codecs.bool` for a [`nest` marker](#nested-objects-nest), or none (`null` here) for an expression of unknown SQL type, such as a `sql` fragment. The driver reads column _i_ with `resultCodecs[i]` as long as the column has that codec's type, and with its registry otherwise ([EXECUTION.md](EXECUTION.md#how-the-builder-picks-codecs)). `resultCodecs` is absent when no entry has a codec.
+
+## Nested objects (`nest`)
+
+`nest(table, columns?)` in a select callback ([QUERIES.md](QUERIES.md#nest-a-tables-columns-as-one-object)) selects some of a joined table's columns as one object of the row, `null` where an outer join found no row. Nothing about it is special in the SQL: `selectionNodes` ([row.ts](row.ts), `nestedNodes`) expands it into ordinary selection entries, a **marker** and then each column, and each entry carries a `nest` field saying which object it belongs to:
+
+```ts
+const marker: SelectionNode = {
+  expression: {
+    kind: 'raw',
+    fragments: [`(${identifier(table)}.ctid is not null)`],
+    nodes: [],
+  },
+  alias,
+  codec: codecs.bool,
+  nest: { key: alias, column: undefined },
+};
+```
+
+Each column is the table's shared reference node, aliased `key.column` (`"posts.id"`), with the column's codec and `nest: { key, column }`. A query (captured, `posts.id` a `bigint`):
+
+```ts
+db.selectFrom(users)
+  .leftJoin(posts)
+  .on('posts.authorId', 'users.id')
+  .select(({ nest }) => ['users.id', nest('posts', ['id', 'title'])]);
+```
+
+```sql
+select "users"."id" as "id", ("posts".ctid is not null) as "posts", "posts"."id" as "posts.id", "posts"."title" as "posts.title"
+from "users" left join "posts" on "posts"."author_id" = "users"."id"
+-- resultCodecs: [int4, bool, int8, text]
+-- nested:       [{ key: 'posts', marker: 1, columns: [[2, 'id'], [3, 'title']] }]
+```
+
+`ctid`, a row's physical address, is never null in a row the table has, and is null exactly where the join found none, so the marker tells a missing row from a row whose columns are all null. `nest('posts', ['title']).as('post')` keys the marker `"post"` and the columns `"post.title"`.
+
+After rendering, `compile` collects the entries' `nest` fields into `CompiledQuery.nested` (`nestedObjects`): one `NestedObject` per object, its key, the marker's position, and each column's position with its key in the object. The SQL and the result codecs are what any select with those columns would have; `nested` only tells the driver how to shape the row. The executor passes it as the query's `nested` option, the driver checks it with the query's options (`checkNested`: every position used once, columns after their marker), and the generated row decoder builds the object where the marker holds ([driver/rows.ts](driver/rows.ts)). Captured, for the columns of the query above:
+
+```js
+{
+  const m = c1.decodeText(utf8(b, pos, pos + length));
+  if (m === true || m === 't') row['posts'] = { id: null, title: null };
+}
+// …
+row['posts']['id'] = utf8(b, pos, pos + length);
+```
+
+The row literal starts with `posts: null`, and a column's value is only stored when it isn't NULL; where the marker is false every column of the object is NULL too, so the object stays `null`. Rows came back as `{ id: 1, posts: { id: '1', title: '…' } }` and `{ id: 2, posts: null }`. ([driver/DECISIONS.md](driver/DECISIONS.md#nested-objects-built-by-the-generated-row-decoder))
 
 ## Errors the compiler raises
 
@@ -361,7 +462,10 @@ A query is built and compiled from scratch each time it runs, but most of its SQ
 - **Every column of a table.** `allSelections(table)` ([expression-builder.ts](expression-builder.ts)) is the frozen list of a table's shared selection nodes that `selectAll` and `returningAll` add, made once per table object. The compiler renders a frozen list once (`sharedList`): its SQL (`"users"."id" as "id", "users"."email" as "email", …`) as one piece, and its result codecs as one frozen array, the same array for every query, so the driver's plan lookup compares it by identity.
 - **The whole SQL text, by its pieces.** `write` doesn't concatenate: it walks a trie (`Prefix`) keyed by the pieces the SQL is written from, such as `'select'`, a shared column's SQL, `' from '`, a quoted name, `' = '` and `'$1'`. Each step is a check against the child taken last (the same piece object, when the shape repeats), or a `Map` lookup. The node a query ends on holds its SQL, made once (`spell`) as one flat string. So a query of a shape rendered before gets **the same string object**, whose hash V8 has kept: the driver's statement cache, keyed by the SQL, finds its entry without flattening, hashing and comparing the text ([driver/DECISIONS.md](driver/DECISIONS.md#statements-keyed-by-their-sql-with-the-declared-types-compared)). The same text from two different sequences of pieces is two strings with equal content, which is still correct, just not free. Bounds: a query goes no deeper than 1,024 pieces, or past a piece longer than 4,096 characters (a long multi-row insert, a big literal). The rest of its SQL is then concatenated as before. The trie starts over once it holds 16,384 prefixes or about a million characters, so shapes made at run time can't grow it without bound.
 
-The builders also reuse a single table's expression builder (`expressionBuilder(users)` is made once and frozen; a scope of several tables is made per call), and the predicate `DataType`. Together with call sites captured only on failure ([EXECUTION.md](EXECUTION.md#errors)), a point lookup's build and compile went from 5.7 to 0.8 µs (#39), then to 0.5 µs with `selectAll`'s shared list and the trie (in-process, mock executor). Its client CPU through the pool fell from 21 to 6.3 µs, then to 3.2–3.4 µs against `pool.query`'s 2.3 ([DECISIONS.md](DECISIONS.md#sql-rendered-through-a-trie-of-its-pieces)).
+The builders also reuse a single table's expression builder (`expressionBuilder(users)` is made once and frozen; a scope of several tables is made per call), and the predicate `DataType`. What these caches saved, as measured in DECISIONS.md:
+
+- **#39** (shared column nodes and their SQL, the identifier memo, one expression builder per table, and call sites captured only on failure, [EXECUTION.md](EXECUTION.md#errors)): a point lookup selecting 6 columns went from 5.7 to 0.8 µs to build and compile (in-process, mock executor), and its client CPU through a pool of 10 at 100 callers from 21.3 to 4.8 µs, against 4.4 for `pool.query` ([DECISIONS.md](DECISIONS.md#columns-resolved-and-quoted-once-per-table)).
+- **#43** (the trie, `selectAll`'s shared list, `isDataStatement`, and result shapes made once): a `selectAll` point lookup went from 1.69 to 0.5 µs to build and compile, and compile alone from 270 to 130 ns; in one process, its client CPU went from 6.3 to 3.2–3.4 µs, against 2.3 for `pool.query` ([DECISIONS.md](DECISIONS.md#sql-rendered-through-a-trie-of-its-pieces)).
 
 **Why not a cache of whole compiled queries.** A cache keyed by query shape needs a key computed from the query's nodes, which are new on every call, so building that key costs a walk of the same tree that rendering already is. #39 measured no gain and kept rendering. The trie is that walk: rendering _is_ the lookup, so the key costs nothing extra, and nothing needs invalidating, because the text a path spells can't change. It only reuses the SQL string. Parameters and their codecs are still collected per query, from the values.
 
@@ -375,23 +479,33 @@ Why the compiler works this way. Each links to its full entry (what it is, why, 
 - [Columns resolved and quoted once per table](DECISIONS.md#columns-resolved-and-quoted-once-per-table): shared, immutable column nodes whose SQL is rendered once.
 - [SQL rendered through a trie of its pieces](DECISIONS.md#sql-rendered-through-a-trie-of-its-pieces): a query of a shape rendered before gets the same SQL string, so the driver's statement cache finds it by identity.
 - [Parameters everywhere, literals only where Postgres refuses a parameter](DECISIONS.md#parameters-everywhere-literals-only-where-postgres-refuses-a-parameter): injection-safe and cache-friendly, with checked exceptions.
-- [Parameters numbered in text order, and `in` as `= any($1)`](DECISIONS.md#parameters-numbered-in-text-order-and-in-as--any1): identical queries give identical SQL, so the statement cache gets hits.
+- [Parameters numbered in text order; `in` takes a list, or one array as `= any($1)`](DECISIONS.md#parameters-numbered-in-text-order-in-takes-a-list-or-one-array-as--any1): identical queries give identical SQL, so the statement cache gets hits.
 - [Every operation operand bracketed](DECISIONS.md#every-operation-operand-bracketed): no precedence table to get wrong.
 - [Codecs as getters on the compiled query](DECISIONS.md#codecs-as-getters-on-the-compiled-query): compiled queries print and compare as `{ sql, params }`.
 - [Many rows through `unnest`, one array per column](DECISIONS.md#many-rows-through-unnest-one-array-per-column): constant SQL text and parameter count whatever the number of rows.
 - [`unnest` casts without type modifiers](DECISIONS.md#unnest-casts-without-type-modifiers): a too-long value is rejected, not truncated.
 - [`setEach`: one method for the source, the assignments and the key match](DECISIONS.md#seteach-one-method-for-the-source-the-assignments-and-the-key-match): rendered with ordinary set and where nodes.
 - [The driver owns the codecs; the builder only chooses them](DECISIONS.md#the-driver-owns-the-codecs-the-builder-only-chooses-them): values are not encoded here.
+- [`selectAll` lists the columns, never `*`](DECISIONS.md#selectall-lists-the-columns-never-): every result column keyed and typed, and one shared list per table.
+- [`nest` marks a joined row with `ctid`](DECISIONS.md#nest-marks-a-joined-row-with-ctid): why the marker, and why the driver builds the object ([driver/DECISIONS.md](driver/DECISIONS.md#nested-objects-built-by-the-generated-row-decoder)).
+- [Plain queries share the pool's pipelined connections](DECISIONS.md#plain-queries-share-the-pools-pipelined-connections): what `isDataStatement` lets the executor skip.
+- [Raw SQL only through the `sql` template tag](DECISIONS.md#raw-sql-only-through-the-sql-template-tag): where `raw` nodes written by the programmer come from.
 
 ## Glossary
 
 **Aggregate**: a function that combines many rows into one value (`count`, `sum`, `max`, …).
+
+**`ctid`**: a system column of every Postgres table, the row's physical address; never null in a row the table has.
+
+**Data statement**: a query `compile` made from a select, insert, update or delete node (`isDataStatement`), as against SQL written by hand.
 
 **`excluded`**: in an upsert's `do update`, the row the insert proposed.
 
 **Identifier**: a name of a table or column in SQL. Quoted identifiers (`"createdAt"`) keep their case.
 
 **Literal**: a value written directly into SQL text (`'theme'`, `true`).
+
+**Marker**: the `(table.ctid is not null)` column a `nest` object is read from: true where the join found a row.
 
 **Placeholder**: `$1`, `$2`, …: where a parameter goes in the SQL text.
 
