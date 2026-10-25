@@ -1252,8 +1252,13 @@ export class Pool implements AsyncDisposable {
 			};
 			if (signal !== undefined) this.#abortWait(queue, waiter, signal);
 			queue.push(waiter);
+			// for the full timeout from now, as a timer of its own would be: it
+			// fires before a connect timeout of the same length started after it
 			if (waiter.deadline !== Number.POSITIVE_INFINITY)
-				this.#waitTimer ??= this.#armWaitTimer(waiter.deadline);
+				this.#waitTimer ??= setTimeout(
+					() => this.#timeOutWaiters(),
+					this.#acquireTimeout,
+				);
 		});
 	}
 
@@ -1296,7 +1301,8 @@ export class Pool implements AsyncDisposable {
 
 	#timeOutWaiters(): void {
 		this.#waitTimer = undefined;
-		const now = performance.now();
+		// timers fire on the event loop's millisecond clock, up to one early
+		const now = performance.now() + 1;
 		let next = Number.POSITIVE_INFINITY;
 		for (const queue of [this.#waiters, this.#sharedWaiters]) {
 			for (let head = queue[0]; head !== undefined; head = queue[0]) {

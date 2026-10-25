@@ -40,9 +40,10 @@ const UNDEFINED_REFUSED: Expectation = {
 	reason:
 		'undefined parameters are refused (UndefinedParameterError) rather than sent as NULL; pass null',
 };
-const NO_MAX_USES: Expectation = {
+const MAX_USES_REPLACED: Expectation = {
 	category: 'intentional',
-	reason: 'quarry has no maxUses; maxLifetime recycles connections instead',
+	reason:
+		'a connection past maxUses is closed and, below min, replaced at once (pg-pool leaves the pool short of min until the next connect)',
 };
 const QUERY_ERRORS_KEEP_CONNECTIONS: Expectation = {
 	category: 'intentional',
@@ -303,12 +304,15 @@ const expectations: Record<string, Table> = {
 		},
 		'test/max-uses.js': {
 			'maxUses getting a connection a second time returns the same connection and releasing it also closes it':
-				NO_MAX_USES,
-			'maxUses getting a connection a third time returns a new connection':
-				NO_MAX_USES,
-			'maxUses getting a connection from a pending request gets a fresh client when the released candidate is expended':
-				NO_MAX_USES,
-			'maxUses logs when removing an expended client': NO_MAX_USES,
+				{
+					category: 'shim',
+					reason:
+						"reads pg's Client._ending; the connection is closed on release (integration/pool.test.ts: replaces a connection after maxUses queries and borrowers)",
+				},
+			'maxUses logs when removing an expended client': {
+				category: 'not-applicable',
+				reason: "pg-pool's log option",
+			},
 		},
 		'test/releasing-clients.js': {
 			'releasing clients removes a client which cannot be queried':
@@ -318,7 +322,7 @@ const expectations: Record<string, Table> = {
 		},
 		'test/sizing.js': {
 			'pool size of 1 does remove clients when at or below min if maxUses is reached':
-				NO_MAX_USES,
+				MAX_USES_REPLACED,
 			'pool size of 1 does remove clients when at or below min if maxLifetimeSeconds is reached':
 				{
 					category: 'intentional',
