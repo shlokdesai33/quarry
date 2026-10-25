@@ -821,8 +821,11 @@ export class Connection implements AsyncDisposable {
 		}
 		this.#cancelAtHead();
 		if (unblocked || this.#written < this.#queue.length) this.#schedule();
-		if (this.#queue.length === 0 && this.#idleWaiters.length > 0)
-			for (const resolve of this.#idleWaiters.splice(0)) resolve();
+		if (this.#queue.length === 0) {
+			this.#reader.dropSpare();
+			if (this.#idleWaiters.length > 0)
+				for (const resolve of this.#idleWaiters.splice(0)) resolve();
+		}
 		this.#finished(op);
 	}
 
