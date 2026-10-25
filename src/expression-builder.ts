@@ -209,7 +209,7 @@ const singleTable = new WeakMap<AnyTable, ExpressionBuilder<Refs>>();
 /**
  * Creates an expression builder with the given tables in scope. The
  * implementation only builds nodes; `ExpressionBuilder` supplies the types.
- * A builder holds no state, so a single table's is made once and shared.
+ * A builder holds no state, so a scope's is made once and shared.
  *
  * @example
  * const eb = expressionBuilder(users, posts.as('p'));
@@ -219,7 +219,8 @@ export function expressionBuilder<const T extends readonly AnyTable[]>(
 	...tables: T
 ): ExpressionBuilder<RefsOf<T>> {
 	const [only] = tables;
-	if (only === undefined || tables.length > 1) return makeBuilder(tables);
+	if (only === undefined) return makeBuilder(tables);
+	if (tables.length > 1) return joinedBuilder(only, tables);
 	let eb = singleTable.get(only);
 	if (eb === undefined) {
 		eb = Object.freeze(makeBuilder([only]));
@@ -227,6 +228,47 @@ export function expressionBuilder<const T extends readonly AnyTable[]>(
 	}
 	// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the builder of this very scope
 	return eb as unknown as ExpressionBuilder<RefsOf<T>>;
+}
+
+/**
+ * The builders of joined scopes, by their first table: a query's every
+ * callback after a join (each `where`, `on`, `select`) asked for one, and
+ * making one builds its function namespaces and reference map. A list per
+ * first table, compared table by table; at most `JOINED_SCOPES` each, since
+ * aliased tables made per query make new scopes.
+ */
+const joinedScopes = new WeakMap<
+	AnyTable,
+	{
+		readonly tables: readonly AnyTable[];
+		readonly eb: ExpressionBuilder<Refs>;
+	}[]
+>();
+const JOINED_SCOPES = 64;
+
+function joinedBuilder<const T extends readonly AnyTable[]>(
+	first: AnyTable,
+	tables: T,
+): ExpressionBuilder<RefsOf<T>> {
+	let scopes = joinedScopes.get(first);
+	if (scopes === undefined) {
+		scopes = [];
+		joinedScopes.set(first, scopes);
+	}
+	search: for (const scope of scopes) {
+		if (scope.tables.length !== tables.length) continue;
+		for (let i = 1; i < tables.length; i++)
+			if (scope.tables[i] !== tables[i]) continue search;
+		// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the builder of these very tables
+		return scope.eb as unknown as ExpressionBuilder<RefsOf<T>>;
+	}
+	const eb = Object.freeze(makeBuilder(tables));
+	if (scopes.length < JOINED_SCOPES) {
+		// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- stored untyped, returned to the same scope
+		const stored = eb as unknown as ExpressionBuilder<Refs>;
+		scopes.push({ tables: [...tables], eb: stored });
+	}
+	return eb;
 }
 
 function makeBuilder<const T extends readonly AnyTable[]>(
