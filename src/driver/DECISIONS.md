@@ -270,7 +270,7 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
 
 **Alternatives.** Threshold 1 (prepare on first use: the old behaviour). Higher thresholds (pgjdbc and Npgsql use 5): measured below, 3 and 5 lose on churn because statements stay unnamed and re-planned for longer. Counting sightings in a separate map: a second structure to bound and evict from, where the unnamed cache entry already exists.
 
-**Cost.** A repeated statement is parsed and planned once more (its first run), and reads text on its first two runs instead of one. `prepareThreshold: 1` restores the old behaviour.
+**Cost.** A repeated statement is parsed and planned once more (its first run), and reads text on its first two runs instead of one. That shows on large results read on a fresh connection: the benchmark suite's equal-work cell (a fresh pool, then three 1M-row fetches) went from 412 to 535 ms per fetch on average, because its first measured fetch now reads text; small queries don't notice (point lookups, inserts, updates, the error path, 1k-row fetches: all within noise). `prepareThreshold: 1` restores the old behaviour.
 
 **Measured.** Pool of 10, 50 callers, PostgreSQL on 2 CPUs and the client on the other 2, 3 s per run, two runs each (ops/s):
 
