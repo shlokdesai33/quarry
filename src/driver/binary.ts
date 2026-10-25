@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer';
 import { DriverError } from './errors.js';
 import { utf8 } from './protocol/text.js';
 

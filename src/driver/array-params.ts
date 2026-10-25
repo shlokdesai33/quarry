@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer';
 import { allocate } from './protocol/text.js';
 import { notBytes } from './types.js';
 
