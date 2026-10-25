@@ -60,7 +60,7 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 - [A write's `execute()` with `returning` resolves to the rows](src/DECISIONS.md#a-writes-execute-with-returning-resolves-to-the-rows)
 - [`db.batch`: two modes with names](src/DECISIONS.md#dbbatch-two-modes-with-names)
 - [`stream()`: only for every-row reads, and it runs immediately](src/DECISIONS.md#stream-only-for-every-row-reads-and-it-runs-immediately)
-- [`execute({ commit: true })` for a transaction's last statement](src/DECISIONS.md#execute-commit-true--for-a-transactions-last-statement)
+- [`executeAndCommit()` for a transaction's last statement](src/DECISIONS.md#executeandcommit-for-a-transactions-last-statement)
 
 ### Compiling to SQL
 

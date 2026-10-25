@@ -594,7 +594,7 @@ The transaction commits when the callback resolves and rolls back when it throws
 - `tx.afterCommit(fn)`: runs once the outermost transaction commits.
 - `tx.afterRollback(fn)`: runs if this transaction or savepoint rolls back.
 - `tx.setLocal(name, value)`: a transaction-local setting, with a bound value.
-- `execute({ commit: true })` on the callback's last statement: COMMIT goes out right behind it, so a one-statement transaction is one round trip.
+- `executeAndCommit()` instead of `execute()` on the callback's last statement: COMMIT goes out right behind it, so a one-statement transaction is one round trip.
 
 An error the callback caught and carried on after fails the savepoint (or the transaction) with that error. Options: `isolation`, `readOnly`, `deferrable`, `retries` (re-runs on serialization failures and deadlocks), `settings` (transaction-local settings, e.g. for row-level security), `timeout`, and `durable` (throws if already inside a transaction).
 
@@ -716,7 +716,7 @@ await conn.query('select 1');
 - **Queries**: `query(sql, params, options)` returns `{ rows, rowCount, command, fields }`. Per-query options: `rowMode: 'array'`, `signal`, `timeout`, `statementTimeout`, `paramTypes`, `paramCodecs`, `resultCodecs`, `codecs`, `prepare`, `keepRows`, `tag`, `onTiming`. `simpleQuery(sql)` runs several statements; `describe(sql)` returns parameter and result types.
 - **Parameters** are always sent separately from the SQL. `typed(value, codec)` encodes a parameter with a codec and declares its type; arrays declared with `arrayOf(codec)` go in binary.
 - **Prepared statements** are cached per connection (100 by default); one made stale by a schema change is retried once, unnamed. Concurrent queries are pipelined on shared connections once the pool is busy.
-- **Transactions** (`pool.transaction`, `conn.transaction`) take `isolation`, `readOnly`, `deferrable`, `retries`, `retryDelay`, `settings`, `timeout` and `durable`; `BEGIN` travels with the first statement, and `tx.query(sql, params, { commit: true })` sends COMMIT behind the last one. `tx.transaction` nests a savepoint, which adds no round trip; `tx.afterCommit`, `tx.afterRollback` and `tx.setLocal` work as in the [query builder](#transactions).
+- **Transactions** (`pool.transaction`, `conn.transaction`) take `isolation`, `readOnly`, `deferrable`, `retries`, `retryDelay`, `settings`, `timeout` and `durable`; `BEGIN` travels with the first statement, and `tx.queryAndCommit(sql, params)` sends COMMIT behind the last one. `tx.transaction` nests a savepoint, which adds no round trip; `tx.afterCommit`, `tx.afterRollback` and `tx.setLocal` work as in the [query builder](#transactions).
 - **Prepared statements** start on a SQL text's second run (`prepareThreshold`, default 2), so SQL run once takes no server-side statement.
 - **Streaming and COPY**: `conn.cursor(sql, params, { batchSize, readAhead })` yields batches, `pool.stream` yields rows, `copyRows`, `copyFrom` and `copyTo` run `COPY`, all with backpressure; `createCopyFromStream` and `createCopyToStream` are the same as Node streams, for `pipeline`.
 - **LISTEN/NOTIFY**: `pool.listen(channel, handler, { onGap })` resubscribes after reconnects and reports the gap; `conn.notify(channel, payload)` sends.
@@ -873,7 +873,7 @@ With 10 connections and 500 callers, the p99 is 5.0 ms, against 10.6 ms for post
 | Point lookups, 500 callers, 1 connection (ops/s) | 5 ms  |   **88,941** |      169 |       7,958 |
 |                                                  | 20 ms |   **23,550** |     47.8 |       2,333 |
 
-A transaction takes two round trips (`BEGIN` travels with the first statement), one when its last statement is run with `execute({ commit: true })`, and `db.batch` with `{ transaction: true }` takes one: three statements in a transaction at 5 ms RTT run at 166 ops/s with `db.batch`, against 57 with `Promise.all` and 43 one after another.
+A transaction takes two round trips (`BEGIN` travels with the first statement), one when its last statement runs with `executeAndCommit()`, and `db.batch` with `{ transaction: true }` takes one: three statements in a transaction at 5 ms RTT run at 166 ops/s with `db.batch`, against 57 with `Promise.all` and 43 one after another.
 
 Through the query builder (`database()`, pool 10), lookups run at 270–312k ops/s with 100–1,000 callers and no added latency, 71–79% of the driver alone. At 5 ms RTT with 1,000 callers, lookups, inserts and updates run at 160–168k ops/s, within 3% of the driver, about 2.2× postgres.js (73–75k) and 100× `pg` (1.6k).
 

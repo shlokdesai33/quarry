@@ -267,9 +267,7 @@ describe.skipIf(noPg)('transactions', () => {
 		).toBe(2);
 		// begin+statement and commit in one write
 		expect(
-			await trips(() =>
-				c.transaction((tx) => tx.query('select 1', [], { commit: true })),
-			),
+			await trips(() => c.transaction((tx) => tx.queryAndCommit('select 1'))),
 		).toBe(1);
 		expect(
 			await trips(() =>
@@ -283,13 +281,13 @@ describe.skipIf(noPg)('transactions', () => {
 		expect(c.transactionStatus).toBe('idle');
 	});
 
-	it('commits behind a statement marked commit: true, and rolls back if it fails', async () => {
+	it('commits right behind queryAndCommit, and rolls back if its statement fails', async () => {
 		await conn.query(`truncate ${name}`);
 		const inserted = await conn.transaction(async (tx) => {
 			await tx.query(`insert into ${name} values (1, 'a')`);
-			const last = await tx.query(`insert into ${name} values (2, 'b')`, [], {
-				commit: true,
-			});
+			const last = await tx.queryAndCommit(
+				`insert into ${name} values (2, 'b')`,
+			);
 			await expect(tx.query('select 1')).rejects.toThrow(/already finished/);
 			return last.rowCount;
 		});
@@ -297,7 +295,7 @@ describe.skipIf(noPg)('transactions', () => {
 		expect(await ids()).toEqual([1, 2]);
 		await rejection(
 			conn.transaction((tx) =>
-				tx.query(`insert into ${name} values (2, 'dup')`, [], { commit: true }),
+				tx.queryAndCommit(`insert into ${name} values (2, 'dup')`),
 			),
 			UniqueViolation,
 		);
@@ -308,9 +306,7 @@ describe.skipIf(noPg)('transactions', () => {
 		await expect(
 			conn.transaction(async (tx) => {
 				tx.afterCommit(() => committed.push('after'));
-				await tx.query(`insert into ${name} values (3, 'c')`, [], {
-					commit: true,
-				});
+				await tx.queryAndCommit(`insert into ${name} values (3, 'c')`);
 				throw new Error('after the commit');
 			}),
 		).rejects.toThrow('after the commit');
@@ -318,7 +314,7 @@ describe.skipIf(noPg)('transactions', () => {
 		expect(await ids()).toEqual([1, 2, 3]);
 		await expect(
 			conn.transaction((tx) =>
-				tx.transaction((sp) => sp.query('select 1', [], { commit: true })),
+				tx.transaction((sp) => sp.queryAndCommit('select 1')),
 			),
 		).rejects.toThrow(/not a savepoint/);
 	});

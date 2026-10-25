@@ -189,7 +189,7 @@ async transaction(fn, options = {}) {
 ## COMMIT behind the last statement
 
 <a id="commit-behind-the-last-statement"></a>
-`tx.query(sql, params, { commit: true })` marks the transaction's last statement: COMMIT goes out right behind it, under a Sync of its own, without waiting (`Session.commitWith`). With BEGIN sharing the statement's Sync, a transaction whose only statement commits so is **one round trip**:
+`tx.queryAndCommit(sql, params)` runs the transaction's last statement: COMMIT goes out right behind it, under a Sync of its own, without waiting (`Session.commitWith`). With BEGIN sharing the statement's Sync, a transaction whose only statement commits so is **one round trip**:
 
 ```
 C> Parse("", "begin") … Execute   Parse("", "insert …") … Execute   Sync   Parse("", "commit") … Execute Sync   (one write)
@@ -199,7 +199,7 @@ S< … BEGIN … INSERT 0 1 … ReadyForQuery(T)   … COMMIT … ReadyForQuery(
 - The transaction takes no more statements afterwards ("This transaction has already finished"). `Transaction.run` awaits that COMMIT instead of sending one.
 - If the statement fails, COMMIT answers ROLLBACK and the statement's error is reported, as without the option. If BEGIN failed, the statement was skipped and COMMIT, outside a transaction, does nothing.
 - Once the statement succeeded, nothing the callback does afterwards can roll the transaction back: an error thrown after it is reported, but the transaction committed, and its `afterCommit` callbacks run.
-- Only in the outermost transaction; a savepoint refuses it. quarry's `execute({ commit: true })` passes it through, and refuses it with an `expect…` shape, whose check would run after COMMIT was sent.
+- Only in the outermost transaction; a savepoint refuses it. quarry's `executeAndCommit()` calls it, and throws for an `expect…` shape, whose check would run after COMMIT was sent.
 - If the statement had to wait for BEGIN's answer (it needs a Sync of its own, or BEGIN went out alone), COMMIT waits behind it, to keep the order.
 
 ## Retries

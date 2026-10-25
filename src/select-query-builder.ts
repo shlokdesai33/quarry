@@ -4,7 +4,7 @@ import type {
 	Executor,
 	NoRowError,
 	QueryDescription,
-	ExecuteRunOptions,
+	RunOptions,
 	StreamOptions,
 	TooManyRowsError,
 } from './executor.js';
@@ -943,8 +943,13 @@ export class SelectQueryBuilder<
 	}
 
 	/** Runs the query and returns every row. */
-	execute(options?: ExecuteRunOptions): Promise<O[]> {
+	execute(options?: RunOptions): Promise<O[]> {
 		return this.toQuery().execute(options);
+	}
+
+	/** Runs the query as its transaction's last statement and commits; see `Query.executeAndCommit`. */
+	executeAndCommit(options?: RunOptions): Promise<O[]> {
+		return this.toQuery().executeAndCommit(options);
 	}
 
 	/** The SQL and parameters `execute()` sends. */

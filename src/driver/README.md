@@ -143,7 +143,7 @@ await pool.transaction(async (tx) => {
 - BEGIN (with the settings) is sent with the callback's first statement, under one Sync, so a transaction takes 2 round trips. If BEGIN fails, the server skips that statement, and the transaction rejects with BEGIN's error. The callback has already started by then.
 - A savepoint's `savepoint` goes out with its first statement and its `release` with the statement after it (or the COMMIT), under their Sync: a savepoint adds no round trip, and one that runs nothing sends nothing.
 - An error the callback caught and carried on after fails the savepoint (or the transaction) with that error, not with the "current transaction is aborted" of the statements after it.
-- `tx.query(sql, params, { commit: true })` sends COMMIT right behind the transaction's last statement: a one-statement transaction is one round trip.
+- `tx.queryAndCommit(sql, params)` sends COMMIT right behind the transaction's last statement: a one-statement transaction is one round trip.
 - quarry's `db.batch(queries, { transaction: true })` runs a fixed list of statements in one round trip: BEGIN, the settings and the statements under one Sync, then COMMIT with its own, all in one write. A failed statement skips the rest, so COMMIT reports ROLLBACK; a failed BEGIN runs nothing, and the COMMIT after it does nothing.
 
 ## Pool

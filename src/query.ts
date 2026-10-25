@@ -2,8 +2,8 @@ import type { CompiledQuery } from './compile.js';
 import type {
 	ExecuteResult,
 	Executor,
-	ExecuteRunOptions,
 	ReadOptions,
+	RunOptions,
 } from './executor.js';
 
 /** What a `Query` holds. */
@@ -80,16 +80,11 @@ export class Query<T> {
 	}
 
 	/** Runs the query on the database it was started from. */
-	async execute(options?: ExecuteRunOptions): Promise<T> {
-		const { executor, query, read, rows, checked } = this._quarry;
+	async execute(options?: RunOptions): Promise<T> {
+		const { executor, query, read, rows } = this._quarry;
 		if (executor === undefined) {
 			throw new Error(
 				'The query has no database to run on: start it from `database(...)`',
-			);
-		}
-		if (options?.commit === true && checked) {
-			throw new TypeError(
-				'execute({ commit: true }) takes no expect… shape: the check would run after COMMIT was sent. Check the rows yourself before committing, or use db.batch with the shape',
 			);
 		}
 		return read(
@@ -99,6 +94,36 @@ export class Query<T> {
 					? (rows ?? options)
 					: { ...options, ...rows },
 			),
+		);
+	}
+
+	/**
+	 * Runs the query as the last statement of the `db.transaction` it was
+	 * started from, and commits: COMMIT goes out right behind it, without
+	 * waiting for its answer, so a callback whose only statement this is
+	 * runs in one round trip. If the statement fails, the transaction rolls
+	 * back; once it succeeded, nothing the callback does after it can roll
+	 * the transaction back, and the transaction takes no more queries.
+	 * Throws outside a transaction, in a savepoint, and for an `expect…`
+	 * shape, whose check would run after COMMIT was sent.
+	 *
+	 * @example
+	 * await db.transaction((tx) => tx.insertInto(events).values(row).executeAndCommit());
+	 */
+	async executeAndCommit(options?: RunOptions): Promise<T> {
+		const { executor, query, read, rows, checked } = this._quarry;
+		if (executor === undefined) {
+			throw new Error(
+				'The query has no database to run on: start it from `database(...)`',
+			);
+		}
+		if (checked) {
+			throw new TypeError(
+				'executeAndCommit() takes no expect… shape: the check would run after COMMIT was sent. Check the rows before committing, or use db.batch with the shape',
+			);
+		}
+		return read(
+			await executor.execute(query, { ...options, ...rows, andCommit: true }),
 		);
 	}
 

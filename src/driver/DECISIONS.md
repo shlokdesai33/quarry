@@ -268,6 +268,8 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
 
 **Why the run that prepares reads text.** Its columns were described by the unnamed runs, but the schema may have changed since; asking for binary from them would fail that run with `DecodeError` if a column's new type has no binary decoder (the cost already accepted behind PgBouncer, not on direct connections). So a repeated statement reads binary from its third run instead of its second.
 
+**Why 2 is the default.** It is the only threshold that wins on every workload measured (below): one-off SQL stops costing server-side statements and evictions, a working set larger than the cache stops churning, and repeated statements pay one extra parse per connection. The price is on large results read on fresh connections (a repeated statement's second run reads text), which a long-lived pool pays once per statement and connection; 1 keeps that run binary for code that only runs a few statements, many times, on short-lived connections.
+
 **Alternatives.** Threshold 1 (prepare on first use: the old behaviour). Higher thresholds (pgjdbc and Npgsql use 5): measured below, 3 and 5 lose on churn because statements stay unnamed and re-planned for longer. Counting sightings in a separate map: a second structure to bound and evict from, where the unnamed cache entry already exists.
 
 **Cost.** A repeated statement is parsed and planned once more (its first run), and reads text on its first two runs instead of one. That shows on large results read on a fresh connection: the benchmark suite's equal-work cell (a fresh pool, then three 1M-row fetches) went from 412 to 535 ms per fetch on average, because its first measured fetch now reads text; small queries don't notice (point lookups, inserts, updates, the error path, 1k-row fetches: all within noise). `prepareThreshold: 1` restores the old behaviour.
@@ -703,6 +705,8 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 
 **Why.** Operating a pool needs to see churn (connections closed as `lost` point at the network or the server), saturation (waits, timeouts, refusals) and failed connects, without wrapping the pool.
 
+**Why this shape.** Two views, as metrics systems want them: counters that only grow (`metrics`, read on a scrape interval and turned into rates), and events for logs and alerts (`onEvent`), each carrying what a log line needs (the connection, the error, the reason). `stats` stays the gauge view. Events are lifecycle-only, so subscribing costs nothing per query; one listener method with a `type` field (like `onNotice`) rather than a method per event keeps the API to one name, returns its own unsubscribe, and can't crash the process the way an unhandled `'error'` event can.
+
 **Alternatives.** An `EventEmitter` (an `'error'` event without a listener crashes the process, pg-pool's trap). Per-query events (a cost on every query; `onTiming` and telemetry already cover queries).
 
 **Cost.** Integer increments on lifecycle paths; nothing per query. A throwing listener is reported in a microtask, as other listeners are.
@@ -728,6 +732,8 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 **Why.** All three drivers measured failed the query issued right after the server killed an idle connection, before the client had read the close. The query provably never ran: the server answers in order and flushes everything it produced before a FATAL, so had it read the query's Parse or Bind (let alone committed at its Sync), a ParseComplete or BindComplete would have come first.
 
 **Why not a socket closed with no FATAL.** The server may have run and committed the query and then died before flushing its answer; there is no proof it didn't run, so it is reported.
+
+**Why stricter than the recommendation.** The comparison suggested also retrying a query whose socket closed while the connection looked idle. A rerun must never run a write twice, and only a FATAL that came first proves the server didn't run the query; an idle connection closing under a written query proves nothing about what the server did before dying. Such a query fails with `ConnectionError`, as before, and the caller decides.
 
 **Alternatives.** Retry on any connection error (can run a write twice). No retry (the old behaviour).
 
@@ -905,17 +911,17 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 
 ### COMMIT pipelined behind a transaction's last statement
 
-**What it is.** `tx.query(sql, params, { commit: true })` (quarry's `execute({ commit: true })` inside `db.transaction`) sends COMMIT right behind the statement, under a Sync of its own, without waiting: with BEGIN sharing the statement's Sync, a one-statement transaction is one round trip. The transaction then takes no more statements. If the statement fails, COMMIT answers ROLLBACK and the transaction rolls back; if BEGIN failed, the statement was skipped and COMMIT, outside a transaction, does nothing ([TRANSACTIONS.md](TRANSACTIONS.md#commit-behind-the-last-statement)).
+**What it is.** `tx.queryAndCommit(sql, params)` (quarry's `executeAndCommit()` inside `db.transaction`) sends COMMIT right behind the statement, under a Sync of its own, without waiting: with BEGIN sharing the statement's Sync, a one-statement transaction is one round trip. The transaction then takes no more statements. If the statement fails, COMMIT answers ROLLBACK and the transaction rolls back; if BEGIN failed, the statement was skipped and COMMIT, outside a transaction, does nothing ([TRANSACTIONS.md](TRANSACTIONS.md#commit-behind-the-last-statement)).
 
 **Why.** `db.batch({ transaction: true })` already sends a fixed list of statements as one round trip; a callback transaction paid a round trip more for its COMMIT, the largest cost of a short transaction on a network.
 
-**Alternatives.** Detect the last statement automatically (impossible: the callback may issue more). Make COMMIT share the statement's Sync (a failed statement would leave the transaction open for a rollback round trip).
+**Alternatives.** Detect the last statement automatically (impossible: the callback may issue more). Make COMMIT share the statement's Sync (a failed statement would leave the transaction open for a rollback round trip). An option on `query` (`commit: true`, the first version): a method whose name says it commits keeps "this ends the transaction" visible where it happens, as quarry names its methods for what they do.
 
 **Cost.** Once the statement succeeded, nothing the callback does after it can roll the transaction back: an error thrown afterwards is reported, but the transaction committed (its `afterCommit` callbacks run). So the builder refuses it with an `expect…` shape (its check would run after COMMIT) and in a savepoint.
 
-**Measured.** begin; insert; commit: 2 → 1 round trips. In the benchmark suite (same setup), `tx-insert-commit` (one insert marked as last): 18,335 → 27,016 transactions/s (+47%), p99 94 → 67 µs, client CPU 33.0 → 23.7 µs; the unmarked `tx-insert` is unchanged (18,123 → 18,007/s).
+**Measured.** begin; insert; commit: 2 → 1 round trips. In the benchmark suite (same setup), `tx-insert-commit` (one insert run with `queryAndCommit`): 18,335 → 27,016 transactions/s (+47%), p99 94 → 67 µs, client CPU 33.0 → 23.7 µs; the unmarked `tx-insert` is unchanged (18,123 → 18,007/s).
 
-**Code.** [transaction.ts](transaction.ts) `Session.commitWith`, `Transaction.query`, `Transaction.run`; [../driver-executor.ts](../driver-executor.ts) `#queryOptions`.
+**Code.** [transaction.ts](transaction.ts) `Session.commitWith`, `Transaction.queryAndCommit`, `Transaction.run`; [../driver-executor.ts](../driver-executor.ts) `execute`.
 
 ### Detect a COMMIT that rolled back
 
@@ -1283,6 +1289,8 @@ Untimed lookups are unchanged (77,092, 79,339, 14,941 and 56,411/s before).
 **What it is.** A `Uint8Array` (or `Buffer`) parameter is sent in binary as bytea; any other typed array or `DataView` is refused with a message saying how to convert it.
 
 **Why.** A `Float32Array` or `Int16Array` went out as its raw, platform-endian bytes: almost never what a column of numbers (a vector, an `int2[]`) wants, and silently wrong.
+
+**Why refuse rather than convert.** There are two plausible meanings (the numbers, for an array or vector column; the raw bytes, for bytea), and the driver can't tell which without the column's type. Guessing the numbers silently changes what a `bytea` receives; guessing the bytes is what happened before. The error names both conversions (`Array.from(value)`, `new Uint8Array(value.buffer, …)`), so the fix is one call.
 
 **Alternatives.** Encode other typed arrays as arrays of numbers (a guess at the column's type).
 

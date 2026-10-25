@@ -340,7 +340,7 @@ await db.transaction(
 - **`afterCommit(fn)`** runs `fn` once the outermost transaction commits; dropped on rollback or retry. **`afterRollback(fn)`** runs if this transaction or savepoint rolls back.
 - **`setLocal(name, value)`** sets a run-time parameter for the rest of the transaction with `set_config(name, $value, true)`: bound, never interpolated.
 - **`settings`** (an option) does the same for several settings at the start, sent with BEGIN.
-- **`execute({ commit: true })`** marks the callback's last statement: `#queryOptions` passes `commit` to the driver `Transaction`, which sends COMMIT right behind the statement, so a one-statement transaction is one round trip. `Query.execute` refuses it with an `expect…` shape (`checked`: its check would run after COMMIT was sent), `#queryOptions` outside a transaction, and the driver in a savepoint.
+- **`executeAndCommit()`** runs the callback's last statement: `DriverExecutor.execute` (asked with `andCommit`) calls the driver's `Transaction.queryAndCommit`, which sends COMMIT right behind the statement, so a one-statement transaction is one round trip. `Query.executeAndCommit` throws for an `expect…` shape (`checked`: its check would run after COMMIT was sent), the executor outside a transaction, and the driver in a savepoint.
 
 The driver's framing (BEGIN sharing the first statement's Sync, savepoints and releases sharing the next statement's Sync, COMMIT behind the last statement, a caught error resurfacing as itself, detecting a COMMIT that rolled back) is in [driver/TRANSACTIONS.md](driver/TRANSACTIONS.md).
 

@@ -3,7 +3,7 @@ import {
 	type Executor,
 	type NoRowError,
 	RowCountError,
-	type ExecuteRunOptions,
+	type RunOptions,
 	type TooManyRowsError,
 } from './executor.js';
 import { Expression } from './expression.js';
@@ -199,8 +199,13 @@ export class SqlQuery<R> {
 	}
 
 	/** Runs the statement, resolving to its rows and row count. */
-	execute(options?: ExecuteRunOptions): Promise<SqlResult<R>> {
+	execute(options?: RunOptions): Promise<SqlResult<R>> {
 		return this.toQuery().execute(options);
+	}
+
+	/** Runs the statement as its transaction's last and commits; see `Query.executeAndCommit`. */
+	executeAndCommit(options?: RunOptions): Promise<SqlResult<R>> {
+		return this.toQuery().executeAndCommit(options);
 	}
 
 	/** The query `execute()` runs, for `db.batch`. */

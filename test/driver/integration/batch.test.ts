@@ -443,7 +443,7 @@ describe.skipIf(noPg)('db.batch', () => {
 		});
 	});
 
-	describe('execute({ commit: true })', () => {
+	describe('executeAndCommit()', () => {
 		it('sends BEGIN, the statement and COMMIT in one write', async () => {
 			// without onQuery, whose per-statement timing needs a Sync of the statement's own
 			const plain = database(conn);
@@ -454,7 +454,7 @@ describe.skipIf(noPg)('db.batch', () => {
 						.set({ balance: 40 })
 						.where('accounts.id', 2)
 						.returning(['accounts.balance'])
-						.execute({ commit: true });
+						.executeAndCommit();
 					return moved;
 				}),
 			);
@@ -478,7 +478,7 @@ describe.skipIf(noPg)('db.batch', () => {
 						.update(accounts)
 						.set({ balance: -1 })
 						.where('accounts.id', 2)
-						.execute({ commit: true });
+						.executeAndCommit();
 				}),
 			);
 			expect(failed.error).toBeInstanceOf(PostgresError);
@@ -487,7 +487,7 @@ describe.skipIf(noPg)('db.batch', () => {
 				{ id: 1, balance: 100 },
 				{ id: 2, balance: 50 },
 			]);
-			await expect(setBalance(1, 1).execute({ commit: true })).rejects.toThrow(
+			await expect(setBalance(1, 1).executeAndCommit()).rejects.toThrow(
 				/inside db.transaction/,
 			);
 			await expect(
@@ -496,7 +496,7 @@ describe.skipIf(noPg)('db.batch', () => {
 						.selectFrom(accounts)
 						.select(['accounts.id'])
 						.expectOne()
-						.execute({ commit: true }),
+						.executeAndCommit(),
 				),
 			).rejects.toThrow(/no expect… shape/);
 			await expect(
@@ -506,7 +506,7 @@ describe.skipIf(noPg)('db.batch', () => {
 							.update(accounts)
 							.set({ balance: 1 })
 							.where('accounts.id', 1)
-							.execute({ commit: true }),
+							.executeAndCommit(),
 					),
 				),
 			).rejects.toThrow(/not a savepoint/);

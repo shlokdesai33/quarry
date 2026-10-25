@@ -31,7 +31,7 @@ export interface Driver {
 	transaction(fn: (tx: Tx) => Promise<void>): Promise<void>;
 	/**
 	 * A transaction whose only statement is marked as its last, so the
-	 * client can send COMMIT behind it (quarry's `commit: true`); clients
+	 * client can send COMMIT behind it (quarry's `queryAndCommit`); clients
 	 * without that run it as a plain transaction.
 	 */
 	transactionCommitting?(sql: string, params: unknown[]): Promise<void>;
@@ -235,7 +235,11 @@ async function quarry(
 			(await pool.query(sql, params, { paramTypes })).rows,
 		transaction: (fn) => pool.transaction((tx: any) => fn(quarryTx(tx))),
 		transactionCommitting: (sql, params) =>
-			pool.transaction((tx: any) => tx.query(sql, params, { commit: true })),
+			pool.transaction((tx: any) =>
+				tx.queryAndCommit
+					? tx.queryAndCommit(sql, params)
+					: tx.query(sql, params),
+			),
 		copyFrom: async (sql, chunks) => {
 			await pool.copyFrom(sql, chunks);
 		},

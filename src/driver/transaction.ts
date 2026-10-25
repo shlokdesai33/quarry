@@ -603,35 +603,38 @@ export class Transaction {
 			throw new DriverError('This transaction has already finished');
 	}
 
-	/**
-	 * Runs a statement in the transaction. With `commit: true`, it is the
-	 * transaction's last: COMMIT goes out right behind it, without waiting
-	 * for its answer, and the transaction then takes no more statements.
-	 * A callback whose only statement commits so runs in one round trip
-	 * (BEGIN shares its Sync). If it fails, the transaction rolls back
-	 * (COMMIT reports ROLLBACK); once it succeeded, nothing the callback does
-	 * after it can roll the transaction back. Only in the outermost
-	 * transaction, not a savepoint.
-	 */
 	query<R = Record<string, unknown>>(
 		sql: string,
 		params?: readonly unknown[],
 		options?: TxQueryOptions,
 	): Promise<QueryResult<R>> {
 		if (this.#finished) return Promise.reject(finishedError());
-		if (options?.['commit'] !== undefined) {
-			const { commit, ...rest } = options;
-			if (commit !== true) return this.#conn.query<R>(sql, params, rest);
-			if (this.#depth > 0)
-				return Promise.reject(
-					new DriverError(
-						'commit: true ends the outermost transaction, not a savepoint',
-					),
-				);
-			this.#finished = true;
-			return this.#conn.commitWith<R>(sql, params, rest);
-		}
 		return this.#conn.query<R>(sql, params, options);
+	}
+
+	/**
+	 * Runs the transaction's last statement and commits: COMMIT goes out
+	 * right behind it, without waiting for its answer, and the transaction
+	 * then takes no more statements. A callback whose only statement this
+	 * is runs in one round trip (BEGIN shares its Sync). If it fails, the
+	 * transaction rolls back (COMMIT reports ROLLBACK); once it succeeded,
+	 * nothing the callback does after it can roll the transaction back.
+	 * Only in the outermost transaction, not a savepoint.
+	 */
+	queryAndCommit<R = Record<string, unknown>>(
+		sql: string,
+		params?: readonly unknown[],
+		options?: TxQueryOptions,
+	): Promise<QueryResult<R>> {
+		if (this.#finished) return Promise.reject(finishedError());
+		if (this.#depth > 0)
+			return Promise.reject(
+				new DriverError(
+					'queryAndCommit() ends the outermost transaction, not a savepoint',
+				),
+			);
+		this.#finished = true;
+		return this.#conn.commitWith<R>(sql, params, options);
 	}
 
 	/**

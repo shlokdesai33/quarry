@@ -221,19 +221,21 @@ The driver's decisions are in [driver/DECISIONS.md](driver/DECISIONS.md), which 
 
 **Code.** `stream` in [select-query-builder.ts](select-query-builder.ts); [driver-executor.ts](driver-executor.ts) `stream`; the driver's [row-stream.ts](driver/row-stream.ts).
 
-### `execute({ commit: true })` for a transaction's last statement
+### `executeAndCommit()` for a transaction's last statement
 
-**What it is.** Inside `db.transaction`, `execute({ commit: true })` makes a statement the transaction's last: the driver sends COMMIT right behind it, so a callback whose only statement commits so is one round trip ([driver/DECISIONS.md](driver/DECISIONS.md#commit-pipelined-behind-a-transactions-last-statement)). It is refused outside a transaction, in a savepoint, and with an `expect…` shape.
+**What it is.** Inside `db.transaction`, `executeAndCommit()` runs a query as the transaction's last statement: the driver sends COMMIT right behind it (`Transaction.queryAndCommit`), so a callback whose only statement this is runs in one round trip ([driver/DECISIONS.md](driver/DECISIONS.md#commit-pipelined-behind-a-transactions-last-statement)). It throws outside a transaction, in a savepoint, and for an `expect…` shape.
 
 **Why.** `db.batch({ transaction: true })` reaches one round trip for statements known up front; a callback transaction, which can branch on results, paid one more for COMMIT.
 
-**Why an option, and refused with `expect…` shapes.** Only the caller knows which statement is the last. An `expect…` shape checks the rows after they arrive, which would be after COMMIT was sent: a `NoRowError` could no longer roll anything back, so the combination is refused rather than allowed to mislead (a batch with `verify` makes COMMIT wait for the check instead).
+**Why a method named for what it does.** Only the caller knows which statement is the last, so it has to say so; a method whose name says it also commits makes that visible where it happens, where an `execute({ commit: true })` flag reads like any other option. It sits beside `execute()` on queries, select builders, write builders and `db.sql`, and takes the same `signal` and `timeout`.
 
-**Alternatives.** A method that commits (`commitWith`): a second way to run a query. Detecting the last statement: the callback may always issue another.
+**Why refused with `expect…` shapes.** A shape checks the rows after they arrive, which would be after COMMIT was sent: a `NoRowError` could no longer roll anything back, so the combination throws rather than mislead (a batch with `verify` makes COMMIT wait for the check instead).
+
+**Alternatives.** An option on `execute` (the first version: `execute({ commit: true })`). Detecting the last statement: the callback may always issue another.
 
 **Cost.** Once the statement succeeded, an error thrown later in the callback no longer rolls the transaction back.
 
-**Code.** [query.ts](query.ts) `execute`; [driver-executor.ts](driver-executor.ts) `#queryOptions`.
+**Code.** [query.ts](query.ts) `executeAndCommit`; [driver-executor.ts](driver-executor.ts) `execute`.
 
 ## Compiling to SQL
 

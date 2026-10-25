@@ -220,14 +220,6 @@ export class DriverExecutor implements TransactionExecutor {
 			out.prepare = this.#options.prepare;
 		if (options.signal !== undefined) out.signal = options.signal;
 		if (options.timeout !== undefined) out.statementTimeout = options.timeout;
-		if (options.commit === true) {
-			if (!(this.#source instanceof Transaction))
-				throw new DriverError(
-					'execute({ commit: true }) commits a transaction: run it inside db.transaction',
-				);
-			// read by the driver's Transaction
-			Reflect.set(out, 'commit', true);
-		}
 		if (onTiming !== undefined) out.onTiming = onTiming;
 		if (tag !== undefined) out.tag = tag;
 		return out;
@@ -331,9 +323,25 @@ export class DriverExecutor implements TransactionExecutor {
 		let acquired = start;
 		let timing: OpTiming | undefined;
 		try {
-			const pool = this.#shared(query);
+			const source = this.#source;
+			const pool = options.andCommit === true ? undefined : this.#shared(query);
 			let result: QueryResult<unknown>;
-			if (pool !== undefined) {
+			if (options.andCommit === true) {
+				if (!(source instanceof Transaction))
+					throw new DriverError(
+						'executeAndCommit() commits a transaction: run it inside db.transaction',
+					);
+				if (observe) acquired = performance.now();
+				result = await source.queryAndCommit<unknown>(
+					query.sql,
+					query.params,
+					this.#queryOptions(
+						options,
+						observe ? (t) => (timing = t) : undefined,
+						query,
+					),
+				);
+			} else if (pool !== undefined) {
 				if (!this.#ready) await this.#prepare(pool);
 				// the pool picks the connection: the time before the query
 				// reached it is the wait for a connection or a pipeline slot
