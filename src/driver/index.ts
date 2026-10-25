@@ -17,6 +17,7 @@ export {
 	type QueryOptions,
 } from './connection.js';
 export * from './errors.js';
+export type { CopyFromStream } from './copy-streams.js';
 export type { Notice, Notification } from './notice.js';
 export type { Description, OpTiming, QueryResult } from './ops.js';
 export type { Field } from './protocol/messages.js';
@@ -46,6 +47,8 @@ export {
 	createPool,
 	Pool,
 	PoolClient,
+	type ListenGap,
+	type ListenOptions,
 	type PoolCloseReason,
 	type PoolEvent,
 	type PoolMetrics,

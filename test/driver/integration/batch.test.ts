@@ -481,7 +481,8 @@ describe.skipIf(noPg)('db.batch', () => {
 						.execute({ commit: true });
 				}),
 			);
-			expect((failed.error as PostgresError).code).toBe('23514');
+			expect(failed.error).toBeInstanceOf(PostgresError);
+			expect(failed.error).toMatchObject({ code: '23514' });
 			expect(await balances()).toEqual([
 				{ id: 1, balance: 100 },
 				{ id: 2, balance: 50 },

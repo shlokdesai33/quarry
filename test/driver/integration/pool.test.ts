@@ -345,10 +345,7 @@ describe.skipIf(noPg)('transactions', () => {
 			await tx.query(`insert into ${name} values (3, 'c')`);
 			return [swallowed, ignored];
 		});
-		expect(seen.map((e) => (e as PostgresError).code)).toEqual([
-			'23505',
-			'23505',
-		]);
+		expect(seen).toMatchObject([{ code: '23505' }, { code: '23505' }]);
 		expect(seen[0]).toBeInstanceOf(UniqueViolation);
 		expect(await ids()).toEqual([1, 3]);
 		// the outermost transaction: TransactionRolledBack, caused by it
@@ -1269,12 +1266,16 @@ describe.skipIf(noPg)('pool', () => {
 	it('listens on a dedicated connection and re-subscribes after it drops', async () => {
 		await using p = pool();
 		const received: string[] = [];
-		const unlisten = await p.listen('pool_events', (n) =>
-			received.push(n.payload),
+		const gaps: { from: Date; to: Date }[] = [];
+		const unlisten = await p.listen(
+			'pool_events',
+			(n) => received.push(n.payload),
+			{ onGap: (gap) => gaps.push(gap) },
 		);
 		await p.query("select pg_notify('pool_events', 'one')");
 		await sleep(100);
 		await using admin = await open();
+		const terminated = Date.now();
 		await admin.query(
 			'select pg_terminate_backend(pid) from pg_stat_activity where query = \'listen "pool_events"\' and pid <> pg_backend_pid()',
 		);
@@ -1282,6 +1283,11 @@ describe.skipIf(noPg)('pool', () => {
 		await p.query("select pg_notify('pool_events', 'two')");
 		await sleep(100);
 		expect(received).toEqual(['one', 'two']);
+		// once, after it listened again: notifications in between were lost
+		expect(gaps).toHaveLength(1);
+		const [gap] = gaps;
+		expect(gap?.from.getTime()).toBeGreaterThanOrEqual(terminated - 5);
+		expect(gap!.to.getTime() - gap!.from.getTime()).toBeGreaterThanOrEqual(45);
 		await unlisten();
 	});
 

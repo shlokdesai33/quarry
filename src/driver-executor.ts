@@ -439,6 +439,7 @@ export class DriverExecutor implements TransactionExecutor {
 				...(options.batchSize === undefined
 					? {}
 					: { batchSize: options.batchSize }),
+				...(options.readAhead === true ? { readAhead: true } : {}),
 			};
 			for await (const batch of runner.cursor<unknown>(
 				query.sql,

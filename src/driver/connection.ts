@@ -26,6 +26,12 @@ import {
 	ProtocolError,
 	postgresError,
 } from './errors.js';
+import type { Readable } from 'node:stream';
+import {
+	copyFromStream,
+	copyToStream,
+	type CopyFromStream,
+} from './copy-streams.js';
 import { CursorIterator, type CursorHost } from './cursor.js';
 import { toNotice, type Notice, type Notification } from './notice.js';
 import {
@@ -60,7 +66,7 @@ import {
 	type RowMode,
 } from './rows.js';
 import type { DriverSocket } from './socket.js';
-import { startQuerySpan } from './telemetry.js';
+import { startQuerySpan, type QuerySpan } from './telemetry.js';
 import { Transaction, type TransactionOptions } from './transaction.js';
 import type { Codec } from './codec.js';
 import {
@@ -175,6 +181,13 @@ export interface GroupStatement {
 export interface CursorOptions extends Omit<QueryOptions, 'keepRows'> {
 	/** Rows fetched per round trip (default 1000), each batch once the one before is taken. */
 	readonly batchSize?: number;
+	/**
+	 * Fetch the next batch as soon as one is handed out, instead of when it
+	 * is asked for: a slow consumer then doesn't wait a round trip per
+	 * batch, for one more batch in memory (default false). Outside a
+	 * transaction only; inside one, other queries run between batches.
+	 */
+	readonly readAhead?: boolean;
 }
 
 /** What a connection needs to know about how it was opened. */
@@ -1448,7 +1461,81 @@ export class Connection implements AsyncDisposable {
 		fn: (tx: Transaction) => Promise<T>,
 		options?: TransactionOptions,
 	): Promise<T> {
-		return Transaction.run(this, fn, options);
+		const span = this.#span('', undefined, 'TRANSACTION');
+		if (span === undefined) return Transaction.run(this, fn, options);
+		return Transaction.run(this, fn, options).then(
+			(result) => {
+				span.finish(undefined);
+				return result;
+			},
+			(error: unknown) => {
+				span.finish(undefined, error);
+				throw error;
+			},
+		);
+	}
+
+	/** A span for an operation, when telemetry is on. */
+	#span(
+		sql: string,
+		tag: string | undefined,
+		name?: string,
+	): QuerySpan | undefined {
+		const telemetry = this.#config.telemetry;
+		return telemetry === undefined
+			? undefined
+			: startQuerySpan(
+					telemetry,
+					{ database: this.#config.database, ...this.#info.host },
+					sql,
+					tag,
+					name,
+				);
+	}
+
+	/** Reports an iteration (a cursor's batches, COPY's chunks) as one span, from its first `next` to its end. */
+	#observeIteration<T>(
+		sql: string,
+		tag: string | undefined,
+		iterable: AsyncIterable<T>,
+		rows: (value: T) => number,
+		rowCount?: () => number,
+	): AsyncIterable<T> {
+		if (this.#config.telemetry === undefined) return iterable;
+		return {
+			[Symbol.asyncIterator]: () => {
+				const iterator = iterable[Symbol.asyncIterator]();
+				let span: QuerySpan | undefined;
+				let count = 0;
+				const end = (error?: unknown) => {
+					span?.finish(
+						{ rowCount: rowCount === undefined ? count : rowCount() },
+						error,
+					);
+					span = undefined;
+				};
+				return {
+					next: async () => {
+						span ??= this.#span(sql, tag);
+						try {
+							const result = await iterator.next();
+							if (result.done === true) end();
+							else count += rows(result.value);
+							return result;
+						} catch (error) {
+							end(error);
+							throw error;
+						}
+					},
+					return: async () => {
+						end();
+						return (
+							(await iterator.return?.()) ?? { done: true, value: undefined }
+						);
+					},
+				};
+			},
+		};
 	}
 
 	/**
@@ -1562,6 +1649,7 @@ export class Connection implements AsyncDisposable {
 					portal,
 					held,
 					statementTimeout,
+					options?.readAhead,
 				);
 				if (!this.#config.catalog.loaded) this.#loadTypesAfter(params, options);
 				return op;
@@ -1570,7 +1658,12 @@ export class Connection implements AsyncDisposable {
 		const iterate = (): AsyncIterator<R[]> =>
 			// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- rows are typed by the caller, as in `asRows`
 			new CursorIterator(this.#cursors(), request) as AsyncIterator<R[]>;
-		return { [Symbol.asyncIterator]: iterate };
+		return this.#observeIteration(
+			sql,
+			options?.tag,
+			{ [Symbol.asyncIterator]: iterate },
+			(batch) => batch.length,
+		);
 	}
 
 	#cursors(): CursorHost {
@@ -1647,10 +1740,13 @@ export class Connection implements AsyncDisposable {
 		return this.copyFrom(sql, copyChunks(rows), options);
 	}
 
-	/** Runs `COPY … TO STDOUT`, yielding the data in chunks, with backpressure. */
+	/**
+	 * Runs `COPY … TO STDOUT`, yielding the data in chunks, with
+	 * backpressure: each chunk holds what arrived since the last.
+	 */
 	copyTo(
 		sql: string,
-		options?: Pick<QueryOptions, 'signal' | 'timeout'> & {
+		options?: Pick<QueryOptions, 'signal' | 'timeout' | 'tag'> & {
 			highWaterMark?: number;
 		},
 	): AsyncIterable<Uint8Array> {
@@ -1662,6 +1758,23 @@ export class Connection implements AsyncDisposable {
 				}),
 			};
 		}
+		let rowCount = 0;
+		return this.#observeIteration(
+			sql,
+			options?.tag,
+			this.#copyTo(sql, options, (n) => (rowCount = n)),
+			() => 0,
+			() => rowCount,
+		);
+	}
+
+	#copyTo(
+		sql: string,
+		options:
+			| (Pick<QueryOptions, 'signal' | 'timeout'> & { highWaterMark?: number })
+			| undefined,
+		onRowCount: (rowCount: number) => void,
+	): AsyncIterable<Uint8Array> {
 		return {
 			[Symbol.asyncIterator]: () => {
 				const op = new CopyToOp(sql, options?.highWaterMark ?? 1 << 20);
@@ -1673,9 +1786,9 @@ export class Connection implements AsyncDisposable {
 							this.#enqueue(op, options?.signal, options?.timeout);
 						}
 						const chunk = await op.next();
-						return chunk === undefined
-							? { done: true, value: undefined }
-							: { done: false, value: chunk };
+						if (chunk !== undefined) return { done: false, value: chunk };
+						onRowCount(op.rowCount);
+						return { done: true, value: undefined };
 					},
 					return: async (): Promise<IteratorResult<Uint8Array>> => {
 						if (started && !op.done) {
@@ -1691,6 +1804,29 @@ export class Connection implements AsyncDisposable {
 				};
 			},
 		};
+	}
+
+	/**
+	 * `copyFrom` as a Node `Writable`, to pipe a file or another stream into
+	 * `COPY … FROM STDIN`. It finishes once the server confirmed the COPY,
+	 * with `rowCount` set; destroying it fails the COPY.
+	 *
+	 * @example
+	 * await pipeline(createReadStream('users.csv'), conn.createCopyFromStream('copy users from stdin (format csv)'));
+	 */
+	createCopyFromStream(
+		sql: string,
+		options?: Pick<QueryOptions, 'signal' | 'timeout' | 'tag'>,
+	): CopyFromStream {
+		return copyFromStream((source) => this.copyFrom(sql, source, options));
+	}
+
+	/** `copyTo` as a Node `Readable`; destroying it stops the COPY. */
+	createCopyToStream(
+		sql: string,
+		options?: Pick<QueryOptions, 'signal' | 'timeout' | 'tag'>,
+	): Readable {
+		return copyToStream(this.copyTo(sql, options));
 	}
 
 	/**
@@ -1857,10 +1993,7 @@ export class Connection implements AsyncDisposable {
 				op.rerunOptions !== undefined &&
 				(terminated || !op.written)
 			) {
-				// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- set from the query's own options
-				const options = (op.rerunOptions ?? undefined) as
-					| QueryOptions
-					| undefined;
+				const options = op.rerunOptions ?? undefined;
 				op.redirect((resolve, reject) =>
 					rerun(op.sql, op.params, options, resolve, reject),
 				);

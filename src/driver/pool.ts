@@ -3,7 +3,13 @@ import {
 	type ConnectionOptions,
 	type ResolvedConfig,
 } from './config.js';
+import type { Readable } from 'node:stream';
 import { openConnection, preloadSockets } from './connect.js';
+import {
+	copyFromStream,
+	copyToStream,
+	type CopyFromStream,
+} from './copy-streams.js';
 import type { Connection, CursorOptions, QueryOptions } from './connection.js';
 import { RowStream } from './row-stream.js';
 import { AbortError, ConnectionError, DriverError } from './errors.js';
@@ -1753,6 +1759,22 @@ export class Pool implements AsyncDisposable {
 		);
 	}
 
+	/** `copyFrom` on a connection of its own, as a Node `Writable`; see `Connection.createCopyFromStream`. */
+	createCopyFromStream(
+		sql: string,
+		options?: Pick<QueryOptions, 'signal' | 'timeout'>,
+	): CopyFromStream {
+		return copyFromStream((source) => this.copyFrom(sql, source, options));
+	}
+
+	/** `copyTo` on a connection of its own, as a Node `Readable`; destroying it stops the COPY and frees the connection. */
+	createCopyToStream(
+		sql: string,
+		options?: Pick<QueryOptions, 'signal' | 'timeout'>,
+	): Readable {
+		return copyToStream(this.copyTo(sql, options));
+	}
+
 	async *copyTo(
 		sql: string,
 		options?: Pick<QueryOptions, 'signal' | 'timeout'>,
@@ -1767,17 +1789,20 @@ export class Pool implements AsyncDisposable {
 
 	/**
 	 * Subscribes to a channel on a dedicated connection (outside `max`). If
-	 * that connection drops, it reconnects and subscribes again; notifications
-	 * sent while it was down are lost, as Postgres doesn't queue them.
+	 * that connection drops, it reconnects (backing off from 100 ms to 5 s,
+	 * with jitter) and subscribes again; notifications sent while it was
+	 * down are lost, as Postgres doesn't queue them, and `onGap` is called
+	 * once it listens again, to re-read what they would have said.
 	 */
 	listen(
 		channel: string,
 		handler: (notification: Notification) => void,
+		options: ListenOptions = {},
 	): Promise<() => Promise<void>> {
 		if (this.#ended)
 			return Promise.reject(new DriverError('The pool has ended'));
 		this.#listener ??= new Listener(this.#config);
-		return this.#listener.listen(channel, handler);
+		return this.#listener.listen(channel, handler, options.onGap);
 	}
 
 	/**
@@ -1849,16 +1874,37 @@ export class Pool implements AsyncDisposable {
 	}
 }
 
+/** Options of `Pool.listen`. */
+export interface ListenOptions {
+	/**
+	 * Called once the channel is subscribed again after its connection
+	 * dropped, with when it dropped and when it listened again:
+	 * notifications sent in between were lost.
+	 */
+	readonly onGap?: ((gap: ListenGap) => void) | undefined;
+}
+
+/** When a pool's LISTEN connection was down; see `ListenOptions.onGap`. */
+export interface ListenGap {
+	readonly from: Date;
+	readonly to: Date;
+}
+
+type NotificationHandler = (notification: Notification) => void;
+
 /** The pool's LISTEN connection: reconnects with backoff and re-subscribes every channel. */
 class Listener {
 	readonly #config: ResolvedConfig;
+	/** Each channel's handlers, with their gap callbacks. */
 	readonly #channels = new Map<
 		string,
-		Set<(notification: Notification) => void>
+		Map<NotificationHandler, ((gap: ListenGap) => void) | undefined>
 	>();
 	#connection: Promise<Connection> | undefined;
 	#closed = false;
 	#attempt = 0;
+	/** When the connection dropped, until it listens again. */
+	#droppedAt: number | undefined;
 
 	constructor(config: ResolvedConfig) {
 		this.#config = config;
@@ -1868,12 +1914,15 @@ class Listener {
 		this.#connection ??= (async () => {
 			const connection = await openConnection(this.#config);
 			connection.onNotification((notification) => {
-				for (const handler of this.#channels.get(notification.channel) ?? [])
-					handler(notification);
+				const handlers = this.#channels.get(notification.channel);
+				if (handlers === undefined) return;
+				for (const handler of handlers.keys()) handler(notification);
 			});
 			connection.onClose(() => {
 				this.#connection = undefined;
-				if (!this.#closed && this.#channels.size > 0) this.#reconnect();
+				if (this.#closed || this.#channels.size === 0) return;
+				this.#droppedAt ??= Date.now();
+				this.#reconnect();
 			});
 			// sent together: the connection pipelines them in one round trip
 			await Promise.all(
@@ -1882,6 +1931,13 @@ class Listener {
 				),
 			);
 			this.#attempt = 0;
+			const droppedAt = this.#droppedAt;
+			if (droppedAt !== undefined) {
+				this.#droppedAt = undefined;
+				const gap = { from: new Date(droppedAt), to: new Date() };
+				for (const handlers of this.#channels.values())
+					for (const onGap of handlers.values()) if (onGap) report(onGap, gap);
+			}
 			return connection;
 		})();
 		this.#connection.catch(() => {
@@ -1891,7 +1947,9 @@ class Listener {
 	}
 
 	#reconnect(): void {
-		const delay = Math.min(5000, 100 * 2 ** this.#attempt++);
+		// jittered, so listeners of many processes don't reconnect in step
+		const delay =
+			Math.min(5000, 100 * 2 ** this.#attempt++) * (0.5 + Math.random());
 		const timer = setTimeout(() => {
 			if (this.#closed || this.#channels.size === 0) return;
 			this.#connect().catch(() => this.#reconnect());
@@ -1901,15 +1959,16 @@ class Listener {
 
 	async listen(
 		channel: string,
-		handler: (notification: Notification) => void,
+		handler: NotificationHandler,
+		onGap: ((gap: ListenGap) => void) | undefined,
 	): Promise<() => Promise<void>> {
 		let handlers = this.#channels.get(channel);
 		const isNew = handlers === undefined;
 		if (handlers === undefined) {
-			handlers = new Set();
+			handlers = new Map();
 			this.#channels.set(channel, handlers);
 		}
-		handlers.add(handler);
+		handlers.set(handler, onGap);
 		try {
 			const connection = await this.#connect();
 			if (isNew)
@@ -1947,6 +2006,17 @@ class Listener {
 }
 
 const quote = (name: string) => `"${name.replaceAll('"', '""')}"`;
+
+/** Calls a listener's callback, reporting (not throwing) its error. */
+function report<T>(callback: (value: T) => void, value: T): void {
+	try {
+		callback(value);
+	} catch (error) {
+		queueMicrotask(() => {
+			throw error;
+		});
+	}
+}
 
 /** Creates a pool. Options can be a connection string. */
 export function createPool(options?: PoolOptions | string): Pool {

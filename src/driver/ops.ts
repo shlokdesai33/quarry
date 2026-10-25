@@ -9,6 +9,7 @@ import {
 	postgresError,
 } from './errors.js';
 import * as fe from './protocol/frontend.js';
+import { allocate } from './protocol/text.js';
 import type { WireValue } from './protocol/frontend.js';
 import type { BackendMessage, Field } from './protocol/messages.js';
 import type { Writer } from './protocol/writer.js';
@@ -24,6 +25,7 @@ import {
 	type ResultSpec,
 } from './results.js';
 import type { NestedObject, RowDecoder, RowMode } from './rows.js';
+import type { QueryOptions } from './connection.js';
 
 /**
  * With $1, sets `statement_timeout` to it until the transaction ends,
@@ -356,7 +358,7 @@ export class QueryOp extends Op {
 	 * The query's options as given, when it may run again on another
 	 * connection if it provably never ran on its own (see `Connection.rerun`).
 	 */
-	rerunOptions: unknown;
+	rerunOptions: QueryOptions | null | undefined;
 	#spec: ResultSpec | undefined;
 	/** The formats asked for before the columns were known; undefined when they came from a plan. */
 	#requested: readonly number[] | 0 | undefined;
@@ -1054,6 +1056,8 @@ export class CursorOp extends Op {
 	readonly #batchSize: number;
 	readonly #portal: string;
 	readonly #held: boolean;
+	/** Fetch the next batch as soon as one is handed out, rather than when it is asked for. */
+	readonly #readAhead: boolean;
 	/** The `statement_timeout` for the portal, as an interval. */
 	readonly #statementTimeout: string | undefined;
 	/** The setting statement is unanswered: its answers come before the portal's. */
@@ -1106,6 +1110,7 @@ export class CursorOp extends Op {
 		portal: string,
 		held: boolean,
 		statementTimeout?: string,
+		readAhead = false,
 	) {
 		super();
 		this.#sql = sql;
@@ -1116,6 +1121,7 @@ export class CursorOp extends Op {
 		this.#batchSize = batchSize;
 		this.#portal = portal;
 		this.#held = held;
+		this.#readAhead = readAhead && !held;
 		this.#statementTimeout = held ? undefined : statementTimeout;
 		this.exclusive = true;
 	}
@@ -1343,8 +1349,23 @@ export class CursorOp extends Op {
 		this.#sync(closePortal);
 	}
 
-	/** Hands batches to waiting consumers, fetching one when they wait for it. */
+	/**
+	 * Hands batches to waiting consumers, fetching one when they wait for
+	 * it, or with `readAhead`, as soon as none is left unread.
+	 */
 	#pump(): void {
+		this.#handOut();
+		if (
+			this.#readAhead &&
+			this.#unread.length === 0 &&
+			this.#phase === 'suspended' &&
+			!this.#discarding &&
+			!this.#finished
+		)
+			this.#fetch();
+	}
+
+	#handOut(): void {
 		while (this.#waiters.length > 0) {
 			const batch = this.#unread.shift();
 			// oxlint-disable-next-line typescript/no-non-null-assertion -- the loop checks there is one
@@ -1784,7 +1805,13 @@ export class CopyFromOp extends Op {
 	}
 }
 
-/** COPY … TO STDOUT, read as chunks with backpressure. */
+/**
+ * COPY … TO STDOUT, read as chunks with backpressure. Each CopyData (a
+ * row, in text format) is kept as a view of the read buffer until `next`
+ * takes it, and `next` copies every one received by then into one chunk:
+ * one allocation per read rather than per row, and no view keeps a read
+ * buffer alive.
+ */
 export class CopyToOp extends Op {
 	override readonly exclusive = true;
 	readonly #sql: string;
@@ -1792,6 +1819,8 @@ export class CopyToOp extends Op {
 	#ctx: OpContext | undefined;
 	readonly #chunks: Uint8Array[] = [];
 	#buffered = 0;
+	/** Rows copied, from the command tag. */
+	rowCount = 0;
 	#paused = false;
 	#waiter: Waiter<Uint8Array | undefined> | undefined;
 	#error: Error | undefined;
@@ -1818,11 +1847,19 @@ export class CopyToOp extends Op {
 	#pump(): void {
 		const waiter = this.#waiter;
 		if (waiter === undefined) return;
-		const chunk = this.#chunks.shift();
-		if (chunk !== undefined) {
+		const chunks = this.#chunks;
+		if (chunks.length > 0) {
 			this.#waiter = undefined;
-			this.#buffered -= chunk.length;
-			if (this.#paused && this.#buffered < this.#highWaterMark / 2) {
+			// a copy: the views are of the read buffer (Buffer#slice would be a view too)
+			const chunk = allocate(this.#buffered);
+			let at = 0;
+			for (const part of chunks) {
+				chunk.set(part, at);
+				at += part.length;
+			}
+			chunks.length = 0;
+			this.#buffered = 0;
+			if (this.#paused) {
 				this.#paused = false;
 				this.#ctx?.resume();
 			}
@@ -1840,7 +1877,7 @@ export class CopyToOp extends Op {
 			case 'CopyDone':
 				return false;
 			case 'CopyData': {
-				const chunk = msg.data.slice();
+				const chunk = msg.data;
 				this.#chunks.push(chunk);
 				this.#buffered += chunk.length;
 				if (!this.#paused && this.#buffered >= this.#highWaterMark) {
@@ -1851,6 +1888,7 @@ export class CopyToOp extends Op {
 				return false;
 			}
 			case 'CommandComplete':
+				this.rowCount = parseTag(msg.tag).rowCount ?? 0;
 				return false;
 			case 'CopyInResponse': {
 				const w = ctx.writer;

@@ -256,6 +256,7 @@ describe('a connection the server ended while it was idle', () => {
 		for (const code of ['57P01', '57P02', '57P03', '57P05']) {
 			// oxlint-disable-next-line no-await-in-loop
 			const { state, port } = await endingServer(code);
+			// oxlint-disable-next-line no-await-in-loop -- disposed at the end of each pass
 			await using pool = createPool({ ...options(port), max: 1 });
 			// oxlint-disable-next-line no-await-in-loop
 			const result = await pool.query('select 1');
@@ -279,7 +280,7 @@ describe('a connection the server ended while it was idle', () => {
 		await using conn = await connect(options(port));
 		const error = await conn.query('select 1').catch((e: unknown) => e);
 		expect(error).toBeInstanceOf(PostgresError);
-		expect((error as PostgresError).code).toBe('57P01');
+		expect(error).toMatchObject({ code: '57P01' });
 	});
 });
 
@@ -686,6 +687,7 @@ describe('statement names behind a pooler', () => {
 		}
 	});
 
+	/* oxlint-disable no-await-in-loop -- one query after another */
 	it('keeps prepared statements cached when SQL run once fills the cache', async () => {
 		const { port, parsed, bound } = await pooler({});
 		await using conn = await connect({
@@ -701,4 +703,5 @@ describe('statement names behind a pooler', () => {
 		expect(parsed.filter((name) => name !== '')).toEqual(['q1', 'q2']);
 		expect(bound.slice(-2)).toEqual(['q1', 'q2']);
 	});
+	/* oxlint-enable no-await-in-loop */
 });

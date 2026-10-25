@@ -91,6 +91,8 @@ describe('parseArray and arrayLiteral', () => {
 const encodeParams = (sql: string, params: readonly unknown[]) =>
 	encode(sql, params, undefined, undefined);
 
+const fields = (code: string) => ({ C: code, M: 'm', S: 'ERROR' });
+
 describe('parameters', () => {
 	it('encodes JavaScript values as Postgres input', () => {
 		expect(encodeParam(null)).toBeNull();
@@ -126,12 +128,13 @@ describe('parameters', () => {
 			expect(() =>
 				encode('select $1', [[view]], undefined, [arrayOids.bytea]),
 			).toThrow(/is not sent/);
-			expect(() => codecs.bytea.encode(view as never)).toThrow(/is not sent/);
+			expect(() =>
+				encode('select $1', [view], [codecs.bytea], undefined),
+			).toThrow(/is not sent/);
 		}
 	});
 
 	it('gives each error class its own name', () => {
-		const fields = (code: string) => ({ C: code, M: 'm', S: 'ERROR' });
 		expect(postgresError(fields('23505')).name).toBe('UniqueViolation');
 		expect(postgresError(fields('23999')).name).toBe(
 			'IntegrityConstraintViolation',

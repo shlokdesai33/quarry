@@ -3,6 +3,8 @@
 // suites that drive their libraries' internals (pg's Connection, custom
 // submittables), so they can't run through the compatibility shims
 // (test/driver/compat), ported to assert the same behaviour on quarry.
+import { Readable, Writable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Connection } from '../../../src/driver/connection.js';
 import { PostgresError } from '../../../src/driver/errors.js';
@@ -146,6 +148,78 @@ describe.skipIf(noPg)('COPY, as pg-copy-streams tests it', () => {
 		} finally {
 			await conn.query(`drop table ${target}`);
 		}
+	});
+
+	it('hands COPY TO rows over in chunks of everything received by then', async () => {
+		const data = conn.copyTo(
+			'copy (select generate_series(1, 20000)) to stdout',
+		);
+		const iterator = data[Symbol.asyncIterator]();
+		const first = await iterator.next();
+		// rows arrive while the first chunk is being used
+		await new Promise((r) => setTimeout(r, 50));
+		const chunks: Uint8Array[] = first.done === true ? [] : [first.value];
+		for (
+			let r = await iterator.next();
+			r.done !== true;
+			r = await iterator.next()
+		)
+			chunks.push(r.value);
+		expect(text(chunks)).toBe(
+			Array.from({ length: 20000 }, (_, i) => `${i + 1}\n`).join(''),
+		);
+		expect(chunks.length).toBeLessThan(10);
+	});
+
+	it('pipes Node streams into COPY FROM and out of COPY TO', async () => {
+		await conn.query(`truncate ${name}`);
+		const lines = Array.from({ length: 1000 }, (_, i) => `${i}\trow ${i}\n`);
+		const into = conn.createCopyFromStream(`copy ${name} from stdin`);
+		await pipeline(Readable.from(lines), into);
+		expect(into.rowCount).toBe(1000);
+		let out = '';
+		await pipeline(
+			conn.createCopyToStream(`copy ${name} to stdout`),
+			new Writable({
+				write(chunk: Buffer, _encoding, callback) {
+					out += chunk.toString();
+					callback();
+				},
+			}),
+		);
+		expect(out).toBe(lines.join(''));
+		// a failing source fails the COPY, and the connection stays usable
+		const failing = conn.createCopyFromStream(`copy ${name} from stdin`);
+		await expect(
+			pipeline(
+				Readable.from(
+					(async function* () {
+						yield '9999\tlast\n';
+						throw new Error('source broke');
+					})(),
+				),
+				failing,
+			),
+		).rejects.toThrow('source broke');
+		// the server's error destroys the stream
+		await expect(
+			pipeline(
+				Readable.from(['not a number\tx\n']),
+				conn.createCopyFromStream(`copy ${name} from stdin`),
+			),
+		).rejects.toBeInstanceOf(PostgresError);
+		expect(
+			(await conn.query(`select count(*)::int as n from ${name}`)).rows,
+		).toEqual([{ n: 1000 }]);
+		// on a pool: a connection of its own, freed afterwards
+		await using pool = createPool(options());
+		let pooled = '';
+		for await (const chunk of pool.createCopyToStream(
+			`copy (select 1) to stdout`,
+		))
+			pooled += String(chunk);
+		expect(pooled).toBe('1\n');
+		expect(pool.stats.busy).toBe(0);
 	});
 });
 
