@@ -977,6 +977,26 @@ describe.skipIf(noPg)('pool', () => {
 		}
 	});
 
+	it('runs a query again on a new connection when it went out on an idle connection the server had just ended', async () => {
+		await using admin = await open();
+		await using p = pool({ max: 2 });
+		const { rows } = await p.query<{ pid: number }>(
+			'select pg_backend_pid() as pid',
+		);
+		const pid = rows[0]?.pid;
+		await admin.query('select pg_terminate_backend($1)', [pid]);
+		// the server's FATAL is in the socket, unread: block until it surely is,
+		// then send a query on the connection, which looks idle
+		const until = Date.now() + 200;
+		while (Date.now() < until) {
+			// busy
+		}
+		const again = p.query<{ pid: number }>('select pg_backend_pid() as pid');
+		const other = (await again).rows[0]?.pid;
+		expect(other).not.toBe(pid);
+		expect(p.metrics).toMatchObject({ opened: 2, closed: 1 });
+	});
+
 	it('replaces connections that die while idle', async () => {
 		await using p = pool({ max: 1 });
 		const client = await p.acquire();

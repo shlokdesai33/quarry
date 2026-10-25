@@ -258,6 +258,21 @@ export class Connection implements AsyncDisposable {
 	#resolveClosed: () => void = () => {};
 	/** When the connection was opened (ms since epoch). */
 	readonly createdAt = Date.now();
+	/**
+	 * @internal Runs again, elsewhere, a query of `queryThen` that provably
+	 * never ran here: the connection failed before it was written, or the
+	 * server's first answer after it was written ended the session
+	 * (`TERMINATED`). Set by a pool.
+	 */
+	rerun:
+		| ((
+				sql: string,
+				params: readonly unknown[],
+				options: QueryOptions | undefined,
+				resolve: (result: QueryResult<unknown>) => void,
+				reject: (error: Error) => void,
+		  ) => void)
+		| undefined;
 	readonly #ctx: OpContext;
 	#defaultOptions: QueryOpOptions | undefined;
 	readonly #flushTask = () => this.#flush();
@@ -732,7 +747,17 @@ export class Connection implements AsyncDisposable {
 			msg.type === 'ErrorResponse' &&
 			(msg.fields['V'] === 'FATAL' || msg.fields['V'] === 'PANIC')
 		) {
-			this.#fatal = postgresError(msg.fields);
+			const fatal = postgresError(msg.fields);
+			this.#fatal = fatal;
+			const head = this.#queue.at(0);
+			if (
+				TERMINATED.has(fatal.code) &&
+				(head === undefined || !head.written || !head.answered)
+			) {
+				// sent before the server answered anything written: it ran none of it
+				this.#fail(fatal, true);
+				return;
+			}
 		}
 		const op = this.#queue.at(0);
 		if (op === undefined || !op.written) {
@@ -1141,10 +1166,16 @@ export class Connection implements AsyncDisposable {
 		params: readonly unknown[] | undefined,
 		options: QueryOptions | undefined,
 		onDone: () => void,
+		rerunnable = false,
 	): Promise<QueryResult<R>> {
 		if (this.#config.telemetry === undefined && !this.#config.captureStack)
-			return this.#query<R>(sql, params ?? [], options, onDone);
-		const result = this.query<R>(sql, params, options);
+			return this.#query<R>(sql, params ?? [], options, onDone, rerunnable);
+		const result = this.#observe(
+			sql,
+			options?.tag,
+			() => this.#query<R>(sql, params ?? [], options, undefined, rerunnable),
+			(r) => r.rowCount,
+		);
 		result.then(onDone, onDone);
 		return result;
 	}
@@ -1188,6 +1219,7 @@ export class Connection implements AsyncDisposable {
 		params: readonly unknown[],
 		options: QueryOptions | undefined,
 		onDone?: () => void,
+		rerunnable = false,
 	): Promise<QueryResult<R>> {
 		if (options?.statementTimeout !== undefined) {
 			const refused = outsideTransactionOnly(sql);
@@ -1225,6 +1257,8 @@ export class Connection implements AsyncDisposable {
 			);
 			op.onTiming = options?.onTiming;
 			op.onDone = onDone;
+			// `null`: no options, but rerunnable
+			if (rerunnable) op.rerunOptions = options ?? null;
 			this.#enqueue(op, options?.signal, options?.timeout);
 			if (!this.#config.catalog.loaded) this.#loadTypesAfter(params, options);
 		} catch (error) {
@@ -1782,7 +1816,12 @@ export class Connection implements AsyncDisposable {
 		);
 	}
 
-	#fail(error: Error): void {
+	/**
+	 * Closes the connection, failing what is queued with `error`. With
+	 * `terminated`, the server ended the session before answering anything
+	 * written: none of it ran.
+	 */
+	#fail(error: Error, terminated = false): void {
 		if (this.#closed) return;
 		this.#closed = true;
 		this.#failure = error;
@@ -1790,7 +1829,23 @@ export class Connection implements AsyncDisposable {
 		this.#startupError?.(error);
 		const ops = this.#queue.drain();
 		this.#written = 0;
-		for (const op of ops) op.fail(error);
+		const rerun = this.rerun;
+		for (const op of ops) {
+			if (
+				rerun !== undefined &&
+				op instanceof QueryOp &&
+				op.rerunOptions !== undefined &&
+				(terminated || !op.written)
+			) {
+				// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- set from the query's own options
+				const options = (op.rerunOptions ?? undefined) as
+					| QueryOptions
+					| undefined;
+				op.redirect((resolve, reject) =>
+					rerun(op.sql, op.params, options, resolve, reject),
+				);
+			} else op.fail(error);
+		}
 		for (const resolve of this.#idleWaiters.splice(0)) resolve();
 		for (const resolve of this.#drainWaiters.splice(0)) resolve();
 		this.#resolveClosed();
@@ -1815,6 +1870,19 @@ function naming(
 }
 
 const noop = () => {};
+
+/**
+ * SQLSTATEs of a server ending the session on its own: an administrator
+ * (`pg_terminate_backend`) or a shutdown, another backend's crash, a server
+ * starting or stopping, `idle_session_timeout`.
+ */
+const TERMINATED: ReadonlySet<string> = new Set([
+	'57P01',
+	'57P02',
+	'57P03',
+	'57P05',
+]);
+
 /**
  * The resolving functions of the promise `capture` just executed for. Reset
  * as soon as they're read: a resolving function keeps its promise, and so

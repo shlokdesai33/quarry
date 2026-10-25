@@ -2,6 +2,7 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 import { statementNames } from '../../src/driver/capabilities.js';
 import { connect } from '../../src/driver/connect.js';
+import { createPool } from '../../src/driver/pool.js';
 import {
 	ConnectionError,
 	PostgresError,
@@ -209,6 +210,69 @@ describe('a misbehaving server', () => {
 		await expect(connect({ ...options(port), ssl: 'require' })).rejects.toThrow(
 			/does not support TLS/,
 		);
+	});
+});
+
+describe('a connection the server ended while it was idle', () => {
+	/**
+	 * A server whose first connection ends its session as a query arrives,
+	 * with `fatal` (or by closing without one); later connections answer
+	 * every query. Counts the connections.
+	 */
+	async function endingServer(fatal: string | undefined) {
+		const state = { connections: 0 };
+		const port = await fakeServer((socket, _version, send) => {
+			const n = ++state.connections;
+			socket.on('data', (data: Buffer) => {
+				if (n === 1) {
+					if (fatal !== undefined)
+						send({
+							type: 'ErrorResponse',
+							fields: { S: 'FATAL', V: 'FATAL', C: fatal, M: 'terminating' },
+						});
+					socket.end();
+					return;
+				}
+				for (let i = 0; i + 5 <= data.length; i += 1 + data.readInt32BE(i + 1)) {
+					const type = String.fromCharCode(data[i] ?? 0);
+					if (type === 'P') send({ type: 'ParseComplete' });
+					else if (type === 'B') send({ type: 'BindComplete' });
+					else if (type === 'D') send({ type: 'NoData' });
+					else if (type === 'E') send({ type: 'CommandComplete', tag: 'SELECT 0' });
+					else if (type === 'S') send({ type: 'ReadyForQuery', status: 'I' });
+				}
+			});
+			send(...ready);
+		});
+		return { state, port };
+	}
+
+	it('runs a pool query again on a new connection when the session ended before answering it', async () => {
+		for (const code of ['57P01', '57P02', '57P03', '57P05']) {
+			// oxlint-disable-next-line no-await-in-loop
+			const { state, port } = await endingServer(code);
+			await using pool = createPool({ ...options(port), max: 1 });
+			// oxlint-disable-next-line no-await-in-loop
+			const result = await pool.query('select 1');
+			expect(result.command).toBe('SELECT');
+			expect(state.connections).toBe(2);
+			expect(pool.metrics).toMatchObject({ opened: 2, closed: 1 });
+		}
+	});
+
+	it('does not run a query again when the connection closed without saying the server ended it', async () => {
+		const { state, port } = await endingServer(undefined);
+		await using pool = createPool({ ...options(port), max: 1 });
+		await expect(pool.query('select 1')).rejects.toBeInstanceOf(ConnectionError);
+		expect(state.connections).toBe(1);
+	});
+
+	it('reports the server’s error on a plain connection, which has nowhere else to run it', async () => {
+		const { port } = await endingServer('57P01');
+		await using conn = await connect(options(port));
+		const error = await conn.query('select 1').catch((e: unknown) => e);
+		expect(error).toBeInstanceOf(PostgresError);
+		expect((error as PostgresError).code).toBe('57P01');
 	});
 });
 

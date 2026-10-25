@@ -795,6 +795,7 @@ export class Pool implements AsyncDisposable {
 			if (lifetime !== Number.POSITIVE_INFINITY) this.#expireAt(slot);
 			this.#slots.set(connection, slot);
 			connection.onClose(() => this.#forget(slot));
+			connection.rerun = this.#rerun;
 			this.#metrics.opened++;
 			if (this.#eventListeners.size > 0)
 				this.#emit({ type: 'open', connection });
@@ -1585,8 +1586,44 @@ export class Pool implements AsyncDisposable {
 			params,
 			options,
 			started < 0 ? slot.settled : this.#settledTimed(slot, started),
+			true,
 		);
 	}
+
+	/**
+	 * Runs once more a query that provably never ran on its connection: the
+	 * connection failed before writing it, or the server ended the session
+	 * before answering it (e.g. it terminated an idle connection the query
+	 * was then sent on). From the next turn of the event loop, once other
+	 * connections the server ended at the same time have read that too, so
+	 * it goes to a live one; it isn't run a third time.
+	 */
+	readonly #rerun = (
+		sql: string,
+		params: readonly unknown[],
+		options: QueryOptions | undefined,
+		resolve: (result: QueryResult<unknown>) => void,
+		reject: (error: Error) => void,
+	): void => {
+		setTimeout(() => {
+			let result: Promise<QueryResult<unknown>>;
+			const slot = this.#claimShared(options?.signal);
+			if (slot === undefined)
+				result = this.#withShared(options?.signal, (connection) =>
+					connection.query(sql, params, options),
+				);
+			else {
+				const started = this.#timing();
+				result = slot.connection.queryThen(
+					sql,
+					params,
+					options,
+					started < 0 ? slot.settled : this.#settledTimed(slot, started),
+				);
+			}
+			result.then(resolve, reject);
+		}, 0);
+	};
 
 	#queryShared<R>(
 		sql: string,
@@ -1594,7 +1631,7 @@ export class Pool implements AsyncDisposable {
 		options: QueryOptions | undefined,
 	): Promise<QueryResult<R>> {
 		return this.#withShared(options?.signal, (connection) =>
-			connection.query<R>(sql, params, options),
+			connection.queryThen<R>(sql, params, options, noop, true),
 		);
 	}
 

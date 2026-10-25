@@ -347,6 +347,11 @@ export class QueryOp extends Op {
 	readonly #options: QueryOpOptions;
 	readonly #resolve: (result: QueryResult<unknown>) => void;
 	readonly #reject: (error: Error) => void;
+	/**
+	 * The query's options as given, when it may run again on another
+	 * connection if it provably never ran on its own (see `Connection.rerun`).
+	 */
+	rerunOptions: unknown;
 	#spec: ResultSpec | undefined;
 	/** The formats asked for before the columns were known; undefined when they came from a plan. */
 	#requested: readonly number[] | 0 | undefined;
@@ -393,6 +398,25 @@ export class QueryOp extends Op {
 
 	override get prepares(): number {
 		return this.#options.prepare ? 1 : 0;
+	}
+
+	get sql(): string {
+		return this.#sql;
+	}
+
+	get params(): readonly unknown[] {
+		return this.#params;
+	}
+
+	/** Settles with what `run` settles with instead: the query never ran here. */
+	redirect(
+		run: (
+			resolve: (result: QueryResult<unknown>) => void,
+			reject: (error: Error) => void,
+		) => void,
+	): void {
+		this.settle();
+		run(this.#resolve, this.#reject);
 	}
 
 	/** The server's error for this statement, once it arrived. */
