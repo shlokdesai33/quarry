@@ -97,6 +97,10 @@ describe('protocol negotiation with older servers and poolers', () => {
 		await using conn = await connect(options(port));
 		expect(versions).toEqual([196610, 196608]);
 		expect(conn.protocol).toBe('3.0');
+		// the host is remembered: the next connection asks for 3.0 at once
+		await using again = await connect(options(port));
+		expect(versions).toEqual([196610, 196608, 196608]);
+		expect(again.protocol).toBe('3.0');
 	});
 
 	it('does not retry when the failure is not about the protocol', async () => {
@@ -205,6 +209,54 @@ describe('a misbehaving server', () => {
 		await expect(connect({ ...options(port), ssl: 'require' })).rejects.toThrow(
 			/does not support TLS/,
 		);
+	});
+});
+
+describe('cancel requests', () => {
+	const CANCEL_CODE = 80877102;
+
+	/** A server that runs queries forever, answering their first messages when `answer`; counts cancel requests. */
+	async function slowServer(answer: boolean) {
+		const state = { cancels: 0, client: undefined as Socket | undefined };
+		const port = await fakeServer((socket, version, send) => {
+			if (version === CANCEL_CODE) {
+				state.cancels++;
+				socket.end();
+				return;
+			}
+			state.client = socket;
+			socket.on('data', () => {
+				if (answer) send({ type: 'ParseComplete' }, { type: 'BindComplete' });
+			});
+			send(...ready);
+		});
+		return { state, port };
+	}
+
+	const aborted = async (port: number) => {
+		const conn = await connect(options(port));
+		const controller = new AbortController();
+		const query = conn.query('select pg_sleep(60)', [], {
+			prepare: false,
+			signal: controller.signal,
+		});
+		query.catch(() => {});
+		await new Promise((r) => setTimeout(r, 30));
+		controller.abort();
+		await new Promise((r) => setTimeout(r, 400));
+		conn.destroy();
+	};
+
+	it('stops repeating the cancel once the server answered part of the query', async () => {
+		const { state, port } = await slowServer(true);
+		await aborted(port);
+		expect(state.cancels).toBe(1);
+	});
+
+	it('repeats the cancel while the server has answered nothing of the query', async () => {
+		const { state, port } = await slowServer(false);
+		await aborted(port);
+		expect(state.cancels).toBeGreaterThanOrEqual(3);
 	});
 });
 

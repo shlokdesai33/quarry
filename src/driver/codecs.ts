@@ -16,7 +16,13 @@ import {
 	vectorValues,
 	type RangeValue,
 } from './parsers.js';
-import { formatTimestamp, numberText, parseBytea, textOf } from './types.js';
+import {
+	formatTimestamp,
+	notBytes,
+	numberText,
+	parseBytea,
+	textOf,
+} from './types.js';
 
 export type { JsonValue } from './binary.js';
 
@@ -52,8 +58,7 @@ const json = (value: unknown): string => {
 
 function bytes(value: unknown): string | Uint8Array {
 	if (value instanceof Uint8Array) return value;
-	if (ArrayBuffer.isView(value))
-		return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+	if (ArrayBuffer.isView(value)) throw notBytes(value);
 	if (typeof value === 'string') return value;
 	throw cannotSend(value, 'bytea');
 }

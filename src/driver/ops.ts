@@ -127,6 +127,8 @@ export interface OpTiming {
 export abstract class Op {
 	written = false;
 	done = false;
+	/** Set once a message for it arrived: the server read all of it and is running it. */
+	answered = false;
 	/**
 	 * Whether later operations must wait until this one completes (it keeps
 	 * talking after being written); read once it is written.

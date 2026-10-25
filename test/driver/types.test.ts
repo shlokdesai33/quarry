@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { parseRange, parseTimestamptz } from '../../src/driver/parsers.js';
 import { encodeParams as encode } from '../../src/driver/params.js';
+import { codecs } from '../../src/driver/codecs.js';
 import {
 	DriverError,
+	postgresError,
 	UndefinedParameterError,
 } from '../../src/driver/errors.js';
 import { parseTag } from '../../src/driver/ops.js';
@@ -11,6 +13,7 @@ import {
 	copyLine,
 	encodeParam,
 	formatTimestamp,
+	arrayOids,
 	parseArray,
 	parseBytea,
 } from '../../src/driver/types.js';
@@ -105,8 +108,38 @@ describe('parameters', () => {
 			'{"1",NULL,"a\\"b",{"t"}}',
 		);
 		expect(encodeParam([new Uint8Array([1, 255])])).toBe('{"\\\\x01ff"}');
-		expect(encodeParam(new Uint16Array([1]))).toEqual(new Uint8Array([1, 0]));
 		expect(() => encodeParam(() => 1)).toThrow(/function/);
+	});
+
+	it('sends only a Uint8Array as bytes, refusing other typed arrays and DataViews', () => {
+		const bytes = Buffer.from([1, 2]);
+		expect(encodeParam(bytes)).toBe(bytes);
+		for (const view of [
+			new Uint16Array([1]),
+			new Float32Array([0.5]),
+			new DataView(new ArrayBuffer(2)),
+		]) {
+			expect(() => encodeParam(view)).toThrow(
+				new RegExp(`A ${view.constructor.name} parameter is not sent`),
+			);
+			expect(() => encodeParam([view])).toThrow(/is not sent/);
+			expect(() =>
+				encode('select $1', [[view]], undefined, [arrayOids.bytea]),
+			).toThrow(/is not sent/);
+			expect(() => codecs.bytea.encode(view as never)).toThrow(/is not sent/);
+		}
+	});
+
+	it('gives each error class its own name', () => {
+		const fields = (code: string) => ({ C: code, M: 'm', S: 'ERROR' });
+		expect(postgresError(fields('23505')).name).toBe('UniqueViolation');
+		expect(postgresError(fields('23999')).name).toBe(
+			'IntegrityConstraintViolation',
+		);
+		expect(postgresError(fields('57014')).name).toBe('QueryCanceled');
+		expect(postgresError(fields('40001')).name).toBe('SerializationFailure');
+		expect(postgresError(fields('XX000')).name).toBe('PostgresError');
+		expect(String(postgresError(fields('42P01')))).toBe('UndefinedTable: m');
 	});
 
 	it('refuses undefined parameters and array elements, naming the position', () => {

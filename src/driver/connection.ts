@@ -111,7 +111,13 @@ export interface QueryOptions {
 	readonly paramTypes?: readonly number[];
 	/** Cancels the query when aborted. A query not yet sent is dropped without contacting the server. */
 	readonly signal?: AbortSignal;
-	/** Cancels the query after this many milliseconds, from the client. */
+	/**
+	 * Cancels the query after this many milliseconds, from the client. The
+	 * time counts from when the query is queued on its connection, so it
+	 * includes the wait behind queries pipelined ahead of it there, not only
+	 * the server's work. A pool's wait for a connection or a pipeline slot
+	 * comes before, bounded by `acquireTimeout`.
+	 */
 	readonly timeout?: number;
 	/**
 	 * A server-side `statement_timeout` for this query only (milliseconds,
@@ -627,11 +633,13 @@ export class Connection implements AsyncDisposable {
 			);
 		}
 		const password = await this.#password();
-		return new ScramClient(
+		const client = new ScramClient(
 			password,
 			binding,
 			encrypted && mode !== 'disable' && !plusOffered,
 		);
+		client.maxIterations = this.#config.scramMaxIterations;
+		return client;
 	}
 
 	// --- incoming ----------------------------------------------------------
@@ -644,8 +652,10 @@ export class Connection implements AsyncDisposable {
 				if (type === 0x44 && !this.#starting) {
 					// rows go straight from the buffer to the operation's decoder
 					const op = this.#queue.at(0);
-					if (op?.written && op.dataRow(reader.bytes, reader.start, reader.end))
+					if (op?.written && op.dataRow(reader.bytes, reader.start, reader.end)) {
+						op.answered = true;
 						continue;
+					}
 				} else if (type === 0x41) {
 					this.#notify(
 						decodeNotification(
@@ -731,6 +741,7 @@ export class Connection implements AsyncDisposable {
 			throw new ProtocolError(`Unexpected ${msg.type} with no query in flight`);
 		}
 		if (msg.type === 'ReadyForQuery') this.#status = msg.status;
+		op.answered = true;
 		if (!op.handle(msg, this.#ctx)) return;
 		this.#queue.shift();
 		this.#written--;
@@ -948,11 +959,15 @@ export class Connection implements AsyncDisposable {
 			return;
 		this.#cancelSent = op;
 		// the server drops a cancel that arrives while it is still reading the
-		// query's messages, so it is repeated, with backoff, until the query ends
+		// query's messages, so it is repeated, with backoff, until the query
+		// ends; once the server answered part of it, it has read all of it, so
+		// the cancel sent then is the last: one sent after the query finished
+		// would hit a query pipelined behind it
 		const send = (attempt: number) => {
 			if (op.done || this.#closed || this.#queue.at(0) !== op) return;
+			const last = op.answered;
 			this.cancel().catch(() => {});
-			if (attempt >= 5) return;
+			if (last || attempt >= 5) return;
 			const timer = setTimeout(() => send(attempt + 1), 50 * 2 ** attempt);
 			if (typeof timer === 'object' && 'unref' in timer) timer.unref();
 			op.onSettle(() => clearTimeout(timer));
@@ -1150,6 +1165,11 @@ export class Connection implements AsyncDisposable {
 		onDone?: () => void,
 	): Promise<QueryResult<R>> {
 		if (options?.statementTimeout !== undefined) {
+			const refused = outsideTransactionOnly(sql);
+			if (refused !== undefined) {
+				onDone?.();
+				return Promise.reject(refused);
+			}
 			return this.#queryWithTimeout<R>(
 				sql,
 				params,
@@ -1814,6 +1834,23 @@ function invalidSql(sql: unknown): DriverError | undefined {
 			`The SQL text contains a NUL byte (at character ${nul + 1}), which PostgreSQL does not accept`,
 		);
 	return undefined;
+}
+
+/**
+ * Statements PostgreSQL refuses inside a transaction block, by their first
+ * words (after comments): a `statementTimeout` frames its query in one.
+ */
+const TRANSACTION_REFUSED =
+	/^(?:\s|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*(vacuum|create\s+database|drop\s+database|alter\s+system|create\s+tablespace|drop\s+tablespace|(?:create\s+(?:unique\s+)?|drop\s+)index\s+concurrently|reindex\s+(?:\([^)]*\)\s*)?(?:system|database)|reindex\b[^;]*?\bconcurrently|cluster\s*(?:\([^)]*\)\s*)?(?:;|$)|discard\s+all|(?:commit|rollback)\s+prepared|(?:create|drop)\s+subscription|alter\s+subscription\s+\S+\s+(?:refresh|enable|disable)|alter\s+database\s+\S+\s+set\s+tablespace)\b/i;
+
+/** Why `sql` can't take a `statementTimeout`, if it can't. */
+function outsideTransactionOnly(sql: string): DriverError | undefined {
+	const match = TRANSACTION_REFUSED.exec(sql);
+	if (match === null) return undefined;
+	const statement = (match[1] ?? '').replace(/\s+/g, ' ').toLowerCase();
+	return new DriverError(
+		`A statementTimeout can't bound ${statement}: it runs only outside a transaction block, and the timeout is set and restored in one around its query. Use a client-side timeout, or set statement_timeout on the session first`,
+	);
 }
 
 export function quoteIdentifier(name: string): string {

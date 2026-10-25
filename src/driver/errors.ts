@@ -166,6 +166,8 @@ export class PostgresError extends Error {
 
 /** A constraint check failed (SQLSTATE class 23). */
 export class IntegrityConstraintViolation extends PostgresError {
+	override name = 'IntegrityConstraintViolation';
+
 	/**
 	 * The columns named in the error: from the `column` field, or parsed
 	 * from a `Key (a, b)=(…)` detail. Undefined when neither says.
@@ -178,34 +180,60 @@ export class IntegrityConstraintViolation extends PostgresError {
 }
 
 /** 23505: a unique or primary-key constraint. */
-export class UniqueViolation extends IntegrityConstraintViolation {}
+export class UniqueViolation extends IntegrityConstraintViolation {
+	override name = 'UniqueViolation';
+}
 /** 23503: a foreign-key constraint. */
-export class ForeignKeyViolation extends IntegrityConstraintViolation {}
+export class ForeignKeyViolation extends IntegrityConstraintViolation {
+	override name = 'ForeignKeyViolation';
+}
 /** 23502: a NOT NULL constraint. */
-export class NotNullViolation extends IntegrityConstraintViolation {}
+export class NotNullViolation extends IntegrityConstraintViolation {
+	override name = 'NotNullViolation';
+}
 /** 23514: a CHECK constraint. */
-export class CheckViolation extends IntegrityConstraintViolation {}
+export class CheckViolation extends IntegrityConstraintViolation {
+	override name = 'CheckViolation';
+}
 /** 23P01: an exclusion constraint. */
-export class ExclusionViolation extends IntegrityConstraintViolation {}
+export class ExclusionViolation extends IntegrityConstraintViolation {
+	override name = 'ExclusionViolation';
+}
 /** 40001: a serializable transaction conflicted with another; retry it. */
-export class SerializationFailure extends PostgresError {}
+export class SerializationFailure extends PostgresError {
+	override name = 'SerializationFailure';
+}
 /** 40P01: a deadlock was detected and this transaction was chosen to abort; retry it. */
-export class DeadlockDetected extends PostgresError {}
+export class DeadlockDetected extends PostgresError {
+	override name = 'DeadlockDetected';
+}
 /** 55P03: a lock could not be taken (`nowait`, `lock_timeout`). */
-export class LockNotAvailable extends PostgresError {}
+export class LockNotAvailable extends PostgresError {
+	override name = 'LockNotAvailable';
+}
 /** 25006: a write was attempted in a read-only transaction. */
-export class ReadOnlyTransaction extends PostgresError {}
+export class ReadOnlyTransaction extends PostgresError {
+	override name = 'ReadOnlyTransaction';
+}
 /**
  * 25P04: the transaction ran longer than `transaction_timeout`. The server
  * ends the session, so the connection is closed.
  */
-export class TransactionTimeout extends PostgresError {}
+export class TransactionTimeout extends PostgresError {
+	override name = 'TransactionTimeout';
+}
 /** 25P03: the session sat idle in a transaction longer than `idle_in_transaction_session_timeout`; the connection is closed. */
-export class IdleInTransactionTimeout extends PostgresError {}
+export class IdleInTransactionTimeout extends PostgresError {
+	override name = 'IdleInTransactionTimeout';
+}
 /** 42P01: the table does not exist. */
-export class UndefinedTable extends PostgresError {}
+export class UndefinedTable extends PostgresError {
+	override name = 'UndefinedTable';
+}
 /** 42703: the column does not exist. */
-export class UndefinedColumn extends PostgresError {}
+export class UndefinedColumn extends PostgresError {
+	override name = 'UndefinedColumn';
+}
 
 /** Why a statement was canceled. */
 export type CancelReason =
@@ -220,6 +248,7 @@ export type CancelReason =
 
 /** 57014: the statement was canceled. */
 export class QueryCanceled extends PostgresError {
+	override name = 'QueryCanceled';
 	#by: 'abort' | 'timeout' | undefined;
 
 	/** Why it was canceled. */

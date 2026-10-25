@@ -96,6 +96,12 @@ export interface ConnectionOptions {
 	readonly ssl?: SslMode | SslOptions | undefined;
 	/** SCRAM channel binding: `prefer` (default) uses it when TLS allows; `require` refuses to authenticate without it. */
 	readonly channelBinding?: 'disable' | 'prefer' | 'require' | undefined;
+	/**
+	 * The most PBKDF2 iterations a server may ask for in SCRAM (default
+	 * 1,000,000; PostgreSQL's default is 4096). A server asking for more is
+	 * refused rather than left to keep the client hashing for minutes.
+	 */
+	readonly scramMaxIterations?: number | undefined;
 	/** Time allowed to connect and authenticate, in milliseconds (0 for none). Default 30s. */
 	readonly connectTimeout?: number | undefined;
 	readonly keepAlive?: boolean | undefined;
@@ -202,6 +208,7 @@ export interface ResolvedConfig {
 		readonly passphrase: string | undefined;
 	};
 	readonly channelBinding: 'disable' | 'prefer' | 'require';
+	readonly scramMaxIterations: number;
 	readonly connectTimeout: number;
 	readonly keepAlive: boolean;
 	readonly keepAliveInitialDelay: number;
@@ -613,7 +620,7 @@ export function resolveConfig(options: ConnectionOptions = {}): ResolvedConfig {
 	const keepalives = kw('keepalives');
 	const keepalivesIdle = kw('keepalives_idle');
 
-	return {
+	return hideSecrets({
 		hosts,
 		user,
 		database: options.database ?? kw('dbname') ?? user,
@@ -664,7 +671,29 @@ export function resolveConfig(options: ConnectionOptions = {}): ResolvedConfig {
 		onNotice: options.onNotice,
 		onNotification: options.onNotification,
 		maxMessageSize: options.maxMessageSize,
-	};
+		scramMaxIterations: scramMaxIterations(options),
+	});
+}
+
+/**
+ * Makes the password, the client key and its passphrase non-enumerable,
+ * so logging or serializing a configuration doesn't print them; code that
+ * reads them by name still can.
+ */
+function hideSecrets(config: ResolvedConfig): ResolvedConfig {
+	Object.defineProperty(config, 'password', { enumerable: false });
+	Object.defineProperty(config.ssl, 'key', { enumerable: false });
+	Object.defineProperty(config.ssl, 'passphrase', { enumerable: false });
+	return config;
+}
+
+function scramMaxIterations(options: ConnectionOptions): number {
+	const max = options.scramMaxIterations ?? 1_000_000;
+	if (!(max === Number.POSITIVE_INFINITY || (Number.isInteger(max) && max > 0)))
+		throw new DriverError(
+			`scramMaxIterations takes a whole number from 1 (or Infinity), not ${max}`,
+		);
+	return max;
 }
 
 const matches = (pattern: string | undefined, value: string) =>

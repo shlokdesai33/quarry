@@ -1,4 +1,5 @@
 import { allocate, NodeBuffer } from './protocol/text.js';
+import { notBytes } from './types.js';
 
 /*
  * Binary encoders for array parameters of the built-in codecs (`arrayOf`),
@@ -260,7 +261,8 @@ function encodeBytes(
 	let nulls = false;
 	for (const value of values) {
 		if (value === null) nulls = true;
-		else if (ArrayBuffer.isView(value)) size += value.byteLength;
+		else if (value instanceof Uint8Array) size += value.byteLength;
+		else if (ArrayBuffer.isView(value)) throw notBytes(value);
 		else return undefined;
 		size += 4;
 	}
@@ -268,16 +270,13 @@ function encodeBytes(
 	const view = viewOf(out);
 	let pos = header(view, codec.element, values.length, nulls);
 	for (const value of values) {
-		if (!ArrayBuffer.isView(value)) {
+		if (!(value instanceof Uint8Array)) {
 			view.setInt32(pos, -1);
 			pos += 4;
 			continue;
 		}
 		view.setInt32(pos, value.byteLength);
-		out.set(
-			new Uint8Array(value.buffer, value.byteOffset, value.byteLength),
-			pos + 4,
-		);
+		out.set(value, pos + 4);
 		pos += 4 + value.byteLength;
 	}
 	return out.subarray(0, pos);

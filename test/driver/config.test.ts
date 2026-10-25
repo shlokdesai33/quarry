@@ -12,6 +12,7 @@ import {
 	nodeScramCrypto,
 	ScramClient,
 	saslprep,
+	serverEndPoint,
 	webScramCrypto,
 	type ScramCrypto,
 } from '../../src/driver/auth/scram.js';
@@ -23,6 +24,10 @@ import {
 	resolveConfig,
 } from '../../src/driver/config.js';
 import { prng } from './helpers/backend.js';
+
+/** A self-signed certificate signed with RSASSA-PSS and SHA-384 (DER, base64). */
+const PSS_SHA384_CERT =
+	'MIICXjCCAZOgAwIBAgIUUJ7/vFpxA7dJbRCLXedI9XefDR8wQQYJKoZIhvcNAQEKMDSgDzANBglghkgBZQMEAgIFAKEcMBoGCSqGSIb3DQEBCDANBglghkgBZQMEAgIFAKIDAgEwMA4xDDAKBgNVBAMMA3BzczAeFw0yNjEwMjUwNjQ1MDhaFw0zNjEwMjIwNjQ1MDhaMA4xDDAKBgNVBAMMA3BzczCBnTALBgkqhkiG9w0BAQoDgY0AMIGJAoGBANI9n5BTVp/JW/Rsu0uik/3lKHieFU7DxmHcXCnpO3r4wPp/3UraOdVC3wivp1JvEQkXTzl1OkHWH+CBda7fxgqwKeDfwXSWhugpfd6ElximA3OEktl8b9mHKpQlgmX67V9GIX0PdcXuFmKfwQGYUGRuCoEU8ESjN+yt3IZPbphnAgMBAAGjUzBRMB0GA1UdDgQWBBTm4SLM6Eud7inXtvJ04n4Pzxq2VjAfBgNVHSMEGDAWgBTm4SLM6Eud7inXtvJ04n4Pzxq2VjAPBgNVHRMBAf8EBTADAQH/MEEGCSqGSIb3DQEBCjA0oA8wDQYJYIZIAWUDBAICBQChHDAaBgkqhkiG9w0BAQgwDQYJYIZIAWUDBAICBQCiAwIBMAOBgQCB4L6pY/JbO7i/E/LVgRYZecnhAsEgc4myA8iP3KpJoZxxTRzTF3mtF5AEzm0lbHAurW/8r4rd9U7aPdqwg+YzjzsNMAJXF3vTXgaF6Cv6guo/iYqKWPTWkDzELHj79mz7dImhsHpx3PfaT1Yx9Z5FT9DjSilwBqT5O0VB9gD9dg==';
 
 /** The client-final-message for a password and salt, with a fixed nonce. */
 async function scramProof(password: string, salt: string): Promise<string> {
@@ -356,6 +361,30 @@ describe('auth primitives', () => {
 			client.final(utf8Encode('r=abc123,s=AAAA,i=0')),
 		).rejects.toThrow(/iteration/);
 	});
+
+	it('SCRAM refuses more iterations than scramMaxIterations', async () => {
+		const client = new ScramClient('pw', undefined, false, 'abc');
+		client.maxIterations = 4096;
+		await expect(
+			client.final(utf8Encode('r=abc123,s=AAAA,i=4097')),
+		).rejects.toThrow(/4097 PBKDF2 iterations, more than scramMaxIterations/);
+		await expect(
+			client.final(utf8Encode('r=abc123,s=AAAA,i=4096')),
+		).resolves.toBeInstanceOf(Uint8Array);
+		expect(resolveConfig({ env: {} }).scramMaxIterations).toBe(1_000_000);
+		expect(() => resolveConfig({ env: {}, scramMaxIterations: 0 })).toThrow(
+			/scramMaxIterations/,
+		);
+	});
+
+	it('channel binding reads the hash of an RSASSA-PSS certificate from its parameters', async () => {
+		// openssl req -x509 -newkey rsa-pss -sigopt rsa_padding_mode:pss -sha384 …
+		const der = base64Decode(PSS_SHA384_CERT);
+		const binding = await serverEndPoint(der);
+		expect([...(binding?.data ?? [])]).toEqual([
+			...createHash('sha384').update(der).digest(),
+		]);
+	});
 });
 
 describe('versions and policies', () => {
@@ -470,5 +499,18 @@ describe('no secrets in errors', () => {
 			configError('postgres://user:secret@host/db?sslmode=sometimes'),
 		).not.toContain('secret');
 		expect(configError("host=h password='secret")).not.toContain('secret');
+	});
+
+	it('keeps the password and client key out of a resolved configuration’s enumerable properties', () => {
+		const config = resolveConfig({
+			env: {},
+			password: 'pw-secret',
+			ssl: { mode: 'require', key: 'key-secret', passphrase: 'pass-secret' },
+		});
+		const shown = `${JSON.stringify(config)} ${Object.keys(config).join()} ${Object.keys(config.ssl).join()}`;
+		expect(shown).not.toMatch(/secret|password|"key"|passphrase/);
+		expect(config.password).toBe('pw-secret');
+		expect(config.ssl.key).toBe('key-secret');
+		expect(config.ssl.passphrase).toBe('pass-secret');
 	});
 });

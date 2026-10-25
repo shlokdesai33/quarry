@@ -2,7 +2,11 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { ConnectionOptions } from '../../../src/driver/config.js';
 import type { Connection } from '../../../src/driver/connection.js';
-import { PostgresError, QueryCanceled } from '../../../src/driver/errors.js';
+import {
+	DriverError,
+	PostgresError,
+	QueryCanceled,
+} from '../../../src/driver/errors.js';
 import { nodeSockets } from '../../../src/driver/node-socket.js';
 import { createPool } from '../../../src/driver/pool.js';
 import type { SocketFactory } from '../../../src/driver/socket.js';
@@ -103,6 +107,34 @@ describe.skipIf(noPg).each(targets)('statementTimeout %s', (_name, target) => {
 	afterAll(async () => {
 		await using conn = await open(target());
 		await conn.query(`drop table if exists ${name}`);
+	});
+
+	it('refuses, before sending anything, statements that only run outside a transaction block', async () => {
+		await using conn = await open(target());
+		for (const sql of [
+			'vacuum',
+			`  -- maintenance\n VACUUM (analyze) ${name}`,
+			`create index concurrently on ${name} (id)`,
+			`CREATE UNIQUE INDEX CONCURRENTLY if not exists i on ${name} (id)`,
+			'drop index concurrently if exists i',
+			`reindex (verbose) table concurrently ${name}`,
+			'reindex database x',
+			'create database x',
+			'alter system set work_mem = 1',
+			'cluster',
+		]) {
+			const error = await rejection(
+				conn.query(sql, [], { statementTimeout: 100 }),
+				DriverError,
+			);
+			expect(error.message).toMatch(/can't bound .* outside a transaction block/);
+		}
+		// nothing was sent: the connection is as it was
+		expect(conn.pending).toBe(0);
+		await conn.query(`vacuum ${name}`);
+		expect(
+			(await conn.query('select 1 as x', [], { statementTimeout: '1s' })).rows,
+		).toEqual([{ x: 1 }]);
 	});
 
 	it("applies while another caller's transaction is open on the connection", async () => {
