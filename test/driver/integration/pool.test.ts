@@ -247,7 +247,7 @@ describe.skipIf(noPg)('transactions', () => {
 			),
 		).toBe(2);
 		expect(await trips(() => c.transaction(async () => {}))).toBe(1);
-		// begin+savepoint, select, 4 × (release+savepoint, select), release+commit
+		// begin+savepoint+select, 4 × release+savepoint+select, release+commit
 		expect(
 			await trips(() =>
 				c.transaction(async (tx) => {
@@ -255,7 +255,22 @@ describe.skipIf(noPg)('transactions', () => {
 						await tx.transaction((sp) => sp.query('select 1'));
 				}),
 			),
-		).toBe(11);
+		).toBe(6);
+		// a savepoint that runs no statement sends nothing
+		expect(
+			await trips(() =>
+				c.transaction(async (tx) => {
+					await tx.transaction(async () => {});
+					await tx.query('select 1');
+				}),
+			),
+		).toBe(2);
+		// begin+statement and commit in one write
+		expect(
+			await trips(() =>
+				c.transaction((tx) => tx.query('select 1', [], { commit: true })),
+			),
+		).toBe(1);
 		expect(
 			await trips(() =>
 				c
@@ -266,6 +281,91 @@ describe.skipIf(noPg)('transactions', () => {
 			),
 		).toBe(0);
 		expect(c.transactionStatus).toBe('idle');
+	});
+
+	it('commits behind a statement marked commit: true, and rolls back if it fails', async () => {
+		await conn.query(`truncate ${name}`);
+		const inserted = await conn.transaction(async (tx) => {
+			await tx.query(`insert into ${name} values (1, 'a')`);
+			const last = await tx.query(`insert into ${name} values (2, 'b')`, [], {
+				commit: true,
+			});
+			await expect(tx.query('select 1')).rejects.toThrow(/already finished/);
+			return last.rowCount;
+		});
+		expect(inserted).toBe(1);
+		expect(await ids()).toEqual([1, 2]);
+		await rejection(
+			conn.transaction((tx) =>
+				tx.query(`insert into ${name} values (2, 'dup')`, [], { commit: true }),
+			),
+			UniqueViolation,
+		);
+		expect(conn.transactionStatus).toBe('idle');
+		expect(await ids()).toEqual([1, 2]);
+		// what the callback does after the statement can't roll it back
+		const committed: string[] = [];
+		await expect(
+			conn.transaction(async (tx) => {
+				tx.afterCommit(() => committed.push('after'));
+				await tx.query(`insert into ${name} values (3, 'c')`, [], {
+					commit: true,
+				});
+				throw new Error('after the commit');
+			}),
+		).rejects.toThrow('after the commit');
+		expect(committed).toEqual(['after']);
+		expect(await ids()).toEqual([1, 2, 3]);
+		await expect(
+			conn.transaction((tx) =>
+				tx.transaction((sp) => sp.query('select 1', [], { commit: true })),
+			),
+		).rejects.toThrow(/not a savepoint/);
+	});
+
+	it('fails a savepoint with the error its callback caught, not with the 25P02 after it', async () => {
+		await conn.query(`truncate ${name}`);
+		await conn.query(`insert into ${name} values (1, 'a')`);
+		const seen = await conn.transaction(async (tx) => {
+			const swallowed = await tx
+				.transaction(async (sp) => {
+					await sp
+						.query(`insert into ${name} values (1, 'dup')`)
+						.catch(() => {});
+					await sp.query(`insert into ${name} values (2, 'b')`);
+				})
+				.catch((e: unknown) => e);
+			const ignored = await tx
+				.transaction(async (sp) => {
+					await sp
+						.query(`insert into ${name} values (1, 'dup')`)
+						.catch(() => {});
+				})
+				.catch((e: unknown) => e);
+			await tx.query(`insert into ${name} values (3, 'c')`);
+			return [swallowed, ignored];
+		});
+		expect(seen.map((e) => (e as PostgresError).code)).toEqual([
+			'23505',
+			'23505',
+		]);
+		expect(seen[0]).toBeInstanceOf(UniqueViolation);
+		expect(await ids()).toEqual([1, 3]);
+		// the outermost transaction: TransactionRolledBack, caused by it
+		const rolledBack = await rejection(
+			conn.transaction(async (tx) => {
+				await tx.query(`insert into ${name} values (1, 'dup')`).catch(() => {});
+			}),
+			TransactionRolledBack,
+		);
+		expect(rolledBack.cause).toBeInstanceOf(UniqueViolation);
+		await rejection(
+			conn.transaction(async (tx) => {
+				await tx.query(`insert into ${name} values (1, 'dup')`).catch(() => {});
+				await tx.query('select 1');
+			}),
+			UniqueViolation,
+		);
 	});
 
 	it('reports a failed first statement as itself and rolls back', async () => {
@@ -865,11 +965,13 @@ describe.skipIf(noPg)('pool', () => {
 		await using p = pool({ max: 1, maxUses: 3 });
 		const events: string[] = [];
 		p.onEvent((event) =>
-			events.push(event.type === 'close' ? `close:${event.reason}` : event.type),
+			events.push(
+				event.type === 'close' ? `close:${event.reason}` : event.type,
+			),
 		);
 		const pid = async () =>
-			(await p.query<{ pid: number }>('select pg_backend_pid() as pid'))
-				.rows[0]?.pid;
+			(await p.query<{ pid: number }>('select pg_backend_pid() as pid')).rows[0]
+				?.pid;
 		const first = await pid();
 		expect(await pid()).toBe(first);
 		const client = await p.acquire();
@@ -883,10 +985,17 @@ describe.skipIf(noPg)('pool', () => {
 	});
 
 	it('counts and reports waits that time out or are refused, and connections closed idle', async () => {
-		await using p = pool({ max: 1, acquireTimeout: 50, maxWaiting: 1, idleTimeout: 50 });
+		await using p = pool({
+			max: 1,
+			acquireTimeout: 50,
+			maxWaiting: 1,
+			idleTimeout: 50,
+		});
 		const events: string[] = [];
 		const stop = p.onEvent((event) =>
-			events.push(event.type === 'close' ? `close:${event.reason}` : event.type),
+			events.push(
+				event.type === 'close' ? `close:${event.reason}` : event.type,
+			),
 		);
 		const held = await p.acquire();
 		const timedOut = rejection(p.acquire(), ConnectionError);
@@ -894,7 +1003,12 @@ describe.skipIf(noPg)('pool', () => {
 		expect((await timedOut).code).toBe('ETIMEDOUT');
 		held.release();
 		await sleep(200);
-		expect(events).toEqual(['open', 'waitRefused', 'waitTimeout', 'close:idle']);
+		expect(events).toEqual([
+			'open',
+			'waitRefused',
+			'waitTimeout',
+			'close:idle',
+		]);
 		expect(p.metrics).toEqual({
 			opened: 1,
 			openFailed: 0,
@@ -947,13 +1061,20 @@ describe.skipIf(noPg)('pool', () => {
 	it('waits connectRetryDelay after a failed connect, without growing the delay', async () => {
 		const { createServer } = await import('node:net');
 		const server = createServer();
-		await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+		await new Promise<void>((resolve) =>
+			server.listen(0, '127.0.0.1', resolve),
+		);
 		const address = server.address();
 		const port = typeof address === 'object' && address ? address.port : 0;
 		await new Promise((resolve) => server.close(resolve));
 		const dead = { host: '127.0.0.1', port, connectTimeout: 1000 };
 		const failures = async (overrides: PoolOptions) => {
-			await using p = pool({ ...dead, max: 1, acquireTimeout: 0, ...overrides });
+			await using p = pool({
+				...dead,
+				max: 1,
+				acquireTimeout: 0,
+				...overrides,
+			});
 			const failedOpens: number[] = [];
 			const started = performance.now();
 			p.onEvent((event) => {

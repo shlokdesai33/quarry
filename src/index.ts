@@ -83,6 +83,7 @@ export {
 	TooManyRowsError,
 	type BatchOptions,
 	type BatchTransactionOptions,
+	type ExecuteRunOptions,
 	type QueryDescription,
 	type RunOptions,
 	type StreamOptions,

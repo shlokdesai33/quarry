@@ -220,6 +220,14 @@ export class DriverExecutor implements TransactionExecutor {
 			out.prepare = this.#options.prepare;
 		if (options.signal !== undefined) out.signal = options.signal;
 		if (options.timeout !== undefined) out.statementTimeout = options.timeout;
+		if (options.commit === true) {
+			if (!(this.#source instanceof Transaction))
+				throw new DriverError(
+					'execute({ commit: true }) commits a transaction: run it inside db.transaction',
+				);
+			// read by the driver's Transaction
+			Reflect.set(out, 'commit', true);
+		}
 		if (onTiming !== undefined) out.onTiming = onTiming;
 		if (tag !== undefined) out.tag = tag;
 		return out;

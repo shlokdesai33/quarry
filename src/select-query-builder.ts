@@ -4,7 +4,7 @@ import type {
 	Executor,
 	NoRowError,
 	QueryDescription,
-	RunOptions,
+	ExecuteRunOptions,
 	StreamOptions,
 	TooManyRowsError,
 } from './executor.js';
@@ -943,7 +943,7 @@ export class SelectQueryBuilder<
 	}
 
 	/** Runs the query and returns every row. */
-	execute(options?: RunOptions): Promise<O[]> {
+	execute(options?: ExecuteRunOptions): Promise<O[]> {
 		return this.toQuery().execute(options);
 	}
 

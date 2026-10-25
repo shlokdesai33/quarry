@@ -22,8 +22,22 @@ export interface ReadOptions {
 	readonly keepRows?: number | undefined;
 }
 
+/** Options of `execute`. */
+export interface ExecuteRunOptions extends RunOptions {
+	/**
+	 * Inside `db.transaction`, makes this the transaction's last statement:
+	 * COMMIT goes out right behind it, without waiting for its answer, so a
+	 * callback whose only statement commits runs in one round trip. If the
+	 * statement fails, the transaction rolls back; once it succeeded,
+	 * nothing the callback does after it can roll the transaction back, and
+	 * the transaction takes no more queries. Not in a savepoint, and not
+	 * with an `expect…` shape, whose check would come after the COMMIT.
+	 */
+	readonly commit?: boolean | undefined;
+}
+
 /** What an executor is asked to do besides the query itself. */
-export interface ExecuteOptions extends RunOptions, ReadOptions {}
+export interface ExecuteOptions extends ExecuteRunOptions, ReadOptions {}
 
 /** A query of a batch, and how its rows are returned. */
 export interface BatchQuery extends ReadOptions {

@@ -231,6 +231,8 @@ export class Connection implements AsyncDisposable {
 	/** Which cached statements are written named: every one, those written alone, or none (see `OpContext.named`). */
 	#naming: 'always' | 'alone' | 'never' = 'always';
 	#status: 'I' | 'T' | 'E' = 'I';
+	/** The error that failed the open transaction; kept until a transaction or savepoint rollback runs again. */
+	#transactionError: Error | undefined;
 	#closed = false;
 	#ending = false;
 	#closing: Promise<void> | undefined;
@@ -402,6 +404,16 @@ export class Connection implements AsyncDisposable {
 			: this.#status === 'T'
 				? 'transaction'
 				: 'failed';
+	}
+
+	/**
+	 * The error of the statement that failed the transaction, once one
+	 * did: later statements fail with "current transaction is aborted"
+	 * (25P02), and this says why. Kept until the transaction ends and
+	 * another starts, or a rollback to a savepoint recovers it.
+	 */
+	get transactionError(): Error | undefined {
+		return this.#transactionError;
 	}
 
 	/** Whether the connection is closed or closing. */
@@ -670,7 +682,10 @@ export class Connection implements AsyncDisposable {
 				if (type === 0x44 && !this.#starting) {
 					// rows go straight from the buffer to the operation's decoder
 					const op = this.#queue.at(0);
-					if (op?.written && op.dataRow(reader.bytes, reader.start, reader.end)) {
+					if (
+						op?.written &&
+						op.dataRow(reader.bytes, reader.start, reader.end)
+					) {
 						op.answered = true;
 						continue;
 					}
@@ -768,7 +783,12 @@ export class Connection implements AsyncDisposable {
 			}
 			throw new ProtocolError(`Unexpected ${msg.type} with no query in flight`);
 		}
-		if (msg.type === 'ReadyForQuery') this.#status = msg.status;
+		if (msg.type === 'ReadyForQuery') {
+			if (msg.status === 'T') this.#transactionError = undefined;
+			else if (msg.status === 'E' && this.#status !== 'E')
+				this.#transactionError = op.failure;
+			this.#status = msg.status;
+		}
 		op.answered = true;
 		if (!op.handle(msg, this.#ctx)) return;
 		this.#queue.shift();

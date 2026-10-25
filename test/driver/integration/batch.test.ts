@@ -443,6 +443,76 @@ describe.skipIf(noPg)('db.batch', () => {
 		});
 	});
 
+	describe('execute({ commit: true })', () => {
+		it('sends BEGIN, the statement and COMMIT in one write', async () => {
+			// without onQuery, whose per-statement timing needs a Sync of the statement's own
+			const plain = database(conn);
+			const { value, trips, writes } = await measure(() =>
+				plain.transaction(async (tx) => {
+					const moved = await tx
+						.update(accounts)
+						.set({ balance: 40 })
+						.where('accounts.id', 2)
+						.returning(['accounts.balance'])
+						.execute({ commit: true });
+					return moved;
+				}),
+			);
+			expect(value).toEqual([{ balance: 40 }]);
+			expect({ trips, writes }).toEqual({ trips: 1, writes: 1 });
+			expect(await balances()).toEqual([
+				{ id: 1, balance: 100 },
+				{ id: 2, balance: 40 },
+			]);
+		});
+
+		it('rolls back when the statement fails, and is refused where it would mislead', async () => {
+			const failed = await measure(() =>
+				db.transaction(async (tx) => {
+					await tx
+						.update(accounts)
+						.set({ balance: 0 })
+						.where('accounts.id', 1)
+						.execute();
+					await tx
+						.update(accounts)
+						.set({ balance: -1 })
+						.where('accounts.id', 2)
+						.execute({ commit: true });
+				}),
+			);
+			expect((failed.error as PostgresError).code).toBe('23514');
+			expect(await balances()).toEqual([
+				{ id: 1, balance: 100 },
+				{ id: 2, balance: 50 },
+			]);
+			await expect(setBalance(1, 1).execute({ commit: true })).rejects.toThrow(
+				/inside db.transaction/,
+			);
+			await expect(
+				db.transaction((tx) =>
+					tx
+						.selectFrom(accounts)
+						.select(['accounts.id'])
+						.expectOne()
+						.execute({ commit: true }),
+				),
+			).rejects.toThrow(/no expect… shape/);
+			await expect(
+				db.transaction((tx) =>
+					tx.transaction((sp) =>
+						sp
+							.update(accounts)
+							.set({ balance: 1 })
+							.where('accounts.id', 1)
+							.execute({ commit: true }),
+					),
+				),
+			).rejects.toThrow(/not a savepoint/);
+			expect(conn.transactionStatus).toBe('idle');
+		});
+	});
+
 	describe('inside a transaction', () => {
 		it('shares one Sync with BEGIN', async () => {
 			const { value, trips } = await measure(() =>

@@ -194,6 +194,11 @@ export abstract class Op {
 		return 0;
 	}
 
+	/** The server's error for it, once one arrived. */
+	get failure(): Error | undefined {
+		return undefined;
+	}
+
 	abstract write(ctx: OpContext): void;
 	/** Handles one message; true when the operation is complete. */
 	abstract handle(msg: BackendMessage, ctx: OpContext): boolean;
@@ -421,6 +426,10 @@ export class QueryOp extends Op {
 
 	/** The server's error for this statement, once it arrived. */
 	get error(): PostgresError | undefined {
+		return this.#error;
+	}
+
+	override get failure(): Error | undefined {
 		return this.#error;
 	}
 
@@ -760,6 +769,10 @@ export class SyncGroupOp extends Op {
 		let count = 0;
 		for (const op of this.#ops) count += op.prepares;
 		return count;
+	}
+
+	override get failure(): Error | undefined {
+		return this.#failed ? this.#ops[this.#current]?.error : undefined;
 	}
 
 	write(ctx: OpContext): void {

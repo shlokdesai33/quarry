@@ -320,14 +320,13 @@ const SIGNATURE_HASHES: Readonly<
 const RSASSA_PSS = '2a864886f70d01010a';
 
 // hash algorithm OIDs in RSASSA-PSS parameters (RFC 4055)
-const PSS_HASHES: Readonly<
-	Record<string, 'SHA-256' | 'SHA-384' | 'SHA-512'>
-> = {
-	'2b0e03021a': 'SHA-256', // id-sha1
-	'608648016503040201': 'SHA-256', // id-sha256
-	'608648016503040202': 'SHA-384', // id-sha384
-	'608648016503040203': 'SHA-512', // id-sha512
-};
+const PSS_HASHES: Readonly<Record<string, 'SHA-256' | 'SHA-384' | 'SHA-512'>> =
+	{
+		'2b0e03021a': 'SHA-256', // id-sha1
+		'608648016503040201': 'SHA-256', // id-sha256
+		'608648016503040202': 'SHA-384', // id-sha384
+		'608648016503040203': 'SHA-512', // id-sha512
+	};
 
 /** Reads a DER tag-length header at `at`: the content's start and length. */
 function derHeader(
@@ -386,11 +385,7 @@ export async function serverEndPoint(
 	const key = hex(der.subarray(oid.start, oid.start + oid.length));
 	const hash =
 		key === RSASSA_PSS
-			? pssHash(
-					der,
-					oid.start + oid.length,
-					algorithm.start + algorithm.length,
-				)
+			? pssHash(der, oid.start + oid.length, algorithm.start + algorithm.length)
 			: SIGNATURE_HASHES[key];
 	if (hash === undefined) return undefined;
 	const data = await scramCrypto().digest(hash, der);

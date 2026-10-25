@@ -5,7 +5,7 @@ import {
 	type Executor,
 	NoRowError,
 	RowCountError,
-	type RunOptions,
+	type ExecuteRunOptions,
 	type TooManyRowsError,
 } from './executor.js';
 import { Expression } from './expression.js';
@@ -478,7 +478,7 @@ export abstract class WriteQueryBuilder<O, M extends string> {
 	 */
 	execute(
 		this: WriteQueryBuilder<O, never>,
-		options?: RunOptions,
+		options?: ExecuteRunOptions,
 	): Promise<WriteOutput<O>> {
 		return writeOutput<O>(this.#executor, this.toNode()).execute(options);
 	}

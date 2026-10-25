@@ -127,7 +127,9 @@ describe.skipIf(noPg).each(targets)('statementTimeout %s', (_name, target) => {
 				conn.query(sql, [], { statementTimeout: 100 }),
 				DriverError,
 			);
-			expect(error.message).toMatch(/can't bound .* outside a transaction block/);
+			expect(error.message).toMatch(
+				/can't bound .* outside a transaction block/,
+			);
 		}
 		// nothing was sent: the connection is as it was
 		expect(conn.pending).toBe(0);

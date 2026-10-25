@@ -2,8 +2,8 @@ import type { CompiledQuery } from './compile.js';
 import type {
 	ExecuteResult,
 	Executor,
+	ExecuteRunOptions,
 	ReadOptions,
-	RunOptions,
 } from './executor.js';
 
 /** What a `Query` holds. */
@@ -80,11 +80,16 @@ export class Query<T> {
 	}
 
 	/** Runs the query on the database it was started from. */
-	async execute(options?: RunOptions): Promise<T> {
-		const { executor, query, read, rows } = this._quarry;
+	async execute(options?: ExecuteRunOptions): Promise<T> {
+		const { executor, query, read, rows, checked } = this._quarry;
 		if (executor === undefined) {
 			throw new Error(
 				'The query has no database to run on: start it from `database(...)`',
+			);
+		}
+		if (options?.commit === true && checked) {
+			throw new TypeError(
+				'execute({ commit: true }) takes no expect… shape: the check would run after COMMIT was sent. Check the rows yourself before committing, or use db.batch with the shape',
 			);
 		}
 		return read(

@@ -1,5 +1,8 @@
 import { expect, test, vi } from 'vitest';
-import { nodeSockets, socketErrorMessage } from '../../src/driver/node-socket.js';
+import {
+	nodeSockets,
+	socketErrorMessage,
+} from '../../src/driver/node-socket.js';
 
 function systemError(message: string, code: string) {
 	return Object.assign(new Error(message), { code });
@@ -41,8 +44,13 @@ test('TCP sockets are opened with NODELAY and keepalive in the connect options, 
 	const server = net.createServer((socket) => socket.destroy());
 	await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
 	const address = server.address();
-	if (address === null || typeof address === 'string') throw new Error('no port');
-	const target = { kind: 'tcp', host: '127.0.0.1', port: address.port } as const;
+	if (address === null || typeof address === 'string')
+		throw new Error('no port');
+	const target = {
+		kind: 'tcp',
+		host: '127.0.0.1',
+		port: address.port,
+	} as const;
 	const netConnect = vi.spyOn(net, 'connect');
 	const tlsConnect = vi.spyOn(tls, 'connect');
 	try {

@@ -5,6 +5,8 @@ import { RowStream } from './row-stream.js';
 /** What a transaction needs from the connection it runs on. */
 export interface TransactionConnection {
 	readonly transactionStatus: 'idle' | 'transaction' | 'failed';
+	/** The error that failed the transaction, once one did (kept until the next transaction or savepoint rollback). */
+	readonly transactionError?: Error | undefined;
 	query<R>(
 		sql: string,
 		params?: readonly unknown[],
@@ -161,12 +163,27 @@ const defaultDelay = (attempt: number) =>
 
 /** The transaction committed nothing: COMMIT reported ROLLBACK because an earlier statement failed. */
 export class TransactionRolledBack extends DriverError {
-	constructor() {
+	/** @param cause the error of the statement that failed the transaction, when known */
+	constructor(cause?: Error) {
 		super(
 			'The transaction was rolled back because an earlier statement in it failed',
+			cause === undefined ? undefined : { cause },
 		);
 		this.name = 'TransactionRolledBack';
 	}
+}
+
+/**
+ * The error to report for a scope that failed with `error`: a statement
+ * refused because the transaction had already failed (25P02) reports the
+ * error that failed it instead, which the code may have caught and gone on.
+ */
+function firstError(error: unknown, first: Error | undefined): unknown {
+	return first !== undefined &&
+		error instanceof PostgresError &&
+		error.code === '25P02'
+		? first
+		: error;
 }
 
 type Callback = () => unknown;
@@ -187,6 +204,14 @@ interface Waiter {
 	readonly run: () => void;
 	readonly fail: (error: unknown) => void;
 }
+
+/** Statements that wait to go out with the next statement, under its Sync (see `Session.queue`). */
+export interface Pending {
+	readonly statements: readonly GroupStatement[];
+	sent: boolean;
+}
+
+const UNPREPARED = { prepare: false } as const;
 
 /** Connections running `Transaction.run` or `batch`, which may not have sent BEGIN yet. */
 const running = new WeakSet<BatchConnection>();
@@ -240,8 +265,13 @@ function openingStatements(
  *   Sync, so a failed BEGIN makes the server skip that statement instead
  *   of running it outside the transaction. Statements issued before BEGIN's
  *   outcome is known wait for it, and fail with its error.
- * - `sendDeferred` sends a statement (`release savepoint`) without waiting
- *   for its answer; the next statement reports its error.
+ * - `queue` holds statements (`savepoint`, `release savepoint`, a
+ *   savepoint's settings) until the next statement, which goes out with
+ *   them under one Sync: once one fails, the server skips the rest, which
+ *   reject with its error. Statements that need a Sync of their own send
+ *   them first, without waiting for their answer; the next statement then
+ *   reports their error. Queued statements nothing followed are dropped.
+ * - `commitWith` sends COMMIT right behind a statement, without waiting.
  *
  * @internal
  */
@@ -259,10 +289,24 @@ export class Session {
 	#failure: { error: unknown } | undefined;
 	/** A statement sent without waiting for its answer; the next one reports its error. */
 	#deferred: Promise<unknown> | undefined;
+	/** Statements waiting for the next one, to share its Sync. */
+	#prefix: Pending[] | undefined;
+	/** COMMIT, once sent behind the transaction's last statement. */
+	#commit: Promise<QueryResult<unknown>> | undefined;
 
 	constructor(conn: TransactionConnection, opening: readonly GroupStatement[]) {
 		this.#conn = conn;
 		this.#opening = opening;
+	}
+
+	/** The error that failed the transaction, while it is failed. */
+	get transactionError(): Error | undefined {
+		return this.#conn.transactionError;
+	}
+
+	/** COMMIT, if `commitWith` sent it. */
+	get committed(): Promise<QueryResult<unknown>> | undefined {
+		return this.#commit;
 	}
 
 	/** `transaction` from the start: BEGIN may not have been sent or answered yet. */
@@ -278,16 +322,61 @@ export class Session {
 		options?: TxQueryOptions,
 	): Promise<QueryResult<R>> {
 		if (
-			this.#opening !== undefined &&
+			(this.#opening !== undefined || this.#prefix !== undefined) &&
 			(options === undefined ||
 				OWN_SYNC.every((key) => options[key] === undefined))
 		) {
 			// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- rows are typed by the caller, as in `asResult`
-			return this.#begin([{ sql, params, options }])[0] as Promise<
+			return this.#group([{ sql, params, options }])[0] as Promise<
 				QueryResult<R>
 			>;
 		}
 		return this.#send(() => this.#conn.query<R>(sql, params, options));
+	}
+
+	/**
+	 * Runs `sql` and sends COMMIT right behind it, under a Sync of its own,
+	 * without waiting: the transaction is one round trip shorter. If the
+	 * statement fails, COMMIT reports ROLLBACK. If BEGIN failed, the
+	 * statement was skipped, and COMMIT, outside a transaction, does nothing.
+	 */
+	commitWith<R>(
+		sql: string,
+		params: readonly unknown[] | undefined,
+		options: TxQueryOptions | undefined,
+	): Promise<QueryResult<R>> {
+		const result = this.query<R>(sql, params, options);
+		// behind the statement, which may wait for BEGIN's answer: only then
+		// does COMMIT wait too, to keep the order
+		const commit =
+			this.#waiting === undefined
+				? this.#conn.query('commit')
+				: this.#send(() => this.#conn.query('commit'));
+		commit.catch(noop);
+		this.#commit = commit;
+		return result;
+	}
+
+	/**
+	 * Holds `statements` to go out with the next statement, under its Sync;
+	 * dropped if nothing follows (`drop`).
+	 */
+	queue(statements: readonly GroupStatement[]): Pending {
+		const pending: Pending = { statements, sent: false };
+		(this.#prefix ??= []).push(pending);
+		return pending;
+	}
+
+	/** Drops queued statements not sent yet; false when they were sent. */
+	drop(pending: Pending): boolean {
+		if (pending.sent) return false;
+		const prefix = this.#prefix;
+		const index = prefix?.indexOf(pending) ?? -1;
+		if (prefix !== undefined && index >= 0) {
+			prefix.splice(index, 1);
+			if (prefix.length === 0) this.#prefix = undefined;
+		}
+		return true;
 	}
 
 	/** Runs statements under one Sync, which BEGIN shares if not yet sent: once one fails, the rest reject with its error. */
@@ -295,7 +384,8 @@ export class Session {
 		statements: readonly GroupStatement[],
 		options?: GroupOptions,
 	): Promise<QueryResult<unknown>>[] {
-		if (this.#opening !== undefined) return this.#begin(statements, options);
+		if (this.#opening !== undefined || this.#prefix !== undefined)
+			return this.#group(statements, options);
 		const group = this.#send(() => {
 			const results = this.#conn.queryGroup(statements, options);
 			// read below once the group was sent; it may never be, if a deferred statement failed
@@ -357,11 +447,62 @@ export class Session {
 		return this.#iterate(() => this.#conn.copyTo(sql));
 	}
 
-	/** Waits for BEGIN's outcome (dropping it if never sent); its error, if it failed. */
+	/** Waits for BEGIN's outcome (dropping it, and anything queued, if never sent); its error, if it failed. */
 	async end(): Promise<{ error: unknown } | undefined> {
 		this.#opening = undefined;
+		this.#prefix = undefined;
 		if (this.#opened !== undefined) await this.#opened;
 		return this.#failure;
+	}
+
+	/** The queued statements, now being sent. */
+	#takePrefix(): GroupStatement[] {
+		const prefix = this.#prefix;
+		if (prefix === undefined) return [];
+		this.#prefix = undefined;
+		const statements: GroupStatement[] = [];
+		for (const pending of prefix) {
+			pending.sent = true;
+			statements.push(...pending.statements);
+		}
+		return statements;
+	}
+
+	/** Sends `statements` with BEGIN (if not sent yet) and the queued statements, under one Sync; their results. */
+	#group(
+		statements: readonly GroupStatement[],
+		options?: GroupOptions,
+	): Promise<QueryResult<unknown>>[] {
+		const prefix = this.#takePrefix();
+		if (this.#opening !== undefined) {
+			const results = this.#begin([...prefix, ...statements], options);
+			// a failed statement skips the rest, which report its error
+			for (let i = 0; i < prefix.length; i++) results[i]?.catch(noop);
+			return results.slice(prefix.length);
+		}
+		const all = [...prefix, ...statements];
+		const group = this.#send(() => {
+			const results = this.#conn.queryGroup(all, options);
+			// read below once the group was sent; it may never be, if a deferred statement failed
+			for (const result of results) result.catch(noop);
+			return Promise.resolve(results);
+		});
+		return statements.map((_, i) =>
+			group.then((results) => results[prefix.length + i]!),
+		);
+	}
+
+	/** Sends the queued statements without waiting for their answer: the next statement reports their error. */
+	#sendPrefix(): void {
+		const prefix = this.#takePrefix();
+		const sent = this.#send(() => {
+			const results = this.#conn.queryGroup(prefix);
+			for (const result of results) result.catch(noop);
+			// oxlint-disable-next-line typescript/no-non-null-assertion -- never empty
+			return results.at(-1)!;
+		});
+		sent.catch(noop);
+		this.#deferred = sent;
 	}
 
 	/** Sends BEGIN and the settings, with `statements` under the same Sync; their results. */
@@ -399,6 +540,7 @@ export class Session {
 	#send<T>(send: () => Promise<T>): Promise<T> {
 		if (this.#opening !== undefined) void this.#begin();
 		if (this.#failure !== undefined) return Promise.reject(this.#failure.error);
+		if (this.#prefix !== undefined) this.#sendPrefix();
 		const result = !this.#beginning
 			? send()
 			: new Promise<T>((resolve, reject) => {
@@ -417,6 +559,7 @@ export class Session {
 	#iterate<T>(make: () => AsyncIterable<T>): AsyncIterable<T> {
 		if (
 			this.#opening === undefined &&
+			this.#prefix === undefined &&
 			!this.#beginning &&
 			this.#failure === undefined &&
 			this.#deferred === undefined
@@ -467,12 +610,34 @@ export class Transaction {
 			throw new DriverError('This transaction has already finished');
 	}
 
+	/**
+	 * Runs a statement in the transaction. With `commit: true`, it is the
+	 * transaction's last: COMMIT goes out right behind it, without waiting
+	 * for its answer, and the transaction then takes no more statements.
+	 * A callback whose only statement commits so runs in one round trip
+	 * (BEGIN shares its Sync). If it fails, the transaction rolls back
+	 * (COMMIT reports ROLLBACK); once it succeeded, nothing the callback does
+	 * after it can roll the transaction back. Only in the outermost
+	 * transaction, not a savepoint.
+	 */
 	query<R = Record<string, unknown>>(
 		sql: string,
 		params?: readonly unknown[],
 		options?: TxQueryOptions,
 	): Promise<QueryResult<R>> {
 		if (this.#finished) return Promise.reject(finishedError());
+		if (options?.['commit'] !== undefined) {
+			const { commit, ...rest } = options;
+			if (commit !== true) return this.#conn.query<R>(sql, params, rest);
+			if (this.#depth > 0)
+				return Promise.reject(
+					new DriverError(
+						'commit: true ends the outermost transaction, not a savepoint',
+					),
+				);
+			this.#finished = true;
+			return this.#conn.commitWith<R>(sql, params, rest);
+		}
 		return this.#conn.query<R>(sql, params, options);
 	}
 
@@ -557,7 +722,15 @@ export class Transaction {
 		this.#afterRollback.push(callback);
 	}
 
-	/** Runs `fn` in a savepoint: rolled back to on error, released on success. */
+	/**
+	 * Runs `fn` in a savepoint: rolled back to on error, released on success.
+	 * The `savepoint` (and its settings) go out with `fn`'s first statement,
+	 * and the release with the statement after the savepoint, each under
+	 * that statement's Sync, so a savepoint adds no round trip; one in which
+	 * `fn` runs no statement sends nothing. An error `fn` caught and went on
+	 * after makes the savepoint fail with that error, not with the "current
+	 * transaction is aborted" (25P02) of the statements after it.
+	 */
 	async transaction<T>(
 		fn: (tx: Transaction) => Promise<T>,
 		options: Pick<TransactionOptions, 'durable' | 'settings'> &
@@ -575,31 +748,45 @@ export class Transaction {
 				);
 		}
 		const name = `quarry_sp_${this.#depth + 1}_${++this.#savepoints}`;
-		await this.#conn.query(`savepoint ${name}`);
-		const inner = new Transaction(this.#conn, this.#depth + 1);
+		const opening: GroupStatement[] = [
+			{ sql: `savepoint ${name}`, options: UNPREPARED },
+		];
+		const settings =
+			options.settings === undefined
+				? undefined
+				: settingsQuery(options.settings);
+		if (settings) opening.push({ ...settings, options: UNPREPARED });
+		const conn = this.#conn;
+		const savepoint = conn.queue(opening);
+		const inner = new Transaction(conn, this.#depth + 1);
 		try {
-			if (options.settings) {
-				const query = settingsQuery(options.settings);
-				if (query) await this.#conn.query(query.sql, query.params);
-			}
 			const result = await fn(inner);
-			if (this.#conn.transactionStatus === 'failed') {
-				// fails, so the savepoint is rolled back to, as when fn throws
-				await this.#conn.query(`release savepoint ${name}`);
-			} else {
-				this.#conn.sendDeferred(`release savepoint ${name}`);
+			if (conn.transactionStatus === 'failed') {
+				// fn caught a database error and went on: fails as if it threw it
+				throw (
+					conn.transactionError ??
+					new DriverError('A statement in the savepoint failed')
+				);
 			}
 			inner.#finished = true;
+			if (!conn.drop(savepoint))
+				conn.queue([{ sql: `release savepoint ${name}`, options: UNPREPARED }]);
 			this.#afterCommit.push(...inner.#afterCommit);
 			this.#afterRollback.push(...inner.#afterRollback);
 			return result;
-		} catch (error) {
+		} catch (caught) {
 			inner.#finished = true;
-			if (this.#conn.transactionStatus !== 'idle') {
-				await Promise.all([
-					this.#conn.query(`rollback to savepoint ${name}`).catch(noop),
-					this.#conn.query(`release savepoint ${name}`).catch(noop),
-				]);
+			let error = caught;
+			if (!conn.drop(savepoint) && conn.transactionStatus !== 'idle') {
+				error = firstError(caught, conn.transactionError);
+				await Promise.all(
+					conn
+						.queryGroup([
+							{ sql: `rollback to savepoint ${name}`, options: UNPREPARED },
+							{ sql: `release savepoint ${name}`, options: UNPREPARED },
+						])
+						.map((result) => result.catch(noop)),
+				);
 			}
 			runCallbacks(inner.#afterRollback);
 			throw error;
@@ -624,13 +811,26 @@ export class Transaction {
 				try {
 					result = await fn(tx);
 					tx.#finished = true;
-					const commit = await session.query('commit');
-					if (commit.command === 'ROLLBACK') throw new TransactionRolledBack();
+					const commit = await (session.committed ?? session.query('commit'));
+					if (commit.command === 'ROLLBACK')
+						throw new TransactionRolledBack(session.transactionError);
 				} catch (caught) {
 					tx.#finished = true;
 					// when BEGIN or the settings failed, fn's statements were skipped: that error is the one to report
 					const failure = await session.end();
-					const error = failure === undefined ? caught : failure.error;
+					const committed = await session.committed?.then(
+						(commit) => commit.command === 'COMMIT',
+						() => false,
+					);
+					if (committed === true && failure === undefined) {
+						// COMMIT went out behind the last statement, which succeeded: fn's error came after
+						runCallbacks(tx.#afterCommit);
+						throw caught;
+					}
+					const error =
+						failure === undefined
+							? firstError(caught, session.transactionError)
+							: failure.error;
 					if (conn.transactionStatus !== 'idle')
 						await conn.query('rollback').catch(() => {});
 					runCallbacks(tx.#afterRollback);

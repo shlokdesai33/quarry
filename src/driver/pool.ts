@@ -1336,7 +1336,8 @@ export class Pool implements AsyncDisposable {
 	#releaseSlot(slot: Slot, discard: boolean): void {
 		if (!slot.busy) return;
 		const { connection } = slot;
-		const reusable = !discard && !connection.closed && slot.expired === undefined;
+		const reusable =
+			!discard && !connection.closed && slot.expired === undefined;
 		if (!reusable) {
 			this.#unlend(slot);
 			const closing = this.#close(

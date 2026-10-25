@@ -233,12 +233,17 @@ describe('a connection the server ended while it was idle', () => {
 					socket.end();
 					return;
 				}
-				for (let i = 0; i + 5 <= data.length; i += 1 + data.readInt32BE(i + 1)) {
+				for (
+					let i = 0;
+					i + 5 <= data.length;
+					i += 1 + data.readInt32BE(i + 1)
+				) {
 					const type = String.fromCharCode(data[i] ?? 0);
 					if (type === 'P') send({ type: 'ParseComplete' });
 					else if (type === 'B') send({ type: 'BindComplete' });
 					else if (type === 'D') send({ type: 'NoData' });
-					else if (type === 'E') send({ type: 'CommandComplete', tag: 'SELECT 0' });
+					else if (type === 'E')
+						send({ type: 'CommandComplete', tag: 'SELECT 0' });
 					else if (type === 'S') send({ type: 'ReadyForQuery', status: 'I' });
 				}
 			});
@@ -263,7 +268,9 @@ describe('a connection the server ended while it was idle', () => {
 	it('does not run a query again when the connection closed without saying the server ended it', async () => {
 		const { state, port } = await endingServer(undefined);
 		await using pool = createPool({ ...options(port), max: 1 });
-		await expect(pool.query('select 1')).rejects.toBeInstanceOf(ConnectionError);
+		await expect(pool.query('select 1')).rejects.toBeInstanceOf(
+			ConnectionError,
+		);
 		expect(state.connections).toBe(1);
 	});
 
@@ -681,7 +688,10 @@ describe('statement names behind a pooler', () => {
 
 	it('keeps prepared statements cached when SQL run once fills the cache', async () => {
 		const { port, parsed, bound } = await pooler({});
-		await using conn = await connect({ ...options(port), statementCacheSize: 4 });
+		await using conn = await connect({
+			...options(port),
+			statementCacheSize: 4,
+		});
 		const hot = ['a', 'b'].map((t) => `insert into ${t} values ($1)`);
 		for (const sql of [...hot, ...hot]) await conn.query(sql, [1]);
 		for (let i = 0; i < 20; i++)
