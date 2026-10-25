@@ -34,13 +34,13 @@ export interface SocketConnectOptions {
 
 /**
  * A connected byte stream. The driver core only talks to this interface,
- * so runtimes other than Node (Bun, Deno, Workers) can supply their own.
+ * so a custom `socket` factory (a proxy, a test double) can supply its own.
  */
 export interface DriverSocket {
 	/** Whether TLS is active. */
 	readonly encrypted: boolean;
 	/**
-	 * Queues bytes for sending. Returns false when the runtime's buffer is
+	 * Queues bytes for sending. Returns false when the socket's buffer is
 	 * full; `onDrain` fires when it empties.
 	 */
 	write(data: Uint8Array): boolean;

@@ -58,19 +58,10 @@ export function resolveCallSite(
 	return undefined;
 }
 
-/**
- * Node's built-in module `id`, without importing it, so the library stays
- * usable where Node's modules don't exist.
- */
-function builtin<const I extends 'node:module' | 'node:url'>(id: I) {
-	return typeof process === 'object' &&
-		typeof process.getBuiltinModule === 'function'
-		? process.getBuiltinModule(id)
-		: undefined;
-}
-
 function mapSource(location: SourceLocation): SourceLocation {
-	const map = builtin('node:module')?.findSourceMap(location.file);
+	const map = process
+		.getBuiltinModule('node:module')
+		.findSourceMap(location.file);
 	if (map === undefined) return location;
 	const origin = map.findOrigin(location.line, location.column);
 	return 'fileName' in origin
@@ -83,10 +74,12 @@ function mapSource(location: SourceLocation): SourceLocation {
 }
 
 function toPath(location: SourceLocation): SourceLocation {
-	const url = builtin('node:url');
-	if (!location.file.startsWith('file:') || url === undefined) return location;
+	if (!location.file.startsWith('file:')) return location;
 	try {
-		return { ...location, file: url.fileURLToPath(location.file) };
+		return {
+			...location,
+			file: process.getBuiltinModule('node:url').fileURLToPath(location.file),
+		};
 	} catch {
 		return location;
 	}

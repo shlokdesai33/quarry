@@ -7,12 +7,11 @@ export default defineConfig({
 		cli: 'src/cli/main.ts',
 	},
 	format: ['esm'],
-	platform: 'neutral',
-	target: 'node22',
+	platform: 'node',
+	target: 'node24',
+	fixedExtension: false,
 	dts: false,
 	clean: true,
 	sourcemap: true,
 	treeshake: true,
-	// the driver loads Node built-ins lazily, only when running on Node
-	deps: { neverBundle: [/^node:/] },
 });

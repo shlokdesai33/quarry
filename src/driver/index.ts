@@ -30,7 +30,6 @@ export type {
 	TlsConnectOptions,
 } from './socket.js';
 export { nodeSockets } from './node-socket.js';
-export { cloudflareSockets } from './cloudflare-socket.js';
 export {
 	arrayLiteral,
 	arrayOids,
