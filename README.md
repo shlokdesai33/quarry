@@ -3,11 +3,11 @@
 A type-safe PostgreSQL query builder for TypeScript, with its own dependency-free driver.
 
 - **`quarry`**: tables defined once in TypeScript give typed rows, inserts and updates, comparisons that only accept what Postgres accepts, and a `verify` command that checks the definitions against the live database.
-- **`quarry/driver`**: a PostgreSQL driver written against the wire protocol, usable on its own. It pipelines concurrent queries, caches prepared statements, receives results in binary, and runs on Node, Bun, Deno and Cloudflare Workers.
+- **`quarry/driver`**: a PostgreSQL driver written against the wire protocol, usable on its own. It pipelines concurrent queries, caches prepared statements and receives results in binary.
 
 ## Requirements and building
 
-Requires PostgreSQL 18+, Node 22.12+ (or Bun, Deno, Cloudflare Workers) and TypeScript with `strict`. From a checkout:
+Requires PostgreSQL 18+, Node 24.11+ and TypeScript with `strict`. quarry runs on Node only: not on Bun, Deno or edge runtimes. From a checkout:
 
 ```sh
 pnpm install
@@ -753,7 +753,7 @@ Options resolve like libpq: the options object, then the connection string (`pos
 | `onNotice`           |                            | Receives `NOTICE`, `WARNING` and other server messages.                             |
 | `onNotification`     |                            | Receives `NOTIFY` messages.                                                         |
 | `maxMessageSize`     |                            | Refuse server messages larger than this many bytes.                                 |
-| `socket`             | per runtime                | A custom `SocketFactory`.                                                           |
+| `socket`             | Node's `net`/`tls`         | A custom `SocketFactory`.                                                           |
 | `env`                | `process.env`              | Where `PG*` variables are read from.                                                |
 
 ### Pool options
@@ -817,7 +817,7 @@ const pool = createPool({
 
 ## Benchmarks
 
-`quarry/driver` against `pg` (unnamed and named statements), `pg-native`, postgres.js and Bun.sql, at commit `b02e93f`: PostgreSQL 18.6 on an 8-vCPU VM (client, server and proxies on separate pinned cores), Node 24.22, Bun 1.4.3, Deno 2.9.7. Each cell ran 5 times in a fresh process in a shuffled order; figures are medians of the runs. quarry decodes like `pg` here (int8 and numeric as strings, timestamptz as `Date`), and all 608 result-equality checks across clients passed.
+`quarry/driver` against `pg` (unnamed and named statements), `pg-native` and postgres.js, at commit `b02e93f`: PostgreSQL 18.6 on an 8-vCPU VM (client, server and proxies on separate pinned cores), Node 24.22. Each cell ran 5 times in a fresh process in a shuffled order; figures are medians of the runs. quarry decodes like `pg` here (int8 and numeric as strings, timestamptz as `Date`), and every result-equality check across clients passed.
 
 **Single queries, Node 24 (median latency)**
 
@@ -870,15 +870,6 @@ With 10 connections and 500 callers, the p99 is 5.0 ms, against 10.6 ms for post
 A transaction takes two round trips (`BEGIN` travels with the first statement), and `db.batch` with `{ transaction: true }` takes one: three statements in a transaction at 5 ms RTT run at 166 ops/s with `db.batch`, against 57 with `Promise.all` and 43 one after another.
 
 Through the query builder (`database()`, pool 10), lookups run at 270–312k ops/s with 100–1,000 callers and no added latency, 71–79% of the driver alone. At 5 ms RTT with 1,000 callers, lookups, inserts and updates run at 160–168k ops/s, within 3% of the driver, about 2.2× postgres.js (73–75k) and 100× `pg` (1.6k).
-
-**Bun 1.4, against Bun.sql**
-
-| Scenario                        |      quarry | Bun.sql | pg (named) |
-| ------------------------------- | ----------: | ------: | ---------: |
-| Point lookup (median latency)   | **24.0 µs** | 28.2 µs |    28.6 µs |
-| Fetch 1,000,000 rows (mean)     |  **258 ms** |  477 ms |     965 ms |
-| 50 concurrent inserts (ops/s)   | **239,045** | 145,671 |    106,432 |
-| `begin; insert; commit` (ops/s) |  **20,698** |  10,723 |     14,998 |
 
 **Through PgBouncer 1.26, transaction mode, Node 24 (ops/s)**
 

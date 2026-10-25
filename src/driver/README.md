@@ -1,14 +1,12 @@
 # quarry's PostgreSQL driver
 
-A PostgreSQL driver with no runtime dependencies, written for quarry but usable on its own. It speaks the wire protocol directly (3.2 with fallback to 3.0), over Node's `net`/`tls` by default, behind a small socket interface for other runtimes.
+A PostgreSQL driver with no runtime dependencies, written for quarry but usable on its own. It speaks the wire protocol directly (3.2 with fallback to 3.0), over Node's `net`/`tls` by default, behind a small socket interface for custom transports.
 
 It requires PostgreSQL 18 or later (connecting to an older server fails with a clear error; a pooler that hides the version is assumed to front 18+). Newer releases are expected to work: unknown messages, fields, parameters and types are tolerated. `connection.capabilities` reports what poolers and proxies may change, such as the negotiated protocol version.
 
-## Runtimes
+## Runtime
 
-- **Node, Bun and Deno:** run on `node:net`/`node:tls`, with every feature available, including SCRAM channel binding and client certificates. `pnpm test:runtimes` runs the same smoke test on all three.
-- **Cloudflare Workers:** the `cloudflare:sockets` adapter is picked automatically. Workers' TLS always verifies against public CAs and doesn't expose the server certificate, so there are no custom CAs, client certificates, direct TLS or channel binding there. `pnpm test:workers` (with `MINIFLARE_FROM` pointing at a Miniflare install) runs the smoke test inside workerd.
-- **Anything else:** pass `socket` (a `SocketFactory`).
+The driver runs on Node 24.11 or later, over `node:net`/`node:tls`, and nowhere else: Bun, Deno and edge runtimes aren't supported ([Node only](DECISIONS.md#node-only)). To use your own transport (a test double, a tunnel), pass `socket` (a `SocketFactory`).
 
 ## Connecting
 
@@ -201,5 +199,5 @@ await db.transaction(async (tx) => {
 ## Development
 
 - `pnpm test` starts a throwaway cluster (TLS, a role per auth method, PgBouncer) when PostgreSQL is installed; otherwise the integration tests skip. `PG_VERSION=17`, `PG_BIN` and `PGBOUNCER_BIN` pick other versions.
-- `pnpm bench:driver` is a quick comparison with `pg` and postgres.js. `bench/driver/suite` is the full, reproducible comparison: every client on Node, Bun and Deno, PgBouncer, simulated network latency, resources and footprint (see its README).
+- `pnpm bench:driver` is a quick comparison with `pg` and postgres.js. `bench/driver/suite` is the full, reproducible comparison: every client on Node, PgBouncer, simulated network latency, resources and footprint (see its README).
 - `pnpm test:compat` runs node-postgres's and postgres.js's own test suites against this driver, through test-only shims in `test/driver/compat`, on PostgreSQL 18 (add `--bouncer` for a second pass through PgBouncer in transaction mode). It clones the pinned upstream releases into `.compat/`; `test/driver/compat/expectations.ts` lists every test allowed to fail and why.

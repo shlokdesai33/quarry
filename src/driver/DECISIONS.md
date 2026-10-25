@@ -13,7 +13,7 @@ The query builder's decisions are in [../DECISIONS.md](../DECISIONS.md); the ind
 
 ## How to read the numbers
 
-Most measurements come from benchmark runs described in the linked PRs, usually on a 4-vCPU cloud VM with the client pinned to 2 CPUs and PostgreSQL 18 to the other 2, Node 24 (and Bun 1.4 where stated), with each cell run several times in fresh processes and interleaved; the figure given is the median. "RTT" is the simulated network round-trip time (added with Toxiproxy); "0 ms" means loopback. "p99" and "p99.9" are the latencies 99% and 99.9% of queries beat: the slow tail. "ops/s" is operations per second. "pg" is node-postgres, the most common Node driver; "postgres.js" is the other popular one; "Bun.sql" is Bun's built-in native client. Absolute numbers depend on the machine; compare within a table. Differences under about 5% are usually noise.
+Most measurements come from benchmark runs described in the linked PRs, usually on a 4-vCPU cloud VM with the client pinned to 2 CPUs and PostgreSQL 18 to the other 2, Node 24 (and Bun 1.4 where stated), with each cell run several times in fresh processes and interleaved; the figure given is the median. "RTT" is the simulated network round-trip time (added with Toxiproxy); "0 ms" means loopback. "p99" and "p99.9" are the latencies 99% and 99.9% of queries beat: the slow tail. "ops/s" is operations per second. "pg" is node-postgres, the most common Node driver; "postgres.js" is the other popular one; "Bun.sql" is Bun's built-in native client. Bun figures predate [Node only](#node-only) and are kept as measured. Absolute numbers depend on the machine; compare within a table. Differences under about 5% are usually noise.
 
 ## Contents
 
@@ -671,9 +671,11 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 
 **Measured.** Node: connect + `select 1` + close, trust auth, 3.35 → 1.81 ms (pg 3.29); process start → first result 58.92 → 56.16 ms (pg 65.59).
 
-**Code.** [node-socket.ts](node-socket.ts) `builtin`, `preloadNodeSockets`; [connect.ts](connect.ts).
+**Code.** [node-socket.ts](node-socket.ts) `loadNet`, `loadTls`, `preloadNodeSockets`; [connect.ts](connect.ts).
 
 ### SCRAM with `node:crypto`, and a derived-key cache
+
+**Status.** The WebCrypto fallback is superseded by [Node only](#node-only): `node:crypto` is always there, so it was removed.
 
 **What it is.** SCRAM's HMACs and hashes use `node:crypto` synchronously where the runtime has it (PBKDF2 still runs off the main thread), with WebCrypto as the fallback; the derived keys are cached per (password, salt, iterations) in a 16-entry LRU; and the crypto module loads right after the startup message is sent, while the server starts its backend ([auth/README.md](auth/README.md#scram-sha-256)).
 
@@ -1008,9 +1010,23 @@ Untimed lookups are unchanged (77,092, 79,339, 14,941 and 56,411/s before).
 
 ## Runtimes
 
+### Node only
+
+**What it is.** quarry runs on Node 24.11 or later (`engines.node`) and nowhere else: Bun, Deno and edge runtimes such as Cloudflare Workers are not supported. Their code paths are gone: the `cloudflare:sockets` adapter, the WebCrypto SCRAM fallback, the Deno branch in `utf8` decoding (#45), the fallbacks for a missing `Buffer` or `process.getBuiltinModule`, the cross-runtime smoke tests (`test:runtimes`, `test:workers`), and the Bun and Deno clients in the benchmark suite.
+
+**Why.** quarry isn't a published library, and the only deployment target is Node. Every extra runtime had its own code paths, a test harness, benchmark phases and per-runtime tuning (#45 kept `toString` on Deno because its `utf8Slice` is slower), all for runtimes nothing runs on.
+
+**Alternatives.** Keep them as untested best effort: they would break without anyone noticing. Keep only the socket adapters: the fallbacks around them were most of the cost.
+
+**Cost.** Running on another runtime later means bringing back an adapter and its fallbacks. `DriverSocket` stays, so the adapter is the small part.
+
+**Code.** `engines` in package.json; [node-socket.ts](node-socket.ts); [protocol/text.ts](protocol/text.ts); [auth/scram.ts](auth/scram.ts) `scramCrypto`.
+
 ### One small socket interface
 
-**What it is.** The driver core only talks to `DriverSocket` (write, startTls, pause/resume, end/destroy, four events), with adapters for Node's `net`/`tls` (Node, Bun, Deno) and `cloudflare:sockets` (Workers) ([ARCHITECTURE.md](ARCHITECTURE.md#part-11-runtimes-and-sockets)).
+**Status.** Superseded in part by [Node only](#node-only). The interface stays, for custom `socket` factories, tests and the walkthrough's byte captures, but Node's is now the only adapter; the Bun, Deno and Workers support described below is history.
+
+**What it is.** The driver core only talks to `DriverSocket` (write, startTls, pause/resume, end/destroy, four events), with adapters for Node's `net`/`tls` (Node, Bun, Deno) and `cloudflare:sockets` (Workers) ([ARCHITECTURE.md](ARCHITECTURE.md#part-11-sockets)).
 
 **Why.** One code base runs everywhere, and a new runtime needs one small adapter. Tests and the walkthrough's byte captures use a fake socket through the same interface.
 
@@ -1018,15 +1034,17 @@ Untimed lookups are unchanged (77,092, 79,339, 14,941 and 56,411/s before).
 
 **Cost.** Bun runs on its JavaScript `node:net` (~5 ms to load cold); a native `Bun.connect` adapter is a possible follow-up.
 
-**Code.** [socket.ts](socket.ts), [node-socket.ts](node-socket.ts), [cloudflare-socket.ts](cloudflare-socket.ts).
+**Code.** [socket.ts](socket.ts), [node-socket.ts](node-socket.ts); `cloudflare-socket.ts` (removed).
 
 ### Counting bytes for backpressure on Workers
+
+**Status.** Superseded by [Node only](#node-only): the Workers adapter was removed.
 
 **What it is.** The Workers adapter counts the bytes whose writes haven't completed and reports a full buffer at 64 KiB.
 
 **Why.** workerd's socket `WritableStream` always reports `desiredSize === 1`, however much is queued (a probe queued 4 MiB without the value changing), so `write` never returned false and backpressure never engaged on Workers.
 
-**Code.** [cloudflare-socket.ts](cloudflare-socket.ts) `HIGH_WATER_MARK`.
+**Code.** `cloudflare-socket.ts` `HIGH_WATER_MARK` (removed).
 
 ## Errors and safety
 

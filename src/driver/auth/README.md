@@ -160,7 +160,7 @@ The driver defaults to **`verify-full` for remote hosts** (libpq defaults to `pr
 4. **`direct`** (PostgreSQL 17+): the TLS handshake starts immediately, with ALPN protocol `postgresql`, saving the SSLRequest round trip.
 5. `Connection.open(socket, config, { host, version, cancel })`: the startup handshake. `cancel` sends cancel requests to the same host **with the same TLS plan** (a cancel request is sent on a new connection; leaking it in plain text would leak the cancel key).
 
-Verification itself is done by the runtime's TLS (`rejectUnauthorized: verifyChain`, and `checkServerIdentity` checking `host` when `verifyHostname`, in [../node-socket.ts](../node-socket.ts)). Cloudflare Workers always verify against public CAs and can't do custom CAs, client certificates or direct TLS ([../ARCHITECTURE.md](../ARCHITECTURE.md#cloudflare-workers-cloudflare-socketts)).
+Verification itself is done by the runtime's TLS (`rejectUnauthorized: verifyChain`, and `checkServerIdentity` checking `host` when `verifyHostname`, in [../node-socket.ts](../node-socket.ts)).
 
 ## Connect timeout and abort
 
@@ -214,7 +214,7 @@ The server decides the method (from its `pg_hba.conf` rules for this user, datab
 | `cert`                        | a client certificate during TLS                       | no password message at all                                                          |
 | GSSAPI, SSPI, Kerberos, OAuth |                                                       | not supported: a clear `ConnectionError` with code `EAUTHMETHOD`                    |
 
-[md5.ts](md5.ts) implements MD5 in plain JavaScript, because WebCrypto (the crypto available everywhere) doesn't offer MD5.
+[md5.ts](md5.ts) implements MD5 in plain JavaScript. It was written when the driver also ran where only WebCrypto, which has no MD5, was available.
 
 ## SCRAM-SHA-256
 
@@ -278,8 +278,6 @@ Postgres implements `tls-server-end-point` (RFC 5929): the binding data is a has
 3. The GS2 header becomes `p=tls-server-end-point,,` and the `c=` attribute carries the header plus the hash.
 4. If binding was possible but the server didn't offer `-PLUS`, the header is `y,,`: the server, which does support it, then knows something stripped `-PLUS` from its offer (a **downgrade attack**) and fails the authentication.
 
-On Workers, the certificate isn't exposed, so SCRAM runs without binding there.
-
 ## Restricting methods: `requireAuth` and `channelBinding`
 
 The server picks the method, so a malicious server (or an impostor) could ask for `password` to receive your password in clear. Two options let the client refuse:
@@ -305,19 +303,16 @@ async #password(): Promise<string> {
 
 - A **string**: used as is.
 - A **function** (sync or async): called for **every new connection**. This is how short-lived credentials work: cloud databases (AWS RDS/Aurora IAM authentication, Google Cloud SQL, Azure Entra ID) accept a token that expires after minutes as the password, so the pool must fetch a fresh one each time it opens a connection: `password: () => signer.getAuthToken()`.
-- Otherwise, **`.pgpass`** (`passfile`, `PGPASSFILE`, or `~/.pgpass`): lines `host:port:database:user:password`, `*` matching anything, `\` escaping `:` and `\`, a Unix socket matching `localhost` (`findPgpassPassword` in [../config.ts](../config.ts)). It is read with dynamic `import('node:fs/promises')`, so runtimes without a file system just don't find it.
+- Otherwise, **`.pgpass`** (`passfile`, `PGPASSFILE`, or `~/.pgpass`): lines `host:port:database:user:password`, `*` matching anything, `\` escaping `:` and `\`, a Unix socket matching `localhost` (`findPgpassPassword` in [../config.ts](../config.ts)). It is read with dynamic `import('node:fs/promises')`, loaded only when needed.
 
 ## Client certificates
 
-For `cert` authentication (mutual TLS), the client presents a certificate during the TLS handshake and the server maps its common name to the user; no password message follows. Give `ssl: { cert, key }` (PEM text) or `certFile`/`keyFile` (libpq's `sslcert`/`sslkey`, `PGSSLCERT`/`PGSSLKEY`), with `passphrase` for an encrypted key; without any, `~/.postgresql/postgresql.crt` and `.key` are used when both exist. The Node socket puts them in a cached TLS context ([../ARCHITECTURE.md](../ARCHITECTURE.md#node-bun-and-deno-node-socketts)). A wrong passphrase fails in `tls.connect` with a `ConnectionError`.
+For `cert` authentication (mutual TLS), the client presents a certificate during the TLS handshake and the server maps its common name to the user; no password message follows. Give `ssl: { cert, key }` (PEM text) or `certFile`/`keyFile` (libpq's `sslcert`/`sslkey`, `PGSSLCERT`/`PGSSLKEY`), with `passphrase` for an encrypted key; without any, `~/.postgresql/postgresql.crt` and `.key` are used when both exist. The Node socket puts them in a cached TLS context ([../ARCHITECTURE.md](../ARCHITECTURE.md#node-node-socketts)). A wrong passphrase fails in `tls.connect` with a `ConnectionError`.
 
 ## Crypto
 
 <a id="crypto"></a>
-`scramCrypto()` picks the implementation once:
-
-- **`node:crypto`** where the runtime has it (Node, Bun, Deno, Workers with `nodejs_compat`), reached through `process.getBuiltinModule`: HMAC and SHA-256 are synchronous and take microseconds, while PBKDF2 runs on Node's thread pool, off the main thread.
-- **WebCrypto** (`crypto.subtle`) otherwise: every call is asynchronous, which is slower for many small HMACs but available everywhere.
+`scramCrypto()` loads **`node:crypto`** once, through `process.getBuiltinModule`: HMAC and SHA-256 are synchronous and take microseconds, while PBKDF2 runs on Node's thread pool, off the main thread.
 
 [encoding.ts](encoding.ts) has the small helpers SCRAM needs: standard base64 encode/decode (strict: invalid input throws), UTF-8 via `TextEncoder`/`TextDecoder`, hex.
 

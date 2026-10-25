@@ -270,7 +270,7 @@ The generated source for a 3-column result is shown in [../WALKTHROUGH.md](../WA
 - Factories are cached **by source**, so decoders of the same shape on every connection share one compiled function. The cache is dropped once its sources exceed 4 million characters.
 - Errors: a value whose codec throws becomes a `DecodeError(column, typeOid, cause)` (the `column` variable tracks which); a malformed row (wrong column count, bad length) is a `ProtocolError`.
 - Duplicate column names: in object mode the last wins, and a later NULL still overwrites an earlier value of the same name.
-- **Fallback** without generated code, where `new Function` is forbidden (Cloudflare Workers) or a column is named `__proto__` (which can't be an object-literal key safely): a loop into an array, then `assignBuilder` defines `__proto__` as an own property, never as the prototype.
+- **Fallback** without generated code, where `new Function` is forbidden (`--disallow-code-generation-from-strings`) or a column is named `__proto__` (which can't be an object-literal key safely): a loop into an array, then `assignBuilder` defines `__proto__` as an own property, never as the prototype.
 
 ## The registry
 
