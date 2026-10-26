@@ -73,6 +73,8 @@ function batchedSockets(interval: number): { factory: SocketFactory } {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** How often `text` occurs in what was sent. */
+const count = (sent: string, text: string) => sent.split(text).length - 1;
 
 const targets: [string, () => ConnectionOptions][] = [
 	['directly', () => options()],
@@ -380,6 +382,114 @@ describe.skipIf(noPg).each(targets)('statementTimeout %s', (_name, target) => {
 			expect(rows).toEqual([{ n: 1 }]);
 		},
 	);
+
+	describe('on a pool, as two statements where no transaction block can precede it', () => {
+		const SHORT = "select set_config('statement_timeout', $1, true)";
+		const LONG = 'select case when $1::text is null';
+
+		it('sends the setting and the query alone, under one Sync, and leaks nothing', async () => {
+			const net = recordingSockets();
+			await using pool = createPool({
+				...target(),
+				max: 1,
+				socket: net.factory,
+			});
+			await pool.query('select 1');
+			const sent = net.sent().length;
+			const error = await rejection(
+				pool.query('select pg_sleep(3)', [], { statementTimeout: 100 }),
+				QueryCanceled,
+			);
+			expect(error.reason).toBe('statement_timeout');
+			expect(
+				(await pool.query('select 1 as x', [], { statementTimeout: '1s' }))
+					.rows,
+			).toEqual([{ x: 1 }]);
+			const written = net.sent().slice(sent);
+			expect(count(written, SHORT)).toBeGreaterThan(0);
+			expect(count(written, LONG)).toBe(0);
+			expect(count(written, 'S\0\0\0\x04')).toBe(2);
+			expect(await timeoutOf(pool)).toBe('0');
+		});
+
+		it('keeps the three statements behind a begin, or anything else, sent through the pool, and leaves the transaction its setting', async () => {
+			const net = recordingSockets();
+			await using pool = createPool({
+				...target(),
+				max: 1,
+				pipeline: 10,
+				socket: net.factory,
+			});
+			await pool.query('select 1');
+			const sent = net.sent().length;
+			// issued together: pipelined on the one connection, the begin unanswered
+			const [, timed, slept, setting] = await Promise.all([
+				pool.query("/* app */ BEGIN; -- the caller's own transaction"),
+				pool.query('select 1 as x', [], { statementTimeout: 50 }),
+				pool.query('select pg_sleep(0.2) as slept'),
+				pool.query<{ t: string }>(
+					"select current_setting('statement_timeout') as t",
+				),
+			]);
+			expect(timed.rows).toEqual([{ x: 1 }]);
+			expect(slept.rowCount).toBe(1);
+			expect(setting.rows).toEqual([{ t: '0' }]);
+			await pool.query('rollback');
+			const behindSimple = await Promise.all([
+				pool.simpleQuery('select 1'),
+				pool.query('select 2 as x', [], { statementTimeout: '1s' }),
+			]);
+			expect(behindSimple[1].rows).toEqual([{ x: 2 }]);
+			const written = net.sent().slice(sent);
+			expect(count(written, LONG)).toBeGreaterThan(0);
+			expect(count(written, SHORT)).toBe(0);
+			expect(await timeoutOf(pool)).toBe('0');
+		});
+
+		it('fails alone when its query fails mid-pipeline, or its interval is invalid', async () => {
+			await using pool = createPool({ ...target(), max: 1, pipeline: 10 });
+			await pool.query('select 1');
+			const results = await Promise.allSettled([
+				pool.query('select 1/0', [], { statementTimeout: 50 }),
+				pool.query('select pg_sleep(0.15) as slept'),
+				pool.query('select 2 as x', [], { statementTimeout: '1s' }),
+				pool.query('select 3 as x', [], { statementTimeout: 'soon' }),
+				pool.query<{ t: string }>(
+					"select current_setting('statement_timeout') as t",
+				),
+			]);
+			const [divided, slept, two, invalid, setting] = results;
+			expect(divided?.status === 'rejected' && divided.reason).toMatchObject({
+				code: '22012',
+			});
+			expect(slept?.status).toBe('fulfilled');
+			expect(two?.status === 'fulfilled' && two.value.rows).toEqual([{ x: 2 }]);
+			expect(invalid?.status === 'rejected' && String(invalid.reason)).toMatch(
+				/statement_timeout/,
+			);
+			expect(setting?.status === 'fulfilled' && setting.value.rows).toEqual([
+				{ t: '0' },
+			]);
+		});
+
+		it('keeps the three statements on a connection and in a transaction', async () => {
+			const net = recordingSockets();
+			await using pool = createPool({
+				...target(),
+				max: 1,
+				socket: net.factory,
+			});
+			const sent = net.sent().length;
+			await pool.transaction((tx) =>
+				tx.query('select 1', [], { statementTimeout: '1s' }),
+			);
+			await using conn = await open({ ...target(), socket: net.factory });
+			await conn.query('select 1', [], { statementTimeout: '1s' });
+			const written = net.sent().slice(sent);
+			expect(count(written, LONG)).toBeGreaterThan(0);
+			expect(count(written, SHORT)).toBe(0);
+		});
+	});
 
 	it('is written with its query under one Sync', async () => {
 		const net = recordingSockets();

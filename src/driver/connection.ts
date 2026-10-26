@@ -43,6 +43,7 @@ import {
 	QueryOp,
 	SimpleQueryOp,
 	STATEMENT_TIMEOUT,
+	STATEMENT_TIMEOUT_LOCAL,
 	SyncGroupOp,
 	closedError,
 	type Description,
@@ -1270,6 +1271,7 @@ export class Connection implements AsyncDisposable {
 				options,
 				options.statementTimeout,
 				onDone,
+				rerunnable && this.#outsideTransactionBlock(),
 			);
 		}
 		// one shared executor: one closing over this query would cost a
@@ -1421,12 +1423,31 @@ export class Connection implements AsyncDisposable {
 		options: QueryOptions,
 		statementTimeout: number | string,
 		onDone: (() => void) | undefined,
+		outsideBlock: boolean,
 	): Promise<QueryResult<R>> {
 		const { statementTimeout: _, signal, timeout, onTiming, ...rest } = options;
 		const interval =
 			typeof statementTimeout === 'number'
 				? `${statementTimeout}ms`
 				: statementTimeout;
+		if (outsideBlock) {
+			// the implicit transaction of the Sync ends the setting: no restore
+			const [set, query] = this.#queryGroup(
+				[
+					{
+						sql: STATEMENT_TIMEOUT_LOCAL,
+						params: [interval],
+						options: STATEMENT_TIMEOUT_OPTIONS,
+					},
+					{ sql, params, options: rest },
+				],
+				signal,
+				{ timeout, onTiming, onDone, whole: true },
+			);
+			set?.catch(() => {});
+			if (query === undefined) throw new ConnectionError('Query did not run');
+			return asResult<R>(await query);
+		}
 		const [set, query, restore] = this.#queryGroup(
 			[
 				{
@@ -1454,6 +1475,20 @@ export class Connection implements AsyncDisposable {
 		// outside a transaction block, a failed restore rolled the query back
 		await restore;
 		return asResult<R>(result);
+	}
+
+	/**
+	 * Whether a query written now surely runs outside a transaction block:
+	 * the last answer left the connection idle, and nothing queued ahead of
+	 * it can open one (a `begin` or `start transaction`, or anything sent
+	 * otherwise than as plain statements). Then a timed query's setting can
+	 * be ended by the implicit transaction of its Sync, with no restore.
+	 */
+	#outsideTransactionBlock(): boolean {
+		if (this.#status !== 'I') return false;
+		for (let i = 0; i < this.#queue.length; i++)
+			if (this.#queue.at(i)?.opensNoBlock !== true) return false;
+		return true;
 	}
 
 	/**

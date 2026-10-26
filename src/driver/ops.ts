@@ -37,6 +37,20 @@ import type { QueryOptions } from './connection.js';
  * where nothing can make the server skip it: groups pipelined behind
  * bind its name before it is answered. Its parameter is text (OID 25).
  */
+/**
+ * A statement that opens a transaction block, by its first word (after
+ * comments): the only ones that leave one open behind their Sync.
+ */
+const BEGINS = /^(?:\s|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*(?:begin|start)\b/i;
+
+/**
+ * Sets `statement_timeout` to $1 until the transaction ends: with its
+ * query under one Sync, outside a transaction block, the implicit
+ * transaction ends it at the Sync. Its parameter is text (OID 25).
+ */
+export const STATEMENT_TIMEOUT_LOCAL =
+	"select set_config('statement_timeout', $1, true)";
+
 export const STATEMENT_TIMEOUT =
 	"select case when $1::text is null then set_config('statement_timeout', current_setting('quarry.statement_timeout'), true) else set_config('quarry.statement_timeout', current_setting('statement_timeout'), true) || set_config('statement_timeout', $1, true) end";
 
@@ -199,6 +213,11 @@ export abstract class Op {
 	/** The server's error for it, once one arrived. */
 	get failure(): Error | undefined {
 		return undefined;
+	}
+
+	/** Whether it surely leaves no transaction block open behind it (see `opensNoBlock`). */
+	get opensNoBlock(): boolean {
+		return false;
 	}
 
 	abstract write(ctx: OpContext): void;
@@ -438,6 +457,10 @@ export class QueryOp extends Op {
 
 	override get failure(): Error | undefined {
 		return this.#error;
+	}
+
+	override get opensNoBlock(): boolean {
+		return !BEGINS.test(this.#sql);
 	}
 
 	/** Writes the statement; without `sync` it ends with the next one's Sync (see `SyncGroupOp`). */
@@ -780,6 +803,11 @@ export class SyncGroupOp extends Op {
 
 	override get failure(): Error | undefined {
 		return this.#failed ? this.#ops[this.#current]?.error : undefined;
+	}
+
+	override get opensNoBlock(): boolean {
+		for (const op of this.#ops) if (!op.opensNoBlock) return false;
+		return true;
 	}
 
 	write(ctx: OpContext): void {
