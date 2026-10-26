@@ -11,25 +11,25 @@ Each area guide ends with a short **Decisions** section linking to the entries f
 
 The ones that shape everything else, with their biggest measured effect:
 
-| Decision                                                                                                                 | In one line                                                                    | Measured                                                                                    |
-| ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
-| [Node only](src/driver/DECISIONS.md#node-only)                                                                           | not a published library, deployed on Node: Bun, Deno and edge runtimes dropped |                                                                                             |
-| [Our own wire-protocol driver](src/driver/DECISIONS.md#our-own-wire-protocol-implementation-with-no-dependencies)        | the speed-ups below need control of every byte                                 | point lookups on 10 connections: 301k/s against postgres.js 130k and pg 61k                 |
-| [Pipelining, one Sync per query](src/driver/DECISIONS.md#pipelining-with-one-sync-per-query)                             | send without waiting; a failing query doesn't fail its neighbours              | N round trips become about one                                                              |
-| [Coalesced writes](src/driver/DECISIONS.md#coalesced-writes-one-write-per-microtask)                                     | every query issued in one tick goes out in one `write`                         | 5.1 queries per write; 4.5 µs client CPU per query (pg 17.1)                                |
-| [Adaptive pipeline depth](src/driver/DECISIONS.md#adaptive-pipeline-depth-from-100-to-1000)                              | how many queries to stack on a connection, tuned from observed latency         | 1 connection at 5 ms RTT: 7,757 → 126,551/s; a fixed 1000 starved slow queries (381 → 45/s) |
-| [Unnamed statements behind PgBouncer](src/driver/DECISIONS.md#unnamed-statements-for-pipelined-queries-behind-pgbouncer) | don't make PgBouncer rewrite every named Parse                                 | PgBouncer was the bottleneck: inserts +23%, point lookups +11%                              |
-| [Binary only after describe](src/driver/DECISIONS.md#binary-only-after-describe)                                         | never guess column types: safe against schema drift                            | first-run binary was 2× faster at 10k rows, and dropped for safety                          |
-| [Generated row decoders](src/driver/DECISIONS.md#generated-monomorphic-row-decoders)                                     | one compiled function per statement's columns                                  | 6 columns: 1,068 → 323–394 ns per row                                                       |
-| [Allocation cuts](src/driver/DECISIONS.md#allocation-cuts-for-the-small-query-tail)                                      | ~4× less garbage per small query                                               | `select 1` p99.9 368 → 264 µs                                                               |
-| [Streams: strict pull](src/driver/DECISIONS.md#streams-strict-pull)                                                      | fetch a batch only when the consumer asks                                      | 5M rows 2,494 → 1,480 ms, peak heap 55 → 27 MB (with binary first run)                      |
-| [Types follow PostgreSQL](src/DECISIONS.md#types-follow-postgresql-not-javascript)                                       | "it type-checks" means "Postgres accepts it"                                   |                                                                                             |
-| [No implicit LIMIT in result shapes](src/DECISIONS.md#no-implicit-limit-in-result-shapes)                                | the SQL you see is what runs, whatever the shape                               |                                                                                             |
-| [Lazy shapes and `db.batch`](src/DECISIONS.md#lazy-result-shapes-and-execute-as-the-one-way-to-run)                      | queries are values, so many can go in one round trip                           | a transfer at 5 ms RTT: 22.8 → 5.86 ms                                                      |
-| [Bulk writes through `unnest`](src/DECISIONS.md#many-rows-through-unnest-one-array-per-column)                           | one array per column: constant SQL, no parameter limit                         | 1k-row insert 514 → 674 queries/s with binary arrays                                        |
-| [`setEach`](src/DECISIONS.md#seteach-one-method-for-the-source-the-assignments-and-the-key-match)                        | bulk update with the key match generated, so it can't be forgotten             | 1,000 rows × 8 columns 7.00 → 4.96 ms                                                       |
-| [Keyset pagination with exact keys](src/DECISIONS.md#exact-text-keyset-keys)                                             | seek from the last key, sent back as the server's exact text                   | a `Date` key lost microseconds and looped forever                                           |
-| [Type-checking speed as a constraint](src/DECISIONS.md#speed-is-a-design-constraint-measured)                            | types written for the compiler's speed, measured                               | #32: per-query cost 131k → 133k instantiations                                              |
+| Decision                                                                                                                 | In one line                                                            | Measured                                                                                    |
+| ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| [Node only](src/driver/DECISIONS.md#node-only)                                                                           | not a published library: Node 24.11 or later is the only target        |                                                                                             |
+| [Our own wire-protocol driver](src/driver/DECISIONS.md#our-own-wire-protocol-implementation-with-no-dependencies)        | the speed-ups below need control of every byte                         | point lookups on 10 connections: 301k/s against postgres.js 130k and pg 61k                 |
+| [Pipelining, one Sync per query](src/driver/DECISIONS.md#pipelining-with-one-sync-per-query)                             | send without waiting; a failing query doesn't fail its neighbours      | N round trips become about one                                                              |
+| [Coalesced writes](src/driver/DECISIONS.md#coalesced-writes-one-write-per-microtask)                                     | every query issued in one tick goes out in one `write`                 | 5.1 queries per write; 4.5 µs client CPU per query (pg 17.1)                                |
+| [Adaptive pipeline depth](src/driver/DECISIONS.md#adaptive-pipeline-depth-from-100-to-1000)                              | how many queries to stack on a connection, tuned from observed latency | 1 connection at 5 ms RTT: 7,757 → 126,551/s; a fixed 1000 starved slow queries (381 → 45/s) |
+| [Unnamed statements behind PgBouncer](src/driver/DECISIONS.md#unnamed-statements-for-pipelined-queries-behind-pgbouncer) | don't make PgBouncer rewrite every named Parse                         | PgBouncer was the bottleneck: inserts +23%, point lookups +11%                              |
+| [Binary only after describe](src/driver/DECISIONS.md#binary-only-after-describe)                                         | never guess column types: safe against schema drift                    | first-run binary was 2× faster at 10k rows, and dropped for safety                          |
+| [Generated row decoders](src/driver/DECISIONS.md#generated-monomorphic-row-decoders)                                     | one compiled function per statement's columns                          | 6 columns: 1,068 → 323–394 ns per row                                                       |
+| [Allocation cuts](src/driver/DECISIONS.md#allocation-cuts-for-the-small-query-tail)                                      | a small query's garbage cut from ~5.0 KB to ~2.2 KB                    | `select 1` p99.9 368 → 264 µs                                                               |
+| [Streams: strict pull](src/driver/DECISIONS.md#streams-strict-pull)                                                      | fetch a batch only when the consumer asks                              | 5M rows 2,494 → 1,480 ms, peak heap 55 → 27 MB (with binary first run)                      |
+| [Types follow PostgreSQL](src/DECISIONS.md#types-follow-postgresql-not-javascript)                                       | "it type-checks" means "Postgres accepts it"                           |                                                                                             |
+| [No implicit LIMIT in result shapes](src/DECISIONS.md#no-implicit-limit-in-result-shapes)                                | the SQL you see is what runs, whatever the shape                       |                                                                                             |
+| [Lazy shapes and `db.batch`](src/DECISIONS.md#lazy-result-shapes-and-execute-as-the-one-way-to-run)                      | queries are values, so many can go in one round trip                   | a transfer at 5 ms RTT: 22.8 → 5.86 ms                                                      |
+| [Bulk writes through `unnest`](src/DECISIONS.md#many-rows-through-unnest-one-array-per-column)                           | one array per column: constant SQL, no parameter limit                 | 1k-row insert 514 → 674 queries/s with binary arrays                                        |
+| [`setEach`](src/DECISIONS.md#seteach-one-method-for-the-source-the-assignments-and-the-key-match)                        | bulk update with the key match generated, so it can't be forgotten     | 1,000 rows × 8 columns 7.00 → 4.96 ms                                                       |
+| [Keyset pagination with exact keys](src/DECISIONS.md#exact-text-keyset-keys)                                             | seek from the last key, sent back as the server's exact text           | a `Date` key lost microseconds and looped forever                                           |
+| [Type-checking speed as a constraint](src/DECISIONS.md#speed-is-a-design-constraint-measured)                            | types written for the compiler's speed, measured                       | #32: per-query cost 131k → 133k instantiations                                              |
 
 ## Everything, by area
 
@@ -45,7 +45,9 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 - [Types follow PostgreSQL, not JavaScript](src/DECISIONS.md#types-follow-postgresql-not-javascript)
 - [Comparisons are methods, typed per SQL kind](src/DECISIONS.md#comparisons-are-methods-typed-per-sql-kind)
 - [Immutable builders](src/DECISIONS.md#immutable-builders)
+- [Reusable pieces are functions: `fragment`, `pipe` and `when`](src/DECISIONS.md#reusable-pieces-are-functions-fragment-pipe-and-when)
 - [What a builder still needs, in its type: `M` and `this` gating](src/DECISIONS.md#what-a-builder-still-needs-in-its-type-m-and-this-gating)
+- [Row locks: a method per strength, several clauses, checked when compiling](src/DECISIONS.md#row-locks-a-method-per-strength-several-clauses-checked-when-compiling)
 - [The locking clause as a state machine: `L`](src/DECISIONS.md#the-locking-clause-as-a-state-machine-l) (measured)
 - [No `orWhere`: precedence is always explicit](src/DECISIONS.md#no-orwhere-precedence-is-always-explicit)
 - [`set` merges, `values` replaces](src/DECISIONS.md#set-merges-values-replaces)
@@ -59,7 +61,7 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 - [`keepRows` instead of `limit`](src/DECISIONS.md#keeprows-instead-of-limit)
 - [A write's `execute()` with `returning` resolves to the rows](src/DECISIONS.md#a-writes-execute-with-returning-resolves-to-the-rows)
 - [`db.batch`: two modes with names](src/DECISIONS.md#dbbatch-two-modes-with-names)
-- [`stream()`: only for every-row reads, and it runs immediately](src/DECISIONS.md#stream-only-for-every-row-reads-and-it-runs-immediately)
+- [`stream()`: only for every-row reads, run by iterating it](src/DECISIONS.md#stream-only-for-every-row-reads-run-by-iterating-it)
 
 ### Compiling to SQL
 
@@ -69,7 +71,7 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 - [SQL rendered through a trie of its pieces](src/DECISIONS.md#sql-rendered-through-a-trie-of-its-pieces) (measured)
 - [Every identifier quoted](src/DECISIONS.md#every-identifier-quoted)
 - [Parameters everywhere, literals only where Postgres refuses a parameter](src/DECISIONS.md#parameters-everywhere-literals-only-where-postgres-refuses-a-parameter)
-- [Parameters numbered in text order, and `in` as `= any($1)`](src/DECISIONS.md#parameters-numbered-in-text-order-and-in-as--any1)
+- [Parameters numbered in text order; `in` takes a list, or one array as `= any($1)`](src/DECISIONS.md#parameters-numbered-in-text-order-in-takes-a-list-or-one-array-as--any1)
 - [Every operation operand bracketed](src/DECISIONS.md#every-operation-operand-bracketed)
 - [Codecs as getters on the compiled query](src/DECISIONS.md#codecs-as-getters-on-the-compiled-query)
 
@@ -77,9 +79,13 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 
 - [The driver owns the codecs; the builder only chooses them](src/DECISIONS.md#the-driver-owns-the-codecs-the-builder-only-chooses-them) (measured)
 - [TypeScript types derived from codecs](src/DECISIONS.md#typescript-types-derived-from-codecs)
+- [Codecs chosen per column: `useCodec` and `defineType`, not a global type table](src/DECISIONS.md#codecs-chosen-per-column-usecodec-and-definetype-not-a-global-type-table)
+- [`DataType` separate from the column](src/DECISIONS.md#datatype-separate-from-the-column)
+- [Enums and custom types keyed by name in their type](src/DECISIONS.md#enums-and-custom-types-keyed-by-name-in-their-type)
 - [`undefined` is refused; optional filters use `when()`](src/DECISIONS.md#undefined-is-refused-optional-filters-use-when)
 - [`eb.val` declares a type from its JavaScript type](src/DECISIONS.md#ebval-declares-a-type-from-its-javascript-type)
-- [`= any($1)` gets a declared type only for integer and boolean columns](src/DECISIONS.md#-any1-gets-a-declared-type-only-for-integer-and-boolean-columns) (measured)
+- [Function value arguments are sent with a declared type](src/DECISIONS.md#function-value-arguments-are-sent-with-a-declared-type)
+- [`= any($1)` gets a declared type only for integer and boolean columns](src/DECISIONS.md#-any1-gets-a-declared-type-only-for-integer-and-boolean-columns) (measured; superseded by Exact parameter OIDs, except for text-like types)
 - [Arithmetic follows Postgres's result types](src/DECISIONS.md#arithmetic-follows-postgress-result-types)
 - [`case`: the first result fixes the SQL type](src/DECISIONS.md#case-the-first-result-fixes-the-sql-type)
 - [The type catalog loaded before the first query](src/DECISIONS.md#the-type-catalog-loaded-before-the-first-query)
@@ -101,6 +107,7 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 - [`selectAll` takes the name a table goes by](src/DECISIONS.md#selectall-takes-the-name-a-table-goes-by)
 - [Ordering by a selected key uses the bare key](src/DECISIONS.md#ordering-by-a-selected-key-uses-the-bare-key)
 - [`nest` marks a joined row with `ctid`](src/DECISIONS.md#nest-marks-a-joined-row-with-ctid)
+- [`nest`'s object keys in the builder's type: `K`](src/DECISIONS.md#nests-object-keys-in-the-builders-type-k) (measured)
 
 ### Pagination
 
@@ -115,8 +122,9 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 ### Execution and errors
 
 - [One small `Executor` interface between the builder and the driver](src/DECISIONS.md#one-small-executor-interface-between-the-builder-and-the-driver)
-- [Plain queries share the pool's pipelined connections](src/DECISIONS.md#plain-queries-share-the-pools-pipelined-connections)
+- [Plain queries share the pool's pipelined connections](src/DECISIONS.md#plain-queries-share-the-pools-pipelined-connections) (measured)
 - [Errors carry the query (hidden) and the code awaiting it](src/DECISIONS.md#errors-carry-the-query-hidden-and-the-code-awaiting-it) (measured)
+- [`onQuery`: one event per settled query, with its phases; `tag()` stays out of the SQL](src/DECISIONS.md#onquery-one-event-per-settled-query-with-its-phases-tag-stays-out-of-the-sql)
 - [Nested `durable` transactions throw](src/DECISIONS.md#nested-durable-transactions-throw)
 
 ### Type-level tricks
@@ -182,12 +190,15 @@ Full entries: [src/driver/DECISIONS.md](src/driver/DECISIONS.md).
 - [Strict bounds checks on every read](src/driver/DECISIONS.md#strict-bounds-checks-on-every-read)
 - [DataRow fast path: no message objects for rows](src/driver/DECISIONS.md#datarow-fast-path-no-message-objects-for-rows)
 - [Generated, monomorphic row decoders](src/driver/DECISIONS.md#generated-monomorphic-row-decoders) (measured)
+- [Text decoded with `Buffer#utf8Slice`](src/driver/DECISIONS.md#text-decoded-with-bufferutf8slice) (measured)
+- [Nested objects built by the generated row decoder](src/driver/DECISIONS.md#nested-objects-built-by-the-generated-row-decoder)
 - [Decode only the rows a caller keeps (`keepRows`)](src/driver/DECISIONS.md#decode-only-the-rows-a-caller-keeps-keeprows)
 - [Shared constant messages and repeated-string caches](src/driver/DECISIONS.md#shared-constant-messages-and-repeated-string-caches)
 
 ### Memory and garbage collection
 
 - [Allocation cuts for the small-query tail](src/driver/DECISIONS.md#allocation-cuts-for-the-small-query-tail) (measured)
+- [The shared promise executor lets go of each query's resolvers](src/driver/DECISIONS.md#the-shared-promise-executor-lets-go-of-each-querys-resolvers) (measured)
 - [One sweep timer for every idle connection](src/driver/DECISIONS.md#one-sweep-timer-for-every-idle-connection)
 - [The writer: reserve one byte per character, hand off big buffers](src/driver/DECISIONS.md#the-writer-reserve-one-byte-per-character-hand-off-big-buffers) (measured)
 
@@ -198,6 +209,7 @@ Full entries: [src/driver/DECISIONS.md](src/driver/DECISIONS.md).
 - [Draining a shared connection for exclusive callers](src/driver/DECISIONS.md#draining-a-shared-connection-for-exclusive-callers) (measured)
 - [Adaptive pipeline depth, from 100 to 1000](src/driver/DECISIONS.md#adaptive-pipeline-depth-from-100-to-1000) (measured)
 - [Adaptive width: no more pipelined backends than the server runs at once](src/driver/DECISIONS.md#adaptive-width-no-more-pipelined-backends-than-the-server-runs-at-once) (measured)
+- [`withShared`: several queries as one pipeline slot](src/driver/DECISIONS.md#withshared-several-queries-as-one-pipeline-slot)
 - [Pool policies: LIFO idle, jittered lifetime, safe release, fail fast](src/driver/DECISIONS.md#pool-policies-lifo-idle-jittered-lifetime-safe-release-fail-fast)
 
 ### Connecting
@@ -243,12 +255,19 @@ Full entries: [src/driver/DECISIONS.md](src/driver/DECISIONS.md).
 - [Cancel only the query at the head, and hold back later writes](src/driver/DECISIONS.md#cancel-only-the-query-at-the-head-and-hold-back-later-writes)
 - [Drop unsent queries without contacting the server](src/driver/DECISIONS.md#drop-unsent-queries-without-contacting-the-server)
 - [Server-side statement timeouts, transaction-local and pipelined](src/driver/DECISIONS.md#server-side-statement-timeouts-transaction-local-and-pipelined)
+- [A statement timeout framed by the transaction status](src/driver/DECISIONS.md#a-statement-timeout-framed-by-the-transaction-status) (superseded by A statement timeout is framed under the query's Sync, whatever the transaction status)
+- [A statement timeout is framed under the query's Sync, whatever the transaction status](src/driver/DECISIONS.md#a-statement-timeout-is-framed-under-the-querys-sync-whatever-the-transaction-status) (measured)
 - [Every wait has a timeout](src/driver/DECISIONS.md#every-wait-has-a-timeout)
+
+### Observability
+
+- [OpenTelemetry spans through a structural tracer, without parameters](src/driver/DECISIONS.md#opentelemetry-spans-through-a-structural-tracer-without-parameters)
+- [Server notices go to listeners, and a listener can't break the connection](src/driver/DECISIONS.md#server-notices-go-to-listeners-and-a-listener-cant-break-the-connection)
 
 ### Runtimes
 
 - [Node only](src/driver/DECISIONS.md#node-only)
-- [One small socket interface](src/driver/DECISIONS.md#one-small-socket-interface) (superseded in part by Node only)
+- [One small socket interface](src/driver/DECISIONS.md#one-small-socket-interface) (superseded by Node only)
 - [Counting bytes for backpressure on Workers](src/driver/DECISIONS.md#counting-bytes-for-backpressure-on-workers) (superseded by Node only)
 
 ### Errors and safety

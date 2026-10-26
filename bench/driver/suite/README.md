@@ -36,8 +36,9 @@ Binaries go to `~/benchbin` (`BENCH_BIN`).
 
 ```sh
 node orchestrate.ts --id run1                 # everything: verify, main, conc, pipeline, rtt, batch, builder, bouncer, reconnect
-node footprint.ts --id run1                   # install/bundle size and cold start
+node footprint.ts --id run1                   # install/bundle size and cold start (--reps 15 by default)
 node analyze.ts --id run1                     # results/run1/tables.md + summary.json
+node compare.ts run1 run2 --driver quarry     # one client's median throughput and p99, cell by cell, between two runs
 python3 charts.py results/run1/summary.json results/run1/charts
 python3 report-tables.py results/run1/summary.json   # the headline tables the published report quotes
 python3 compare-snapshots.py results-snapshots/<old>/tables.md results/run1/tables.md --column quarry   # before/after
@@ -45,14 +46,18 @@ python3 compare-snapshots.py results-snapshots/<old>/tables.md results/run1/tabl
 
 Useful options for `orchestrate.ts`:
 
-- `--phases main,conc` picks phases.
-- `--runs 5` sets the runs per cell (default 5).
+- `--id run1` names the results directory (default: the start time).
+- `--phases main,conc` picks phases ([below](#phases)).
+- `--runs 5` sets the runs per cell (default 5). The `verify` phase always runs each cell once.
 - `--seed 1` sets the order shuffle.
 - `--only-drivers quarry,pg` and `--only-scenarios pk,fetch1k` narrow the matrix.
-- `--quick` uses 150 ms measurements, as a smoke test.
-- `--parallel 3` runs cells concurrently. Use it only with `--quick`, since the timings are then meaningless.
+- `--quick` uses 150 ms measurements and 50 ms warm-ups, as a smoke test.
+- `--parallel 3` runs cells concurrently, without CPU pinning. Use it only with `--quick`, since the timings are then meaningless. The `reconnect`, `rtt`, `pipeline`, `batch` and `builder` phases always run one cell at a time, because the simulated RTT and server restarts are global.
+- `--dir <path>` puts the cluster somewhere other than `~/.cache/quarry-driver-bench` (`footprint.ts` takes it too).
 
-Results append to `results/<id>/raw.jsonl` as each cell finishes, so re-running with the same `--id` resumes where it stopped. `results/` is gitignored; `results-snapshots/` keeps the tables, footprint figures and metadata of the published runs; runs before Node only also cover Bun and Deno, which the scripts here now skip.
+`analyze.ts` takes `--id` more than once to merge result sets, and `--out <dir>` to write elsewhere than the first id's directory.
+
+Results append to `results/<id>/raw.jsonl` as each cell finishes, so re-running with the same `--id` resumes where it stopped. Each start also writes `results/<id>/meta-<timestamp>.json`: seed, runs, phases, CPU model and pinning, server and PgBouncer configuration, each client's configuration, and `versions` (Node, PostgreSQL, PgBouncer, Toxiproxy, libpq, each client package, and `quarry`, the repository's short `HEAD` commit). `results/` is gitignored; `results-snapshots/` keeps the tables, footprint figures and metadata of the published runs; runs before Node only also cover Bun and Deno, which the scripts here now skip.
 
 To compare a change to the driver, build it somewhere else and set `QUARRY_DIST_CANDIDATE` to its `driver/index.js`. Every `quarry` cell (and its equal-work memory twin) then gets a `quarry-candidate` twin, measured in the same session and shuffled with everything else:
 
@@ -60,7 +65,7 @@ To compare a change to the driver, build it somewhere else and set `QUARRY_DIST_
 QUARRY_DIST_CANDIDATE=/path/to/candidate/dist/driver/index.js node orchestrate.ts --id ab --only-drivers quarry,quarry-candidate,pg,postgres.js
 ```
 
-`QUARRY_DIST` replaces the build for every quarry configuration instead (`worker.ts`, `cold.ts`). With `BENCH_NO_PROXIES=1`, `env.ts` starts no Toxiproxy or wsproxy, for quick local A/B runs without the `rtt`, `pipeline` and Neon cells.
+`QUARRY_DIST` replaces the build for every quarry configuration instead (`drivers.ts`, `cold.ts`). With `BENCH_NO_PROXIES=1`, `env.ts` starts no Toxiproxy or wsproxy, for quick local A/B runs without the `rtt`, `pipeline` and Neon cells.
 
 To run one cell by hand:
 
@@ -72,11 +77,13 @@ node --expose-gc worker.ts '{"driver":"quarry","scenario":"pk","target":{"host":
 
 `env.ts` starts the following, each pinned with `taskset`:
 
-| Component | CPUs (default) | Notes |
-| ---------------------------------- | --------------------------------------------------------- |
-| Benchmarked client process | 0–2 (`BENCH_CLIENT_CPUS`) | One fresh process per cell and run |
-| PostgreSQL 18 | 4–7 (`BENCH_SERVER_CPUS`) | Own cluster in `~/.cache/quarry-driver-bench`, port 55432 |
-| PgBouncer 1.26, Toxiproxy, wsproxy | 3 (`BENCH_PROXY_CPUS`) | Ports 56432, 57432 (API 58474), 59432 |
+| Component                          | CPUs (default)            | Notes                                                                       |
+| ---------------------------------- | ------------------------- | --------------------------------------------------------------------------- |
+| Benchmarked client process         | 0–2 (`BENCH_CLIENT_CPUS`) | One fresh process per cell and run                                          |
+| PostgreSQL 18                      | 4–7 (`BENCH_SERVER_CPUS`) | Own cluster in `~/.cache/quarry-driver-bench`, port 55432                   |
+| PgBouncer 1.26, Toxiproxy, wsproxy | 3 (`BENCH_PROXY_CPUS`)    | PgBouncer on 56432, Toxiproxy on 57432 (its API on 58474), wsproxy on 59432 |
+
+PostgreSQL's binaries are taken from `PG_BIN` (default `/usr/lib/postgresql/<PG_VERSION>/bin`, version 18), and Toxiproxy and wsproxy from `BENCH_BIN` (default `~/benchbin`).
 
 Move other processes off the client and server CPUs before a run, for example `for p in $(ps -eo pid=); do sudo taskset -pc 3 $p; done` (skipping PostgreSQL's processes).
 
@@ -103,6 +110,24 @@ The data set is generated once:
 PgBouncer runs in transaction mode with `max_prepared_statements = 500` and `default_pool_size = 20`.
 
 Network latency comes from Toxiproxy's `latency` toxic. It is applied to the server → client direction, at the whole RTT, because Toxiproxy takes whole milliseconds. Each request still waits one RTT, and pipelined requests overlap. The kernel on the reference VM has no `tc` qdiscs, so netem wasn't an option. Toxiproxy adds its own cost at 0 ms, so compare RTT rows with each other, not with direct connections.
+
+## Phases
+
+`orchestrate.ts` builds each phase's cells in `matrix()`. `CORE` is `quarry`, `pg`, `pg-named`, `pg-native`, `postgres.js` and `neon`; the variants (`quarry-lossless`, `quarry-noprep`, `postgres.js-noprep`, `pg-native-named`, `neon-default`) run only the scenarios where their setting matters.
+
+| Phase       | Cells                                                                                                                                                                                                                |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `verify`    | Every scenario that has a correctness check, once per `CORE` client and variant: compares result digests ([methodology](#methodology))                                                                               |
+| `main`      | Every scenario except `reconnect`, the batches and the builder ones, on `CORE` and the variants, direct, pool 10; scenarios with `memOps` also get an equal-work memory cell                                         |
+| `conc`      | `pk` on `CORE` and `quarry-nopipe`, at 1, 10, 50, 100, 500 and 1000 callers × pool 1, 5, 10 and 50                                                                                                                   |
+| `pipeline`  | quarry only: `pk` with 100 callers on one connection, pipeline depth 1, 2, 4, 8, 16, 32, 64, 100 and the adaptive default, at 0 and 5 ms RTT                                                                         |
+| `rtt`       | `CORE` at 0, 1, 5 and 20 ms RTT: `select1`, `pk` (also with 50 callers, and with 100 and 500 callers on one connection), `fetch1k`, `tx-insert`, `tx-empty`, `savepoints`, `insert1-c50`, `connect-plain-trust`      |
+| `bouncer`   | Through PgBouncer: `quarry`, `quarry-noprep`, `pg`, `pg-named`, `pg-native`, `postgres.js`, `postgres.js-noprep` × `select1`, `pk` (also with 50 callers), `fetch1k`, `insert1`, `tx-insert`, `insert1-c50`, `error` |
+| `batch`     | `quarry-db`: the `batches` scenarios, at 0 and 5 ms RTT                                                                                                                                                              |
+| `builder`   | `quarry-db` running `db-pk`, `db-pk-timed`, `db-insert`, `db-update`, and `quarry`, `pg` and `postgres.js` running `pk`, `insert1`, `update`, at 1, 100, 500 and 1000 callers on pool 10, at 0 and 5 ms RTT          |
+| `reconnect` | `CORE` except Neon: the server is restarted while the client queries, and the time from the server being up to the pool serving queries again is measured                                                            |
+
+The runs of every cell in a phase are shuffled together ([methodology](#methodology)).
 
 ## Clients and configurations
 
@@ -151,14 +176,16 @@ Resource metrics:
 
 ## Files
 
-| File                                       | Role                                                                                    |
-| ------------------------------------------ | --------------------------------------------------------------------------------------- |
-| `env.ts`                                   | Cluster, data set, PgBouncer, Toxiproxy, wsproxy, CPU pinning                           |
-| `drivers.ts`                               | One adapter per client configuration                                                    |
-| `scenarios.ts`                             | Every scenario: operation, check, verification                                          |
-| `worker.ts`                                | Runs one cell; measurement and resource sampling                                        |
-| `orchestrate.ts`                           | The matrix, order, runs, resume                                                         |
-| `canon.ts`                                 | Canonical results for the correctness check                                             |
-| `footprint.ts`, `cold.ts`                  | Install and bundle size, cold start                                                     |
-| `analyze.ts`, `charts.py`                  | Tables and charts                                                                       |
-| `report-tables.py`, `compare-snapshots.py` | Headline tables for the report; one client's before/after between two `tables.md` files |
+| File                                       | Role                                                                                                                                     |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `env.ts`                                   | Cluster, data set, PgBouncer, Toxiproxy, wsproxy, CPU pinning                                                                            |
+| `drivers.ts`                               | One adapter per client configuration                                                                                                     |
+| `scenarios.ts`                             | Every scenario: operation, check, verification                                                                                           |
+| `worker.ts`                                | Runs one cell; measurement and resource sampling                                                                                         |
+| `setup.sh`                                 | One-time machine setup ([above](#setup))                                                                                                 |
+| `orchestrate.ts`                           | The matrix, order, runs, resume                                                                                                          |
+| `canon.ts`                                 | Canonical results for the correctness check                                                                                              |
+| `footprint.ts`, `cold.ts`                  | Install size (quarry from a `pnpm pack` tarball of this repository, the other clients at their pinned versions), bundle size, cold start |
+| `analyze.ts`, `charts.py`                  | Tables and charts                                                                                                                        |
+| `compare.ts`                               | Median throughput and p99 of one client, cell by cell, between two result ids                                                            |
+| `report-tables.py`, `compare-snapshots.py` | Headline tables for the report; one client's before/after between two `tables.md` files                                                  |

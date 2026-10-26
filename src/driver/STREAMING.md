@@ -56,13 +56,18 @@ Until the final Sync, nothing else can be written on the connection: another Bin
 **Inside a transaction** (status `T`): a **named portal** (`quarry_1`, `quarry_2`, …, from `CursorHost.portal()`) survives Sync until the transaction ends, so each batch is a self-contained Execute + Sync:
 
 ```
+C> [Parse] Describe(S) Flush                               ← CursorOp, only if the columns aren't cached
+S< [ParseComplete] ParameterDescription RowDescription
 C> Bind("quarry_1", …) Execute("quarry_1", 1000) Sync     ← CursorOp: the first batch
 S< BindComplete DataRow × 1000 PortalSuspended ReadyForQuery(T)
 C> (other queries of the transaction, if the loop runs any)
 C> Execute("quarry_1", 1000) Sync                          ← FetchOp: each later batch
 S< DataRow × 1000 PortalSuspended ReadyForQuery(T)
 C> Close(P "quarry_1") Sync                                ← ClosePortalOp at the end
+S< CloseComplete ReadyForQuery(T)
 ```
+
+Captured in a transaction, `batchSize: 2` over five rows: `Parse("q2", …) Describe(S "q2") Flush`, then `Bind("quarry_1", "q2", results 1) Execute("quarry_1", 2) Sync`, `Execute("quarry_1", 2) Sync` twice, and `Close(P "quarry_1") Sync`.
 
 The cursor is exclusive only while it describes the statement; between batches the connection is free, so `for await (… tx.stream()) await tx.update(…)` works, and several cursors can be read in step. (Before #34 the cursor was always exclusive, and that loop **deadlocked**: the update waited for the cursor, which waited for the loop.)
 

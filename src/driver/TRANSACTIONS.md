@@ -52,7 +52,7 @@ await pool.transaction(async (tx) => {
 }, { isolation: 'serializable', retries: 3, settings: { 'app.tenant_id': tenant }, timeout: '10s' });
 ```
 
-`Pool.transaction` reserves a connection for the callback (`#with`), `Connection.transaction` and `PoolClient.transaction` use theirs; all call `Transaction.run(connection, fn, options)`.
+`Pool.transaction` reserves a connection for the callback (`#with`; its options also take a `signal`, which bounds the wait for that connection), `Connection.transaction` and `PoolClient.transaction` use theirs; all call `Transaction.run(connection, fn, options)`.
 
 `TransactionOptions`: `isolation`, `readOnly`, `deferrable`, `retries`, `retryDelay(attempt)`, `settings`, `timeout`, `durable`.
 
@@ -103,21 +103,21 @@ A `Transaction` must not be used after its callback settles (`#finished`): its m
 
 ## BEGIN shares the first statement's Sync
 
-A naive transaction costs one round trip more than its statements: `begin` → wait → first statement → wait → … → `commit` → wait. The driver sends `begin` **together with the first statement, under one Sync**. Captured:
+A naive transaction costs one round trip more than its statements: `begin` → wait → first statement → wait → … → `commit` → wait. The driver sends `begin` **together with the first statement, under one Sync**. Captured on a fresh connection, a transaction running `select 1 as a` twice:
 
 ```
-C> Parse("", "begin") Bind Describe(P) Execute   Parse("q2", "select …") Describe(S) Bind(q2) Execute   Sync
-S< ParseComplete BindComplete NoData CommandComplete(BEGIN)   ParseComplete … DataRow CommandComplete(SELECT 1)   ReadyForQuery(T)
-C> Bind(q2) Execute Sync                         (the second statement)
+C> Parse("", "begin") Bind("", "") Describe(P "") Execute("")   Parse("q1", "select 1 as a") Describe(S "q1") Bind("", "q1") Execute("")   Sync
+S< ParseComplete BindComplete NoData CommandComplete(BEGIN)   ParseComplete ParameterDescription RowDescription BindComplete DataRow CommandComplete(SELECT 1)   ReadyForQuery(T)
+C> Bind("", "q1", results 1) Execute("") Sync          (the second statement: described, so binary)
 S< BindComplete DataRow CommandComplete(SELECT 1) ReadyForQuery(T)
-C> Parse("q3", "commit") Describe(S) Bind(q3) Execute Sync
-S< … CommandComplete(COMMIT) ReadyForQuery(I)
+C> Parse("q2", "commit") Describe(S "q2") Bind("", "q2") Execute("") Sync
+S< ParseComplete ParameterDescription NoData BindComplete CommandComplete(COMMIT) ReadyForQuery(I)
 ```
 
 With settings (`isolation: 'serializable', settings: { 'app.tenant': '7' }`), BEGIN, the `set_config` and the first statement share the Sync:
 
 ```
-C> Parse("", "begin isolation level serializable") … Execute   Parse("", "select set_config($1, $2, true)") … Execute   Bind(q2) Execute   Sync
+C> Parse("", "begin isolation level serializable") Bind Describe(P) Execute   Parse("", "select set_config($1, $2, true)") Bind("", "", "app.tenant", "7") Describe(P) Execute   Parse("q1", "select 1 as a") Describe(S "q1") Bind("", "q1") Execute   Sync
 ```
 
 Why **one Sync**? If BEGIN fails (an invalid option, a connection-level problem), the server skips everything until Sync: the first statement does **not** run, and certainly not outside the transaction, which is what could happen with separate Syncs. The statement then rejects with BEGIN's error. (The callback has already started by then, since the first statement is what triggers sending BEGIN.)
@@ -141,7 +141,8 @@ class Session {
 - **`#send(fn)`** for everything else: if BEGIN is still unsent, send it; if it failed, reject with its error; if it's in flight, queue `fn` until its outcome (`#waiting`, run by `#began`). So statements issued before BEGIN's answer arrive in order after it, and fail with BEGIN's error if it failed.
 - **`transactionStatus`** reports `transaction` from the start, even before BEGIN was sent or answered, so code inside the callback sees what it expects.
 - **`queryGroup(statements)`**: several statements under one Sync, sharing BEGIN's if unsent.
-- **`cursor`, `stream`, `copyTo`** (`#iterate`) wait for BEGIN (and any deferred statement) before starting, since they hold the connection exclusively.
+- **`describe`, `copyFrom`** go through `#send` like a query with its own Sync.
+- **`cursor`, `stream`, `copyTo`** (`#iterate`) wait for BEGIN (and any deferred statement) before starting: they send their messages through the connection's own iterators, which can't share BEGIN's Sync or wait in `#waiting`. `stream` is a [`RowStream`](row-stream.ts) over `cursor`. Inside a transaction a cursor uses a named portal, so other statements can run between its batches ([STREAMING.md](STREAMING.md#how-it-works-on-the-wire)); for the same reason it refuses a `statementTimeout` ("A cursor inside a transaction takes no statementTimeout, since other queries run between its batches: set statement_timeout with set_config(…, true)").
 - **`sendDeferred(sql)`**: send without waiting for the answer; the **next** statement's result waits for it first, and reports its error instead if it failed (`#send` chains on `#deferred`).
 - **`end()`**: drops BEGIN if it was never sent (a callback that ran no statement costs no round trip at all, and COMMIT then does nothing), waits for BEGIN's outcome, and returns its failure.
 
@@ -180,7 +181,7 @@ async transaction(fn, options = {}) {
 - **The callback resolved but swallowed a database error** (the transaction is `failed`): release is awaited and fails, so the savepoint behaves as if `fn` had thrown.
 - **Error**: roll back to the savepoint and release it (pipelined together), run the savepoint's `afterRollback` callbacks, rethrow. The outer transaction can continue.
 - The inner transaction's `afterCommit` callbacks move up to the outer one: they run when the **outermost** transaction commits. If the outer one later rolls back, they're dropped.
-- As the first statement of a transaction, `savepoint` shares BEGIN's Sync like any statement (captured: `Parse("", "begin") … Parse("q4", "savepoint quarry_sp_1_1") … Sync`).
+- As the first statement of a transaction, `savepoint` shares BEGIN's Sync like any statement (captured on a fresh connection: `Parse("", "begin") … Execute Parse("q1", "savepoint quarry_sp_1_1") Describe(S "q1") Bind Execute Sync`; once the callback's statements are answered, the deferred `Parse("q3", "release savepoint quarry_sp_1_1") … Sync` goes out, and the next statement follows it without waiting for its answer).
 
 ## Retries
 
@@ -196,6 +197,11 @@ Retries are opt-in (default 0): a retry is only correct when you know the callba
 - **`tx.setLocal(name, value)`**: the same, later in the transaction.
 - **`timeout`**: becomes the `transaction_timeout` setting (PostgreSQL 17+): if the transaction runs longer, the **server** ends the session, and the call fails with `TransactionTimeout` (25P04). The connection is closed by the server; the pool replaces it.
 - Savepoints accept `settings` too (applied after the savepoint, so rolling back to it undoes them).
+- **A query's `statementTimeout`** bounds that query alone, in a transaction as outside one: the query goes out with its own Sync (not BEGIN's), between a statement setting `statement_timeout` and the same statement restoring it, all three under that Sync ([CANCELLATION.md](CANCELLATION.md#statement-timeouts)). Captured, as the second statement of a transaction:
+
+```
+C> Parse("q2", "select case when $1::text is null the…") Describe(S "q2") Bind("", "q2", "2000ms") Execute   Parse("q3", "select 2 as b") Describe(S "q3") Bind("", "q3") Execute   Bind("", "q2", null) Execute   Sync
+```
 
 ## A COMMIT that rolled back
 
@@ -212,7 +218,7 @@ If a statement inside the transaction failed and your code caught the error and 
 ## Batches in one round trip
 
 <a id="batches-in-one-round-trip"></a>
-`Transaction.batch(conn, statements, options)` (used by quarry's `db.batch(…, { transaction: true })`) runs a **fixed list** of statements as one transaction in one round trip:
+`Transaction.batch(conn, statements, options)` (used by quarry's `db.batch(…, { transaction: true })`) runs a **fixed list** of statements as one transaction in one round trip. Its options (`TransactionBatchOptions`) are the transaction's without `retries`, `retryDelay` and `durable`, plus `signal` and `verify`:
 
 ```ts
 const opening = openingStatements(conn, options);
@@ -221,28 +227,46 @@ const results = all.slice(opening.length);
 const pipelined =
   verify === undefined && !signal?.aborted ? conn.query('commit') : undefined; // COMMIT, own Sync
 const done = (async () => {
-  rows = await Promise.all(all);
-  verify?.(rows); // failure → rollback
-  const commit = await (pipelined ?? conn.query('commit'));
-  if (commit.command === 'ROLLBACK') throw new TransactionRolledBack();
-  return rows;
+  try {
+    let failure,
+      rows = [];
+    try {
+      rows = (await Promise.all(all)).slice(opening.length);
+      verify?.(rows); // throwing → no COMMIT, rollback
+    } catch (error) {
+      failure = { error };
+    }
+    if (failure !== undefined) {
+      await pipelined?.catch(noop); // a pipelined COMMIT is answered ROLLBACK
+      throw failure.error;
+    }
+    const commit = await (pipelined ?? conn.query('commit'));
+    if (commit.command === 'ROLLBACK') throw new TransactionRolledBack();
+    return rows;
+  } finally {
+    if (conn.transactionStatus !== 'idle')
+      await conn.query('rollback').catch(noop);
+    running.delete(conn);
+  }
 })();
 return { results, done };
 ```
 
-Captured (two queries):
+Captured (the same prepared statement twice):
 
 ```
-C> begin … Execute  Bind(q1) Execute  Bind(q1) Execute  Sync  Parse("q2", "commit") … Execute Sync   (one write)
-S< … BEGIN … SELECT 1 … SELECT 1 … ReadyForQuery(T)
-S< … COMMIT … ReadyForQuery(I)
+C> Parse("", "begin") Bind Describe(P) Execute   Bind("", "q1", results 1) Execute   Bind("", "q1", results 1) Execute   Sync   Parse("q2", "commit") Describe(S "q2") Bind("", "q2") Execute Sync   (one write)
+S< ParseComplete BindComplete NoData CommandComplete(BEGIN)   BindComplete DataRow CommandComplete(SELECT 1)   BindComplete DataRow CommandComplete(SELECT 1)   ReadyForQuery(T)
+S< ParseComplete ParameterDescription NoData BindComplete CommandComplete(COMMIT) ReadyForQuery(I)
 ```
 
 - Under one Sync, the first failure makes the server skip the rest, so the remaining statements reject with that error, and COMMIT (outside the failed segment) is answered `ROLLBACK` → `TransactionRolledBack`.
 - If BEGIN failed, nothing ran, and COMMIT, outside any transaction, does nothing (Postgres answers with a warning).
 - **`verify`**: when results must be checked before committing (quarry's `expect…` shapes), COMMIT isn't pipelined: `done` waits for the results, calls `verify`, and only then sends COMMIT, a second round trip. Throwing in `verify` rolls back.
 - Without `verify`, COMMIT is sent before any result is read: a result the client can't **decode** fails the batch, but its transaction has committed. (Decoding happens after the server's work; it can't be part of the server's decision.)
+- When a statement failed, `done` waits for the pipelined COMMIT's answer (`ROLLBACK`) before rejecting with the statement's error, so the connection is idle again when the caller hears of it. With `verify` there is no pipelined COMMIT, and `finally` rolls back.
 - `finally`: if the connection is still in a transaction, roll back.
+- quarry's `db.batch(…, { transaction: true, timeout })` adds the timeout to the batch's settings as `statement_timeout`, so it bounds each statement of the batch ([../EXECUTION.md](../EXECUTION.md#batches)).
 
 ## What goes wrong, and what you see
 

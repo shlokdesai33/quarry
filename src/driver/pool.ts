@@ -683,7 +683,7 @@ export class Pool implements AsyncDisposable {
 			this.#open().then(
 				(slot) => this.#giveBack(slot),
 				() => {
-					// retried on the next acquire or release
+					// retried when a connection is lost, released unusable or swept
 				},
 			);
 		}

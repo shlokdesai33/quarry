@@ -428,8 +428,9 @@ export function tstzrange<T extends Out<'tstzrange'> = Out<'tstzrange'>>() {
  * the database, whose value is a `number[]`. `T` narrows it.
  *
  * Values are sent in pgvector's syntax, e.g. `[1,2.5,3]`, rather than as a
- * postgres array. The number of dimensions isn't modelled, and neither are
- * the distance operators, so it admits only the null checks.
+ * postgres array. It admits the null checks and pgvector's distances:
+ * `l2Distance` (`<->`), `cosineDistance` (`<=>`) and `innerProduct`
+ * (`<#>`), each a `double precision`.
  *
  * @example embedding: vector()
  * @example embedding: vector().nullable()

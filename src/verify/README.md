@@ -19,6 +19,7 @@ The command-line front end is [../cli/README.md](../cli/README.md).
 - [Every rule](#every-rule)
 - [Step 5: the report (`report.ts`)](#step-5-the-report-reportts)
 - [Step 6: rendering (`render/`)](#step-6-rendering-render)
+  - [Options and terminal detection](#options-and-terminal-detection)
 - [Decisions](#decisions)
 - [Glossary](#glossary)
 
@@ -60,7 +61,12 @@ return {
 };
 ```
 
-It runs on the database's own executor, so it works through any executor (and in tests, on a fake one).
+It runs on the database's own executor, so it works through any executor (and in tests, on a fake one). With no tables it sends no query at all.
+
+`VerifyOptions` ([report.ts](report.ts)) has two fields:
+
+- **`strict`**: columns only the database has are errors, for a CI check that the code declares the whole schema. Default `false`.
+- **`schema`**: look the tables up in this schema instead of through the session's `search_path`. Fixes then qualify table names with it (unless it is `public`).
 
 ## Step 1: describing the code (`spec.ts`)
 
@@ -126,9 +132,11 @@ interface SqlType {
 
 - `codeType(dataType)`: kinds whose DDL name differs are renamed (`decimal` → `numeric`); arrays become their element with `array: true`; enums use their enum name, custom types their `sqlName`. `numeric(p)` becomes `numeric(p, 0)`, as Postgres records it.
 - `catalogType(row)`: built-in types (`pg_catalog`) map from internal names (`int4` → `integer`, `float8` → `double precision`, `bpchar` → `char`, …); enums and pgvector's `vector` keep `typname` whatever schema they're in; other types use the server's `format_type`, which qualifies them when they are not on the search path.
-- `decodeTypmod(name, typmod)` unpacks the **type modifier**, an integer Postgres stores per column: `varchar(n)` stores n + 4; `numeric(p, s)` stores `((p << 16) | s) + 4`, with the scale an 11-bit signed number since PostgreSQL 15 (so negative scales work); time types store their precision directly.
+- `decodeTypmod(name, typmod)` unpacks the **type modifier**, an integer Postgres stores per column: `varchar(n)` stores n + 4; `numeric(p, s)` stores `((p << 16) | s) + 4`, with the scale an 11-bit signed number since PostgreSQL 15 (so negative scales work); time types store their precision directly, and pgvector's `vector` its dimension count.
 - `sameType(expected, actual)`: same name, enum-ness and array-ness, and modifiers equal **if the code gives any**: `varchar()` in the code accepts a `varchar(320)` column; `varchar(255)` doesn't.
-- `renderType(type)` writes it back as DDL (`varchar(32)[]`, `numeric(10,2)`), for messages and fixes.
+- `renderType(type)` writes it back as DDL (`varchar(32)[]`, `numeric(10,2)`, an enum's name quoted when it needs it), for messages and fixes.
+
+The same `codeType` and `renderType` give the casts of multi-row inserts (without modifiers); how each `DataType` class maps to a name is in [data-type/README.md](../data-type/README.md#sql-names-and-modifiers-codetype-and-rendertype).
 
 ## Step 4: comparing (`compare.ts`)
 
@@ -136,17 +144,18 @@ interface SqlType {
 
 For each table:
 
-1. **Missing**, or not a table or view (e.g. a sequence): `table-missing`, with a `create table` fix generated from the spec. Every column of it is then marked as an error.
+1. **Missing**, or not a table or view (e.g. a sequence): one `table-missing` diagnostic, with a `create table` fix generated from the spec. Its columns get no diagnostics of their own; in the per-table view each is listed with status `error` and code `table-missing`.
 2. For each declared column, find the database column by name (a `Map`, removing each one found):
    - not found: `column-missing`, fix `alter table … add column …`;
    - found: `compareColumn` (type, enum labels, nullability, fill).
-3. Database columns left over are **extra**: `column-extra`. Its severity depends on harm: an error with `strict`; otherwise a **warning** if inserts will fail (not null, no default, not identity), else **info**. The hint suggests the code to declare it (`legacyCode: text().name('legacy_code')`, via `suggestCode`).
+3. Database columns left over are **extra**: `column-extra`. Its severity depends on harm: an error with `strict`; otherwise a **warning** if inserts will fail (not null, no default, not identity), else **info**. The hint suggests the code to declare it (`legacyCode: text().name('legacy_code')`, via `suggestCode`); with `strict`, the fix is `alter table … drop column …`.
 
 `compareColumn`:
 
 - **Type**: `sameType`, or the code names the domain the column is declared with (`sameDomain`, for `defineType` of a domain). A mismatch suggests both directions: `alter table … alter column … type … using …::…`, or "declare it as `bigint()`" (`suggestType`).
 - **Enum labels**, once per enum (`enumsChecked`): labels missing on either side are an error, with `alter type … add value … after …` fixes in the right order (Postgres can add labels but not drop them, so labels only the database has can only be fixed in the code); the same labels in another order are a warning, since `<` and `>` follow the order.
-- **Nullability** (skipped for views, which report every column nullable): nullable in the database but not in the code is an **error** (your types claim a value is never null, and it can be); the reverse is a **warning** (harmless but imprecise).
+- **Nullability and fill are skipped for views and materialized views**, which report every column nullable and without defaults. For other relations:
+- **Nullability**: nullable in the database but not in the code is an **error** (your types claim a value is never null, and it can be); the reverse is a **warning** (harmless but imprecise).
 - **Fill** (`compareFill`): `default()` without a database default is an error (inserts that omit it would fail); a database identity or generated column that the code writes is an error (inserts that set it fail); a database default the code doesn't declare is info (you could omit it on insert).
 
 Every diagnostic gets its `source` from the column's (or table's, or enum's) call site through `resolveCallSite` ([column/README.md](../column/README.md#call-sites-remembering-where-things-were-declared)), so the report can point at a file, line and column.
@@ -177,8 +186,8 @@ Every diagnostic gets its `source` from the column's (or table's, or enum's) cal
 ```ts
 interface VerifyReport {
   ok: boolean; // no errors
-  diagnostics: Diagnostic[]; // errors first, then table and column order
-  tables: TableResult[]; // per table: relation, kind, status, and each column's expected/actual/status/codes
+  diagnostics: Diagnostic[]; // in the order compare found them
+  tables: TableResult[]; // the per-table view
   summary: { errors; warnings; infos; tables; columns; durationMs };
 }
 interface Diagnostic {
@@ -197,6 +206,10 @@ interface Diagnostic {
 }
 ```
 
+- **`diagnostics`** are in the order `compare` produced them: table by table, each declared column's checks (type, enum labels, nullability, fill), then the extra columns. They are not sorted by severity, so a warning can come before a later table's errors.
+- **`tables`** is the **per-table view**: for each table, `relation` (`schema.name`, or `undefined` when missing), `kind`, a `status`, and one `ColumnResult` per column (declared ones in order, then extra ones): `key` (`undefined` for an extra column), `name`, `expected` and `actual` as short text (`varchar(32)[] null`), `status` and the rule `codes` of its diagnostics. A status is the most severe of its diagnostics (`error` > `warning` > `info`), or `ok`; a table's is the worst of its columns'.
+- **`summary`** counts diagnostics by severity, tables checked, and columns checked (counting those only the code or only the database has), and the time taken.
+
 The report is plain data: it can be serialised (`--format json`), filtered, or rendered.
 
 ## Step 6: rendering (`render/`)
@@ -208,7 +221,7 @@ The report is plain data: it can be serialised (`--format json`), filtered, or r
 | `pretty` (default) | [render/pretty.ts](render/pretty.ts), [render/code-frame.ts](render/code-frame.ts) | each diagnostic with a code frame of the declaring line, a label under the exact span, and `help:` lines              |
 | `table`            | [render/table.ts](render/table.ts)                                                 | one table per database table: column, expected, actual, status                                                        |
 | `github`           | [render/github.ts](render/github.ts)                                               | GitHub Actions workflow commands (`::error file=…,line=…::…`), which appear as annotations on the pull request's diff |
-| `json`             |                                                                                    | `JSON.stringify(report)`                                                                                              |
+| `json`             |                                                                                    | `JSON.stringify(report, null, 2)` and a newline                                                                       |
 
 A `pretty` diagnostic looks like this (from the integration test's snapshot):
 
@@ -226,7 +239,46 @@ A `pretty` diagnostic looks like this (from the integration test's snapshot):
         or declare it as varchar(320)
 ```
 
-`code-frame.ts` reads the schema file (`readSource`, cached), finds the span of the declaration on that line (`findSpan`), expands tabs to keep columns aligned, and draws the frame. [render/terminal.ts](render/terminal.ts) detects what the output supports (`detectTerminal`: colour from `NO_COLOR`/`FORCE_COLOR`/TTY, Unicode box characters or ASCII, width, hyperlinks), so the same report renders well in a terminal, a CI log or a file.
+`code-frame.ts` reads the schema file (`readSource`, cached), finds the span of the declaration on that line (`findSpan`), expands tabs to keep columns aligned, and draws the frame. When the file can't be read, the frame is replaced by an `at file:line:column (table.column)` line, and a diagnostic without a source gets `at table.column`. `pretty` and `table` both end with the same summary line (`formatSummary`):
+
+```
+  ✖ 8 errors, 2 warnings · 3 tables, 14 columns checked in 5ms
+```
+
+or `✔ schema matches the database` when there is nothing to report. Infos are counted as "notes".
+
+The `table` format, from the render test's snapshot:
+
+```
+  × users  public.users (table)
+      column                      code           database          issues
+    ✔ id                          integer        integer
+    × email                       varchar(255)   varchar(320)      column-type-mismatch
+    ✔ display_name (displayName)  text null      text null
+    …
+    ⚠ legacy_code                 —              text              column-extra
+
+  × invoices  missing
+      column                      code           database          issues
+    × id                          bigint         —                 table-missing
+    × order_id (orderId)          bigint         —                 table-missing
+```
+
+The `github` format writes one workflow command per diagnostic: `error`, `warning` or `notice` by severity, with `file` (relative to `root`), `line`, `col` and `title=quarry(<code>)`, and the message, `help: <fix>` and the hint as the body. Newlines and `%` are escaped as the runner expects (`%0A`, `%25`), and `:` and `,` in property values too. It ends with a plain line: `quarry verify: 8 errors, 2 warnings, 0 notes in 3 tables, 14 columns`.
+
+### Options and terminal detection
+
+`FormatOptions` are `format` (default `pretty`), `root` (where `github` paths are relative to: default `GITHUB_WORKSPACE`, else the working directory), `read` (how schema files are read for code frames; the file system by default), and any field of `Terminal` to override detection. [render/terminal.ts](render/terminal.ts) `detectTerminal(process.stdout)` fills in the rest, so the same report renders well in a terminal, a CI log or a file:
+
+| Field        | Detected from                                                                                                                                                      |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `color`      | `FORCE_COLOR` when set (`0` or `false` turn it off); otherwise on a TTY unless `NO_COLOR` is set. `TERM=dumb` counts as no TTY                                     |
+| `unicode`    | `QUARRY_ASCII` when set (`0` keeps Unicode); otherwise Unicode except on `TERM=linux`, and on Windows only in Windows Terminal, VS Code, JetBrains terminals or CI |
+| `hyperlinks` | `FORCE_HYPERLINK` when set (`0` or `false` turn it off); otherwise when colour is on, on a TTY, outside CI. File paths become OSC 8 links                          |
+| `width`      | the stream's `columns`, else `COLUMNS`, else 80; messages and hints wrap at it                                                                                     |
+| `cwd`        | `process.cwd()`: paths under it are shown relative to it                                                                                                           |
+
+Without Unicode, the frame and icons use ASCII (`x`, `!`, `i`, `,-[`, `|`).
 
 ## Decisions
 
