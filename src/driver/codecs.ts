@@ -292,8 +292,10 @@ const tstzrange = builtin<RangeValue<Date>, RangeValue<Date>>({
 	name: 'tstzrange',
 	oid: 3910,
 	arrayOid: 3911,
+	resultFormat: 'binary',
 	encode: (range) => rangeText(range, timestamp),
 	decodeText: (text) => parseRange(text, parseTimestamptz),
+	decodeBinary: bin.rangeDecoder(bin.timestamptz),
 });
 
 const vectorText = (value: unknown): string => {

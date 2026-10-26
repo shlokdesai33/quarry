@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { int4, rangeDecoder } from '../../src/driver/binary.js';
 import { parseRange, parseTimestamptz } from '../../src/driver/parsers.js';
 import { encodeParams as encode } from '../../src/driver/params.js';
 import { codecs } from '../../src/driver/codecs.js';
@@ -261,7 +262,36 @@ describe('quarry parsers', () => {
 			upper: 'x',
 			bounds: '(]',
 		});
+		expect(parseRange('["a b","c\\"d"]', String)).toEqual({
+			empty: false,
+			lower: 'a b',
+			upper: 'c"d',
+			bounds: '[]',
+		});
+		expect(parseRange('["x""y","z"]', String)).toEqual({
+			empty: false,
+			lower: 'x"y',
+			upper: 'z',
+			bounds: '[]',
+		});
 		expect(() => parseRange('1,2', String)).toThrow();
+	});
+
+	it('decodes the binary range format as the text', () => {
+		const decode = rangeDecoder(int4);
+		const bytes = (...b: number[]) => Uint8Array.from(b);
+		expect(decode(bytes(0x01), 0, 1)).toEqual({ empty: true });
+		expect(
+			decode(bytes(0x02, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 5), 0, 17),
+		).toEqual(parseRange('[1,5)', Number));
+		expect(decode(bytes(0x18), 0, 1)).toEqual(parseRange('(,)', Number));
+		expect(decode(bytes(0x0c, 0, 0, 0, 4, 0, 0, 0, 9), 0, 9)).toEqual(
+			parseRange('(,9]', Number),
+		);
+		expect(() => decode(bytes(0x02, 0, 0, 0, 4, 0), 0, 6)).toThrow(
+			DriverError,
+		);
+		expect(() => decode(bytes(0x18, 0), 0, 2)).toThrow(DriverError);
 	});
 });
 

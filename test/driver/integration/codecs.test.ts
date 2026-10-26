@@ -182,6 +182,20 @@ const CASES: readonly (readonly [string, Codec, string, readonly Case[]])[] = [
 			],
 			[{ empty: false, lower: null, upper: null, bounds: '()' }],
 			[{ empty: true }],
+			[
+				{
+					empty: false,
+					lower: new Date(Date.UTC(2024, 0, 1, 12, 30, 15, 250)),
+					upper: null,
+					bounds: '(]',
+				},
+				{
+					empty: false,
+					lower: new Date(Date.UTC(2024, 0, 1, 12, 30, 15, 250)),
+					upper: null,
+					bounds: '()',
+				},
+			],
 		],
 	],
 ];
@@ -343,6 +357,30 @@ describe.skipIf(noPg)('built-in codecs', () => {
 			{ t: 'bigint' },
 			{ t: 'integer' },
 		]);
+	});
+
+	it('reads infinite timestamp bounds the same in text and binary', async () => {
+		const read = (codec: Codec, binary: boolean) =>
+			c.query(
+				"select tstzrange('-infinity', 'infinity', '[]') as v",
+				[],
+				{ resultCodecs: [codec], binary },
+			);
+		const expected = {
+			empty: false,
+			lower: new Date(-8.64e15),
+			upper: new Date(8.64e15),
+			bounds: '[]',
+		};
+		for (const [codec, binary] of [
+			[codecs.tstzrange, false],
+			[inBinary(codecs.tstzrange), true],
+		] as const) {
+			await read(codec, binary);
+			const result = await read(codec, binary);
+			expect(result.rows).toEqual([{ v: expected }]);
+			expect(result.fields[0]?.format).toBe(binary ? 1 : 0);
+		}
 	});
 
 	it('tests a range against a single point', async () => {

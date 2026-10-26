@@ -132,27 +132,39 @@ export function parseRange<T>(
 	const end = text.length - 1;
 	for (let n = 0; n < 2; n++) {
 		if (text[i] === '"') {
-			let value = '';
-			i++;
-			while (i < end) {
-				const ch = text[i];
-				if (ch === '\\') {
-					value += text[i + 1] ?? '';
-					i += 2;
-				} else if (ch === '"') {
-					if (text[i + 1] === '"') {
-						value += '"';
+			const quote = text.indexOf('"', i + 1);
+			const escape = text.indexOf('\\', i + 1);
+			if (
+				quote > 0 &&
+				quote < end &&
+				text[quote + 1] !== '"' &&
+				(escape < 0 || escape > quote)
+			) {
+				bounds.push(text.slice(i + 1, quote));
+				i = quote + 1;
+			} else {
+				let value = '';
+				i++;
+				while (i < end) {
+					const ch = text[i];
+					if (ch === '\\') {
+						value += text[i + 1] ?? '';
 						i += 2;
+					} else if (ch === '"') {
+						if (text[i + 1] === '"') {
+							value += '"';
+							i += 2;
+						} else {
+							i++;
+							break;
+						}
 					} else {
+						value += ch;
 						i++;
-						break;
 					}
-				} else {
-					value += ch;
-					i++;
 				}
+				bounds.push(value);
 			}
-			bounds.push(value);
 		} else {
 			const stop = n === 0 ? text.indexOf(',', i) : end;
 			if (stop < 0)
