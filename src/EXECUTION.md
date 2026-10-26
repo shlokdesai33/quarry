@@ -1,8 +1,8 @@
 # Running queries: `database()`, executors and the driver
 
-This guide covers what happens after a query is built: how `database()` connects the builder to the driver, how a compiled query is handed over, which codecs the driver is told to use, and how batches, transactions, streams, timeouts, `onQuery` events and errors work from the builder's side.
+This guide covers what happens after a query is built: how `database()` connects the builder to the driver, how a compiled query is handed over, which codecs the driver is told to use, which connection it runs on, and how batches, transactions, streams, `describe()`, timeouts, `onQuery` events, OpenTelemetry spans, errors and closing work from the builder's side.
 
-Files: [database.ts](database.ts), [executor.ts](executor.ts), [driver-executor.ts](driver-executor.ts), [batch.ts](batch.ts), [query.ts](query.ts), [kind-codecs.ts](kind-codecs.ts). The driver's side of each topic is linked as it comes up.
+Files: [database.ts](database.ts), [executor.ts](executor.ts), [driver-executor.ts](driver-executor.ts), [batch.ts](batch.ts), [query.ts](query.ts), [shape.ts](shape.ts), [kind-codecs.ts](kind-codecs.ts). The driver's side of each topic is linked as it comes up.
 
 ## Contents
 
@@ -15,8 +15,10 @@ Files: [database.ts](database.ts), [executor.ts](executor.ts), [driver-executor.
 - [Batches](#batches)
 - [Transactions](#transactions)
 - [Streaming](#streaming)
+- [`describe()`](#describe)
 - [Timeouts and cancellation](#timeouts-and-cancellation)
 - [`onQuery` events](#onquery-events)
+- [OpenTelemetry spans and tags](#opentelemetry-spans-and-tags)
 - [Errors](#errors)
 - [Closing](#closing)
 - [Decisions](#decisions)
@@ -44,8 +46,8 @@ export function database(
 }
 ```
 
-- A **string** or **pool options** make a new `Pool` that the database **owns** (`owned = true`): `db.close()` ends it. Creating a pool opens no connection yet; the first query does ([driver/POOL.md](driver/POOL.md)).
-- A driver `Pool`, `PoolClient` or `Connection` is used as is, and `db.close()` leaves it alone.
+- A **string** or **pool options** make a new `Pool` that the database **owns** (`owned = true`): `db.close()` ends it. Creating a pool opens no connection yet; the first query does ([driver/POOL.md](driver/POOL.md)). The pool options are the driver's (`PoolOptions`, which include every connection option), so driver-level settings such as `max`, `statementCacheSize` or `telemetry` ([below](#opentelemetry-spans-and-tags)) go there, and quarry's own settings go in the second argument.
+- A driver `Pool`, `PoolClient` or `Connection` is used as is, and `db.close()` leaves it alone. (`isDriverSource` also accepts a driver `Transaction`, which is how a transaction's executor is made; `database()` is never given one in practice.)
 - `databaseWith(executor)` (internal) builds the `Database` object over **any** executor; tests use it with a fake ([test/helpers/executor.ts](../test/helpers/executor.ts)).
 
 The `Database` object is a plain object of functions (`queries(executor)`), each starting a builder or an operation with that executor: `selectFrom`, `insertInto`, `update`, `deleteFrom`, `sql` (a hand-written statement, [QUERIES.md](QUERIES.md#whole-statements-dbsql)), `batch`, `transaction`, `verify`, plus `close` and `[Symbol.asyncDispose]` (so `await using db = database(url)` closes it at the end of the scope). Inside a transaction, `transactionWith(tx)` makes the same object over the transaction's executor, plus `afterCommit`, `afterRollback` and `setLocal`, and without `close`.
@@ -59,6 +61,8 @@ The `Database` object is a plain object of functions (`queries(executor)`), each
 | `onQuery`   |                  | called once per query with its SQL, timings, row count, error ([below](#onquery-events)) |
 | `callsites` | `true`           | append the stack of the code awaiting a failed query to its error ([below](#errors))     |
 | `prepare`   | the connection's | use cached prepared statements                                                           |
+
+The options object is kept as given and read per query; a transaction's executor shares it (and the registry) with the database's.
 
 ## The `Executor` interface
 
@@ -92,7 +96,7 @@ interface ExecuteResult {
 }
 ```
 
-`ExecuteOptions` combines what the caller passed (`signal`, `timeout`) with what the result shape needs (`rowMode`, `keepRows`). An executor returns rows already decoded; the builder never sees bytes or text.
+`ExecuteOptions` combines what the caller passed (`RunOptions`: `signal`, `timeout`) with what the result shape needs (`ReadOptions`: `rowMode`, `keepRows`). A `BatchQuery` is a compiled query with its `ReadOptions`; `ExecuteBatchOptions` adds `transaction` (always an options object here: `batchWith` turns `true` into `{}`) and `verify`, the check that must pass before an atomic batch commits ([Batches](#batches)). `describe` resolves to a `QueryDescription` ([below](#describe)). An executor returns rows already decoded; the builder never sees bytes or text.
 
 Not part of the public API: it exists so the builder can be tested without a database and could run on another backend (an HTTP proxy, PGlite) without changing a builder.
 
@@ -144,10 +148,10 @@ Because a column's TypeScript type is derived from its codec ([column/README.md]
 
 ### The type catalog
 
-Some codecs don't know their type's OID in advance: enums (`EnumType`), `codecs.vector`, `defineType` codecs without an `oid`. The driver looks them up in `pg_type` once per pool (the **catalog**, [driver/CODECS.md](driver/CODECS.md#types-looked-up-by-name-the-catalog)). `DriverExecutor.#prepare` calls `runner.loadTypes()` before its first operation, so even the first query declares enum parameters exactly and reads `vector` columns in binary:
+Some codecs don't know their type's OID in advance: enums (`EnumType`), `codecs.vector`, `defineType` codecs without an `oid`. The driver looks them up in `pg_type` once per pool (the **catalog**, [driver/CODECS.md](driver/CODECS.md#types-looked-up-by-name-the-catalog)). `DriverExecutor.#prepare` calls `loadTypes()` on the pool (shared operations) or the connection (the others) before its first operation, so even the first query declares enum parameters exactly and reads `vector` columns in binary:
 
 ```ts
-async #prepare(runner: Runner): Promise<void> {
+async #prepare(runner: Runner | Pool): Promise<void> {
   if (this.#ready || runner.loadTypes === undefined) return;
   await runner.loadTypes();
   this.#ready = true;
@@ -157,6 +161,8 @@ async #prepare(runner: Runner): Promise<void> {
 With `catalog: false` it doesn't wait for it; the driver then loads the catalog in the background behind the first query that needs it (quarry's registry includes `vector`, so in practice that is the first query), and until it arrives such parameters are inferred and such columns read as text.
 
 ## `execute`, step by step
+
+Simplified from [driver-executor.ts](driver-executor.ts) (the `onTiming` callbacks and the `#report` arguments are abbreviated):
 
 ```ts
 async execute(query, options = {}) {
@@ -218,18 +224,22 @@ Over a pool, an operation runs either on the pool's **shared** connections, pipe
 COPY and LISTEN aren't builder operations: the driver's `pool.copyFrom`, `copyRows` and `copyTo` take a connection of their own, and `pool.listen` a dedicated one outside `max` ([driver/POOL.md](driver/POOL.md#two-ways-to-use-a-connection)).
 
 ```ts
-#shared(queries): Pool | undefined {
+#shared(queries: CompiledQuery | readonly CompiledQuery[] | undefined): Pool | undefined {
   const source = this.#source;
   if (!(source instanceof Pool)) return undefined;
-  // undefined as well when a statement changesSession
+  if (queries === undefined) return source; // describe(): no statement runs
+  if ('sql' in queries) return changesSession(queries) ? undefined : source;
+  for (const query of queries) if (changesSession(query)) return undefined;
   return source;
 }
 
-const changesSession = (query) =>
+const changesSession = (query: CompiledQuery): boolean =>
   !isDataStatement(query) && SESSION_STATEMENT.test(query.sql);
 ```
 
-Only SQL written by hand is read: `isDataStatement` ([compile.ts](compile.ts)) is true for a query `compile` made from a select, insert, update or delete node, which leaves no session state behind, so the builders' queries skip the regular expression. A `db.sql` statement, or a query object made anywhere else (a copy of a compiled one included), is tested as before.
+`SESSION_STATEMENT` is one anchored, case-insensitive regular expression over the first keyword: `begin`, `start`, `commit`, `end`, `rollback`, `abort`, `savepoint`, `release`, `prepare`, `set`, `reset`, `discard`, `listen`, `unlisten`, `declare`, `fetch`, `move`, `close`, and `create temp` / `temporary` / `local temp` / `local temporary`. A batch takes a connection of its own if any one of its statements matches.
+
+Only SQL written by hand is read: `isDataStatement` ([compile.ts](compile.ts)) is true for a query `compile` made from a select, insert, update or delete node, which leaves no session state behind, so the builders' queries skip the regular expression (#43; it had been 4–5% of a builder point lookup's client CPU). It reads a private field of the compiled query's class, so a `db.sql` statement, or a query object made anywhere else (a copy of a compiled one included), is tested.
 
 **Shared.** Until the pool is full, a query takes an idle connection or waits for one being opened; once it is full, it pipelines onto the least loaded busy connection, waits in the pool's FIFO of pipeline slots beyond each connection's (adaptive) depth, and a connection is drained for a caller who needs one of its own, so transactions and streams aren't starved ([driver/POOL.md](driver/POOL.md#pipelining-onto-busy-connections)). Each query keeps its own behaviour, because all of it is per query in the connection: codecs and binary results once its statement is described (the statement cache is per connection), `keepRows`, the tag, the signal (a cancel is only sent once the query is at the head of the connection's queue, so it can't hit another caller's query: [driver/CANCELLATION.md](driver/CANCELLATION.md)), the unnamed statements behind PgBouncer, and the retry of a stale cached statement. A failing query fails alone: each has its own Sync. A batch runs as one pipeline slot: `withShared` hands it one connection, its statements go out together, and the slot ends when the last one settles.
 
@@ -275,7 +285,14 @@ const [user, posts, { rowCount }] = await db.batch([
 ]);
 ```
 
-Each item is a `Query` or a builder (`toQuery()` gives its default shape). `batchWith` compiles them, sends `{ query, rowMode, keepRows }` for each, and reads each result with its shape. It runs them on **this** database's executor wherever they were started, so queries built with the standalone `selectFrom` work too.
+Each item is an `Executable`: a `Query` (a shaped query, already compiled) or a builder, whose `toQuery()` compiles it with its default shape (every row, or a write's `{ rowCount }` / `returning` rows). `batchWith` ([batch.ts](batch.ts)):
+
+1. calls `toQuery()` on each item; an empty list resolves to `[]` without contacting the executor;
+2. turns `transaction: true` into `{}` (and drops `false`), and, if any query's shape is **checked** (it can throw once the statement has run: the `expect…` shapes), adds a `verify` callback that reads every result;
+3. sends `{ query, rowMode, keepRows }` for each query to `executor.batch`, with the caller's `signal` and `timeout`;
+4. reads each result with its shape, by position: in `verify` (before an atomic batch commits), or afterwards from the settled outcomes, turning failures into a [`BatchError`](#batcherror).
+
+It runs them on **this** database's executor wherever they were started, so queries built with the standalone `selectFrom` work too. The result type is a tuple, `BatchResults<Q>`, each position typed by its query's result.
 
 There are three modes. The message sequences below were captured from the driver; "Sync" ends a protocol segment and is where the server reports success or failure ([driver/protocol/README.md](driver/protocol/README.md#the-extended-query-protocol)).
 
@@ -289,7 +306,7 @@ S< BindComplete DataRow CommandComplete ReadyForQuery
 S< BindComplete DataRow CommandComplete ReadyForQuery
 ```
 
-If any fails (or its shape throws, e.g. `expectOne` finds no row), the batch rejects with a `BatchError` holding every outcome ([QUERIES.md](QUERIES.md#batcherror-batchts)).
+If any fails (or its shape throws, e.g. `expectOne` finds no row), the batch rejects with a [`BatchError`](#batcherror) holding every outcome. Over a `PoolClient` or `Connection` the same statements go out on that connection (`#run`). `signal` and `timeout` are passed to each query, so each gets its own server-side timeout under its own Sync.
 
 ### `transaction: true` (or transaction options)
 
@@ -312,11 +329,27 @@ S< … ReadyForQuery(T)
 C> commit + Sync                                       (second write)
 ```
 
-Take shapes (`takeFirst`, `takeValue`) and builders check nothing, so they keep the batch at one round trip. A `timeout` becomes a `statement_timeout` setting of that transaction.
+Take shapes (`takeFirst`, `takeValue`) and builders check nothing, so they keep the batch at one round trip. A `timeout` becomes a `statement_timeout` setting of that transaction (added to its `settings`, sent with BEGIN). The transaction options are those of `db.transaction` without `retries` (`BatchTransactionOptions`): the batch runs once.
+
+The batch rejects with the error that failed it, never a `BatchError`: a server error, the shape's own error when a check failed (captured: `NoRowError: The query on "users" returned no row, where exactly one was expected`, after which the transaction was rolled back), or `TransactionRolledBack` when COMMIT reports ROLLBACK. Over a pool, an atomic batch takes a connection of its own (`#run`), since BEGIN leaves a transaction open on it until COMMIT.
 
 ### Inside a transaction
 
-On a transaction's `tx.batch(...)`, the queries share **one** Sync (and BEGIN's, if it hasn't been sent yet): the first error skips the rest and rejects the batch, and the transaction is failed, as after any failed query. `transaction: true` there makes the batch a savepoint. A `timeout` is refused inside a transaction (set `statement_timeout` with `tx.setLocal` instead).
+On a transaction's `tx.batch(...)`, the queries share **one** Sync (and BEGIN's, if it hasn't been sent yet), through the driver's `queryGroup`: the first error skips the rest and rejects the batch, and the transaction is failed, as after any failed query. The results are then read with `verify` as for an atomic batch, so a failed shape check rejects the batch with the shape's error (not a `BatchError`); thrown inside the `db.transaction` callback, it rolls the transaction back like any other error. `transaction: true` (or options) there makes the batch a savepoint: `DriverExecutor.batch` calls `this.transaction(tx => tx.batch(…))`, which nests. A `timeout` is refused inside a transaction (`A batch inside a transaction takes no timeout: set statement_timeout with setLocal`): its statements share one Sync, and the driver's group statements take no `statementTimeout`, since a timed query is framed under a Sync of its own ([below](#timeouts-and-cancellation)).
+
+### `BatchError`
+
+`BatchError` ([batch.ts](batch.ts)) is what a batch outside a transaction rejects with when any query failed or its shape threw. It extends `AggregateError`, so it has:
+
+- `results`: every query's outcome, by position, as `PromiseSettledResult`s: `{ status: 'fulfilled', value }` with the value its shape read, or `{ status: 'rejected', reason }`;
+- `errors`: the failures alone, in order (`AggregateError`'s own field);
+- a message counting them, e.g. `1 of the 2 queries in the batch failed; the others ran` (captured).
+
+The successful positions' values are there because the others really ran and what they wrote stays committed: the caller may need them (an inserted row's id) to compensate or report. Inside a transaction there is nothing to report position by position (the first error skipped the rest), so the plain error is thrown instead.
+
+### Batches in `onQuery` and telemetry
+
+Each query of a batch reports its own `onQuery` event of kind `'execute'`, with its tag, when the batch settles. They share the batch's timings: `acquireMs` is the time until the batch had its connection, `queuedMs` is 0, and `execMs` runs from then until the outcomes were settled, so every query of a batch shows about the batch's duration (the driver's per-query timing isn't asked for in a batch). BEGIN and COMMIT aren't `onQuery` events; the driver's [spans](#opentelemetry-spans-and-tags) do include them, since the driver sees every statement. Captured for a `transaction: true` batch with an `expectOne()` query tagged `users.byEmail` and a `takeFirst()`: spans `BEGIN quarry_test`, `users.byEmail`, `SELECT quarry_test`, `COMMIT quarry_test`.
 
 ## Transactions
 
@@ -355,17 +388,38 @@ await db.transaction(async (tx) => {
 });
 ```
 
-`SelectQueryBuilder.stream` (reworked in #34) checks `batchSize`, compiles the query, and returns a `RowStream` over `executor.stream(compiled, options)`, without starting anything: the executor's generator only runs when the first row is pulled. `DriverExecutor.stream`:
+`SelectQueryBuilder.stream` (reworked in #34) checks `batchSize` (a whole number from 1, else a `RangeError`, thrown by `stream()` itself), compiles the query, and returns a `RowStream` over `executor.stream(compiled, options)`, without starting anything: the executor's generator only runs when the first row is pulled. `stream` exists only on the select builder, for every row: the `take…` and `expect…` shapes read a whole result, so they have none. `DriverExecutor.stream`:
 
-1. Refuses a `timeout` inside a transaction (other queries of the transaction run between the stream's batches, so a transaction-local `statement_timeout` would apply to them too; use `tx.setLocal`).
-2. Over a pool, **acquires a connection** when the first batch is asked for, and releases it in `finally`, however the iteration ends: read to the end, `break`, `return`, a throw, an abort. Inside a transaction, it uses the transaction's connection.
-3. Iterates `runner.cursor(sql, params, { batchSize, readAhead, …codecs, signal, statementTimeout })` ([driver/STREAMING.md](driver/STREAMING.md#cursors)): each batch is fetched only once the rows before it are taken, columns come in their codecs' formats (binary where they can) **from the first run**, and outside a transaction a `timeout` becomes the cursor's `statementTimeout`: the driver sets it before the portal and restores it before the portal's Sync, so it bounds the whole stream (the loop's time included) and can't leak.
-4. Decorates an error with the query and the call site, as `execute` does; an error in the middle (a division by zero at row 10,001) rejects the pull that reaches it, after the rows before it.
-5. Reports one `onQuery` event of kind `'stream'` with the total row count.
+1. Refuses a `timeout` inside a transaction (`A stream inside a transaction takes no timeout: set statement_timeout with setLocal`): a timed cursor runs as one operation under one Sync, holding the connection from its first batch to its last, so the transaction's other queries couldn't run between its batches ([driver/DECISIONS.md](driver/DECISIONS.md#a-statement-timeout-bounds-the-whole-stream)).
+2. Over a pool, **acquires a connection** (`pool.acquire()`) when the first batch is asked for, and releases it in `finally`, however the iteration ends: read to the end, `break`, `return`, a throw, an abort. Inside a transaction, it uses the transaction's connection; over a `PoolClient` or `Connection`, that connection.
+3. Iterates `runner.cursor(sql, params, { batchSize, readAhead, …codecs, signal, statementTimeout, tag })` ([driver/STREAMING.md](driver/STREAMING.md#cursors)): each batch is fetched only once the rows before it are taken, columns come in their codecs' formats (binary where they can) **from the first run**, and outside a transaction a `timeout` becomes the cursor's `statementTimeout`: the driver sets it before the portal and restores it before the portal's Sync, so it bounds the whole stream (the loop's time included) and can't leak.
+4. Decorates an error with the query and the call site, as `execute` does (the call site is captured when the generator starts, at the first pull); an error in the middle (a division by zero at row 10,001) rejects the pull that reaches it, after the rows before it.
+5. Reports one `onQuery` event of kind `'stream'` when the iteration ends, with the total row count and `command: 'SELECT'` (or the error). Its clock starts at the first pull: `acquireMs` is the wait for the connection, `queuedMs` is 0, and `execMs` runs from then to the end of the iteration, the loop's own time included. A stream is not a span: the driver's telemetry wraps queries, not cursors ([below](#opentelemetry-spans-and-tags)).
 
-A `RowStream` is an async iterable, so `Readable.from(query.stream())` (Node) and `ReadableStream.from(query.stream())` (web) read it with backpressure, and close it when destroyed or canceled; `await using rows = query.stream()` closes it at the end of the block.
+A `RowStream` ([driver/row-stream.ts](driver/row-stream.ts)) runs once: iterating it again yields nothing. It is an async iterable, so `Readable.from(query.stream())` (Node streams) and `ReadableStream.from(query.stream())` (the web streams API, also in Node) read it with backpressure, and close it when destroyed or canceled; `await using rows = query.stream()` closes it at the end of the block. The driver's side (strict pull, named portals inside transactions, why `RowStream` is a hand-written iterator) is in [driver/STREAMING.md](driver/STREAMING.md).
 
-The keyset helpers (`iterateChunks`, `paginateByCursor`, `paginateByOffset`) are the other way to read big results in pieces: each batch is its own query, holding no connection or cursor between batches ([PAGINATION.md](PAGINATION.md)). `paginateByOffset({ countTotal: true })` runs its page and its `count(*)` through `executor.batch`, in one round trip.
+The keyset helpers (`iterateChunks`, `paginateByCursor`, `paginateByOffset`) are the other way to read big results in pieces: each batch is its own `executor.execute`, on the pool's shared connections, holding no connection or cursor between batches ([PAGINATION.md](PAGINATION.md)). `paginateByOffset({ countTotal: true })` runs its page and its `count(*)` through `executor.batch`, in one round trip.
+
+## `describe()`
+
+`describe()` on a select builder asks the server for the query's parameter types and result columns **without running it**:
+
+```ts
+const d = await db
+  .selectFrom(users)
+  .where('users.email', email)
+  .select(['users.id', 'users.createdAt'])
+  .describe();
+// captured:
+// { params: [25],
+//   columns: [
+//     { name: 'id', typeOid: 23, typeModifier: -1, tableOid: 16392, columnNumber: 1 },
+//     { name: 'createdAt', typeOid: 1184, typeModifier: -1, tableOid: 16392, columnNumber: 3 } ] }
+```
+
+`SelectQueryBuilder.describe` compiles the query and calls `executor.describe(compiled)`. `DriverExecutor.describe` sends only the SQL (`pool.describe(sql)` over a pool, on its shared connections, since nothing runs; otherwise the connection's `describe`), and the driver sends `Parse` (unnamed) / `Describe` (statement) / `Sync`, reading back ParameterDescription and RowDescription ([driver/protocol/README.md](driver/protocol/README.md#the-extended-query-protocol)). The parameters' types are the server's inference, since no parameter codecs are sent (`25` is `text` above). The description is mapped to quarry's `QueryDescription` ([executor.ts](executor.ts)): `params` (type OIDs, in order) and `columns` (`name`, `typeOid`, `typeModifier`, and `tableOid` / `columnNumber`, the source table's OID and attribute number, or 0 for a computed column). The column names are the select list's aliases, i.e. the row's keys.
+
+Errors (a misspelled table in raw SQL, a type error) are decorated like `execute`'s, with a call site captured when `describe` starts. `describe` reports no `onQuery` event and no span.
 
 ## Timeouts and cancellation
 
@@ -386,7 +440,7 @@ A canceled query fails with `QueryCanceled` (`reason`: `'abort'`, `'timeout'`, `
 database(url, { onQuery: (event) => logger.debug(event) });
 ```
 
-Each `execute`, each query of a batch, each `stream` and `describe` reports one `QueryEvent` when it settles:
+Each `execute` (builder queries, `db.sql` statements, and each page or batch of the pagination helpers), each query of a `db.batch`, and each `stream` reports one `QueryEvent` ([driver-executor.ts](driver-executor.ts)) when it settles. `describe()` reports none, though `'describe'` is one of the type's kinds. The transaction's own statements (BEGIN, COMMIT, savepoints) and the catalog lookup aren't events: only the queries you built are.
 
 ```ts
 interface QueryEvent {
@@ -406,26 +460,119 @@ interface QueryEvent {
 }
 ```
 
-The timestamps come from `performance.now()`; `queuedMs` and `execMs` come from the driver's `onTiming` callback ([driver/ARCHITECTURE.md](driver/ARCHITECTURE.md#timing)). On a shared connection the pool picks the connection inside `pool.query`, so `acquireMs` is the time before the query reached one (a connection being opened, or a pipeline slot), worked out from the driver's timing: the time it settled, less `queuedMs` and `execMs`; and `queuedMs` includes other callers' queries pipelined ahead of it. Nothing is timed when there is no `onQuery`. A listener that throws doesn't break the query: `#emit` rethrows its error in a microtask, where it surfaces as an uncaught exception instead of rejecting your query.
+A real event, captured from a builder insert on a pool (`tag` and `error` are `undefined`, so `JSON.stringify` left them out):
+
+```json
+{
+  "kind": "execute",
+  "sql": "insert into \"users\" (\"email\") values ($1) returning \"users\".\"id\" as \"id\"",
+  "params": ["a@x"],
+  "command": "INSERT",
+  "rowCount": 1,
+  "durationMs": 1.577,
+  "phases": { "acquireMs": 0.161, "queuedMs": 0.02, "execMs": 1.309 }
+}
+```
+
+`rowCount` is the command tag's count, or the number of rows for a command without one; with `keepRows` it still counts every row. `error` is the error the caller gets (already decorated), or a `DriverError` wrapping a thrown non-`Error` value. Unlike an error's `query`, the event's `params` is an ordinary property: a listener that logs whole events logs parameter values.
+
+The timestamps come from `performance.now()`; `queuedMs` and `execMs` come from the driver's `onTiming` callback ([driver/ARCHITECTURE.md](driver/ARCHITECTURE.md#timing)) where it is asked for. What each phase measures depends on the operation:
+
+| Operation                                 | `acquireMs`                                                                                 | `queuedMs`                                                    | `execMs`                              |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------- | ------------------------------------- |
+| `execute`, shared (`pool.query`)          | before the query reached a connection: one being opened, or a pipeline slot (derived below) | the driver's: behind earlier queries, other callers' included | the driver's: written → finished      |
+| `execute`, a connection of its own        | `pool.acquire()`, plus the catalog lookup on the first query                                | the driver's                                                  | the driver's                          |
+| each query of a `db.batch`                | until the batch had its connection                                                          | 0                                                             | from then until the batch settled     |
+| `stream` (the clock starts at first pull) | until the stream had its connection                                                         | 0                                                             | from then to the end of the iteration |
+
+On a shared connection the pool picks the connection inside `pool.query`, so there is no moment quarry could read; `acquireMs` is worked out from the driver's timing instead: the time the query settled, less `queuedMs` and `execMs`. Nothing is timed when there is no `onQuery`: `observe` is false, no `performance.now()` is read and no `onTiming` callback is made. A listener that throws doesn't break the query: `#emit` rethrows its error in a microtask, where it surfaces as an uncaught exception instead of rejecting your query.
+
+## OpenTelemetry spans and tags
+
+**OpenTelemetry** is the common standard for **traces**: a trace is a tree of timed **spans**, one per unit of work (an HTTP request, a database query), which a collector gathers across services. quarry doesn't emit spans itself; the **driver** does, when its connections are given a tracer ([driver/telemetry.ts](driver/telemetry.ts), [driver/ARCHITECTURE.md](driver/ARCHITECTURE.md#timing)). From the builder's side that means passing `telemetry` in the pool options:
+
+```ts
+import { trace } from '@opentelemetry/api';
+
+const db = database({
+  connectionString: process.env.DATABASE_URL,
+  telemetry: { tracer: trace.getTracer('app') }, // queryText: false leaves the SQL out
+});
+// or: database(createPool({ connectionString, telemetry: { tracer } }))
+```
+
+The driver only calls `startSpan`, `setAttribute`, `setStatus`, `recordException` and `end` (its `TracerLike` and `SpanLike` interfaces), so it doesn't depend on `@opentelemetry/api`. A database made from a connection string alone has no tracer.
+
+**What becomes a span.** Every statement the driver runs through `query`, `queryGroup`, `simpleQuery` or `copyFrom` is one client span, started when the statement is handed to a connection and ended when it settles. For quarry that is each `execute()` (with a `timeout`, the setting and restoring statements are inside the query's one span), each query of a `db.batch`, and the BEGIN and COMMIT of transactions and atomic batches. A `stream()` (a cursor) and a `describe()` are not spans.
+
+**What a span records.** Captured from a builder insert that hit a unique violation:
+
+```json
+{
+  "name": "INSERT quarry_test",
+  "kind": 2,
+  "attributes": {
+    "db.system.name": "postgresql",
+    "db.namespace": "quarry_test",
+    "db.operation.name": "INSERT",
+    "server.address": "/tmp/quarry-pg-nfcob9",
+    "db.query.text": "insert into \"users\" (\"email\") values ($1) returning \"users\".\"id\" as \"id\"",
+    "db.response.status_code": "23505",
+    "error.type": "23505"
+  },
+  "status": {
+    "code": 2,
+    "message": "duplicate key value violates unique constraint \"users_email_key\""
+  }
+}
+```
+
+- The name is the query's tag, or the operation and the database (`INSERT quarry_test`). Kind 2 is "client".
+- `db.operation.name` is the SQL's first keyword, upper-cased (comments skipped; `QUERY` if there is none). `server.port` is added for TCP connections (this capture used a Unix socket, whose directory is the `server.address`).
+- `db.query.text` is the SQL, with `$1` placeholders; parameters are never recorded.
+- On success, `db.response.returned_rows` is the command tag's row count, when it has one. On failure, the SQLSTATE (`db.response.status_code` and `error.type`; the error's name for errors that aren't the server's), the exception, and an error status.
+
+**How a tag travels.** `.tag('users.byEmail')` on any of the four builders stores the label in the builder's state and its node; `compile` copies it to `CompiledQuery.tag`, an own property set only when there is a tag, and never part of `sql`, so tagging doesn't change the statement the driver caches. From there `#queryOptions` passes it to the driver as `QueryOptions.tag`, where it names the span and becomes `db.query.summary`; `#report` puts it in the `QueryEvent`; and `decorate` adds it to a server error's `query`. In a batch, each statement carries its own tag. `db.sql` statements have no `tag()`.
+
+**`onQuery` or spans?** They overlap but answer different questions:
+
+|               | `onQuery`                               | driver spans                                      |
+| ------------- | --------------------------------------- | ------------------------------------------------- |
+| Configured on | `database(…, { onQuery })` (quarry)     | `telemetry` in the pool or connection options     |
+| Reports       | the queries you built, streams included | every statement the driver runs, BEGIN/COMMIT too |
+| Parameters    | included                                | never                                             |
+| Timing        | phases: acquire, queued, exec           | the span's start and end                          |
+| Errors        | the decorated error object              | SQLSTATE, exception, status                       |
+
+The driver also has a `captureStack` option that appends the issuing code's stack to errors; it is off by default because quarry's executor does its own ([Errors](#errors)), and leaving it off avoids two `--- query issued at ---` sections on one error.
 
 ## Errors
 
-`decorate(error, query, callsite)`:
+Every executor method catches what fails and passes it to `decorate(error, query, callsite)` ([driver-executor.ts](driver-executor.ts)) before rethrowing it unchanged (same object, same class):
 
-1. A `PostgresError` (an error the **server** reported) gets a non-enumerable `query` property: `{ sql, params, tag }`. Non-enumerable, so a logger that prints the error's own properties won't print parameter values.
-2. **Any** error gets the caller's stack appended, once (a symbol marks it):
+1. A `PostgresError` (an error the **server** reported) gets a non-enumerable `query` property: `{ sql, params, tag }`. The driver already sets `query` to `{ sql, params }` when it builds the error; `decorate` replaces it to add the tag. Non-enumerable, so a logger that prints the error's own properties, and `JSON.stringify`, won't print parameter values.
+2. **Any** error gets the caller's stack appended, once (a symbol marks it), under `--- query issued at ---`.
+
+Captured from a builder insert hitting a unique constraint, called from `signUp` → `createUser` (paths shortened):
 
 ```
-UniqueViolation: duplicate key value violates unique constraint "users_email_key"
-    at … (driver internals)
+PostgresError: duplicate key value violates unique constraint "users_email_key"
+    at postgresError (…/src/driver/errors.ts:270:9)
+    at QueryOp.handle (…/src/driver/ops.ts:585:6)
+    at #dispatch (…/src/driver/connection.ts:734:11)
+    at #onData (…/src/driver/connection.ts:661:19)
+    … (Node's socket and stream frames)
     --- query issued at ---
-    at DriverExecutor.execute (…/quarry/dist/index.js:…)
-    at async Query.execute (…/quarry/dist/index.js:…)
-    at async createUser (/app/src/users.ts:42:7)
-    at async signUp (/app/src/routes.ts:18:3)
+    at DriverExecutor.execute (…/src/driver-executor.ts:377:27)
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async Query.execute (…/src/query.ts:91:4)
+    at async createUser (/app/users.ts:51:9)
+    at async signUp (/app/users.ts:54:9)
 ```
 
-Without this, a server error's stack shows only the driver's code (the error is created when the server's reply is read, long after your call returned to the event loop).
+The error is a `UniqueViolation` (`instanceof` works), but the driver's subclasses don't set their own `name`, so the stack's first line says `PostgresError`. Without the appended part, a server error's stack shows only the driver's code: the error is created when the server's reply is read, long after your call returned to the event loop.
+
+Errors that aren't the server's (a connection failure, an abort, a `DecodeError`, the `DriverError` refusing a timeout in a transaction) get the call site but no `query`. quarry's own result-shape errors (`NoRowError`, `TooManyRowsError`, `RowCountError`) are thrown by the shape after `execute` returned, so they aren't decorated: they carry their own non-enumerable `query` and name the table in their message ([QUERIES.md](QUERIES.md#errors)). In an atomic batch, a failing check is decorated with the call site (`decorate(error, undefined, …)`).
 
 **When the call site is captured.** Only when a query fails. `issuedAt()` creates the `Error` in `execute`'s `catch`, after the `await`, where the engine's **async stack trace** lists the async functions awaiting the query: `Query.execute`, then your function, then whatever awaits it, up to `Error.stackTraceLimit` frames (10 by default). A query that succeeds captures nothing. Before, `execute` and `batch` ran `new Error()` for every query: about 2 µs on V8 however few frames it keeps, a quarter of a pipelined point lookup's client CPU ([DECISIONS.md](DECISIONS.md#errors-carry-the-query-hidden-and-the-code-awaiting-it)).
 
@@ -438,11 +585,26 @@ What it lists, compared with a stack taken when the query was issued:
 
 `batch` captures once, at its first failure, in its own continuation: `settle` runs after `await pool.withShared(…)` or inside `#run`'s callback, and `#run` awaits that callback, so the chain reaches `batchWith` and your code. Each link has to be an `await`; a returned promise breaks the chain. `stream` and `describe` still capture when they start: once per stream or description, not per query. `callsites: false` turns it all off.
 
-Error classes: the driver's `PostgresError` subclasses (`UniqueViolation`, `SerializationFailure`, …), `ConnectionError`, `DecodeError`, `AbortError`, `QueryCanceled`, `TransactionRolledBack`, all re-exported from `quarry` ([driver/ARCHITECTURE.md](driver/ARCHITECTURE.md#errors)); and quarry's own `NoRowError`, `TooManyRowsError`, `RowCountError`, `BatchError` ([QUERIES.md](QUERIES.md#errors)).
+Error classes, all exported from `quarry` ([index.ts](index.ts)):
+
+- the driver's ([driver/ARCHITECTURE.md](driver/ARCHITECTURE.md#errors)): `PostgresError` and its SQLSTATE subclasses (`IntegrityConstraintViolation` with `UniqueViolation`, `ForeignKeyViolation`, `NotNullViolation`, `CheckViolation`, `ExclusionViolation`; `SerializationFailure`, `DeadlockDetected`, `LockNotAvailable`, `ReadOnlyTransaction`, `TransactionTimeout`, `IdleInTransactionTimeout`, `UndefinedTable`, `UndefinedColumn`, `QueryCanceled`), and `DriverError`, `ConnectionError`, `ProtocolError`, `DecodeError`, `AbortError`, `UndefinedParameterError`, `TransactionRolledBack`;
+- quarry's ([QUERIES.md](QUERIES.md#errors)): `NoRowError`, `TooManyRowsError`, `RowCountError` ([executor.ts](executor.ts)), [`BatchError`](#batcherror) ([batch.ts](batch.ts)) and `InvalidCursorError` ([pagination.ts](pagination.ts), [PAGINATION.md](PAGINATION.md#cursors)).
+
+`violatedColumns(error, table)` ([errors.ts](errors.ts)) maps an `IntegrityConstraintViolation`'s database column names back to the table's TypeScript keys, for answering "which field was taken" ([QUERIES.md](QUERIES.md#errors)).
 
 ## Closing
 
-`db.close()` calls `executor.close()`, which ends the pool **only if the database created it** (`#owned`). `pool.end()` waits for work already issued, then closes every connection ([driver/POOL.md](driver/POOL.md#ending-the-pool)).
+`db.close()` and `[Symbol.asyncDispose]` (so `await using db = database(url)`) both call `executor.close()`:
+
+```ts
+async close(): Promise<void> {
+  if (this.#owned && this.#source instanceof Pool) await this.#source.end();
+}
+```
+
+- A database made from a connection string or pool options **owns** its pool, and `close()` ends it with `pool.end()`: idle connections close at once; queries already issued, callers already waiting for a connection, and reserved connections (a running transaction, a stream being read, an atomic batch) finish first, and `close()` resolves once every connection is closed ([driver/POOL.md](driver/POOL.md#ending-the-pool)). A query issued afterwards rejects with `DriverError: The pool has ended`. Calling `close()` again waits for the same ending.
+- A database over a `Pool`, `PoolClient` or `Connection` you passed in doesn't own it: `close()` resolves and leaves it open (captured: `pool.ended` is still `false`), so you end it yourself (`pool.end()`, `client.release()`, `connection.close()`).
+- `tx` inside a transaction has no `close` (`DatabaseTransaction` omits it): the transaction ends when its callback settles.
 
 ## Decisions
 
@@ -453,19 +615,28 @@ Why execution works this way. Each links to its full entry (what it is, why, the
 - [The type catalog loaded before the first query](DECISIONS.md#the-type-catalog-loaded-before-the-first-query): the first query behaves like every later one.
 - [Plain queries share the pool's pipelined connections](DECISIONS.md#plain-queries-share-the-pools-pipelined-connections): concurrent builder queries pipeline beyond `max`; what holds state keeps a connection of its own.
 - [Server-side statement timeouts, transaction-local and pipelined](driver/DECISIONS.md#server-side-statement-timeouts-transaction-local-and-pipelined): a client-side timer can't stop the server; a transaction-local setting can't leak.
+- [A statement timeout is framed under the query's Sync, whatever the transaction status](driver/DECISIONS.md#a-statement-timeout-is-framed-under-the-querys-sync-whatever-the-transaction-status): why a query with a `timeout` can share the pool's connections (#38).
 - [`db.batch`: two modes with names](DECISIONS.md#dbbatch-two-modes-with-names): "together" and "atomically" fail differently.
 - [`db.batch` framing: one write, with COMMIT pipelined unless results are checked](driver/DECISIONS.md#dbbatch-framing-one-write-with-commit-pipelined-unless-results-are-checked): how a batch goes on the wire.
-- [`stream()`: only for every-row reads, and it runs immediately](DECISIONS.md#stream-only-for-every-row-reads-and-it-runs-immediately): and why its `timeout` is refused in a transaction.
+- [`stream()`: only for every-row reads, run by iterating it](DECISIONS.md#stream-only-for-every-row-reads-run-by-iterating-it): and why its `timeout` is refused in a transaction.
+- [A statement timeout bounds the whole stream](driver/DECISIONS.md#a-statement-timeout-bounds-the-whole-stream): the cursor's framing behind `stream({ timeout })`.
 - [Errors carry the query (hidden) and the code awaiting it](DECISIONS.md#errors-carry-the-query-hidden-and-the-code-awaiting-it): debuggable without leaking parameters into logs, and without a stack captured per query.
+- [Errors carry everything and leak nothing](driver/DECISIONS.md#errors-carry-everything-and-leak-nothing): the driver's side of the same rule.
 - [Nested `durable` transactions throw](DECISIONS.md#nested-durable-transactions-throw): a durable request never silently becomes a savepoint.
+- [`onQuery`: one event per settled query, with its phases; `tag()` stays out of the SQL](DECISIONS.md#onquery-one-event-per-settled-query-with-its-phases-tag-stays-out-of-the-sql): why one callback tells the three waits apart, costs nothing without a listener, and why a tag travels next to the SQL instead of in it.
+- [OpenTelemetry spans through a structural tracer, without parameters](driver/DECISIONS.md#opentelemetry-spans-through-a-structural-tracer-without-parameters): why the driver emits spans without depending on `@opentelemetry/api`.
 
 ## Glossary
 
 **Catalog** (`pg_type`): Postgres's table of types; the driver reads it to find the OIDs of named types.
 
+**Checked shape**: a result shape whose read can throw once the statement has run (the `expect…` shapes); an atomic batch waits for its check before committing.
+
 **Executor**: the object that runs compiled queries ([executor.ts](executor.ts)).
 
 **OID**: a Postgres type's numeric id.
+
+**Pipeline slot**: one place in a shared connection's pipeline: a query, or a whole default batch, waiting for or holding one.
 
 **Registry**: the driver's map from type OID to codec, for columns no query typed.
 
@@ -475,6 +646,12 @@ Why execution works this way. Each links to its full entry (what it is, why, the
 
 **Serialization failure**: the error a `serializable` transaction gets when it conflicts with a concurrent one; retrying succeeds.
 
+**Shared connection**: a pool connection lent to several callers' queries at once, pipelined; the opposite of a connection reserved with `pool.acquire()` ([driver/POOL.md](driver/POOL.md)).
+
+**Span**: one timed unit of work in an OpenTelemetry trace; the driver makes one per statement when given a tracer.
+
 **`statement_timeout`**: Postgres's setting that cancels statements running longer than it.
 
 **Sync**: the protocol message that ends a segment of pipelined statements ([driver/protocol/README.md](driver/protocol/README.md)).
+
+**Tag**: a query's label from `tag()`: the span's name, `QueryEvent.tag`, and a server error's `query.tag`; never part of the SQL.

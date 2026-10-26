@@ -2,7 +2,7 @@
 
 A query can run for a long time: a slow plan, a lock it waits for, an accidental full-table scan. This guide explains how the driver stops one: with an `AbortSignal`, with a client-side `timeout`, with a server-side `statementTimeout`, and with `connection.cancel()`; how a **cancel request** reaches the server; and why the driver holds back later queries while one is being canceled.
 
-Code: `#enqueue`, `#abortOn`, `#timeOut`, `#abort`, `#cancelAtHead`, `cancel`, `#queryWithTimeout` in [connection.ts](connection.ts); `sendCancel` in [connect.ts](connect.ts); `Op.classify` in [ops.ts](ops.ts); `QueryCanceled` in [errors.ts](errors.ts).
+Code: `#enqueue`, `#abortOn`, `#timeOut`, `#abort`, `#cancelAtHead`, `cancel`, `#queryWithTimeout` in [connection.ts](connection.ts); `sendCancel` in [connect.ts](connect.ts); `Op.classify`, `CursorOp.interrupt`, `STATEMENT_TIMEOUT` and `SyncGroupOp` in [ops.ts](ops.ts); `QueryCanceled` in [errors.ts](errors.ts).
 
 ## Contents
 
@@ -11,6 +11,7 @@ Code: `#enqueue`, `#abortOn`, `#timeOut`, `#abort`, `#cancelAtHead`, `cancel`, `
 - [`signal` and `timeout`: canceling from the client](#signal-and-timeout-canceling-from-the-client)
 - [The cancel request](#the-cancel-request)
 - [Why later writes are held back](#why-later-writes-are-held-back)
+- [Cursors](#cursors)
 - [Statement timeouts](#statement-timeouts)
 - [`QueryCanceled` and its reason](#querycanceled-and-its-reason)
 - [Decisions](#decisions)
@@ -53,15 +54,17 @@ Both call `#abort(op, reason)`:
   if (!op.written) {                 // still in the queue: just drop it
     this.#queue.removeAt(this.#queue.indexOf(op));
     op.fail(new AbortError(reason === 'timeout' ? 'The query timed out before it was sent' : 'The query was aborted before it was sent', { cause }));
+    this.#finished(op);
     return;
   }
-  op.canceledBy = reason;            // sent: ask the server
-  this.#canceling ??= op;            // hold back later writes
+  op.canceledBy = reason;
+  if (op.interrupt(reason, cause)) return; // a suspended cursor closes its portal instead
+  this.#canceling ??= op;            // sent: hold back later writes, ask the server
   this.#cancelAtHead();
 }
 ```
 
-A query that was never sent can't have done anything, so it fails with `AbortError` and the connection is unaffected. A sent one is canceled on the server.
+A query that was never sent can't have done anything, so it fails with `AbortError` and the connection is unaffected. A sent one is canceled on the server, unless the op can stop without the server's help (`interrupt` returns true: a cursor between batches, [below](#cursors)).
 
 **`timeout` counts from when the query is queued on its connection**, not from when it is written: the wait behind queries pipelined ahead of it on that connection counts, as the caller waits. A pool's wait for a connection or a pipeline slot comes before that and is bounded by `acquireTimeout`; quarry's `execute({ timeout })` is a server-side `statementTimeout`, which counts only the server's work on the statement.
 
@@ -135,6 +138,14 @@ select case when $1::text is null
 end
 ```
 
+Captured on a fresh connection, `query('select 1 as a', [], { statementTimeout: 2000 })`, one write:
+
+```
+C> Parse("q1", "select case when $1::text is null the…") Describe(S "q1") Bind("", "q1", "2000ms") Execute   Parse("q2", "select 1 as a") Describe(S "q2") Bind("", "q2") Execute   Bind("", "q1", null) Execute   Sync
+```
+
+The restore binds the statement the set prepared: one Parse, first in the group.
+
 With a value, it keeps the current `statement_timeout` in a custom setting, `quarry.statement_timeout`, and sets the new one. With null, it puts the kept value back. Both settings are transaction-local, so the same three statements are right in both cases:
 
 - **Outside a transaction block**: statements under one Sync run in one implicit transaction, which ends at the Sync and takes both settings with it; the restore changes nothing.
@@ -155,7 +166,7 @@ C> set_config('statement_timeout', $1, true)  <query>  Sync
 
 Their implicit transaction ends the setting at the Sync, so there is nothing to restore. `#outsideTransactionBlock` decides it when the query is queued: the last ReadyForQuery said idle (`I`), and every op queued or in flight on the connection says `opensNoBlock`, which a plain statement does unless its SQL starts with `begin` or `start` (after comments), and a group does when all its statements do; a simple query, a cursor or COPY never does. The timed query mustn't be a `begin` either, or its setting would last for the block it opens. Anything else (a connection's own `query`, a `Transaction`, a pool connection with a `begin` pipelined ahead) keeps the three statements. Only the pool takes this path because it issued everything on its shared connections itself; the status alone isn't enough, as the next paragraph explains.
 
-**Why one Sync group, independent of the transaction status.** The connection's transaction status is the one in the **last ReadyForQuery received**: it says how the last answered query left the connection, not how the queries still queued or in flight ahead of this one will leave it. Until #38 the framing was chosen from it (`begin`/`set_config`/query/`commit` with four Syncs when idle; set, query, then an asynchronous restore when in a transaction). On a pipelined connection, a pool's shared connection included, that was wrong three ways:
+**Why one Sync group, independent of the transaction status.** The connection's transaction status is the one in the **last ReadyForQuery received**: it says how the last answered query left the connection, not how the queries still queued or in flight ahead of this one will leave it. Until #38 the framing was chosen from it (`begin`/`set_config`/query/`commit` with four Syncs when idle; set, query, then an asynchronous restore when in a transaction: [the superseded decision](DECISIONS.md#a-statement-timeout-framed-by-the-transaction-status)). On a pipelined connection, a pool's shared connection included, that was wrong three ways:
 
 - **Not applied.** In a transaction whose `commit` is already queued (another caller's transaction, or another timed query's framing), the in-transaction variant ran its `set_config(…, true)` after that commit, in an implicit transaction of its own, and the query ran unbounded. The pool doesn't pipeline onto a connection reporting a transaction, but a caller waiting for a pipeline slot is handed one mid-read and runs a microtask later, after the rest of that read (which can hold another timed query's `begin`) changed the status.
 - **Another caller's transaction committed.** Behind a `begin` not yet answered, the status still said idle: the timed query's own `begin` was ignored (a warning) and its `commit` committed the other caller's transaction, half done.
@@ -171,7 +182,17 @@ Because the timeout leaves nothing on the connection, quarry's executor runs a b
 **A cursor's statement timeout.** A cursor with a `statementTimeout` is always opened as an unnamed portal in the implicit transaction of one Sync (the kind used outside a transaction: [STREAMING.md](STREAMING.md#cursors)), whatever the transaction status says, and `CursorOp` frames it like a query:
 
 ```
-C> S('2000ms')  Parse/Bind/Execute(portal) Flush   … Execute Flush per batch …   [Close]  S(null)  Sync
+C> S('2000ms')  [Parse] Describe(S) Flush   Bind/Execute(portal) Flush   … Execute Flush per batch …   [Close]  S(null)  Sync
+```
+
+Captured on a fresh connection, `batchSize: 2` over five rows (the Describe because the statement's columns weren't cached, [binary from the first run](STREAMING.md#binary-from-the-first-run)):
+
+```
+C> Parse("", "select case when $1::text is null the…") Bind("", "", "2000ms") Execute("")   Parse("q1", …) Describe(S "q1") Flush
+C> Bind("", "q1", results 1) Execute("", 2) Flush
+C> Execute("", 2) Flush
+C> Execute("", 2) Flush
+C> Parse("", "select case when $1::text is null the…") Bind("", "", null) Execute("") Sync
 ```
 
 `S` (unnamed: a cursor runs rarely enough) shares the portal's implicit transaction, so the setting covers every batch; outside a transaction block the Sync ends it, inside one the restore does. The restore is written only once nothing the portal asked for is unanswered (its statement's Describe, a running batch), so its answers come last and can't be mistaken for the portal's: a cursor closed while the server runs a batch writes Close, the restore and Sync when that batch ends, which costs nothing, since the server finishes the batch anyway. After an error the server skips to the Sync, restore included, which a failed implicit transaction doesn't need (an explicit one is failed and rolls the setting back). A cursor that goes stale on its first batch is reopened with `S` again, since its implicit transaction ended with the error.
@@ -198,6 +219,7 @@ Why cancellation works this way. Each links to its full entry (what it is, why, 
 - [Aborting a suspended cursor closes it instead of cancelling](DECISIONS.md#aborting-a-suspended-cursor-closes-it-instead-of-cancelling): between batches there is nothing to cancel.
 - [Server-side statement timeouts, transaction-local and pipelined](DECISIONS.md#server-side-statement-timeouts-transaction-local-and-pipelined): the server enforces them even if the client is stuck.
 - [A statement timeout is framed under the query's Sync, whatever the transaction status](DECISIONS.md#a-statement-timeout-is-framed-under-the-querys-sync-whatever-the-transaction-status): it bounds its own query alone, whatever else is pipelined.
+- [Two statements on a pool, where no transaction block can precede the query](DECISIONS.md#two-statements-on-a-pool-where-no-transaction-block-can-precede-the-query): no restore where the pool knows nothing ahead of the query can open a block.
 - [A statement timeout bounds the whole stream](DECISIONS.md#a-statement-timeout-bounds-the-whole-stream): for cursors.
 - [Every wait has a timeout](DECISIONS.md#every-wait-has-a-timeout): nothing waits forever by default.
 - [Stop repeating a cancel once the server answered the query](DECISIONS.md#stop-repeating-a-cancel-once-the-server-answered-the-query): closes the race with a query pipelined behind.

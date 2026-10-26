@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""The headline tables of the published report (docs/driver-benchmarks.md),
-from analyze.ts's summary.json. The full set is in tables.md; these are
+"""The headline tables of a benchmark report (such as the README's
+Benchmarks section), from analyze.ts's summary.json. The full set is in tables.md; these are
 the curated subsets the report's sections quote.
 
     python3 report-tables.py results/<id>/summary.json > headline.md

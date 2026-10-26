@@ -16,6 +16,7 @@ Files: [codec.ts](codec.ts), [codecs.ts](codecs.ts), [registry.ts](registry.ts),
 - [Reading results: plans](#reading-results-plans)
 - [Binary after describe](#binary-after-describe)
 - [Row decoders](#row-decoders)
+  - [Nested objects](#nested-objects)
 - [The registry](#the-registry)
 - [Types looked up by name: the catalog](#types-looked-up-by-name-the-catalog)
 - [Value formats worth knowing](#value-formats-worth-knowing)
@@ -74,31 +75,31 @@ interface Codec<In = unknown, Out = In> {
 
 [codecs.ts](codecs.ts) `codecs`:
 
-| Codec                                                                                                                                                            | OID                    | Reads as        | Results asked in | Notes                                                                             |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- | --------------- | ---------------- | --------------------------------------------------------------------------------- |
-| `bool`                                                                                                                                                           | 16                     | `boolean`       | binary           |                                                                                   |
-| `int2`, `int4`                                                                                                                                                   | 21, 23                 | `number`        | binary           |                                                                                   |
-| `oid`                                                                                                                                                            | 26                     | `number`        | binary           | unsigned                                                                          |
-| `int8`                                                                                                                                                           | 20                     | `bigint`        | binary           |                                                                                   |
-| `int8AsString`                                                                                                                                                   | 20                     | `string`        | text             | quarry's choice for `bigint()` columns                                            |
-| `float4`                                                                                                                                                         | 700                    | `number`        | text             | has a binary decoder, used if the column arrives in binary                        |
-| `float8`                                                                                                                                                         | 701                    | `number`        | binary           |                                                                                   |
-| `numeric`                                                                                                                                                        | 1700                   | `string`        | text             | exact digits; a binary decoder exists                                             |
-| `text`, `varchar`, `bpchar`, `name`, `char`                                                                                                                      | 25, 1043, 1042, 19, 18 | `string`        | text             | **text-like**: `inferParamType`, binary = text                                    |
-| `uuid`                                                                                                                                                           | 2950                   | `string`        | text             | has a binary decoder, used if the column arrives in binary                        |
-| `bytea`                                                                                                                                                          | 17                     | `Uint8Array`    | binary           | sent in binary too                                                                |
-| `json`, `jsonb`                                                                                                                                                  | 114, 3802              | parsed JSON     | text             | encode is `JSON.stringify`                                                        |
-| `timestamptz`                                                                                                                                                    | 1184                   | `Date`          | binary           |                                                                                   |
-| `timestamptzAsString`                                                                                                                                            | 1184                   | `string`        | text             |                                                                                   |
-| `date`, `time`, `timetz`, `timestamp`, `interval`, `inet`, `cidr`, `macaddr`, `money`, `xml`, `bit`, `varbit`, `point`, `box`, `tsvector`, `tsquery`, `jsonpath` |                        | `string`        | text             | the server's text, as is                                                          |
-| `daterange`                                                                                                                                                      | 3912                   | `Range<string>` | text             | `daterangeAsString` keeps the text                                                |
-| `tstzrange`                                                                                                                                                      | 3910                   | `Range<Date>`   | binary           | bounds through `timestamptz`'s binary decoder; `tstzrangeAsString` keeps the text |
-| `vector`                                                                                                                                                         | 0 (by name)            | `number[]`      | binary           | pgvector; float32 values                                                          |
-| `raw`                                                                                                                                                            | 0, name `''`           | `string`        | text             | any type, as text both ways; `inferParamType`                                     |
+| Codec                                                                                                                                                            | OID                    | Reads as             | Results asked in | Notes                                                                                                                   |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- | -------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `bool`                                                                                                                                                           | 16                     | `boolean`            | binary           |                                                                                                                         |
+| `int2`, `int4`                                                                                                                                                   | 21, 23                 | `number`             | binary           |                                                                                                                         |
+| `oid`                                                                                                                                                            | 26                     | `number`             | binary           | unsigned                                                                                                                |
+| `int8`                                                                                                                                                           | 20                     | `bigint`             | binary           |                                                                                                                         |
+| `int8AsString`                                                                                                                                                   | 20                     | `string`             | text             | quarry's choice for `bigint()` columns                                                                                  |
+| `float4`                                                                                                                                                         | 700                    | `number`             | text             | has a binary decoder, used if the column arrives in binary                                                              |
+| `float8`                                                                                                                                                         | 701                    | `number`             | binary           |                                                                                                                         |
+| `numeric`                                                                                                                                                        | 1700                   | `string`             | text             | exact digits; a binary decoder exists                                                                                   |
+| `text`, `varchar`, `bpchar`, `name`, `char`                                                                                                                      | 25, 1043, 1042, 19, 18 | `string`             | text             | **text-like**: `inferParamType`, binary = text                                                                          |
+| `uuid`                                                                                                                                                           | 2950                   | `string`             | text             | has a binary decoder, used if the column arrives in binary                                                              |
+| `bytea`                                                                                                                                                          | 17                     | `Uint8Array`         | binary           | sent in binary too                                                                                                      |
+| `json`, `jsonb`                                                                                                                                                  | 114, 3802              | parsed JSON          | text             | encode is `JSON.stringify`; binary decoders exist (`jsonb`: after its version byte), so their arrays are read in binary |
+| `timestamptz`                                                                                                                                                    | 1184                   | `Date`               | binary           |                                                                                                                         |
+| `timestamptzAsString`                                                                                                                                            | 1184                   | `string`             | text             |                                                                                                                         |
+| `date`, `time`, `timetz`, `timestamp`, `interval`, `inet`, `cidr`, `macaddr`, `money`, `xml`, `bit`, `varbit`, `point`, `box`, `tsvector`, `tsquery`, `jsonpath` |                        | `string`             | text             | the server's text, as is                                                                                                |
+| `daterange`                                                                                                                                                      | 3912                   | `RangeValue<string>` | text             | `daterangeAsString` keeps the text                                                                                      |
+| `tstzrange`                                                                                                                                                      | 3910                   | `RangeValue<Date>`   | binary           | bounds through `timestamptz`'s binary decoder; `tstzrangeAsString` keeps the text                                       |
+| `vector`                                                                                                                                                         | 0 (by name)            | `number[]`           | binary           | pgvector; float32 values                                                                                                |
+| `raw`                                                                                                                                                            | 0, name `''`           | `string`             | text             | any type, as text both ways; `inferParamType`                                                                           |
 
 Results are read in binary **where that builds the JavaScript value faster**: numbers, booleans, bytes, `Date`s, and arrays of those. Where the value is a string anyway (`numeric`, `uuid`, `text`), text is just as cheap and avoids work, so their own results stay text. Parameters are text, except `bytea` and arrays of fixed-size types (below).
 
-**`defaultCodecs`** is what the driver uses when nobody chose: lossless conversions only (`bool`, `int2`, `int4`, `oid`, `int8` as `bigint`, `float4`, `float8`, `json`, `jsonb`, `bytea`, and arrays of those and of the text types); `numeric`, dates, times and everything else stay as the server's text. quarry layers its own choices on top ([../EXECUTION.md](../EXECUTION.md#how-the-builder-picks-codecs)).
+**`defaultCodecs`** is what the driver uses when nobody chose: lossless conversions only. `bool`, `int2`, `int4`, `oid`, `int8` (as `bigint`), `float4`, `float8`, `json`, `jsonb` and `bytea` are registered, and through their `arrayOid` so are their arrays. Scalar `numeric`, dates, times, `uuid` and the character types aren't: those columns stay the server's text, which is what those codecs would return anyway. Arrays of them are registered explicitly, so they become JavaScript arrays of the server's text: `text[]`, `varchar[]`, `bpchar[]`, `char[]`, `name[]`, `uuid[]`, `numeric[]`, `date[]`, `time[]`, `timetz[]`, `timestamp[]`, `timestamptz[]` (as strings), `interval[]`, `inet[]`, `cidr[]`, `point[]`, `daterange[]` and `tstzrange[]` (as strings), and `box[]`. quarry layers its own choices on top ([../EXECUTION.md](../EXECUTION.md#how-the-builder-picks-codecs)).
 
 Internal marks, kept in `WeakSet`s keyed by codec so they add no fields to the public objects:
 
@@ -128,11 +129,11 @@ ints === arrayOf(codecs.int4); // true: memoised per element and delimiter
 
 - **Memoised** in a `WeakMap` by element (and delimiter), so caches keyed by codec find it, and it costs nothing to call per query.
 - **No arrays of arrays**: `arrayOf(arrayOf(x))` throws. Postgres has no such type: `int4[][]` **is** `int4[]` with two dimensions, which this codec already handles.
-- **OID**: the element's `arrayOid`, or 0 (looked up through the catalog) for an element looked up by name.
-- **Encoding**: if the element is marked `sendArraysInBinary` and the array OID is known, `binaryArray(values, oid)` ([array-params.ts](array-params.ts)) tries to write the binary format; it returns `undefined` when an element doesn't fit (a nested array, a number out of range, a non-canonical uuid spelling, a value of another JavaScript type), and the codec falls back to a **literal** built by `arrayText` with each element through `element.encode` and the quoting rules above. A string is passed through as an already-written literal.
+- **OID**: the element's `arrayOid`, or 0 (looked up through the catalog) for an element looked up by name. `inferParamType` is the element's, so an array of a text-like type leaves its type to the server too.
+- **Encoding**: if the element is marked `sendArraysInBinary` and the array OID is known, `binaryArray(values, oid)` ([array-params.ts](array-params.ts)) tries to write the binary format; it returns `undefined` when an element doesn't fit (a nested array, a number out of range, a non-canonical uuid spelling, a value of another JavaScript type), and the codec falls back to a **literal** built by `arrayText` with each element through `element.encode` and the quoting rules above. A string is passed through as an already-written literal; any other non-array value throws a `DriverError`.
 - **Decoding**: text through `parseArray(text, elementDecoder, delimiter)` ([types.ts](types.ts)); binary through `arrayDecoder(elementOid, element)` ([binary.ts](binary.ts)), which checks the element OID and the dimensions (at most 6, Postgres's `MAXDIM`), drops lower bounds, and decodes each element with the element's binary decoder. For text-like elements it slices strings from **one latin1 decode of the whole array** where they are ASCII: a substring is far cheaper than a native UTF-8 decode per element.
 - **Result format**: binary when the element's own results are binary, or it's marked `readArraysInBinary`; otherwise text.
-- The `box` type uses `;` as its delimiter (because a box's text contains commas), hence the `delimiter` parameter.
+- The `box` type uses `;` as its delimiter (because a box's text contains commas), hence the `delimiter` parameter: it defaults to `;` for an element named `box` and `,` otherwise. Arrays looked up through the catalog use the type's own `typdelim`.
 
 What `binaryArray` can encode (one dimension): `bool[]`, `int2[]`, `int4[]`, `int8[]` (numbers, bigints, or digit strings, range-checked), `float8[]`, `timestamptz[]` (`Date`s, as exact microsecond halves), `uuid[]` (canonical form only), `text[]`/`varchar[]`/`bpchar[]`, `jsonb[]` (with jsonb's version byte), `bytea[]`. Buffers are sized exactly before writing.
 
@@ -210,11 +211,13 @@ When a result's columns are known (from RowDescription, or a cached statement), 
 interface ResultPlan {
   formats: readonly number[] | 0; // per column as asked for at Bind (0 = all text)
   fields: readonly Field[]; // the columns, with those formats
-  codecs: (Codec | undefined)[]; // per column: what reads it (undefined = the server's text)
+  codecs: readonly (Codec | undefined)[]; // per column: what reads it (undefined = the server's text)
   unreadable: Field | undefined; // a binary column nothing can read
-  decoders: Map<RowMode, RowDecoder>; // built on first use
+  decoders: Map<string, RowDecoder>; // by row mode and nested objects, built on first use
 }
 ```
+
+`planDecoder(plan, mode, nested)` builds a plan's row decoder once per key: the row mode alone, or the mode and the `nested` list (its JSON, made once per list object), so the same statement read as objects, as arrays, or with [nested objects](#nested-objects) keeps one decoder for each.
 
 `columnCodec(spec, field, i)` decides each column's codec:
 
@@ -223,7 +226,7 @@ interface ResultPlan {
 
 The check in step 1 matters when the schema changes under a cached query (a column changed type), or when the query expected one type and got another: the column is then read by what it actually is, instead of by a codec that would misread it.
 
-Then each column's format: when the plan is made **before** binding (`requested === undefined`), binary if the spec allows binary and the codec reads binary (`resultFormat === 'binary'` with a `decodeBinary`, and a known OID); otherwise what was requested. A column that came in binary without a binary decoder is fine for text-like types (format 2: "sent in binary, read as text", since their binary is their text) and otherwise `unreadable`: the query fails with a `DecodeError` after running.
+Then each column's format: when the plan is made **before** binding (`requested === undefined`), binary if the spec allows binary and the codec reads binary (`resultFormat === 'binary'` with a `decodeBinary`, and a known OID); otherwise what was requested. A column that came in binary without a binary decoder is fine for `text`, `varchar`, `bpchar` and `name` (`TEXT_LIKE` in [results.ts](results.ts); format 2: "sent in binary, read as text", since their binary is their text) and otherwise `unreadable`: the query fails with a `DecodeError` after running.
 
 **Caching**: `cachedPlan(statement.plans, fields, spec)` keeps up to 8 plans per prepared statement, keyed by the columns array, the registry, the expected codecs, the binary flag and the catalog generation. A cached statement mostly sees one, so every later run reuses its plan **and its compiled row decoder**.
 
@@ -271,7 +274,47 @@ The generated source for a 3-column result is shown in [../WALKTHROUGH.md](../WA
 - Factories are cached **by source**, so decoders of the same shape on every connection share one compiled function. The cache is dropped once its sources exceed 4 million characters. A short key of the shape (row mode, decode kinds, names, nesting) finds a factory before its source is generated (`factoryOf`), which matters for unprepared statements: they get a RowDescription, and so a decoder lookup, on every run.
 - Errors: a value whose codec throws becomes a `DecodeError(column, typeOid, cause)` (the `column` variable tracks which); a malformed row (wrong column count, bad length) is a `ProtocolError`.
 - Duplicate column names: in object mode the last wins, and a later NULL still overwrites an earlier value of the same name.
-- **Fallback** without generated code, where `new Function` is forbidden (`--disallow-code-generation-from-strings`) or a column is named `__proto__` (which can't be an object-literal key safely): a loop into an array, then `assignBuilder` defines `__proto__` as an own property, never as the prototype.
+- **Fallback** without generated code, where `new Function` is forbidden (`--disallow-code-generation-from-strings`) or a column (or a nested object or its key) is named `__proto__` (which can't be an object-literal key safely): a loop into an array, then `assignBuilder` defines `__proto__` as an own property, never as the prototype.
+
+### Nested objects
+
+<a id="nested-objects"></a>
+A query's `nested` option (`QueryOptions.nested`, a list of `NestedObject`s from [rows.ts](rows.ts)) reads some columns into an object of the row rather than the row itself. quarry's `nest` uses it for the columns of a joined table ([../QUERIES.md](../QUERIES.md#nest-a-tables-columns-as-one-object)):
+
+```ts
+interface NestedObject {
+  readonly key: string; // the object's key in the row
+  readonly marker: number; // the column it replaces: true (or 't') where the joined row exists
+  readonly columns: readonly (readonly [position: number, key: string])[]; // its columns, each under its own key
+}
+```
+
+- The object takes the place of its **marker** column, under `key`; its columns aren't values of the row. In `array` mode it takes the marker's place in the array.
+- Where the marker reads `true` (or `'t'`, when the column has no codec and stays the server's text), the object is built; where it is false or NULL, the object is `null`. quarry's builder writes the marker as `("bookings".ctid is not null) as "bookings"`, true exactly where the outer join found a row ([../DECISIONS.md](../DECISIONS.md#nest-marks-a-joined-row-with-ctid)).
+- Its columns must be NULL wherever the marker isn't true (they are a missing joined row's): the generated decoder stores them into the object, so a non-NULL value there fails the query with a `DecodeError` naming that column.
+- `checkNested` runs when the query is issued and throws a `DriverError` if a position isn't a non-negative integer, a column is in two objects (or is a marker too), or a column comes before its object's marker.
+
+The generated decoder is the same straight-line code, with the marker storing a literal of its own. Captured from `rowDecoder` for columns `id int4` (binary), `title text`, `author bool` (the marker, binary), `author_id int4`, `author_name text`, with `nested: [{ key: 'author', marker: 2, columns: [[3, 'id'], [4, 'name']] }]` (one value's length checks shown, the others elided):
+
+```js
+// in columns0(b, pos, end, row):
+column = 2;
+{
+  const m = c2.decodeBinary(b, pos, pos + length);
+  if (m === true || m === 't') row['author'] = { id: null, name: null };
+}
+// …
+column = 3;
+row['author']['id'] = c3.decodeBinary(b, pos, pos + length);
+// …
+column = 4;
+row['author']['name'] = utf8(b, pos, pos + length);
+
+// in decodeRow:
+const row = { id: null, title: null, author: null };
+```
+
+Two rows decode to `{"id":1,"title":"Hi","author":{"id":42,"name":"Ada"}}` and, with the marker false and both columns NULL, `{"id":2,"title":"Draft","author":null}`. A missing joined row allocates nothing beyond the row, and every nested object of one shape shares one hidden class, as rows do. Without generated code, `nestedBuilder` builds the same layout from the values array.
 
 ## The registry
 
@@ -296,7 +339,11 @@ Lookup (`codecFor(oid, catalog)`), memoised per catalog **generation** (so a rel
 
 `needsCatalog` is true when some codec is registered by name: decoding then needs the catalog loaded.
 
-A connection gets its registry from the `codecs` option (default `defaultRegistry`); a query can pass its own (`codecs` in `QueryOptions`, a registry or a list, which is turned into a registry once and cached by list object).
+Registries are layered:
+
+- A connection (or pool) gets its registry from the `codecs` option: a `CodecRegistry` is used as is; a list becomes `createCodecRegistry(list)` over `defaultRegistry`, so it only needs the codecs that differ; no option (or an empty list) is `defaultRegistry` itself. It is made once, in the resolved config.
+- A query can pass its own (`codecs` in `QueryOptions`): a registry is used as is; a list is layered over **the connection's** registry, made once per list object (a `WeakMap` in [connection.ts](connection.ts)), so a constant list costs a lookup per query.
+- `createCodecRegistry(list, null)` starts from nothing, for a registry that reads every other column as the server's text.
 
 ## Types looked up by name: the catalog
 
@@ -313,7 +360,7 @@ where t.oid >= 16384 and t.typtype <> 'c'
 and not exists (select from pg_type e where e.oid = t.typelem and e.typtype = 'c')
 ```
 
-- `load(run)` runs the query once (concurrent callers share the promise); a failure clears it so the next query tries again. `reloadTypes()` runs it again for types created since; it waits for a load in progress first.
+- `load(run)` runs the query once (concurrent callers share the promise). A failed lookup is not an error: the promise still resolves, the catalog stays unloaded, and the next query that needs it tries again (meanwhile named types are inferred and read as text, as before the first load). `reloadTypes()` runs it again for types created since; it waits for a load in progress first. On a pool, both go through the shared path ([POOL.md](POOL.md#two-ways-to-use-a-connection)), and `loadTypes()` returns at once when the catalog is already loaded.
 - `setTypes(rows)` indexes by OID and by `schema.name` (and by bare name when visible), clears the OID memo and bumps `generation`, which invalidates registry memos and cached result plans.
 - `oidOf(codec)`: the fixed OID; for an array codec, its element's `arrayOid` or the catalog's array type of the element; for a named codec, the type found by name (names normalised as Postgres does: unquoted parts lower-cased, quoted parts kept). Memoised per codec once loaded.
 - `resultOidOf(codec)`: follows a domain to its base type (up to 8 levels), since RowDescription reports base types.
@@ -332,7 +379,7 @@ and not exists (select from pg_type e where e.oid = t.typelem and e.typtype = 'c
 - **`jsonb`** binary: a version byte (1) then the JSON text.
 - **`vector`** (pgvector) binary: `Int16` dimensions, `Int16` unused, then `float32` values. Decoded values are the float32 values stored: `[0.1]` reads as `[0.10000000149011612]` in binary **and** text, because that is what pgvector holds.
 - **`bytea`** text: `\x` hex or the old escape format (`parseBytea`); binary: the bytes, **copied** so a row never keeps the read buffer alive.
-- **Ranges** (`parseRange`): `empty`, or `[lower,upper)` with each bound unquoted and parsed by the element parser, `null` when unbounded; `Range<T>` is `{ empty: true } | { empty: false, lower, upper, bounds }`.
+- **Ranges** (`parseRange`): `empty`, or `[lower,upper)` with each bound unquoted and parsed by the element parser, `null` when unbounded; `RangeValue<T>` is `{ empty: true } | { empty: false, lower, upper, bounds }`, with `bounds` one of `'[)'`, `'(]'`, `'[]'`, `'()'`.
 
 ## Decisions
 
@@ -346,6 +393,8 @@ Why codecs work this way. Each links to its full entry (what it is, why, the alt
 - [Binary array parameters, with a per-array fallback](DECISIONS.md#binary-array-parameters-with-a-per-array-fallback): binary when every element fits, a literal otherwise.
 - [Arrays of text read as one latin1 string](DECISIONS.md#arrays-of-text-read-as-one-latin1-string): faster than decoding each element.
 - [Generated, monomorphic row decoders](DECISIONS.md#generated-monomorphic-row-decoders): straight-line code with no per-row garbage.
+- [Decoder factories found by result shape, not by their source](DECISIONS.md#decoder-factories-found-by-result-shape-not-by-their-source): an unprepared statement finds its decoder without generating its source.
+- [`nest` marks a joined row with `ctid`](../DECISIONS.md#nest-marks-a-joined-row-with-ctid) (quarry's decisions): why a nested object's marker is a `ctid` test, which is what the decoder's `true` check relies on.
 - [Named types resolved once per pool through the catalog](DECISIONS.md#named-types-resolved-once-per-pool-through-the-catalog): enums and extension types work like built-ins.
 - [`undefined` is refused, never sent as NULL](DECISIONS.md#undefined-is-refused-never-sent-as-null): a missing value is a bug, not NULL.
 
@@ -362,6 +411,10 @@ Why codecs work this way. Each links to its full entry (what it is, why, the alt
 **Format**: text (0) or binary (1), per parameter and per result column.
 
 **Hidden class**: V8's internal description of an object's shape; objects created the same way share one.
+
+**Marker**: the column a [nested object](#nested-objects) replaces; true where the object exists.
+
+**Nested object**: columns of a result read into one object of the row (`nested`), `null` where its marker is false.
 
 **OID**: a type's number in Postgres.
 

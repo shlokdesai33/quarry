@@ -9,6 +9,8 @@ Every design decision and optimisation trick in quarry's PostgreSQL driver, expl
 - **Measured**: numbers, where we have them, with the pull request (PR) they came from.
 - **Code**: where it lives.
 
+An entry replaced by a later decision is kept for its history, marked **Superseded** at its top with a link to what replaced it.
+
 The query builder's decisions are in [../DECISIONS.md](../DECISIONS.md); the index of both is [../../DECISIONS.md](../../DECISIONS.md). The mechanisms themselves are explained step by step in the other driver guides ([ARCHITECTURE.md](ARCHITECTURE.md) and its neighbours); this file is about **why**.
 
 ## How to read the numbers
@@ -18,19 +20,125 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
 ## Contents
 
 - [Architecture](#architecture)
+  - [Our own wire-protocol implementation, with no dependencies](#our-own-wire-protocol-implementation-with-no-dependencies)
+  - [Requests as operations in one FIFO queue](#requests-as-operations-in-one-fifo-queue)
+  - [The driver knows nothing about the query builder](#the-driver-knows-nothing-about-the-query-builder)
+  - [PostgreSQL 18 or later only](#postgresql-18-or-later-only)
 - [Writing to the socket](#writing-to-the-socket)
+  - [Coalesced writes: one write per microtask](#coalesced-writes-one-write-per-microtask)
+  - [`TCP_NODELAY`](#tcp_nodelay)
+  - [`noDelay` in the connect options](#nodelay-in-the-connect-options)
+  - [Backpressure: 64 KiB chunks, and queued ops stay unencoded](#backpressure-64-kib-chunks-and-queued-ops-stay-unencoded)
+  - [Back-filled message lengths](#back-filled-message-lengths)
+  - [Pipelining, with one Sync per query](#pipelining-with-one-sync-per-query)
 - [Prepared statements and PgBouncer](#prepared-statements-and-pgbouncer)
+  - [Prepared statements by default, named per connection](#prepared-statements-by-default-named-per-connection)
+  - [A bounded LRU cache with use stamps](#a-bounded-lru-cache-with-use-stamps)
+  - [Statements keyed by their SQL, with the declared types compared](#statements-keyed-by-their-sql-with-the-declared-types-compared)
+  - [Retry a stale statement once, unprepared](#retry-a-stale-statement-once-unprepared)
+  - [Unnamed statements for pipelined queries behind PgBouncer](#unnamed-statements-for-pipelined-queries-behind-pgbouncer)
+  - [Detect poolers at login rather than configure them](#detect-poolers-at-login-rather-than-configure-them)
+  - [Prepare on a SQL text's second run](#prepare-on-a-sql-texts-second-run)
 - [Codecs, types and formats](#codecs-types-and-formats)
+  - [Codecs owned by the driver, chosen by the caller](#codecs-owned-by-the-driver-chosen-by-the-caller)
+  - [Exact parameter OIDs, except for text-like types](#exact-parameter-oids-except-for-text-like-types)
+  - [Binary only after describe](#binary-only-after-describe)
+  - [Which types are binary and which stay text](#which-types-are-binary-and-which-stay-text)
+  - [Binary array parameters, with a per-array fallback](#binary-array-parameters-with-a-per-array-fallback)
+  - [Arrays of text read as one latin1 string](#arrays-of-text-read-as-one-latin1-string)
+  - [Named types resolved once per pool through the catalog](#named-types-resolved-once-per-pool-through-the-catalog)
+  - [`undefined` is refused, never sent as NULL](#undefined-is-refused-never-sent-as-null)
 - [Reading and decoding](#reading-and-decoding)
+  - [Zero-copy reads: messages decoded in place](#zero-copy-reads-messages-decoded-in-place)
+  - [Large split DataRows reassembled in one reused buffer](#large-split-datarows-reassembled-in-one-reused-buffer)
+  - [Strict bounds checks on every read](#strict-bounds-checks-on-every-read)
+  - [DataRow fast path: no message objects for rows](#datarow-fast-path-no-message-objects-for-rows)
+  - [Generated, monomorphic row decoders](#generated-monomorphic-row-decoders)
+  - [Decoder factories found by result shape, not by their source](#decoder-factories-found-by-result-shape-not-by-their-source)
+  - [Text decoded with `Buffer#utf8Slice`](#text-decoded-with-bufferutf8slice)
+  - [Nested objects built by the generated row decoder](#nested-objects-built-by-the-generated-row-decoder)
+  - [Decode only the rows a caller keeps (`keepRows`)](#decode-only-the-rows-a-caller-keeps-keeprows)
+  - [Shared constant messages and repeated-string caches](#shared-constant-messages-and-repeated-string-caches)
+  - [`Buffer` read from `node:buffer` once](#buffer-read-from-nodebuffer-once)
 - [Memory and garbage collection](#memory-and-garbage-collection)
+  - [Allocation cuts for the small-query tail](#allocation-cuts-for-the-small-query-tail)
+  - [The shared promise executor lets go of each query's resolvers](#the-shared-promise-executor-lets-go-of-each-querys-resolvers)
+  - [One sweep timer for every idle connection](#one-sweep-timer-for-every-idle-connection)
+  - [The writer: reserve one byte per character, hand off big buffers](#the-writer-reserve-one-byte-per-character-hand-off-big-buffers)
+  - [GC on million-row results: left to V8](#gc-on-million-row-results-left-to-v8)
 - [The pool](#the-pool)
+  - [Pipelining onto busy connections, only once the pool is full](#pipelining-onto-busy-connections-only-once-the-pool-is-full)
+  - [A FIFO of pipeline slots, with slot hand-off](#a-fifo-of-pipeline-slots-with-slot-hand-off)
+  - [Draining a shared connection for exclusive callers](#draining-a-shared-connection-for-exclusive-callers)
+  - [Adaptive pipeline depth, from 100 to 1000](#adaptive-pipeline-depth-from-100-to-1000)
+  - [Adaptive width: no more pipelined backends than the server runs at once](#adaptive-width-no-more-pipelined-backends-than-the-server-runs-at-once)
+  - [The pool's hot path: no change from the clock reads or per-waiter timers](#the-pools-hot-path-no-change-from-the-clock-reads-or-per-waiter-timers)
+  - [`maxUses`](#maxuses)
+  - [Pool events and counters](#pool-events-and-counters)
+  - [Connect retry delay, opt-in and not escalating](#connect-retry-delay-opt-in-and-not-escalating)
+  - [Run a query again when the server ended the session before answering it](#run-a-query-again-when-the-server-ended-the-session-before-answering-it)
+  - [`withShared`: several queries as one pipeline slot](#withshared-several-queries-as-one-pipeline-slot)
+  - [Pool policies: LIFO idle, jittered lifetime, safe release, fail fast](#pool-policies-lifo-idle-jittered-lifetime-safe-release-fail-fast)
 - [Connecting](#connecting)
+  - [libpq-compatible configuration](#libpq-compatible-configuration)
+  - [Password functions, called for every new connection](#password-functions-called-for-every-new-connection)
+  - [Lazy `node:tls`, `getBuiltinModule`, and preloading](#lazy-nodetls-getbuiltinmodule-and-preloading)
+  - [SCRAM with `node:crypto`, and a derived-key cache](#scram-with-nodecrypto-and-a-derived-key-cache)
+  - [A TLS secure-context cache](#a-tls-secure-context-cache)
+  - [`close()` with libpq semantics](#close-with-libpq-semantics)
+  - [`verify-full` by default, and strict TLS and SCRAM checks](#verify-full-by-default-and-strict-tls-and-scram-checks)
+  - [Ask for protocol 3.2, accept 3.0, retry once, remember who refused](#ask-for-protocol-32-accept-30-retry-once-remember-who-refused)
+  - [A cap on SCRAM iterations, and the RSASSA-PSS hash read from the certificate](#a-cap-on-scram-iterations-and-the-rsassa-pss-hash-read-from-the-certificate)
 - [Transactions and batches](#transactions-and-batches)
+  - [BEGIN shares the first statement's Sync](#begin-shares-the-first-statements-sync)
+  - [Savepoints and RELEASE share the next statement's Sync](#savepoints-and-release-share-the-next-statements-sync)
+  - [A swallowed error resurfaces as itself](#a-swallowed-error-resurfaces-as-itself)
+  - [COMMIT pipelined behind a transaction's last statement](#commit-pipelined-behind-a-transactions-last-statement)
+  - [Detect a COMMIT that rolled back](#detect-a-commit-that-rolled-back)
+  - [`afterCommit` callbacks that can't change the outcome](#aftercommit-callbacks-that-cant-change-the-outcome)
+  - [`db.batch` framing: one write, with COMMIT pipelined unless results are checked](#dbbatch-framing-one-write-with-commit-pipelined-unless-results-are-checked)
+  - [Retries opt-in, re-running the whole callback](#retries-opt-in-re-running-the-whole-callback)
+  - [Settings with `set_config(…, true)`](#settings-with-set_config-true)
 - [Cursors and streams](#cursors-and-streams)
+  - [Exclusive ops for anything that keeps talking](#exclusive-ops-for-anything-that-keeps-talking)
+  - [Streams: strict pull, read-ahead opt-in](#streams-strict-pull-read-ahead-opt-in)
+  - [Cursors: describe first for binary from the first run](#cursors-describe-first-for-binary-from-the-first-run)
+  - [Cursors inside a transaction use a named portal](#cursors-inside-a-transaction-use-a-named-portal)
+  - [Aborting a suspended cursor closes it instead of cancelling](#aborting-a-suspended-cursor-closes-it-instead-of-cancelling)
+  - [`RowStream`: a hand-written iterator instead of an async generator](#rowstream-a-hand-written-iterator-instead-of-an-async-generator)
+  - [A statement timeout bounds the whole stream](#a-statement-timeout-bounds-the-whole-stream)
 - [COPY and LISTEN/NOTIFY](#copy-and-listennotify)
+  - [COPY with backpressure both ways](#copy-with-backpressure-both-ways)
+  - [`copyRows` loops synchronously over sync rows](#copyrows-loops-synchronously-over-sync-rows)
+  - [`copyTo` chunks: everything received, one copy per read](#copyto-chunks-everything-received-one-copy-per-read)
+  - [Node stream adapters for COPY](#node-stream-adapters-for-copy)
+  - [A NOTIFY fast path and a channel-name cache](#a-notify-fast-path-and-a-channel-name-cache)
+  - [`notify` with `pg_notify($1, $2)`](#notify-with-pg_notify1-2)
+  - [A dedicated, self-healing LISTEN connection, re-subscribing in one round trip](#a-dedicated-self-healing-listen-connection-re-subscribing-in-one-round-trip)
 - [Cancellation and timeouts](#cancellation-and-timeouts)
+  - [Cancel only the query at the head, and hold back later writes](#cancel-only-the-query-at-the-head-and-hold-back-later-writes)
+  - [Stop repeating a cancel once the server answered the query](#stop-repeating-a-cancel-once-the-server-answered-the-query)
+  - [A statement timeout is refused for statements that can't run in a transaction block](#a-statement-timeout-is-refused-for-statements-that-cant-run-in-a-transaction-block)
+  - [Drop unsent queries without contacting the server](#drop-unsent-queries-without-contacting-the-server)
+  - [Server-side statement timeouts, transaction-local and pipelined](#server-side-statement-timeouts-transaction-local-and-pipelined)
+  - [A statement timeout framed by the transaction status](#a-statement-timeout-framed-by-the-transaction-status) (superseded)
+  - [A statement timeout is framed under the query's Sync, whatever the transaction status](#a-statement-timeout-is-framed-under-the-querys-sync-whatever-the-transaction-status)
+  - [Two statements on a pool, where no transaction block can precede the query](#two-statements-on-a-pool-where-no-transaction-block-can-precede-the-query)
+  - [Every wait has a timeout](#every-wait-has-a-timeout)
+- [Observability](#observability)
+  - [OpenTelemetry spans through a structural tracer, without parameters](#opentelemetry-spans-through-a-structural-tracer-without-parameters)
+  - [Server notices go to listeners, and a listener can't break the connection](#server-notices-go-to-listeners-and-a-listener-cant-break-the-connection)
 - [Runtimes](#runtimes)
+  - [Node only](#node-only)
+  - [One small socket interface](#one-small-socket-interface) (superseded)
+  - [Counting bytes for backpressure on Workers](#counting-bytes-for-backpressure-on-workers) (superseded)
 - [Errors and safety](#errors-and-safety)
+  - [Errors carry everything and leak nothing](#errors-carry-everything-and-leak-nothing)
+  - [Typed error classes per SQLSTATE](#typed-error-classes-per-sqlstate)
+  - [Secrets hidden from a configuration's enumerable properties](#secrets-hidden-from-a-configurations-enumerable-properties)
+  - [Only a `Uint8Array` is sent as bytes](#only-a-uint8array-is-sent-as-bytes)
+  - [Spans for cursors, COPY TO and transactions](#spans-for-cursors-copy-to-and-transactions)
+  - [A decode failure fails one query, not the connection](#a-decode-failure-fails-one-query-not-the-connection)
 
 ## Architecture
 
@@ -42,7 +150,7 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
 
 **Alternatives.** Wrap pg (the most used Node driver) or postgres.js. pg never pipelines through its pool (exactly one query in flight per connection), sends unnamed statements by default (re-parsed and re-planned every time), and parses every value from text. postgres.js pipelines, but at the time had a queue bug that made it slow on several connections, text-only results, and an unbounded statement cache ([implementation comparison, summarised in #12/#15](https://github.com/shlokdesai33/quarry/pull/15)).
 
-**Cost.** About 8k lines to maintain; every protocol edge case is ours to get right. Mitigation: `pnpm test:compat` runs pg's and postgres.js's own test suites against this driver, and found 10 bugs early ([#11](https://github.com/shlokdesai33/quarry/pull/11)).
+**Cost.** About 13k lines of TypeScript to maintain (10k without comments and blank lines); every protocol edge case is ours to get right. Mitigation: `pnpm test:compat` runs pg's and postgres.js's own test suites against this driver, and found 10 bugs early ([#11](https://github.com/shlokdesai33/quarry/pull/11)).
 
 **Measured.** On the full benchmark run after the driver batch (#12–#25): point lookups on 10 connections with 1000 callers 301k/s against postgres.js 130k and pg 61k; 1M-row fetch 487 ms against 1,078 ms (postgres.js) and 1,293 ms (pg); lowest median latency in all 17 sequential scenarios on Node.
 
@@ -64,7 +172,7 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
 
 **What it is.** `src/driver/` imports nothing from the builder; everything quarry-specific is in [../driver-executor.ts](../driver-executor.ts).
 
-**Why.** The driver can be tested against other drivers' suites, benchmarked alone, used without the builder (`quarry/driver`), and could be published separately. The builder stays free of protocol details.
+**Why.** The driver can be tested against other drivers' suites, benchmarked alone, used without the builder (`quarry/driver`). The builder stays free of protocol details.
 
 **Alternatives.** Let the builder reach into connections (cheaper integration, but couples the two forever).
 
@@ -98,7 +206,7 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
 - `Buffer.concat` the pending chunk per query and flush on `setImmediate` (postgres.js): extra copies, and a deferred flush.
 - A deferred flush in quarry (`setImmediate`, or several chained microtasks) was measured: 228–242k against 228k ops/s, within noise. With quarry's least-loaded placement, the burst of new queries triggered by a connection's answers goes back to that same connection, so a microtask flush already batches it. (Conversely, a microtask flush made postgres.js **worse**, 140k → 112k at 10 connections × 100 callers, because its round-robin placement spreads a burst over every connection: placement and flush timing have to match.)
 
-**Cost.** A burst that spans several ticks goes out in several writes. Adaptive write coalescing under load is a possible follow-up (#25 found that a faster client sends smaller batches, which raised p99 slightly in one server-saturated scenario).
+**Cost.** A burst that spans several ticks goes out in several writes. A faster client sends smaller batches, which raised p99 slightly in one server-saturated scenario (#25); there, under load, each read carried one result, so adaptive write coalescing had nothing to coalesce ([adaptive width](#adaptive-width-no-more-pipelined-backends-than-the-server-runs-at-once)).
 
 **Measured.** At 10 connections × 100 callers, quarry averages 5.1 queries per write (postgres.js 5.3, pg 1), at 4.5 µs of client CPU per query against 8.4 µs (postgres.js with its queue bug fixed) and 17.1 µs (pg).
 
@@ -312,7 +420,7 @@ Client CPU per query on the churn workload fell from 11.4–13.6 to 7.2–7.5 µ
 
 **Alternatives.** Never declare (what the driver did before #28): wrong inference in edge cases, and no binary arrays. Always declare: breaks citext and enums.
 
-**Cost.** The statement cache key includes the declared OIDs (+0.3 µs per small query in #28's profile), and the OID array is built per query (+0.3 µs).
+**Cost.** The declared OIDs are compared on every statement-cache lookup ([keyed by the SQL](#statements-keyed-by-their-sql-with-the-declared-types-compared); in #28 they were part of the key, +0.3 µs per small query in its profile), and the OID array is built per query (+0.3 µs).
 
 **Code.** [params.ts](params.ts) `paramOids`; [codec.ts](codec.ts) `declareParamType`.
 
@@ -335,7 +443,7 @@ Client CPU per query on the churn workload fell from 11.4–13.6 to 7.2–7.5 µ
 
 **What it is.** Results are read in binary for `bool`, `int2`, `int4`, `oid`, `int8` (as `bigint`), `float8`, `bytea`, `timestamptz`, `tstzrange`, pgvector's `vector`, and arrays of those, of text-like types and of json/jsonb. Everything else (numeric, uuid, date, daterange, time, text, enums, jsonb scalars, int8 as a string, float4) stays text ([CODECS.md](CODECS.md#the-built-in-codecs)).
 
-**Why.** Binary wins when the JavaScript value **isn't a string**: it skips building a string and then parsing it. It ties or loses when the value is returned as a string anyway, because JavaScript then has to build that string itself, which is slower than Node's one native UTF-8 slice.
+**Why.** Binary wins when the JavaScript value **isn't a string**: it skips building a string and then parsing it. When the value is returned as a string anyway, the gain is small or negative, because JavaScript then has to build that string itself instead of one native UTF-8 slice (uuid: 92 → 99 ns). numeric and int8 as a string decode about a fifth faster in binary on Node, but were 2–3× slower on Bun, a target when #19 measured them (dropped since by [Node only](#node-only)), so they stayed text.
 
 **Measured** (decode ns per value, Node, text → binary; [binary vs text benchmark](https://github.com/shlokdesai33/quarry/pull/19)):
 
@@ -347,8 +455,8 @@ Client CPU per query on the churn workload fell from 11.4–13.6 to 7.2–7.5 µ
 | int4 → number            | 134 → 42                    | +26%               | binary                                                     |
 | bool → boolean           | 82 → 44                     | +4%                | binary (free)                                              |
 | uuid → string            | 92 → 99                     |                    | text                                                       |
-| numeric → string         | 98 → 79 (Bun: 61 → **123**) |                    | text                                                       |
-| int8 > 2^53 → string     | 93 → 73 (Bun: 80 → **240**) |                    | text (BigInt is slow on Bun)                               |
+| numeric → string         | 98 → 79 (Bun: 61 → **123**) |                    | text (for Bun, above)                                      |
+| int8 > 2^53 → string     | 93 → 73 (Bun: 80 → **240**) |                    | text (for Bun, above: BigInt is slow there)                |
 | jsonb → parsed           | 615 → 572                   | noisy              | text (binary is a version byte plus the same text)         |
 | `int4[10]` → number[]    | 709 → 124                   | +89%               | binary                                                     |
 | `vector(128)` → number[] | 5,129 → 1,451               | +208%              | binary (server CPU 50,645 → 9,691 µs)                      |
@@ -489,6 +597,32 @@ Client CPU per query on the churn workload fell from 11.4–13.6 to 7.2–7.5 µ
 
 **Code.** [rows.ts](rows.ts) `factoryOf`.
 
+### Text decoded with `Buffer#utf8Slice`
+
+**What it is.** `utf8()`, which the driver's text decoding goes through (text values, names and string fields of messages), calls `Buffer#utf8Slice(start, end)` directly on the read buffer. Byte arrays that aren't Buffers build short ASCII runs (up to 24 bytes) in JavaScript and use `TextDecoder` for the rest ([protocol/README.md](protocol/README.md#decoding)).
+
+**Why.** `utf8Slice` is the native call that `toString('utf8', start, end)` makes once it has checked its arguments and looked up the encoding. A short string costs 62 ns through it against 70 ns through `toString`, and in the profile that wrapper was about 7% of a 100k-row fetch.
+
+**Alternatives.** `toString('utf8', start, end)`, the documented API (what `utf8()` called before). `TextDecoder.decode` on a `subarray`: a view object per value.
+
+**Cost.** `utf8Slice` isn't in Node's documentation, though `toString` is built on it. Unit tests cover what could go wrong: Buffers sharing a larger allocation, offsets, multibyte text and invalid bytes, and the same inputs as plain `Uint8Array`s.
+
+**Measured.** Node 24, A/B in one session, medians, before → after ([#45](https://github.com/shlokdesai33/quarry/pull/45)): fetching 1k rows p50 0.32 → 0.30 ms (2,793 → 3,012/s); wide rows p50 3.63 → 3.40 ms; 100k rows × 5 at equal work p50 36.5 → 31.6 ms; 1M rows × 3 mean 437 → 412 ms.
+
+**Code.** [protocol/text.ts](protocol/text.ts) `utf8`.
+
+### Nested objects built by the generated row decoder
+
+**What it is.** A query's `nested` option names objects to build inside each row, each with a `key`, a `marker` column and its `columns` (by position). The object goes in place of its marker: the generated row decoder starts it as `null` and, when the marker is true, stores a fresh literal of the object's keys, into which the object's columns are then decoded. The builder's `nest()` sends it, with `ctid is not null` as the marker of a joined table ([../DECISIONS.md](../DECISIONS.md#nest-marks-a-joined-row-with-ctid)).
+
+**Why.** The object's columns are ordinary columns, each read with its own codec and format, binary included. Building the object while the row is decoded needs no second pass over the rows, and a row with no match allocates nothing for it.
+
+**Alternatives.** `json_build_object` in the SQL: one JSON value per object, decoded with JSON's types instead of the columns' codecs. Regrouping the columns after decoding: a pass over the rows, and a second object per row.
+
+**Cost.** A marker that isn't true means the object's columns are never read, so they must be null there (the builder's `ctid` marker guarantees it). The option is checked on each query (`checkNested`: every column after its object's marker, none in two objects). Decoders are cached on the result plan by row mode and nesting, and the fallback decoder (where `new Function` is forbidden) builds the objects too.
+
+**Code.** [rows.ts](rows.ts) `NestedObject`, `checkNested`, `factorySource`; [results.ts](results.ts) `planDecoder`; [connection.ts](connection.ts) `QueryOptions` `nested` ([#44](https://github.com/shlokdesai33/quarry/pull/44)).
+
 ### Decode only the rows a caller keeps (`keepRows`)
 
 **What it is.** A query can say "keep only the first N rows" (`keepRows`); the op skips decoding every row after that, while the query still runs to completion and the row count still counts every row ([ARCHITECTURE.md](ARCHITECTURE.md#keeprows)).
@@ -551,6 +685,20 @@ Client CPU per query on the churn workload fell from 11.4–13.6 to 7.2–7.5 µ
 **Measured.** Node, sequential: `select 1` p99.9 368 → 264 µs (postgres.js 363), GCs/s 60 → 33, throughput 39.0k → 43.4k/s; point lookup p99.9 446 → 364 µs. Bun: `select 1` p99.9 258 → 62 µs (Bun.sql 191). Throughput sweep: median +4.9%.
 
 **Code.** [pool.ts](pool.ts), [connection.ts](connection.ts), [queue.ts](queue.ts), [protocol/writer.ts](protocol/writer.ts), [protocol/reader.ts](protocol/reader.ts).
+
+### The shared promise executor lets go of each query's resolvers
+
+**What it is.** Each query (`Connection.#query`, behind `query` and `queryThen`) creates its promise with one module-level executor, `capture`, which stores the promise's `resolve` and `reject` in two module variables; the query reads them and resets both to a shared no-op straight away.
+
+**Why.** The shared executor is one of the [allocation cuts](#allocation-cuts-for-the-small-query-tail): an executor closing over the query would cost a closure and its context per query. But #25 never cleared the two variables, and a resolving function keeps its promise reachable, and a settled promise its value: **the latest query's whole result stayed alive until the next query started**, so every large fetch ran with the previous one's rows still in memory. The heap snapshot's retainer path was the module context's `capturedReject` → the resolve closure → the `Promise` → the result → `rows`; bisecting the benchmark's equal-work fetch put the step exactly at #25.
+
+**Alternatives.** Back to an executor closure per query: it fixes large results by undoing the cut for every query.
+
+**Cost.** Two stores per query, with no allocation. A regression test drops a result and checks that a `WeakRef` to its rows is cleared after a GC.
+
+**Measured.** Node, equal-work peak RSS: fetching 1M rows 3 times 1,252 → 1,020 MB, and 100k rows 5 times 351 → 282 MB, back to where they were before #25 (1,024 and 280 MB at af58bb2) ([#36](https://github.com/shlokdesai33/quarry/pull/36)).
+
+**Code.** [connection.ts](connection.ts) `capture`, `capturedResolve`, `capturedReject`, `#query`; [test/driver/integration/query.test.ts](../../test/driver/integration/query.test.ts).
 
 ### One sweep timer for every idle connection
 
@@ -800,6 +948,18 @@ Before, the stall rule narrowed pools only once callers outnumbered connections 
 
 **Code.** [connection.ts](connection.ts) `TERMINATED`, `#dispatch`, `#fail`; [pool.ts](pool.ts) `#rerun`.
 
+### `withShared`: several queries as one pipeline slot
+
+**What it is.** `pool.withShared(fn, { signal })` (internal) claims one pipeline slot the way `query()` does (an idle connection, a busy one once the pool is full or at its width, or the next free slot in the FIFO), runs `fn` on that connection, and ends the slot when `fn`'s promise settles. quarry's executor sends a default `db.batch` through it: the batch's statements go out together on one connection, each with its own Sync, counted as one query of that connection's pipeline and one completion for the width ([POOL.md](POOL.md#how-quarry-uses-the-pool)).
+
+**Why.** A batch has to stay on one connection to go out in one write, but it leaves nothing on the connection, so reserving the connection was waste: on the exclusive path, which every quarry operation took before [#37](https://github.com/shlokdesai33/quarry/pull/37), its callers beyond `max` waited for a whole connection while the others pipelined. #37 moved builder queries to `pool.query` and batches to `withShared` ([../DECISIONS.md](../DECISIONS.md#plain-queries-share-the-pools-pipelined-connections)).
+
+**Alternatives.** The exclusive path (`#with`, as before #37). Each statement through `query()`: spread over several connections, in several writes.
+
+**Cost.** `fn` must issue all its queries before its promise settles and leave no session or transaction state behind; the pool can't check either, so the method is internal, for the executor. With `pipeline: 1`, or once the pool has ended, it takes the exclusive path.
+
+**Code.** [pool.ts](pool.ts) `withShared`, `#withShared`, `#runShared`; [../driver-executor.ts](../driver-executor.ts) `batch`.
+
 ### Pool policies: LIFO idle, jittered lifetime, safe release, fail fast
 
 **What it is.**
@@ -854,13 +1014,11 @@ Before, the stall rule narrowed pools only once callers outnumbered connections 
 
 ### SCRAM with `node:crypto`, and a derived-key cache
 
-**Status.** The WebCrypto fallback is superseded by [Node only](#node-only): `node:crypto` is always there, so it was removed.
-
-**What it is.** SCRAM's HMACs and hashes use `node:crypto` synchronously where the runtime has it (PBKDF2 still runs off the main thread), with WebCrypto as the fallback; the derived keys are cached per (password, salt, iterations) in a 16-entry LRU; and the crypto module loads right after the startup message is sent, while the server starts its backend ([auth/README.md](auth/README.md#scram-sha-256)).
+**What it is.** SCRAM's HMACs and hashes use `node:crypto` synchronously (PBKDF2 still runs off the main thread); the derived keys are cached per (password, salt, iterations) in a 16-entry LRU; and `node:crypto` loads (through `process.getBuiltinModule`) right after the startup message is sent, while the server starts its backend ([auth/README.md](auth/README.md#scram-sha-256)).
 
 **Why.** SCRAM makes about 10 hash calls per connect; each WebCrypto call is a round trip through Node's thread pool. PBKDF2 (thousands of iterations, slow on purpose) would otherwise run on every connect, though the salt only changes with the password.
 
-**Alternatives.** WebCrypto only (before #17); `pbkdf2Sync` (postgres.js: blocks the event loop).
+**Alternatives.** WebCrypto only (before #17; then kept as a fallback for runtimes without `node:crypto` until [Node only](#node-only) removed it); `pbkdf2Sync` (postgres.js: blocks the event loop).
 
 **Cost.** The cache holds derived keys in memory; they grant nothing beyond the password already in the configuration.
 
@@ -874,7 +1032,7 @@ Before, the stall rule narrowed pools only once callers outnumbered connections 
 
 **Why.** `tls.connect({ ca })` builds a context per connection, re-parsing the CA: ~0.15 ms per build, ~0.3 ms per connect on Node.
 
-**Cost.** None visible; neutral on Bun.
+**Cost.** None visible.
 
 **Code.** [node-socket.ts](node-socket.ts) `secureContext`; [connect.ts](connect.ts) `tlsOptions`.
 
@@ -936,7 +1094,7 @@ Before, the stall rule narrowed pools only once callers outnumbered connections 
 
 **Alternatives.** BEGIN as its own round trip (every other driver). Pipeline BEGIN with its own Sync (saves the round trip, but a failed BEGIN lets the next statement run in autocommit).
 
-**Cost.** The callback starts before BEGIN is acknowledged (it has to, to produce the statement that shares the Sync); side effects before its first statement still happen if BEGIN fails. A first statement that needs its own Sync (with a `signal` or `timeout`, or a cursor) gets BEGIN separately. BEGIN and `set_config` are sent unprepared (they run once per transaction and can't go stale).
+**Cost.** The callback starts before BEGIN is acknowledged (it has to, to produce the statement that shares the Sync); side effects before its first statement still happen if BEGIN fails. A first statement that needs its own Sync (with a `signal`, `timeout`, `statementTimeout` or `onTiming`, or a cursor) gets BEGIN separately. BEGIN and `set_config` are sent unprepared (they run once per transaction and can't go stale).
 
 **Measured.** Round trips: begin; statement; commit 3 → 2; an empty transaction 2 → 1. `begin; select 1; commit` on a direct connection 13,447 → 17,407/s (+29%); at 5 ms RTT 56.5 → 84.6/s (+50%); at 20 ms a short transaction takes 41.7 ms against 62.6–62.9 ms for every other client ([#18](https://github.com/shlokdesai33/quarry/pull/18)).
 
@@ -1036,7 +1194,7 @@ Before, the stall rule narrowed pools only once callers outnumbered connections 
 
 **Why.** Values are never interpolated into SQL, and a transaction-local setting can't leak into another client's session behind a pooler, where `SET` would persist on a server connection someone else gets next.
 
-**Code.** [transaction.ts](transaction.ts) `settingsQuery`; [connection.ts](connection.ts) `#queryWithTimeout`.
+**Code.** [transaction.ts](transaction.ts) `settingsQuery`; [ops.ts](ops.ts) `STATEMENT_TIMEOUT`; [connection.ts](connection.ts) `#queryWithTimeout`.
 
 ## Cursors and streams
 
@@ -1246,13 +1404,25 @@ Before, the stall rule narrowed pools only once callers outnumbered connections 
 
 ### Server-side statement timeouts, transaction-local and pipelined
 
-**What it is.** A per-query `statementTimeout` is enforced by the server with `set_config('statement_timeout', $1, true)` ([CANCELLATION.md](CANCELLATION.md#statement-timeouts)).
+**What it is.** A per-query `statementTimeout` is enforced by the server with `set_config('statement_timeout', $1, true)`, pipelined with the query in the same write ([CANCELLATION.md](CANCELLATION.md#statement-timeouts); the framing is [below](#a-statement-timeout-is-framed-under-the-querys-sync-whatever-the-transaction-status)). The driver's other per-query bound, `timeout`, is a client-side timer that sends a cancel request when it fires. quarry's `execute({ timeout })` and `stream({ timeout })` use `statementTimeout`.
 
 **Why.** A client-side timer can only ask the server to stop; a server-side timeout stops the work even if the client is stuck or the network is down. Transaction-local, so it can't leak through poolers.
 
-**Alternatives.** pg's `query_timeout` doesn't cancel on the server.
+**Alternatives.** pg's `query_timeout` doesn't cancel on the server. A client-side timer alone (the driver's `timeout`): the cancel request is a new connection to the server, and nothing stops the query if it can't get through.
 
-**Code.** [connection.ts](connection.ts) `#queryWithTimeout`.
+**Code.** [connection.ts](connection.ts) `#queryWithTimeout`; [ops.ts](ops.ts) `STATEMENT_TIMEOUT`; [../driver-executor.ts](../driver-executor.ts) `#queryOptions`.
+
+### A statement timeout framed by the transaction status
+
+**Superseded** by [A statement timeout is framed under the query's Sync, whatever the transaction status](#a-statement-timeout-is-framed-under-the-querys-sync-whatever-the-transaction-status) (#38).
+
+**What it was.** Until #38, a timed query read the connection's transaction status when it was issued. Outside a transaction it went out as `begin`, `select set_config('statement_timeout', $1, true)`, the query and `commit`, each with its own Sync, pipelined in one write; inside one, as a statement reading the previous value and setting the new one, pipelined with the query, and the previous value restored once the answer came. Cursors were framed the same way ([above](#a-statement-timeout-bounds-the-whole-stream)).
+
+**Why.** Transaction-local, so the timeout couldn't leak into the session; one write, so no extra round trip.
+
+**Cost.** The status is the last ReadyForQuery's, which says nothing about what is queued or in flight: on a pipelined connection, a timed query behind another caller's unanswered `begin` committed that transaction with its own `commit`, and one behind a queued `commit` ran unbounded. The next entry has the details and the fix.
+
+**Code.** [connection.ts](connection.ts) `#queryWithTimeout` (before #38).
 
 ### A statement timeout is framed under the query's Sync, whatever the transaction status
 
@@ -1303,6 +1473,47 @@ Untimed lookups are unchanged (77,092, 79,339, 14,941 and 56,411/s before).
 
 **Code.** [connect.ts](connect.ts), [pool.ts](pool.ts), [connection.ts](connection.ts).
 
+## Observability
+
+### OpenTelemetry spans through a structural tracer, without parameters
+
+**What it is.** The connection option `telemetry: { tracer, queryText? }` (which a pool passes to each of its connections) takes anything shaped like an OpenTelemetry `Tracer`: `TracerLike` and `SpanLike` are structural interfaces holding only `startSpan`, `setAttribute`, `setStatus`, `recordException` and `end`, so `trace.getTracer('…')` from `@opentelemetry/api` can be passed straight in. Each statement sent through `query`, `queryGroup`, `simpleQuery`, `copyFrom` or `copyRows` (which goes through `copyFrom`) is one client span, `BEGIN` and `COMMIT` included. A span is named after the query's tag (quarry's `tag()`), or else `` `${operation} ${database}` ``. It carries the database semantic conventions' attributes: `db.system.name`, `db.namespace`, `db.operation.name`, `server.address`, `server.port` (left out for a Unix socket), `db.query.text` (unless `queryText: false`), `db.query.summary` (the tag) and `db.response.returned_rows`. On failure it adds `db.response.status_code`, `error.type` (the SQLSTATE for a `PostgresError`, the error's `name` otherwise), the recorded exception and an error status. Parameter values are never recorded ([ARCHITECTURE.md](ARCHITECTURE.md#spans), [../EXECUTION.md](../EXECUTION.md#opentelemetry-spans-and-tags)).
+
+**Why.**
+
+- _No dependency._ The driver has no runtime dependencies. Taking the tracer by shape keeps OpenTelemetry the application's choice and version; the driver doesn't pin `@opentelemetry/api`.
+- _Parameters are data._ They hold passwords, tokens and personal data, and span exporters send everything to a third party. The SQL text is parameterised, so it holds no values, and `queryText: false` turns it off where the statements themselves are sensitive.
+- _Free when unset._ Without `telemetry` (and without `captureStack`), `query` calls `#query` directly; `#observe` and its closure are skipped.
+
+**Alternatives.**
+
+- Depend on `@opentelemetry/api` and use the global tracer: a dependency, and a version to keep in step with the application's.
+- Node's `diagnostics_channel` tracing channels: no dependency either, but every application would need a subscriber to turn events into spans.
+- Spans from quarry's builder instead of the driver: they would miss `BEGIN`, `COMMIT` and savepoints, and the driver used on its own would have none.
+
+**Cost.** Cursors and streams, `copyTo`, `describe` and the catalog lookup make no span. A span covers the statement on its connection, not the wait for a pooled connection. Without a tag, the name falls back to the first keyword, so untagged queries group as `SELECT mydb`.
+
+**Code.** `TracerLike`, `SpanLike`, `TelemetryOptions` and `startQuerySpan` in [telemetry.ts](telemetry.ts); `#observe` and the `query`, `queryThen`, `queryGroup`, `simpleQuery` and `copyFrom` paths in [connection.ts](connection.ts); `telemetry` in [config.ts](config.ts).
+
+### Server notices go to listeners, and a listener can't break the connection
+
+**What it is.** NoticeResponse (warnings, `RAISE NOTICE`) and NotificationResponse (`NOTIFY`) answer no request. The connection hands them to listeners before it looks at the op at the head of its queue, whatever is running, and for notices during startup too. The `onNotice` and `onNotification` options apply to every connection of a pool; the `connection.onNotice` and `connection.onNotification` methods add a listener and return a function that removes it. A notice becomes a `Notice` with `severity` (from the non-localized field), `code`, `message`, `detail`, `hint`, `where`, and `fields` holding every field the server sent. A listener that throws has its error rethrown in a microtask (`queueMicrotask`) ([ARCHITECTURE.md](ARCHITECTURE.md#notices-and-notifications)).
+
+**Why.**
+
+- _An op only understands replies to what it sent._ A notice read among a query's rows would be an unexpected message: a `ProtocolError`, which closes the connection.
+- _Listeners run inside the reader's loop._ There, `#onData` would catch a listener's exception and fail the connection and every query on it, for a bug in logging code. Rethrown in a microtask, the error still surfaces as an uncaught exception the application sees, and the connection is left alone.
+
+**Alternatives.**
+
+- Swallow listener errors: a broken listener would go unnoticed.
+- Emit through an `EventEmitter`: a listener's exception still propagates into the emitting code.
+- Attach each notice to the query that was running: with several statements pipelined, the server doesn't say which one a notice belongs to.
+
+**Cost.** A listener's error is reported after the message that triggered it, asynchronously. Notices are dropped when there is no listener.
+
+**Code.** [connection.ts](connection.ts) `#dispatch`, `#emit`, `#notify`, `onNotice`, `onNotification`; [notice.ts](notice.ts) `toNotice`.
+
 ## Runtimes
 
 ### Node only
@@ -1319,27 +1530,29 @@ Untimed lookups are unchanged (77,092, 79,339, 14,941 and 56,411/s before).
 
 ### One small socket interface
 
-**Status.** Superseded in part by [Node only](#node-only). The interface stays, for custom `socket` factories, tests and the walkthrough's byte captures, but Node's is now the only adapter; the Bun, Deno and Workers support described below is history.
+**Superseded** by [Node only](#node-only) (#49).
 
-**What it is.** The driver core only talks to `DriverSocket` (write, startTls, pause/resume, end/destroy, four events), with adapters for Node's `net`/`tls` (Node, Bun, Deno) and `cloudflare:sockets` (Workers) ([ARCHITECTURE.md](ARCHITECTURE.md#part-11-sockets)).
+The interface itself stays: the config's `socket` option takes a custom factory (by default Node's `net`/`tls`, [node-socket.ts](node-socket.ts)), and tests and the walkthrough's byte captures use a fake socket through it. What #49 removed is the reason below, running on several runtimes: Node's is now the only adapter.
 
-**Why.** One code base runs everywhere, and a new runtime needs one small adapter. Tests and the walkthrough's byte captures use a fake socket through the same interface.
+**What it was.** The driver core only talks to `DriverSocket` (write, startTls, pause/resume, end/destroy, four events), with adapters for Node's `net`/`tls` (then used on Node, Bun and Deno) and `cloudflare:sockets` (Workers) ([ARCHITECTURE.md](ARCHITECTURE.md#part-11-sockets)).
+
+**Why.** One code base for every runtime, each needing one small adapter. Tests and the walkthrough's byte captures use a fake socket through the same interface.
 
 **Alternatives.** Text-transpiled per-runtime copies (postgres.js's `cf/` and `deno/`); Node compatibility layers only.
 
-**Cost.** Bun runs on its JavaScript `node:net` (~5 ms to load cold); a native `Bun.connect` adapter is a possible follow-up.
+**Cost.** Bun ran on its JavaScript `node:net` (~5 ms to load cold).
 
-**Code.** [socket.ts](socket.ts), [node-socket.ts](node-socket.ts); `cloudflare-socket.ts` (removed).
+**Code.** [socket.ts](socket.ts), [node-socket.ts](node-socket.ts); `cloudflare-socket.ts` (removed in #49).
 
 ### Counting bytes for backpressure on Workers
 
-**Status.** Superseded by [Node only](#node-only): the Workers adapter was removed.
+**Superseded** by [Node only](#node-only) (#49).
 
-**What it is.** The Workers adapter counts the bytes whose writes haven't completed and reports a full buffer at 64 KiB.
+**What it was.** The Workers adapter, removed with the other runtimes, counted the bytes whose writes hadn't completed and reported a full buffer at 64 KiB.
 
 **Why.** workerd's socket `WritableStream` always reports `desiredSize === 1`, however much is queued (a probe queued 4 MiB without the value changing), so `write` never returned false and backpressure never engaged on Workers.
 
-**Code.** `cloudflare-socket.ts` `HIGH_WATER_MARK` (removed).
+**Code.** `cloudflare-socket.ts` `HIGH_WATER_MARK` (removed in #49).
 
 ## Errors and safety
 

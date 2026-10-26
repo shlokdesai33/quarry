@@ -8,7 +8,7 @@ Everything a client and a PostgreSQL server say to each other is a sequence of *
 | [writer.ts](writer.ts)     | `Writer`: builds many messages into one growable buffer, back-filling each length.                             |
 | [reader.ts](reader.ts)     | `Reader`: splits incoming bytes into complete **server** messages, and decodes them; the notification decoder. |
 | [messages.ts](messages.ts) | Types only: `BackendMessage` (every server message), `Field` (a result column), `NoticeFields`.                |
-| [text.ts](text.ts)         | UTF-8 helpers: `utf8` (decode), `allocate` (a Node `Buffer` where possible), `asBuffer`.                       |
+| [text.ts](text.ts)         | UTF-8 helpers: `utf8` (decode), `allocate` (a new Node `Buffer`), `asBuffer`.                                  |
 
 The official reference is the PostgreSQL documentation's [Frontend/Backend Protocol](https://www.postgresql.org/docs/current/protocol.html) chapter. [../../WALKTHROUGH.md](../../WALKTHROUGH.md) shows real captured bytes for a whole query.
 
@@ -136,15 +136,18 @@ flowchart LR
 - A **prepared statement** is the parsed and planned SQL. The **unnamed** statement (`''`) is replaced by the next Parse of the unnamed statement; a **named** one lasts until closed or the session ends.
 - A **portal** is a statement bound to values, ready to run. The driver always uses the unnamed portal.
 - **Execute with max rows** returns at most that many rows and suspends the portal; another Execute continues it. That is how cursors fetch in batches ([../STREAMING.md](../STREAMING.md#cursors)).
-- **Flush** asks the server to send what it has without ending the segment: cursors use Execute + Flush so the portal stays open between batches.
+- **Flush** asks the server to send what it has without ending the segment: cursors use Execute + Flush so the portal stays open between batches, and a cursor's first Describe is followed by a Flush too, so its columns arrive before the first batch is asked for.
 
 What the driver writes for one query, depending on the cache ([../ARCHITECTURE.md](../ARCHITECTURE.md#queryopwrite-four-ways-to-send-one-statement)):
 
 ```
 new statement:     Parse("q1", sql) Describe(S "q1") Bind("", "q1", values, text) Execute("", 0) Sync
 cached statement:  Bind("", "q1", values, formats) Execute("", 0) Sync
+unnamed, cached:   Parse("", sql) Bind("", "", values, cached formats) Describe(P "") Execute("", 0) Sync
 unprepared:        Parse("", sql) Bind("", "", values, text) Describe(P "") Execute("", 0) Sync
 ```
+
+The third form is for a preparable statement written unnamed (`ctx.named()` is false): behind a pooler that rewrites named statements, a query pipelined with others is sent this way, and behind one that can't keep named statements at all, every query is. It is parsed again each time, but once its columns have been described (cached on the connection under the name `''`) they are bound in the formats their codecs read, and in text until then.
 
 ## Errors, Sync and pipelining
 
@@ -157,7 +160,7 @@ S< ErrorResponse ReadyForQuery                  ← q2 failed; skipped to its Sy
 S< BindComplete DataRow CommandComplete ReadyForQuery   ← the third still runs
 ```
 
-With one Sync per query, a failure affects only that query. With several statements under one Sync (`SyncGroupOp`), the first failure skips the rest, which the driver uses deliberately for BEGIN + first statement and for transactional batches ([../TRANSACTIONS.md](../TRANSACTIONS.md)).
+With one Sync per query, a failure affects only that query. With several statements under one Sync (`SyncGroupOp`), the first failure skips the rest, which the driver uses deliberately for BEGIN + first statement, for transactional batches ([../TRANSACTIONS.md](../TRANSACTIONS.md)), and for a query with a statement timeout: `#queryWithTimeout` in [../connection.ts](../connection.ts) sends the `STATEMENT_TIMEOUT` statement (its parameter declared as `text`, OID 25) to set the timeout, then the query, then the same statement again to restore it, all under one Sync, so the setting lives only in that implicit transaction.
 
 ErrorResponse and NoticeResponse share a body format: repeated `Byte1 field code` + `String value`, ended by a zero byte. Codes: `S`/`V` severity (`V` is never translated), `C` SQLSTATE, `M` message, `D` detail, `H` hint, `P` position, `W` where, `s` schema, `t` table, `c` column, `d` data type, `n` constraint, `F` file, `L` line, `R` routine, and a few more. `noticeFields()` reads them into an object; [../errors.ts](../errors.ts) maps them to properties.
 
@@ -219,11 +222,11 @@ socket.write(w.take());
 - **`begin(type)`** writes the type byte, remembers where the length goes, and skips 4 bytes. **`end()`** writes the length (`pos − start`) back into that slot. Messages are written front to back without knowing their size in advance.
 - **`#ensure(n)`** grows the buffer by doubling (amortised constant time per byte).
 - **`int8/16/32`** write big-endian through a `DataView`.
-- **`string(value)`** encodes UTF-8 in place. Short ASCII strings (most parameters) are copied character by character, cheaper than creating a view for `TextEncoder.encodeInto`. Long strings reserve one byte per character first and only grow for what didn't fit: most text is ASCII, and reserving 3 bytes per character (the UTF-8 worst case for JavaScript strings) would triple the buffer for large values.
+- **`string(value)`** encodes UTF-8 in place. Strings of up to 64 characters (most parameters) are copied character by character while they are ASCII, cheaper than creating a view for `TextEncoder.encodeInto`; the first non-ASCII character hands the string to `encodeInto`. A longer string goes straight to `encodeInto` when the buffer already has 3 bytes per character free. Otherwise it reserves one byte per character first and only grows for what didn't fit: most text is ASCII, and reserving 3 bytes per character (the UTF-8 worst case for JavaScript strings) would triple the buffer for large values.
 - **`cstring(value)`** refuses a NUL character (it would end the string early, changing what the server reads), then writes the zero terminator.
 - **`value(v)`** writes a length-prefixed value for Bind: −1 for `null`, the bytes of a `Uint8Array`, or a string's UTF-8 with its length back-filled.
 - **`truncate(length)`** drops what was written after `length`: if an op throws halfway through writing itself, the connection cuts its partial messages out, so the buffer stays valid.
-- **`take()`** returns the bytes and resets the writer. Small outputs are copied into a Node `Buffer` (from Node's shared pool, so cheap, and accepted by Node's socket without wrapping); a buffer that grew past 1 MiB (`MAX_RETAINED`) for one big message is handed over as is and replaced with a fresh small one, so it isn't copied, nor kept for the connection's lifetime.
+- **`take()`** returns the bytes and resets the writer. While the buffer is at most 1 MiB (`MAX_RETAINED`), the output is copied into a new Node `Buffer` (`allocate`; small ones come from Node's shared pool, so cheap, and Node's socket accepts them without wrapping), by a plain loop for up to 256 bytes and `set` above. A buffer that grew past 1 MiB for one big message is handed over as is and replaced with a fresh small one, so it isn't copied, nor kept for the connection's lifetime.
 
 ## The reader
 
@@ -236,6 +239,8 @@ for (let type = reader.nextType(); type >= 0; type = reader.nextType()) {
   const msg = reader.parse(); // or read the body directly (DataRow)
 }
 ```
+
+`next()` combines the two (`nextType()`, then `parse()`, or `undefined` when more bytes are needed), for callers that want message objects. `textValues(payload)` reads a DataRow body's values as text strings, `null` for SQL NULL; the tests use it.
 
 ### Reading in place
 
@@ -252,7 +257,7 @@ When `push` arrives while unread messages remain in the current chunk (the calle
 
 ### Bounds and limits
 
-Every length is checked: a message length below 4 or above `maxMessageSize` (default 1 GiB) is a `ProtocolError`, so a corrupt or hostile length can't make the driver allocate without bound. Inside a body, the `Cursor` helper checks every read stays within the message (`#need`), and `cstring` requires its terminator inside it. A DataRow's value lengths are checked by the row decoder.
+Every length is checked: a message length below 4 or above `maxMessageSize` (default 1 GiB; the connection option of the same name passes another to the `Reader` constructor) is a `ProtocolError`, so a corrupt or hostile length can't make the driver allocate without bound. Inside a body, the `Cursor` helper checks every read stays within the message (`#need`), and `cstring` requires its terminator inside it. A DataRow's value lengths are checked by the row decoder.
 
 ### Decoding
 
@@ -271,7 +276,7 @@ Every length is checked: a message length below 4 or above `maxMessageSize` (def
 
 ### UTF-8: [text.ts](text.ts)
 
-`utf8(bytes, start, end)` decodes natively when the bytes are a `Buffer` (fast for short strings), with `Buffer#utf8Slice`: the call `toString('utf8', …)` makes after checking its arguments (about 10% less per short string). Otherwise it builds short ASCII strings by hand and uses `TextDecoder` for the rest. `asBuffer` wraps a chunk as a `Buffer` sharing its memory (no copy) so that fast path applies.
+`utf8(bytes, start, end)` decodes natively when the bytes are a `Buffer` (fast for short strings), with `Buffer#utf8Slice`: the call `toString('utf8', …)` makes after checking its arguments (about 10% less per short string). Other byte arrays build strings of up to 24 ASCII bytes by hand and use `TextDecoder` for the rest. `asBuffer` wraps a chunk as a `Buffer` sharing its memory (no copy) so that fast path applies, and `allocate(size)` is `Buffer.allocUnsafe(size)`, so buffers the driver creates take it too.
 
 ## Decisions
 
@@ -285,6 +290,7 @@ Why the protocol layer works this way. Each links to its full entry (what it is,
 - [DataRow fast path: no message objects for rows](../DECISIONS.md#datarow-fast-path-no-message-objects-for-rows): rows go straight to the decoder.
 - [Strict bounds checks on every read](../DECISIONS.md#strict-bounds-checks-on-every-read): a protocol error closes the connection instead of corrupting later results.
 - [Shared constant messages and repeated-string caches](../DECISIONS.md#shared-constant-messages-and-repeated-string-caches): the messages every query receives cost nothing.
+- [`Buffer` read from `node:buffer` once](../DECISIONS.md#buffer-read-from-nodebuffer-once): no global accessor read per decoded string.
 - [A NOTIFY fast path and a channel-name cache](../DECISIONS.md#a-notify-fast-path-and-a-channel-name-cache): notifications without message objects.
 
 ## Glossary

@@ -1,10 +1,10 @@
 /* oxlint-disable no-await-in-loop -- measurements run one at a time */
 /**
  * Footprint and cold start: per client, install size and dependency count
- * (a clean `npm install` of the published package), minified bundle size
- * (esbuild, platform node), module import time and process-start → first
- * query result. Needs the environment from env.ts running
- * (orchestrate.ts starts it; or run this after `node env-up.ts`).
+ * (a clean `npm install --omit=dev` of its package; quarry's is the tarball
+ * `pnpm pack` makes), minified bundle size (esbuild, platform node), module
+ * import time and process-start → first query result. Starts the
+ * environment from env.ts itself.
  *
  *   node footprint.ts [--id name] [--reps 15]
  */

@@ -13,7 +13,7 @@ The rest of the builder documentation:
 | [EXPRESSIONS.md](EXPRESSIONS.md)     | The expression builder (`eb`): references, values, comparison methods, functions, jsonb, `and`/`or`/`not` |
 | [QUERIES.md](QUERIES.md)             | The select, insert, update and delete builders; result shapes (`execute`, `take…`, `expect…`); errors     |
 | [COMPILER.md](COMPILER.md)           | How the node tree becomes SQL text, parameters and codecs (`compile.ts`)                                  |
-| [EXECUTION.md](EXECUTION.md)         | `database()`, executors, how the builder hands queries to the driver, `db.batch`, transactions, `onQuery` |
+| [EXECUTION.md](EXECUTION.md)         | `database()`, executors, shared vs own connections, `db.batch`, transactions, `stream`, `onQuery`, spans  |
 | [PAGINATION.md](PAGINATION.md)       | Keyset pagination: `iterateChunks`, `paginateByCursor`, `paginateByOffset`, exact keys, cursors           |
 | [DECISIONS.md](DECISIONS.md)         | Every design decision and trick in the builder: what, why, alternatives, cost, measured impact            |
 | [WALKTHROUGH.md](WALKTHROUGH.md)     | One real query traced end to end, down to the bytes on the wire and back                                  |
@@ -118,7 +118,7 @@ flowchart TD
     B["Builders<br/>db.selectFrom(users).where(…).select(…)<br/>(select-query-builder.ts, insert-…, update-…, delete-…)"]
     C["Expression builder<br/>eb.ref('users.age').gte(18)<br/>(expression-builder.ts, expression-methods.ts, comparison.ts, functions.ts, json.ts)"]
     D["Node tree: plain immutable data<br/>{ kind: 'select', selections, from, joins, where, … }<br/>(node.ts)"]
-    E["compile()<br/>→ CompiledQuery { sql, params, paramCodecs, resultCodecs, tag }<br/>(compile.ts)"]
+    E["compile()<br/>→ CompiledQuery { sql, params, paramCodecs, resultCodecs, nested, tag }<br/>(compile.ts)"]
     F["Result shape → Query<br/>execute / takeFirst / expectOne …<br/>(query.ts, shape.ts)"]
     G["Executor interface<br/>(executor.ts)"]
     H["DriverExecutor<br/>(driver-executor.ts)"]
@@ -161,7 +161,7 @@ Files are listed by layer. "Public" means exported from [index.ts](index.ts), th
 | [define-type.ts](define-type.ts)           | `defineType({ sql, codec })`: returns a column factory for a type quarry has no factory for.                                                                                                           |
 | [range.ts](range.ts)                       | The `Range<T>` value type and `isRange`.                                                                                                                                                               |
 | [types.ts](types.ts)                       | `Schema`, `Prettify`, and the row helpers `InferSelectType`, `InferInsertType`, `InferUpdateType`.                                                                                                     |
-| [call-site.ts](call-site.ts)               | Captures and resolves where a factory was called (file, line, column), for `db.verify`'s code frames.                                                                                                  |
+| [call-site.ts](call-site.ts)               | Captures where a table, column, enum or custom type was defined (one stack frame), and resolves it to file, line and column, for `db.verify`'s and the CLI's code frames.                              |
 
 ### Expressions
 
@@ -190,8 +190,9 @@ Files are listed by layer. "Public" means exported from [index.ts](index.ts), th
 | [delete-query-builder.ts](delete-query-builder.ts) | `deleteFrom`, `DeleteQueryBuilder` (`where`, `allRows`, `returning`, `when`).                                                                                                                                                                                                                                                         |
 | [write-query.ts](write-query.ts)                   | What the write builders share: `WriteQueryBuilder` (shapes, `expectRows`, `execute`), and the helpers that turn values into `SetNode`s and `RowsNode`s.                                                                                                                                                                               |
 | [row.ts](row.ts)                                   | The select list: `Selection`, the row type it produces (`RowOf`, `AddRow`), and `selectionNodes()`.                                                                                                                                                                                                                                   |
+| [nest.ts](nest.ts)                                 | `nest(table, columns?)` in a select list: a joined table's columns as one object of the row, null where an outer join found no row (`Nested`, `Nest`, `SelectBuilder`, `nestOf`).                                                                                                                                                     |
 | [node.ts](node.ts)                                 | Types only: every node of the tree (`OperationNode`, `SelectNode`, `InsertNode`, …).                                                                                                                                                                                                                                                  |
-| [compile.ts](compile.ts)                           | `compile(node)`: node tree → `CompiledQuery`.                                                                                                                                                                                                                                                                                         |
+| [compile.ts](compile.ts)                           | `compile(node)`: node tree → `CompiledQuery`, the SQL rendered through a trie of its pieces; `isDataStatement`, which tells the executor a query came from a builder.                                                                                                                                                                 |
 | [query.ts](query.ts)                               | `Query<T>`: a compiled query plus how to read its result; `rejectAwait`; `Executable`.                                                                                                                                                                                                                                                |
 | [shape.ts](shape.ts)                               | The result shapes (`allRows`, `takeFirst`, `takeValue`, `expectNonEmpty`, `expectFirst`, `expectOne`, `expectAtMostOne`, `expectValue`).                                                                                                                                                                                              |
 
@@ -201,7 +202,7 @@ Files are listed by layer. "Public" means exported from [index.ts](index.ts), th
 | ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [database.ts](database.ts)               | `database(source, options)`: the `Database` object (`selectFrom`, `insertInto`, `update`, `deleteFrom`, `sql`, `batch`, `transaction`, `verify`, `close`). |
 | [executor.ts](executor.ts)               | The `Executor` interface the builder runs on, its option types, and `NoRowError`, `TooManyRowsError`, `RowCountError`.                                     |
-| [driver-executor.ts](driver-executor.ts) | `DriverExecutor`: the `Executor` built on the driver's pool, client, connection or transaction; `onQuery` events; error decoration.                        |
+| [driver-executor.ts](driver-executor.ts) | `DriverExecutor`: the `Executor` on the driver's pool, client, connection or transaction; shared or own connections; `onQuery`; error decoration.          |
 | [batch.ts](batch.ts)                     | `db.batch()` and `BatchError`.                                                                                                                             |
 | [errors.ts](errors.ts)                   | `violatedColumns(error, table)`: maps a constraint error's columns back to your TypeScript keys.                                                           |
 | [verify/](verify/README.md)              | `db.verify`.                                                                                                                                               |
@@ -322,7 +323,7 @@ The decisions that shape the whole builder. Each paragraph links to where it liv
 
 **One `Executor` interface between the builder and the driver.** [executor.ts](executor.ts) is small (`execute`, `stream`, `describe`, `batch`, `transaction`, `close`). The real one is `DriverExecutor`; tests use an in-memory one; nothing in the builders knows the difference. [EXECUTION.md](EXECUTION.md). Decision: [One small `Executor` interface between the builder and the driver](DECISIONS.md#one-small-executor-interface-between-the-builder-and-the-driver).
 
-**The driver knows nothing about quarry.** The driver module (`quarry/driver`) has no imports from the builder and could be published alone. Everything quarry-specific (decoding to quarry's column types, `onQuery`, adding your call site to errors) lives in `driver-executor.ts`. [driver/ARCHITECTURE.md](driver/ARCHITECTURE.md#the-driver-knows-nothing-about-quarry). Decision: [The driver knows nothing about the query builder](driver/DECISIONS.md#the-driver-knows-nothing-about-the-query-builder).
+**The driver knows nothing about quarry.** The driver module (`quarry/driver`) has no imports from the builder and could stand on its own. Everything quarry-specific (decoding to quarry's column types, `onQuery`, adding your call site to errors) lives in `driver-executor.ts`. [driver/ARCHITECTURE.md](driver/ARCHITECTURE.md#the-driver-knows-nothing-about-quarry). Decision: [The driver knows nothing about the query builder](driver/DECISIONS.md#the-driver-knows-nothing-about-the-query-builder).
 
 **`db.verify` instead of trusting that code and database agree.** Table definitions describe the database but don't create it. `verify` compares them with the live catalog and points at the line that's wrong. [verify/README.md](verify/README.md). Decision: [`verify` instead of trusting that code and database agree](DECISIONS.md#verify-instead-of-trusting-that-code-and-database-agree).
 
@@ -338,7 +339,7 @@ The decisions that shape the whole builder. Each paragraph links to where it liv
 
 **Column**: a named slot of a table with a type. In quarry, a `Column` object made by a factory such as `text()`, carrying a `DataType` and its select, insert and update TypeScript types.
 
-**CompiledQuery**: the output of `compile()`: `sql`, `params`, and (as getters) `paramCodecs`, `resultCodecs`, plus `tag`.
+**CompiledQuery**: the output of `compile()`: `sql`, `params`, and (as getters) `paramCodecs`, `resultCodecs`, `nested`, plus `tag`.
 
 **Data type** (`DataType`): quarry's object for a SQL type: its `kind` (`'integer'`, `'text'`, …), its codec, and its modifiers (`varchar(320)`).
 
@@ -372,4 +373,4 @@ The decisions that shape the whole builder. Each paragraph links to where it liv
 
 **SQL injection**: changing a query's meaning by smuggling SQL into a value pasted into its text. Parameters prevent it.
 
-**Tag**: a label attached to a query with `.tag('users.byEmail')`, passed to `onQuery` and telemetry, never written into the SQL.
+**Tag**: a label attached to a query with `.tag('users.byEmail')`, passed to `onQuery`, telemetry spans and server errors' `query`, never written into the SQL ([EXECUTION.md](EXECUTION.md#opentelemetry-spans-and-tags)).

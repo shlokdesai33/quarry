@@ -157,15 +157,18 @@ Why not just use the type parameters? Because TypeScript compares objects **stru
 
 The same trick, everywhere:
 
-| Where                                              | Phantom                                    | Carries                                        |
-| -------------------------------------------------- | ------------------------------------------ | ---------------------------------------------- |
-| [column/base-column.ts](column/base-column.ts)     | `$select`, `$insert`, `$update`            | the column's three TypeScript types            |
-| [table.ts](table.ts)                               | `$refs`                                    | every `table.column` reference and its column  |
-| [expression.ts](expression.ts)                     | `_quarry.$type?: T`                        | the type an expression evaluates to            |
-| [expression.ts](expression.ts) `Quantified`        | `$element`, `$dataType`, `$null`, `$typed` | what `any(…)`/`all(…)` holds                   |
-| [select-query-builder.ts](select-query-builder.ts) | `$output`, `$lock`                         | the result row; the locking state              |
-| [write-query.ts](write-query.ts)                   | `$output`, `$missing`                      | the `returning` row; the clauses still missing |
-| [query.ts](query.ts)                               | `$result`                                  | what `execute()` resolves to                   |
+| Where                                              | Phantom                                    | Carries                                                 |
+| -------------------------------------------------- | ------------------------------------------ | ------------------------------------------------------- |
+| [column/base-column.ts](column/base-column.ts)     | `$select`, `$insert`, `$update`            | the column's three TypeScript types                     |
+| [table.ts](table.ts)                               | `$refs`                                    | every `table.column` reference and its column           |
+| [expression.ts](expression.ts)                     | `_quarry.$type?: T`                        | the type an expression evaluates to                     |
+| [expression.ts](expression.ts) `Quantified`        | `$element`, `$dataType`, `$null`, `$typed` | what `any(…)`/`all(…)` holds                            |
+| [table.ts](table.ts) `NullableColumn`              | `$inner?`                                  | the column itself, before an outer join                 |
+| [select-query-builder.ts](select-query-builder.ts) | `$output`, `$lock`, `$nested`              | the result row; the locking state; `nest`'s object keys |
+| [nest.ts](nest.ts) `Nested`                        | `_quarry.$type?: T`                        | the nested object's type in the row                     |
+| [write-query.ts](write-query.ts)                   | `$output`, `$missing`                      | the `returning` row; the clauses still missing          |
+| [sql.ts](sql.ts) `SqlQuery`                        | `$output`                                  | the row type `db.sql<R>` promises                       |
+| [query.ts](query.ts)                               | `$result`                                  | what `execute()` resolves to                            |
 
 On expressions the phantom is optional (`$type?: T`) so the object can be constructed without it; `Expression<infer T>` still infers `T` from it.
 
@@ -208,8 +211,8 @@ The type of a reference argument is `Ref<R>`: the union of every key in scope. T
 
 ```ts
 // select-query-builder.ts
-innerJoin<J extends AnyTable>(table: J): JoinBuilder<T, J, O, L> { … }
-// JoinBuilder.on returns SelectQueryBuilder<[...T, J], O, L>
+innerJoin<J extends AnyTable>(table: J, ..._newName: NewName<T, J>): JoinBuilder<T, J, O, L, K> { … }
+// JoinBuilder.on returns SelectQueryBuilder<[...T, J], O, L, K>
 ```
 
 `innerJoin(users)` doesn't add `users` to the scope of the builder you called it on; it returns a `JoinBuilder` whose `on` callback already sees `[...T, J]` (so the condition can reference the joined table), and whose result is a `SelectQueryBuilder<[...T, J], …>`. Before the join, `'users.email'` is not a `Ref` of the scope, so using it is a type error.
@@ -307,6 +310,22 @@ eq<V extends Q>(value: V): Predicate<N | NullIn<V>>;
 
 The method is generic in its argument so the **result** type can depend on the argument: comparing with an expression that can be null makes the predicate nullable ([next part](#part-5-null-propagation)).
 
+### `case`: a type that grows per branch
+
+`eb.case()` ([case.ts](case.ts)) is typed as three interfaces, one per stage, so each stage offers only what SQL allows there: `CaseStart` has only `when` (Postgres needs at least one branch, so `eb.case().end()` is a type error), `CaseWhen<V, D>` has `when`, `else` and `end`, and `CaseElse<V, D>` only `end`. Each `when` returns a new `CaseWhen` with the result's type added:
+
+```ts
+when<const X extends CaseResult<V, D>>(condition: AnyPredicate, result: X): CaseWhen<V | TypeOfResult<X>, Next<D, X>>;
+end(): Expr<V | null, D>; // on CaseWhen: no else, so null when no branch matches
+```
+
+- `V` is the union of the results' TypeScript types; `end()` without an `else` adds `null`.
+- `D` is the SQL type, `never` until the first result fixes it (`Next`): an expression's own type, or a plain value's by its JavaScript type (`PlainType`: `text`, `integer`, `boolean`, `bigint`, `timestamptz`). `[D] extends [never]` is the [never test](#conditional-types-and-the-never-test).
+- `CaseResult<V, D>` is what a later result may be: a value of the type so far, widened (`Widen`: after `'large'`, any `string`), `null`, or an expression of a SQL type Postgres resolves with `D` (`Compatible`, the same families as comparisons). So `.when(…, 'a').else(1)` and `.else(eb.ref('users.age'))` after a text result are type errors.
+- `end()` returns an `Expr<V, D>`, so the `case` has its kind's methods (`.like(…)` on a text `case`) and is selected with `.as()` like any expression.
+
+The run-time side (`caseType`, which finds the same SQL type from the values and refuses a `case` of only nulls) is in [EXPRESSIONS.md](EXPRESSIONS.md#case).
+
 ## Part 5: Null propagation
 
 In SQL, any comparison involving NULL is NULL ("unknown"). `where` treats unknown as false, but the difference matters when predicates are combined (`not (x = 1)` is NULL, not true, when `x` is NULL) or selected as values. quarry tracks it in types.
@@ -344,6 +363,7 @@ eb.ref('users.name').isDistinctFrom('a'); // Predicate: null-safe
 ```ts
 export type Selection<R extends Refs> =
   Ref<R> | AliasedExpression<unknown, string>;
+export type SelectItem<R extends Refs> = Selection<R> | Nested<unknown, string>; // a select list also takes nest's objects
 
 export type KeyOf<S> = S extends `${string}.${infer C}`
   ? C
@@ -367,7 +387,20 @@ export type RowOf<R extends Refs, S> = { [K in S as KeyOf<K>]: ValueOf<R, K> };
 
 `select(['users.id', 'users.name'])` has `S = 'users.id' | 'users.name'`. `RowOf` maps each selection to a key (the part after the dot, or the alias) and a type (the column's `$select`, or the expression's `T`): `{ id: number; name: string | null }`.
 
-The method signature uses `const S extends readonly Selection<RefsOf<T>>[]` so the array is inferred as a tuple of literal strings, not `string[]`.
+`select`'s signature uses `const S extends readonly SelectItem<RefsOf<T>>[]` so the array is inferred as a tuple of literal strings, not `string[]`. The write builders' `returning` takes `Selection<R>`: columns and aliased expressions, not `nest`'s objects.
+
+### `selectAll`: every column of a table, by the name it goes by
+
+```ts
+selectAll<N extends T[number]['name']>(
+  table: N,
+  ..._unique: UniqueColumns<O, TableRefs<RefsOf<T>, N>>
+): SelectQueryBuilder<T, AddRow<O, RowOf<RefsOf<T>, TableRefs<RefsOf<T>, N>>>, L, K>;
+
+type TableRefs<R extends Refs, N extends string> = Extract<Ref<R>, `${N}.${string}`>;
+```
+
+`N` is one of the names the scope's tables go by (`T[number]['name']`, an alias for an aliased table), so `selectAll('posts')` after `selectFrom(posts.as('p'))`, `selectAll(posts)` and `selectAll()` are all type errors (#42 removed the table-object and argument-less forms; [QUERIES.md](QUERIES.md#select-and-selectall)). `TableRefs` picks the scope's references that start with `N.`, and the row is built from them with the same `RowOf` as an explicit list, so a left-joined table's columns come out `| null` (its references are the `NullableTable`'s). `UniqueColumns` is `UniqueKeys` for a whole table: it rejects a column key already in the row.
 
 ### Adding to the row: `AddRow`
 
@@ -393,16 +426,23 @@ type WhenRow<O, P> = [keyof P] extends [never] ? O : Prettify<O & Partial<P>>;
 
 ### `pipe`: fragments that join
 
-`pipe(piece)` adds a fragment's joins and columns. Its return type is `SelectQueryBuilder<[...T, ...JoinedBy<Q, P>], AddRow<O, Q['$output']>, …>`, where `JoinedBy` reads the tables the fragment's own query has beyond the ones it was declared over:
+`pipe(piece)` adds a fragment's joins, columns, `nest` keys and locking state:
 
 ```ts
+pipe<P extends readonly AnyTable[], Q extends AnyQuery>(
+  piece: (qb: Fragment<P>) => Q,
+  ..._inScope: InScope<T, P>
+): SelectQueryBuilder<[...T, ...JoinedBy<Q, P>], AddRow<O, Q['$output']>, LockAfter<L, Q['$lock']>, K | Q['$nested']>;
+
 type JoinedBy<Q, P extends readonly AnyTable[]> =
-  Q extends SelectQueryBuilder<infer T, unknown, LockState>
+  Q extends SelectQueryBuilder<infer T, infer _O, infer _L, infer _K>
     ? T extends readonly [...P, ...infer J extends AnyTable[]]
       ? J
       : never
     : never;
 ```
+
+`JoinedBy` reads the tables the fragment's own query has beyond the ones it was declared over (`P`), which are its joins, and appends them to the query's tuple. `AnyQuery` is "any select builder, by shape" (`$output`, `$lock`, `$nested`, `toNode()`): a builder over particular tables isn't assignable to one over any tables, since the tables appear in its parameter types, so `Q` is constrained structurally instead. The fragment's own type only needs `P` to be in the query, in any position, which [`InScope`](#inscope-an-impossible-extra-argument) checks.
 
 ### Outer joins: `NullableTable`
 
@@ -454,7 +494,19 @@ type NestedRow<X extends AnyTable, K extends ColumnKey<X>> =
     : { [C in K]: InnerColumn<X['schema']['columns'][C]>['$select'] };
 ```
 
-A table on the outer side of a join gives `{…} | null`, with its columns typed as the table's own, since the object exists only where the table has a row. The base table, an inner join and a cross join give `{…}`. A `rightJoin` after a `nest` makes the object nullable through `NullableRow<O>`, like any selected column. A `Nested<T, A>` is a select-list entry like an aliased expression: `KeyOf` gives its key `A` and `ValueOf` its type `T`. So `UniqueKeys` checks the object's key against the row, and never the columns inside it. `.as(B)` gives a `Nested<T, B>`. Listing a column twice is a type error through an impossible extra argument (`ListedOnce`, built on the same `Repeated` as `UniqueKeys`).
+A table on the outer side of a join gives `{…} | null`, with its columns typed as the table's own, since the object exists only where the table has a row. The base table, an inner join and a cross join give `{…}`. A `rightJoin` after a `nest` makes the object nullable through `NullableRow<O>`, like any selected column. `InnerColumn` unwraps `$inner` recursively, so a table left-joined and then on the earlier side of a right join still reads its `not null` columns as non-null inside the object. A `Nested<T, A>` is a select-list entry like an aliased expression: `KeyOf` gives its key `A` and `ValueOf` its type `T`. So `UniqueKeys` checks the object's key against the row, and never the columns inside it. `.as(B)` gives a `Nested<T, B>`. Listing a column twice is a type error through an impossible extra argument (`ListedOnce`, built on the same `Repeated` as `UniqueKeys`).
+
+| Join kind of the nested table                              | `left.select(({ nest }) => [nest('bookings', ['id'])])` gives |
+| ---------------------------------------------------------- | ------------------------------------------------------------- |
+| `from`, `innerJoin`, `crossJoin`                           | `{ bookings: { id: number } }`                                |
+| `leftJoin`, `fullJoin`, or before a `rightJoin`/`fullJoin` | `{ bookings: { id: number } \| null }`                        |
+
+What is a type error ([test/nest.test-d.ts](../test/nest.test-d.ts)):
+
+- a table not in the query, or an aliased table by its table name (`nest('users')` after `selectFrom(users.as('u'))`): `N extends T[number]['name']`;
+- a column the table doesn't have, an empty list (`C` is a non-empty tuple), a column listed twice (`ListedOnce`);
+- an object key already in the row, from a column, an alias or another `nest` (`UniqueKeys`);
+- the object's key in `orderBy`, `groupBy`, `distinctOn` (callback forms included), or as a keyset `by` (below).
 
 An object's key holds no column, so it can't be ordered, grouped or keyset-paginated by. Nothing in `O` tells an object from a jsonb column, so the select builder keeps the object keys in a fourth type parameter, `K` (default `never`, read as `$nested`). `select` adds `NestedKey<S[number]>` to it, `when` and `pipe` add their piece's, and the joins carry it. `Key<R, O, K>` (`orderBy`, `groupBy`, `distinctOn`) and `KeyColumn<T, O, K>` (`iterateChunks`, `paginateByCursor`) exclude it. Measured: +0.8% instantiations on the existing type tests, with check time unchanged.
 
@@ -480,19 +532,19 @@ type SetEachRefs<T, K, A> = {
 
 ### Keyset keys: `KeyColumn`
 
-`iterateChunks` and `paginateByCursor` take `by` of type `KeyColumn<T, O>` ([pagination.ts](pagination.ts)):
+`iterateChunks` and `paginateByCursor` take `by` of type `KeyColumns<KeyColumn<T, O, K>>` (one key, or a non-empty tuple of them; [pagination.ts](pagination.ts)):
 
 ```ts
-type KeyColumn<T, O> = {
+type KeyColumn<T, O, N extends string = never> = {
   [K in Ref<RefsOf<T>>]: null extends RefsOf<T>[K]['$select']
     ? never
-    : KeyOf<K> extends keyof O
+    : KeyOf<K> extends Exclude<keyof O, N>
       ? K
       : never;
 }[Ref<RefsOf<T>>];
 ```
 
-A key column must be **non-null** (a seek can't continue past a NULL) and **selected under its own name** (each page's last row gives the next page's start). Both are checked again at run time for JavaScript callers ([PAGINATION.md](PAGINATION.md#the-key-rules)). `paginateByOffset` takes any reference, since it doesn't read keys back; its `countTotal: true` overload adds `total: number` to the result type.
+A key column must be **non-null** (a seek can't continue past a NULL) and **selected under its own name** (each page's last row gives the next page's start). `N` is the builder's `K`: a `nest` object under the column's name holds no column value, so it doesn't count as selecting it. Both are checked again at run time for JavaScript callers ([PAGINATION.md](PAGINATION.md#the-key-rules)). `paginateByOffset` takes any reference, since it doesn't read keys back; its `countTotal: true` overload adds `total: number` to the result type.
 
 ### Streams: `RowStream<O>`
 
@@ -509,7 +561,36 @@ export type WriteOutput<O> = [O] extends [undefined] ? WriteResult : O[];
 
 ### Result shapes
 
-Each shape returns a `Query<R>` whose `R` is computed from the row `O`: `takeFirst(): Query<O | undefined>`, `expectOne(): Query<O>`, `expectNonEmpty(): Query<[O, ...O[]]>` (a non-empty tuple type), `takeValue(): Query<ColumnValue<O> | undefined>` where `ColumnValue<O> = O[keyof O]`. See [QUERIES.md](QUERIES.md#result-shapes).
+Each shape returns a `Query<R>` whose `R` is computed from the row `O` ([shape.ts](shape.ts), [select-query-builder.ts](select-query-builder.ts)):
+
+```ts
+takeFirst(): Query<O | undefined>;
+takeValue(..._oneColumn: ValueArgs<O, []>): Query<ColumnValue<O> | undefined>;
+expectNonEmpty(err?: ErrorFor<NoRowError>): Query<[O, ...O[]]>;
+expectFirst(err?: ErrorFor<NoRowError>): Query<O>;
+expectOne(err?: ErrorFor<NoRowError | TooManyRowsError>): Query<O>;
+expectAtMostOne(err?: ErrorFor<TooManyRowsError>): Query<O | undefined>;
+expectValue(...args: ValueArgs<O, [err?: ErrorFor<NoRowError>]>): Query<ColumnValue<O>>;
+
+type ErrorFor<E extends Error> = (error: E) => Error;
+type ColumnValue<O> = O[keyof O];
+```
+
+- `[O, ...O[]]` is a **non-empty tuple type**: `rows[0]` is `O`, not `O | undefined`, even with `noUncheckedIndexedAccess`.
+- `err` is typed by the errors the shape can throw: `expectOne`'s mapper receives `NoRowError | TooManyRowsError`, `expectFirst`'s only `NoRowError`. It returns any `Error`, which is thrown instead; the result type doesn't change, since a shape either returns its result or throws.
+- `ValueArgs<O, A>` gives the value shapes their real arguments `A` only when `O` has exactly one column (`IsOneColumn<O>`: for every key, no other key is left). For zero columns or several it is `[oneColumn: 'select exactly one column to read a value']`, an argument nobody passes, so the call fails and the message says why ([below](#inscope-an-impossible-extra-argument)). The value is read by position, and an object type doesn't record which column comes first ([decision](DECISIONS.md#takevalue-needs-a-one-column-row)). `expectValue`'s `err` sits inside `A`, as `[err?: ErrorFor<NoRowError>]`, so it is allowed only when the call is.
+
+On **write builders** the same shapes are gated by `this` ([write-query.ts](write-query.ts)): the row shapes take `this: WriteQueryBuilder<O & object, never>` (a `returning` list and nothing missing, [below](#what-a-write-query-still-needs-m)), while `expectNonEmpty` and `expectRows` take `this: WriteQueryBuilder<O, never>` and work with or without `returning`:
+
+```ts
+type NonEmptyOutput<O> = [O] extends [undefined] ? WriteResult : [O, ...O[]];
+expectNonEmpty(this: WriteQueryBuilder<O, never>, err?: ErrorFor<NoRowError>): Query<NonEmptyOutput<O>>;
+expectRows(this: WriteQueryBuilder<O, never>, count: number, err?: ErrorFor<RowCountError>): Query<WriteOutput<O>>;
+```
+
+**`db.sql`** queries ([sql.ts](sql.ts)) have the same shapes on their row type `R`, plus `expectRows(count, err?): Query<SqlResult<R>>`. `R` defaults to `Record<string, unknown>`, whose one key type `string` counts as one column for `IsOneColumn`, so ``db.sql`select 1`.takeValue()`` compiles and reads `unknown`; pass a row type (``db.sql<{ n: string }>`…` ``) to type it.
+
+A `Query` has only `execute()`, `toSQL()` and `toQuery()` ([query.ts](query.ts)), so a shape is the last call: `q.expectOne().takeFirst()`, `update(…).expectRows(1).returning([…])` and `q.expectOne().stream()` are type errors. See [QUERIES.md](QUERIES.md#result-shapes) for what each shape does at run time.
 
 ### `db.batch`: a tuple of results
 
@@ -570,11 +651,24 @@ stateDiagram-v2
 ```
 
 ```ts
-of(this: SelectQueryBuilder<T, O, 'strength'>, ...tables): SelectQueryBuilder<T, O, 'of'>;
-skipLocked(this: SelectQueryBuilder<T, O, 'strength' | 'of'>): SelectQueryBuilder<T, O, 'done'>;
+type LockState = 'none' | 'strength' | 'of' | 'done';
+type LockTarget<T extends readonly AnyTable[]> = T[number] | T[number]['name'];
+
+forUpdate(): SelectQueryBuilder<T, O, 'strength', K>;
+of(
+  this: SelectQueryBuilder<T, O, 'strength', K>,
+  ...tables: readonly [LockTarget<T>, ...LockTarget<T>[]]
+): SelectQueryBuilder<T, O, 'of', K>;
+skipLocked(this: SelectQueryBuilder<T, O, 'strength' | 'of', K>): SelectQueryBuilder<T, O, 'done', K>;
+noWait(this: SelectQueryBuilder<T, O, 'strength' | 'of', K>): SelectQueryBuilder<T, O, 'done', K>;
 ```
 
-So `.forUpdate().skipLocked().of(jobs)` is a type error (`of` must come right after the strength). The run-time methods check the same rules for code that casts around the types. `when` and `pipe` combine the states with `LockAfter<L, B>`: unchanged if the piece added no locking clause, `'done'` otherwise, since what the piece did may not have happened.
+- Each strength (`forUpdate`, `forNoKeyUpdate`, `forShare`, `forKeyShare`) starts a new locking clause, so it is allowed in any state and returns `'strength'`.
+- `of` needs `'strength'`: `.forUpdate().skipLocked().of(jobs)` and `.forUpdate().of(jobs).of(users)` are type errors (list every table in one `of`), and so is `of()` with no table, since the rest parameter is a non-empty tuple.
+- `LockTarget<T>` is a table in the query or the name it goes by there: after `selectFrom(jobs.as('j'))`, `of('j')` compiles and `of('jobs')` doesn't.
+- Every other method keeps `L` as it is, so `forUpdate().where(…).of(jobs)` is fine. `T` is read when `of` is called, so a table joined after the strength can be named in `of`.
+
+The run-time methods check the same rules for code that casts around the types ([QUERIES.md](QUERIES.md#the-lock-state-l)). `when` and `pipe` combine the states with `LockAfter<L, B>`: unchanged if the piece added no locking clause (`B` is `'none'`), `'done'` otherwise, since what the piece did may not have happened, so neither `of` nor a wait policy can follow it. `pipe` reads the piece's state from the `$lock` member of what it returns (`AnyQuery`).
 
 ### The select row `O`
 
@@ -590,7 +684,7 @@ pipe<P extends readonly AnyTable[], Q extends AnyQuery>(piece: (qb: Fragment<P>)
 type InScope<T, P> = [P[number]] extends [T[number]] ? [] : [missingTables: Exclude<P[number], T[number]>['name']];
 ```
 
-When the fragment's tables are all in the query, the rest parameter is the empty tuple: `pipe(piece)` is fine. When one is missing, the signature demands one more argument named `missingTables` whose type is the missing table's name, so the error reads "Expected 2 arguments, but got 1" and points at `missingTables: "contacts"`, which says exactly what is wrong. The same trick is `ValueArgs` in [shape.ts](shape.ts): `takeValue()` on a row with more than one column demands an argument of type `'select exactly one column to read a value'`.
+When the fragment's tables are all in the query, the rest parameter is the empty tuple: `pipe(piece)` is fine. When one is missing, the signature demands one more argument named `missingTables` whose type is the missing table's name, so the error reads "Expected 2 arguments, but got 1" and points at `missingTables: "contacts"`, which says exactly what is wrong. The same trick is `ValueArgs` in [shape.ts](shape.ts): `takeValue()` on a row with no column or more than one demands an argument of type `'select exactly one column to read a value'`.
 
 ### `NewName` and `UniqueKeys`: the same trick for joins and selections
 
@@ -610,7 +704,14 @@ export interface NotExecuted {
 export function rejectAwait(_resolve: (value: NotExecuted) => unknown, reject: …): void
 ```
 
-Builders and queries have `readonly then = rejectAwait`. TypeScript types `await x` by looking at `x.then`'s callback, so `const rows = await db.selectFrom(users)` gives `rows` the type `NotExecuted`, and using it as rows fails with that message in the error. At run time the `await` rejects ([ARCHITECTURE.md](ARCHITECTURE.md#nothing-runs-by-accident)).
+Builders, `Query` and `db.sql` statements have `readonly then = rejectAwait`. TypeScript types `await x` by looking for a `then` method on `x` and taking the type its first callback (`onfulfilled`) is called with: here the `value: NotExecuted` of `_resolve`. So `const rows = await db.selectFrom(users)` gives `rows` the type `NotExecuted`, and the first use of it as rows fails:
+
+```ts
+// error TS2740: Type 'NotExecuted' is missing the following properties from type '{ id: number; }[]': length, pop, push, concat, and 35 more.
+const rows: { id: number }[] = await db.selectFrom(users).select(['users.id']);
+```
+
+The error names `NotExecuted`, and hovering it shows its one member, whose type is the hint. That member is keyed by a `unique symbol` that is only declared, so no value of the type can be made, and nothing else is assignable to it by accident. The same typing applies to `Promise.all([builder])` and to `return builder` from an `async` function whose return type is declared. The `@deprecated` tag on `then` makes editors strike it through and hide it from completions. At run time the `await` rejects with a `TypeError` ([QUERIES.md](QUERIES.md#nothing-runs-until-execute), [ARCHITECTURE.md](ARCHITECTURE.md#nothing-runs-by-accident)).
 
 ### `Unconstrained`: literal arguments without a slow check
 
@@ -649,7 +750,7 @@ Types that are correct but slow make editors lag on real schemas with dozens of 
 
 ## Testing the types
 
-Type behaviour is tested in `*.test-d.ts` files under [test/](../test/) (`select-query-builder.test-d.ts`, `expression-builder.test-d.ts`, `write-queries.test-d.ts`, `codecs.test-d.ts`, `database.test-d.ts`, `batch.test-d.ts`), which Vitest type-checks (`pnpm test` runs them with `--typecheck`; `pnpm test:types` runs only them). They use `expectTypeOf(x).toEqualTypeOf<…>()` for what should compile, and `// @ts-expect-error` above lines that must **not** compile: if such a line ever starts compiling, the directive itself becomes an error, so a loosened type is caught.
+Type behaviour is tested in `*.test-d.ts` files under [test/](../test/) (`select-query-builder.test-d.ts`, `nest.test-d.ts`, `expression-builder.test-d.ts`, `everyday-sql.test-d.ts`, `write-queries.test-d.ts`, `pagination.test-d.ts`, `stream.test-d.ts`, `codecs.test-d.ts`, `database.test-d.ts`, `batch.test-d.ts`), which Vitest type-checks (`pnpm test` runs them with `--typecheck`; `pnpm test:types` runs only them). They use `expectTypeOf(x).toEqualTypeOf<…>()` for what should compile, and `// @ts-expect-error` above lines that must **not** compile: if such a line ever starts compiling, the directive itself becomes an error, so a loosened type is caught.
 
 ## Decisions
 
@@ -659,9 +760,14 @@ Why the types work this way. Each links to its full entry (what it is, why, the 
 - [What a builder still needs, in its type: `M` and `this` gating](DECISIONS.md#what-a-builder-still-needs-in-its-type-m-and-this-gating): required clauses as a type parameter.
 - [The locking clause as a state machine: `L`](DECISIONS.md#the-locking-clause-as-a-state-machine-l): modifier order as a type parameter.
 - [Errors as an impossible extra argument](DECISIONS.md#errors-as-an-impossible-extra-argument): `InScope`, `NewName`, `UniqueKeys`, `ValueArgs`: errors that say what is wrong.
+- [A table joined twice, or a key selected twice, is refused](DECISIONS.md#a-table-joined-twice-or-a-key-selected-twice-is-refused): `NewName` and `UniqueKeys`.
 - [`takeValue` needs a one-column row](DECISIONS.md#takevalue-needs-a-one-column-row): an object type has no column order.
+- [`case`: the first result fixes the SQL type](DECISIONS.md#case-the-first-result-fixes-the-sql-type): `CaseWhen`'s two types, and why later branches must match the first.
+- [Reusable pieces are functions: `fragment`, `pipe` and `when`](DECISIONS.md#reusable-pieces-are-functions-fragment-pipe-and-when): `Fragment<T>`, `InScope`, `JoinedBy`.
+- [`selectAll` takes the name a table goes by](DECISIONS.md#selectall-takes-the-name-a-table-goes-by): `TableRefs` picks the references under that name.
 - [Outer joins make the joined side nullable: `NullableTable`](DECISIONS.md#outer-joins-make-the-joined-side-nullable-nullabletable): only `$select` changes.
 - [`nest` marks a joined row with `ctid`](DECISIONS.md#nest-marks-a-joined-row-with-ctid): one object per table, `null` as a whole on the outer side of a join.
+- [`nest`'s object keys in the builder's type: `K`](DECISIONS.md#nests-object-keys-in-the-builders-type-k): an object's key can't be ordered, grouped or paged by.
 - [`setEach` rows are typed by the table, and duplicate keys are refused](DECISIONS.md#seteach-rows-are-typed-by-the-table-and-duplicate-keys-are-refused): `SetEachRow` and `SetEachRefs`.
 - [Key rules in the types: non-null and selected under its own name](DECISIONS.md#key-rules-in-the-types-non-null-and-selected-under-its-own-name): `KeyColumn`.
 - [Awaiting a builder rejects](DECISIONS.md#awaiting-a-builder-rejects): `NotExecuted`.
@@ -675,6 +781,8 @@ Why the types work this way. Each links to its full entry (what it is, why, the 
 
 **Distribution**: a conditional type on a naked type parameter applies to each member of a union separately.
 
+**Fragment** (`Fragment<T>`): a select builder over the tables `T` with nothing selected, which `fragment` and `when` callbacks receive.
+
 **Inference**: the compiler choosing type arguments from the values passed.
 
 **`infer`**: captures part of a type inside a conditional type's condition.
@@ -685,7 +793,13 @@ Why the types work this way. Each links to its full entry (what it is, why, the 
 
 **Literal type**: a type with a single value, such as `'users'` or `42`.
 
+**Lock state** (`L`): what a select's latest locking clause still accepts: `'none'`, `'strength'`, `'of'` or `'done'`.
+
 **Mapped type**: `{ [K in Keys]: … }`, an object type built by iterating over keys.
+
+**Nested keys** (`K`): the keys of the row that hold `nest`'s objects, kept so they can't be used as columns.
+
+**Non-empty tuple** (`[O, ...O[]]`): an array type with at least one element, so `[0]` is `O`, not `O | undefined`.
 
 **Phantom type**: a type carried by a property that is declared but never set.
 

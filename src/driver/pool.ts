@@ -948,7 +948,7 @@ export class Pool implements AsyncDisposable {
 			this.#open().then(
 				(slot) => this.#giveBack(slot),
 				() => {
-					// retried on the next acquire or release, or after connectRetryDelay
+					// retried when a connection is lost, released unusable or swept, or after connectRetryDelay
 					if (this.#connectRetryDelay > 0) this.#fillMin();
 				},
 			);

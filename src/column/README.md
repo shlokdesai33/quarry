@@ -92,6 +92,10 @@ Read it as: "for every key `K` of the form `users.<column key>`, the value is th
 
 `tableNode(table)` turns a table into the `TableNode` the compiler renders: `{ name: source, alias: name === source ? undefined : name }`, so `users` renders as `"users"` and an alias as `"users" as "managers"`.
 
+### `NullableTable`: a table on the outer side of a join
+
+A `left join` reads the joined table's columns as `null` in rows with no match. [table.ts](../table.ts) expresses that as a type only: `NullableTable<X>` is the same `Table` with every column replaced by a `NullableColumn<C>`, whose `$select` is `C['$select'] | null`. Its `_quarry` is the column's, so the SQL type, comparisons and codec don't change. `NullableColumn` also has an optional phantom `$inner: C`, the column as it reads in a row that matched, which `nest()` uses to type a nested object that is `null` as a whole instead of a set of nullable fields. Which joins make which tables nullable is in [TYPES.md](../TYPES.md#outer-joins-nullabletable).
+
 ## A column: four types in one object
 
 A column ([base-column.ts](base-column.ts), `BaseColumn<D, S, I, U>`) carries one run-time value and four types:
@@ -132,7 +136,7 @@ stateDiagram-v2
     [*] --> Column: text(), real(), …
     [*] --> IntegerColumn: smallint(), integer(), bigint()
     IntegerColumn --> IdentityColumn: identity()
-    IntegerColumn --> IntegerColumn: nullable()
+    IntegerColumn --> Column: nullable()
     IntegerColumn --> DefaultColumn: default()
     IntegerColumn --> GeneratedColumn: generated()
     Column --> Column: nullable()
@@ -145,11 +149,13 @@ stateDiagram-v2
 
 `name()`, `typed()` and `useCodec()` are on every class (they are `abstract` in `BaseColumn`) and keep the state. Repeating a modifier is harmless, so it stays available.
 
+`IntegerColumn` doesn't override `nullable()`: it inherits `Column`'s, which returns a plain `Column`. That is what makes `integer().nullable().identity()` impossible to write, since an identity column can't be nullable. `integer().identity()` and `integer().nullable().default()` are both fine.
+
 How each modifier changes the types (from [column.ts](column.ts), [default-column.ts](default-column.ts), [generated-column.ts](generated-column.ts), [integer-column.ts](integer-column.ts), [identity-column.ts](identity-column.ts)):
 
 | Modifier                          | Returns           | `S`          | `I`              | `U`         | `_quarry`                     |
 | --------------------------------- | ----------------- | ------------ | ---------------- | ----------- | ----------------------------- |
-| `nullable()`                      | same class        | `S \| null`  | `I \| null`      | `U \| null` | `nullable: true`              |
+| `nullable()`                      | see below         | `S \| null`  | `I \| null`      | `U \| null` | `nullable: true`              |
 | `default()`                       | `DefaultColumn`   | `S`          | `I \| undefined` | `U`         | `fill: 'default'`             |
 | `generated()`                     | `GeneratedColumn` | `S`          | `never`          | `never`     | `fill: 'generated'`           |
 | `identity()` (integer types only) | `IdentityColumn`  | `S`          | `never`          | `never`     | `fill: 'identity'`            |
@@ -157,7 +163,7 @@ How each modifier changes the types (from [column.ts](column.ts), [default-colum
 | `typed<X, Y, Z>()`                | same class        | `X`          | `Y`              | `Z`         |                               |
 | `useCodec(codec)`                 | same class        | codec output | codec input      | codec input | `dataType` with the new codec |
 
-Notice that `nullable()` on a `DefaultColumn` adds `null` to `I` too: `I | undefined | null`, "may be omitted, or set to null".
+`nullable()` returns a `Column` from `Column` and `IntegerColumn`, a `DefaultColumn` from `DefaultColumn`, and a `GeneratedColumn` from `GeneratedColumn`. On a `DefaultColumn` it adds `null` to `I` too: `I | undefined | null`, "may be omitted, or set to null". On a `GeneratedColumn` it adds `null` to `S` only (`S | null, I, U`), since `I` and `U` are `never`: a generated column is never written, nullable or not.
 
 Why does `IntegerColumn` extend `Column` and override `name`/`typed`/`useCodec`? So those methods return an `IntegerColumn` (keeping `identity()` available) rather than a plain `Column`. Each class re-declares them for the same reason.
 
@@ -195,26 +201,28 @@ The subclasses add what their kind needs:
 
 `EnumType<N>` and `CustomType<N>` carry their name as a type parameter, so two different enums are two different SQL types to the type checker, and can't be compared with each other ([EXPRESSIONS.md](../EXPRESSIONS.md#which-types-compare-with-which)).
 
+The data type classes have their own guide, [data-type/README.md](../data-type/README.md): what each holds, how `withCodec` copies them, and how their SQL names and modifiers are rendered for `db.verify`, `unnest` casts and `eb.fn.cast`.
+
 ### `kindCodecs`: the codec of each factory
 
 [kind-codecs.ts](../kind-codecs.ts) maps each kind to the driver codec its columns use:
 
-| Kind                                    | Codec                                  | JavaScript value                                             |
-| --------------------------------------- | -------------------------------------- | ------------------------------------------------------------ |
-| `smallint`, `integer`                   | `codecs.int2`, `codecs.int4`           | `number`                                                     |
-| `bigint`                                | `codecs.int8AsString`                  | `string` (digits; a JS number can't hold every int8 exactly) |
-| `decimal`                               | `codecs.numeric`                       | `string` (exact digits)                                      |
-| `real`, `double precision`              | `codecs.float4`, `codecs.float8`       | `number`                                                     |
-| `boolean`                               | `codecs.bool`                          | `boolean`                                                    |
-| `text`, `varchar`                       | `codecs.text`, `codecs.varchar`        | `string`                                                     |
-| `uuid`                                  | `codecs.uuid`                          | `string`                                                     |
-| `bytea`                                 | `codecs.bytea`                         | `Uint8Array`                                                 |
-| `date`, `time`, `timestamp`, `interval` | `codecs.date`, …                       | `string` (the server's text)                                 |
-| `timestamptz`                           | `codecs.timestamptz`                   | `Date`                                                       |
-| `jsonb`                                 | `codecs.jsonb`                         | parsed JSON (`JsonValue`)                                    |
-| `inet`, `tsvector`                      | `codecs.inet`, `codecs.tsvector`       | `string`                                                     |
-| `vector`                                | `codecs.vector`                        | `number[]` (pgvector)                                        |
-| `daterange`, `tstzrange`                | `codecs.daterange`, `codecs.tstzrange` | `Range<string>`, `Range<Date>`                               |
+| Kind                                    | Codec                                                               | JavaScript value                                             |
+| --------------------------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------ |
+| `smallint`, `integer`                   | `codecs.int2`, `codecs.int4`                                        | `number`                                                     |
+| `bigint`                                | `codecs.int8AsString`                                               | `string` (digits; a JS number can't hold every int8 exactly) |
+| `decimal`                               | `codecs.numeric`                                                    | `string` (exact digits)                                      |
+| `real`, `double precision`              | `codecs.float4`, `codecs.float8`                                    | `number`                                                     |
+| `boolean`                               | `codecs.bool`                                                       | `boolean`                                                    |
+| `text`, `varchar`                       | `codecs.text`, `codecs.varchar`                                     | `string`                                                     |
+| `uuid`                                  | `codecs.uuid`                                                       | `string`                                                     |
+| `bytea`                                 | `codecs.bytea`                                                      | `Uint8Array`                                                 |
+| `date`, `time`, `timestamp`, `interval` | `codecs.date`, `codecs.time`, `codecs.timestamp`, `codecs.interval` | `string` (the server's text)                                 |
+| `timestamptz`                           | `codecs.timestamptz`                                                | `Date`                                                       |
+| `jsonb`                                 | `codecs.jsonb`                                                      | parsed JSON (`JsonValue`)                                    |
+| `inet`, `tsvector`                      | `codecs.inet`, `codecs.tsvector`                                    | `string`                                                     |
+| `vector`                                | `codecs.vector`                                                     | `number[]` (pgvector)                                        |
+| `daterange`, `tstzrange`                | `codecs.daterange`, `codecs.tstzrange`                              | `Range<string>`, `Range<Date>`                               |
 
 Kinds without an entry (`enum`, `custom`, `array`) always get their codec from their `DataType` subclass; `kindCodec` falls back to `codecs.raw` (the server's text) for safety.
 
@@ -238,6 +246,36 @@ export function integer<T extends Out<'integer'> = Out<'integer'>>() {
 - The type parameter `T` defaults to the codec's output (`number`), and may narrow it (`integer<UserId>()`, `text<'free' | 'pro'>()`). `T extends Out<…>` means you can only narrow, never claim a type the codec doesn't produce.
 - `IntegerColumn` for `smallint`, `integer`, `bigint` (the only ones that can be identities); `Column` for the rest.
 - `captureCallSite(integer)` records where the factory was called.
+
+Every factory, with what it returns:
+
+| Factory                          | Returns                                                                   | Arguments                            |
+| -------------------------------- | ------------------------------------------------------------------------- | ------------------------------------ |
+| `smallint<T>()`                  | `IntegerColumn<DataType<'smallint'>, T>`                                  |                                      |
+| `integer<T>()`                   | `IntegerColumn<DataType<'integer'>, T>`                                   |                                      |
+| `bigint<T>()`                    | `IntegerColumn<DataType<'bigint'>, T>`                                    |                                      |
+| `real<T>()`                      | `Column<DataType<'real'>, T>`                                             |                                      |
+| `doublePrecision<T>()`           | `Column<DataType<'double precision'>, T>`                                 |                                      |
+| `decimal<T>(precision?, scale?)` | `Column<DataType<'decimal'>, T>`                                          | the type modifiers                   |
+| `boolean<T>()`                   | `Column<DataType<'boolean'>, T>`                                          |                                      |
+| `text<T>()`                      | `Column<DataType<'text'>, T>`                                             |                                      |
+| `varchar<T>(length?)`            | `Column<DataType<'varchar'>, T>`                                          | the type modifier                    |
+| `uuid<T>()`                      | `Column<DataType<'uuid'>, T>`                                             |                                      |
+| `bytea()`                        | `Column<DataType<'bytea'>, Out<'bytea'>>`                                 | no type parameter (`Uint8Array`)     |
+| `date<T>()`                      | `Column<DataType<'date'>, T>`                                             |                                      |
+| `time<T>()`                      | `Column<DataType<'time'>, T>`                                             |                                      |
+| `timestamp<T>()`                 | `Column<DataType<'timestamp'>, T>`                                        |                                      |
+| `timestamptz<T>()`               | `Column<DataType<'timestamptz'>, T>`                                      |                                      |
+| `interval<T>()`                  | `Column<DataType<'interval'>, T>`                                         |                                      |
+| `jsonb()`, `jsonb<T>()`          | `Column<DataType<'jsonb'>, Out<'jsonb'>>`, `Column<DataType<'jsonb'>, T>` | two overloads                        |
+| `inet<T>()`                      | `Column<DataType<'inet'>, T>`                                             |                                      |
+| `tsvector<T>()`                  | `Column<DataType<'tsvector'>, T>`                                         |                                      |
+| `daterange<T>()`                 | `Column<DataType<'daterange'>, T>`                                        |                                      |
+| `tstzrange<T>()`                 | `Column<DataType<'tstzrange'>, T>`                                        |                                      |
+| `vector<T>()`                    | `Column<DataType<'vector'>, T>`                                           |                                      |
+| `array(element)`                 | `Column<ArrayType<D>, T[]>`                                               | an element column ([below](#arrays)) |
+
+`T` defaults to the kind's codec output (`Out<kind>`) in each row. Enum and custom-type columns come from the factories `defineEnum` and `defineType` return ([enums](#enums), [custom types](#custom-types-definetype)).
 
 `decimal(p, s)` and `varchar(n)` pass their arguments as `modifiers` (via the `modifiers()` helper, which stops at the first one left out). `bytea()` has no type parameter: what is read is always a plain `Uint8Array`, so there is nothing to narrow. `jsonb()` has two overloads so that an untyped `jsonb()` is a `JsonValue` and `jsonb<T>()` is `T` (the overload without a type parameter prevents TypeScript from inferring `T` from where the column is used).
 
@@ -364,7 +402,7 @@ export type InferInsertType<T extends AnyTable> = DrainOuterGeneric<
 1. The first mapped type keeps the **required** keys: those whose insert type isn't `never` (identity, generated) and doesn't include `undefined` (default).
 2. The second keeps the **optional** keys (`?:`): those whose insert type includes `undefined`, with `undefined` removed from the value.
 3. `as …` in a mapped type renames or **drops** keys: mapping a key to `never` removes it.
-4. `[X] extends [never]` (with brackets) is the reliable way to test for `never`: a bare `X extends never` distributes over a union and gives `never` for `never` itself. See [TYPES.md](../TYPES.md#conditional-types-and-the-never-test).
+4. `[X] extends [never]` (with brackets) is the reliable way to test for `never`: a bare `X extends never` distributes over a union and gives `never` for `never` itself. See [TYPES.md](../TYPES.md#distribution-and-the-never-test).
 5. `Prettify` flattens the intersection into one object type so editor hovers are readable; `DrainOuterGeneric` forces the compiler to resolve it once ([TYPES.md](../TYPES.md#type-checking-speed)).
 
 A nullable column without a default is **required** on insert: you pass `null` explicitly. That is deliberate: leaving a key out is never an implicit NULL.

@@ -100,7 +100,7 @@ export interface TableResult {
 export interface VerifyReport {
 	/** `true` when there are no errors. */
 	readonly ok: boolean;
-	/** Every difference, errors first, then in table and column order. */
+	/** Every difference, in table and column order. */
 	readonly diagnostics: readonly Diagnostic[];
 	readonly tables: readonly TableResult[];
 	readonly summary: {

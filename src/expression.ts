@@ -100,8 +100,9 @@ export class TypedExpression<T, D extends DataType> extends Expression<T> {
  * comparison it is encoded by the other side's codec (as the array of `in`
  * or `any` / `all`, by `arrayOf` it), exactly like a plain value; as a
  * `coalesce` fallback, by the first argument's. Elsewhere it is encoded by
- * its own codec, if `eb.val` was given one, or by its JavaScript type, with
- * its SQL type inferred by postgres.
+ * its own codec, if `eb.val` was given one, or by the codec its JavaScript
+ * type maps to (`codecOfValue`), which declares its SQL type; a value of
+ * another JavaScript type is left for postgres to infer.
  *
  * It has no SQL type of its own, so it is never a `TypedExpression`, and an
  * operand that takes a parameter does not thereby take an expression of any

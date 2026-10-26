@@ -411,8 +411,9 @@ export class DriverExecutor implements TransactionExecutor {
 	 * has a connection of its own, taken by the first batch and released
 	 * when the iteration ends however it ends; inside a transaction, other
 	 * queries of the transaction run between its batches. A `timeout`
-	 * outside a transaction runs the cursor in a transaction of its own,
-	 * so the setting can't leak.
+	 * outside a transaction is the cursor's `statementTimeout`, set before
+	 * its portal and restored before its Sync, so the setting can't leak;
+	 * inside one it is refused.
 	 */
 	async *stream(
 		query: CompiledQuery,

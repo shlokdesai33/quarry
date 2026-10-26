@@ -5,8 +5,8 @@
  * `results/<id>/raw.jsonl` as they come, so an interrupted run resumes
  * with `--id <id>`.
  *
- *   node orchestrate.ts [--phases main,conc,pipeline,rtt,bouncer,reconnect,verify]
- *                       [--runs 5] [--seed 1] [--id name]
+ *   node orchestrate.ts [--phases verify,main,conc,pipeline,rtt,batch,builder,bouncer,reconnect]
+ *                       [--runs 5] [--seed 1] [--id name] [--dir path]
  *                       [--only-drivers a,b] [--only-scenarios a,b] [--quick] [--parallel 1]
  */
 import { execSync, spawn } from 'node:child_process';
@@ -508,7 +508,7 @@ async function main() {
 		for (const phase of PHASES) {
 			const cells = matrix(phase);
 			const runs = phase === 'verify' ? 1 : RUNS;
-			// phases with server restarts run in order; everything else interleaves runs of every cell
+			// every phase interleaves the runs of its cells, in the seeded order
 			const queue = shuffle(
 				cells.flatMap((cell) =>
 					Array.from({ length: runs }, (_, run) => ({ cell, run })),
