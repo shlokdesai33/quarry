@@ -446,6 +446,25 @@ describe.skipIf(noPg).each(targets)('statementTimeout %s', (_name, target) => {
 			expect(await timeoutOf(pool)).toBe('0');
 		});
 
+		it('keeps the three statements for a timed begin, so the block it opens is unbounded', async () => {
+			const net = recordingSockets();
+			await using pool = createPool({
+				...target(),
+				max: 1,
+				socket: net.factory,
+			});
+			await pool.query('select 1');
+			const sent = net.sent().length;
+			await pool.query(' -- opens a block\nbegin', [], { statementTimeout: 50 });
+			const slept = await pool.query('select pg_sleep(0.2) as slept');
+			expect(slept.rowCount).toBe(1);
+			expect(await timeoutOf(pool)).toBe('0');
+			await pool.query('rollback');
+			const written = net.sent().slice(sent);
+			expect(count(written, LONG)).toBeGreaterThan(0);
+			expect(count(written, SHORT)).toBe(0);
+		});
+
 		it('fails alone when its query fails mid-pipeline, or its interval is invalid', async () => {
 			await using pool = createPool({ ...target(), max: 1, pipeline: 10 });
 			await pool.query('select 1');

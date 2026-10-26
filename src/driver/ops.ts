@@ -43,6 +43,9 @@ import type { QueryOptions } from './connection.js';
  */
 const BEGINS = /^(?:\s|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*(?:begin|start)\b/i;
 
+export const opensTransactionBlock = (sql: string): boolean =>
+	BEGINS.test(sql);
+
 /**
  * Sets `statement_timeout` to $1 until the transaction ends: with its
  * query under one Sync, outside a transaction block, the implicit
@@ -460,7 +463,7 @@ export class QueryOp extends Op {
 	}
 
 	override get opensNoBlock(): boolean {
-		return !BEGINS.test(this.#sql);
+		return !opensTransactionBlock(this.#sql);
 	}
 
 	/** Writes the statement; without `sync` it ends with the next one's Sync (see `SyncGroupOp`). */

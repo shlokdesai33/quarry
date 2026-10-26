@@ -44,6 +44,7 @@ import {
 	SimpleQueryOp,
 	STATEMENT_TIMEOUT,
 	STATEMENT_TIMEOUT_LOCAL,
+	opensTransactionBlock,
 	SyncGroupOp,
 	closedError,
 	type Description,
@@ -1271,7 +1272,10 @@ export class Connection implements AsyncDisposable {
 				options,
 				options.statementTimeout,
 				onDone,
-				rerunnable && this.#outsideTransactionBlock(),
+				// a timed begin would keep a local setting for the block it opens
+				rerunnable &&
+					!opensTransactionBlock(sql) &&
+					this.#outsideTransactionBlock(),
 			);
 		}
 		// one shared executor: one closing over this query would cost a

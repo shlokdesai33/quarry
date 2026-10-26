@@ -116,11 +116,13 @@ describe('insertInto', () => {
 
 	it('aligns rows whose keys come in other orders, or are left undefined', () => {
 		const at = new Date('2024-01-01T00:00:00.000Z');
+		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the undefined a plain JS caller can pass
+		const missing = undefined as never;
 		const { values } = insertInto(users)
 			.values([
-				{ name: 'Ada', email: 'ada@example.com', createdAt: undefined },
-				{ createdAt: at, email: 'alan@example.com' },
-				{ email: 'grace@example.com', name: undefined, createdAt: at },
+				{ name: 'Ada', email: 'ada@example.com', createdAt: missing },
+				{ createdAt: at, email: 'alan@example.com', name: missing },
+				{ email: 'grace@example.com', name: missing, createdAt: at },
 			])
 			.toNode();
 		expect(values?.columns).toEqual(['name', 'email', 'created_at']);
