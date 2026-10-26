@@ -361,11 +361,10 @@ describe.skipIf(noPg)('built-in codecs', () => {
 
 	it('reads infinite timestamp bounds the same in text and binary', async () => {
 		const read = (codec: Codec, binary: boolean) =>
-			c.query(
-				"select tstzrange('-infinity', 'infinity', '[]') as v",
-				[],
-				{ resultCodecs: [codec], binary },
-			);
+			c.query("select tstzrange('-infinity', 'infinity', '[]') as v", [], {
+				resultCodecs: [codec],
+				binary,
+			});
 		const expected = {
 			empty: false,
 			lower: new Date(-8.64e15),

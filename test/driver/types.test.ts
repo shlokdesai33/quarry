@@ -20,6 +20,8 @@ import {
 } from '../../src/driver/types.js';
 import { prng } from './helpers/backend.js';
 
+const rangeBytes = (...b: number[]) => Uint8Array.from(b);
+
 describe('parseArray and arrayLiteral', () => {
 	it('parses Postgres array output', () => {
 		expect(parseArray('{}')).toEqual([]);
@@ -279,19 +281,22 @@ describe('quarry parsers', () => {
 
 	it('decodes the binary range format as the text', () => {
 		const decode = rangeDecoder(int4);
-		const bytes = (...b: number[]) => Uint8Array.from(b);
-		expect(decode(bytes(0x01), 0, 1)).toEqual({ empty: true });
+		expect(decode(rangeBytes(0x01), 0, 1)).toEqual({ empty: true });
 		expect(
-			decode(bytes(0x02, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 5), 0, 17),
+			decode(
+				rangeBytes(0x02, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 5),
+				0,
+				17,
+			),
 		).toEqual(parseRange('[1,5)', Number));
-		expect(decode(bytes(0x18), 0, 1)).toEqual(parseRange('(,)', Number));
-		expect(decode(bytes(0x0c, 0, 0, 0, 4, 0, 0, 0, 9), 0, 9)).toEqual(
+		expect(decode(rangeBytes(0x18), 0, 1)).toEqual(parseRange('(,)', Number));
+		expect(decode(rangeBytes(0x0c, 0, 0, 0, 4, 0, 0, 0, 9), 0, 9)).toEqual(
 			parseRange('(,9]', Number),
 		);
-		expect(() => decode(bytes(0x02, 0, 0, 0, 4, 0), 0, 6)).toThrow(
+		expect(() => decode(rangeBytes(0x02, 0, 0, 0, 4, 0), 0, 6)).toThrow(
 			DriverError,
 		);
-		expect(() => decode(bytes(0x18, 0), 0, 2)).toThrow(DriverError);
+		expect(() => decode(rangeBytes(0x18, 0), 0, 2)).toThrow(DriverError);
 	});
 });
 

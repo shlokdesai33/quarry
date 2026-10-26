@@ -455,7 +455,9 @@ describe.skipIf(noPg).each(targets)('statementTimeout %s', (_name, target) => {
 			});
 			await pool.query('select 1');
 			const sent = net.sent().length;
-			await pool.query(' -- opens a block\nbegin', [], { statementTimeout: 50 });
+			await pool.query(' -- opens a block\nbegin', [], {
+				statementTimeout: 50,
+			});
 			const slept = await pool.query('select pg_sleep(0.2) as slept');
 			expect(slept.rowCount).toBe(1);
 			expect(await timeoutOf(pool)).toBe('0');

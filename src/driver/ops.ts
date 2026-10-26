@@ -43,8 +43,7 @@ import type { QueryOptions } from './connection.js';
  */
 const BEGINS = /^(?:\s|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*(?:begin|start)\b/i;
 
-export const opensTransactionBlock = (sql: string): boolean =>
-	BEGINS.test(sql);
+export const opensTransactionBlock = (sql: string): boolean => BEGINS.test(sql);
 
 /**
  * Sets `statement_timeout` to $1 until the transaction ends: with its

@@ -127,7 +127,11 @@ describe('insertInto', () => {
 			.toNode();
 		expect(values?.columns).toEqual(['name', 'email', 'created_at']);
 		expect(values?.rows).toStrictEqual([
-			[value('Ada', codecs.text), value('ada@example.com', codecs.text), undefined],
+			[
+				value('Ada', codecs.text),
+				value('ada@example.com', codecs.text),
+				undefined,
+			],
 			[
 				undefined,
 				value('alan@example.com', codecs.text),
