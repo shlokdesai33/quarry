@@ -252,6 +252,35 @@ function factorySource(
 	return out.join('\n');
 }
 
+/**
+ * Factories by result shape: a short key of the names, how each column is
+ * read, the row mode and the nested objects. Unprepared queries build a
+ * decoder per query, and generating its source just to find the cached
+ * factory cost more than the rest of the lookup.
+ */
+const shapes = new Map<string, MakeDecoder | undefined>();
+let shapeKeysLength = 0;
+
+function factoryOf(
+	names: readonly string[],
+	how: readonly Decode[],
+	mode: RowMode,
+	nested: readonly NestedObject[] | undefined,
+): MakeDecoder | undefined {
+	// names can't contain NUL (PostgreSQL identifiers don't), so it separates them
+	let key = `${mode}\0${how.join(',')}\0${names.join('\0')}`;
+	if (nested !== undefined) key += `\0${JSON.stringify(nested)}`;
+	if (shapes.has(key)) return shapes.get(key);
+	const make = factory(factorySource(names, how, mode, nested));
+	if (shapeKeysLength + key.length > MAX_FACTORY_SOURCE) {
+		shapes.clear();
+		shapeKeysLength = 0;
+	}
+	shapes.set(key, make);
+	shapeKeysLength += key.length;
+	return make;
+}
+
 function factory(source: string): MakeDecoder | undefined {
 	if (factories.has(source)) return factories.get(source);
 	let make: MakeDecoder | undefined;
@@ -303,7 +332,7 @@ function compiledDecoder(
 		)
 	)
 		return undefined;
-	const make = factory(factorySource(names, how, mode, nested));
+	const make = factoryOf(names, how, mode, nested);
 	return make?.(
 		fields.length,
 		codecs,
