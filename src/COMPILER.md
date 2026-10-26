@@ -241,7 +241,7 @@ function renderLock(lock) {
 
 `for update of "posts" skip locked` locks the matched rows of `posts` until the transaction ends, skipping rows another transaction already locked: the standard way for workers to claim jobs from a queue table without blocking each other. ([QUERIES.md](QUERIES.md#row-locking) explains the strengths.)
 
-Postgres rejects a locking clause on a query with aggregates. The compiler checks first, so the error is clear: `hasAggregate` walks each selection's node (through functions, operations, lists, `case` branches and raw nodes) looking for a `function` node named `count`, `min`, `max`, `sum`, `avg`, `array_agg`, `string_agg`, `bool_and` or `bool_or` (the aggregates `eb.fn` builds), and throws "A locking clause (forUpdate() and the like) cannot be used with aggregate functions".
+Postgres rejects a locking clause on a query with aggregates. The compiler checks first, so the error is clear: `hasAggregate` walks each selection's node (through functions, operations, lists, `case` branches and raw nodes) looking for a `function` node named `count`, `min`, `max`, `sum`, `avg`, `array_agg`, `string_agg`, `bool_and`, `bool_or` or `jsonb_agg` (the aggregates `eb.fn` builds), and throws "A locking clause (forUpdate() and the like) cannot be used with aggregate functions".
 
 ## Insert
 
