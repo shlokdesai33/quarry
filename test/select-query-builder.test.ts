@@ -433,6 +433,36 @@ describe('locking', () => {
 		).toMatch(/ for update$/);
 	});
 
+	it('refuses every aggregate eb.fn builds', () => {
+		const base = selectFrom(users);
+		const aggregated = {
+			count: base.select((eb) => [eb.fn.count().as('n')]),
+			countDistinct: base.select((eb) => [
+				eb.fn.countDistinct('users.age').as('n'),
+			]),
+			min: base.select((eb) => [eb.fn.min('users.age').as('n')]),
+			max: base.select((eb) => [eb.fn.max('users.age').as('n')]),
+			sum: base.select((eb) => [eb.fn.sum('users.age').as('n')]),
+			avg: base.select((eb) => [eb.fn.avg('users.age').as('n')]),
+			arrayAgg: base.select((eb) => [eb.fn.arrayAgg('users.age').as('n')]),
+			stringAgg: base.select((eb) => [
+				eb.fn.stringAgg('users.role', ', ').as('n'),
+			]),
+			boolAnd: base.select((eb) => [
+				eb.fn.boolAnd(eb.ref('users.age').gt(18)).as('n'),
+			]),
+			boolOr: base.select((eb) => [
+				eb.fn.boolOr(eb.ref('users.age').gt(18)).as('n'),
+			]),
+			jsonbAgg: base.select((eb) => [eb.fn.jsonbAgg('users.age').as('n')]),
+		};
+		for (const [name, query] of Object.entries(aggregated)) {
+			expect(() => compile(query.forUpdate().toNode()), name).toThrow(
+				'A locking clause (forUpdate() and the like) cannot be used with aggregate functions',
+			);
+		}
+	});
+
 	it('leaves the builder it was called on unchanged', () => {
 		const query = selectFrom(users);
 		query.forUpdate();
