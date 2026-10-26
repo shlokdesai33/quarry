@@ -146,6 +146,15 @@ The query's result is returned, or its error is thrown. If `S` fails (an invalid
 
 Numbers are milliseconds (`'2000ms'`); strings are any Postgres interval (`'2s'`, `'500ms'`).
 
+<a id="two-statements-on-a-pool"></a>
+**Two statements on a pool.** A pool's `query()` on a shared connection sends two statements instead, when nothing can have opened a transaction block ahead of it:
+
+```
+C> set_config('statement_timeout', $1, true)  <query>  Sync
+```
+
+Their implicit transaction ends the setting at the Sync, so there is nothing to restore. `#outsideTransactionBlock` decides it when the query is queued: the last ReadyForQuery said idle (`I`), and every op queued or in flight on the connection says `opensNoBlock`, which a plain statement does unless its SQL starts with `begin` or `start` (after comments), and a group does when all its statements do; a simple query, a cursor or COPY never does. The timed query mustn't be a `begin` either, or its setting would last for the block it opens. Anything else (a connection's own `query`, a `Transaction`, a pool connection with a `begin` pipelined ahead) keeps the three statements. Only the pool takes this path because it issued everything on its shared connections itself; the status alone isn't enough, as the next paragraph explains.
+
 **Why one Sync group, independent of the transaction status.** The connection's transaction status is the one in the **last ReadyForQuery received**: it says how the last answered query left the connection, not how the queries still queued or in flight ahead of this one will leave it. Until #38 the framing was chosen from it (`begin`/`set_config`/query/`commit` with four Syncs when idle; set, query, then an asynchronous restore when in a transaction). On a pipelined connection, a pool's shared connection included, that was wrong three ways:
 
 - **Not applied.** In a transaction whose `commit` is already queued (another caller's transaction, or another timed query's framing), the in-transaction variant ran its `set_config(…, true)` after that commit, in an implicit transaction of its own, and the query ran unbounded. The pool doesn't pipeline onto a connection reporting a transaction, but a caller waiting for a pipeline slot is handed one mid-read and runs a microtask later, after the rest of that read (which can hold another timed query's `begin`) changed the status.

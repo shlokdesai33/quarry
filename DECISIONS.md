@@ -67,6 +67,7 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 - [A node tree, and one compiler](src/DECISIONS.md#a-node-tree-and-one-compiler)
 - [References resolved before compiling](src/DECISIONS.md#references-resolved-before-compiling)
 - [Columns resolved and quoted once per table](src/DECISIONS.md#columns-resolved-and-quoted-once-per-table) (measured)
+- [Joined scopes' expression builders made once](src/DECISIONS.md#joined-scopes-expression-builders-made-once) (measured)
 - [SQL rendered through a trie of its pieces](src/DECISIONS.md#sql-rendered-through-a-trie-of-its-pieces) (measured)
 - [The builder's remaining per-query cost: profiled, nothing cut](src/DECISIONS.md#the-builders-remaining-per-query-cost-profiled-nothing-cut) (measured)
 - [Every identifier quoted](src/DECISIONS.md#every-identifier-quoted)
@@ -90,6 +91,7 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 ### Bulk writes
 
 - [Many rows through `unnest`, one array per column](src/DECISIONS.md#many-rows-through-unnest-one-array-per-column) (measured)
+- [Rows built in one pass](src/DECISIONS.md#rows-built-in-one-pass) (measured)
 - [`unnest` casts without type modifiers](src/DECISIONS.md#unnest-casts-without-type-modifiers)
 - [`setEach`: one method for the source, the assignments and the key match](src/DECISIONS.md#seteach-one-method-for-the-source-the-assignments-and-the-key-match) (measured)
 - [Rows that set different columns: flag columns and `case`](src/DECISIONS.md#rows-that-set-different-columns-flag-columns-and-case)
@@ -174,7 +176,7 @@ Full entries: [src/driver/DECISIONS.md](src/driver/DECISIONS.md).
 - [Codecs owned by the driver, chosen by the caller](src/driver/DECISIONS.md#codecs-owned-by-the-driver-chosen-by-the-caller) (measured)
 - [Exact parameter OIDs, except for text-like types](src/driver/DECISIONS.md#exact-parameter-oids-except-for-text-like-types)
 - [Binary only after describe](src/driver/DECISIONS.md#binary-only-after-describe)
-- [Which types are binary and which stay text](src/driver/DECISIONS.md#which-types-are-binary-and-which-stay-text)
+- [Which types are binary and which stay text](src/driver/DECISIONS.md#which-types-are-binary-and-which-stay-text) (measured)
 - [Binary array parameters, with a per-array fallback](src/driver/DECISIONS.md#binary-array-parameters-with-a-per-array-fallback) (measured)
 - [Arrays of text read as one latin1 string](src/driver/DECISIONS.md#arrays-of-text-read-as-one-latin1-string) (measured)
 - [Named types resolved once per pool through the catalog](src/driver/DECISIONS.md#named-types-resolved-once-per-pool-through-the-catalog)
@@ -183,11 +185,14 @@ Full entries: [src/driver/DECISIONS.md](src/driver/DECISIONS.md).
 ### Reading and decoding
 
 - [Zero-copy reads: messages decoded in place](src/driver/DECISIONS.md#zero-copy-reads-messages-decoded-in-place) (measured)
+- [Large split DataRows reassembled in one reused buffer](src/driver/DECISIONS.md#large-split-datarows-reassembled-in-one-reused-buffer) (measured)
 - [Strict bounds checks on every read](src/driver/DECISIONS.md#strict-bounds-checks-on-every-read)
 - [DataRow fast path: no message objects for rows](src/driver/DECISIONS.md#datarow-fast-path-no-message-objects-for-rows)
 - [Generated, monomorphic row decoders](src/driver/DECISIONS.md#generated-monomorphic-row-decoders) (measured)
+- [Decoder factories found by result shape, not by their source](src/driver/DECISIONS.md#decoder-factories-found-by-result-shape-not-by-their-source) (measured)
 - [Decode only the rows a caller keeps (`keepRows`)](src/driver/DECISIONS.md#decode-only-the-rows-a-caller-keeps-keeprows)
-- [Shared constant messages and repeated-string caches](src/driver/DECISIONS.md#shared-constant-messages-and-repeated-string-caches)
+- [Shared constant messages and repeated-string caches](src/driver/DECISIONS.md#shared-constant-messages-and-repeated-string-caches) (measured)
+- [`Buffer` read from `node:buffer` once](src/driver/DECISIONS.md#buffer-read-from-nodebuffer-once) (measured)
 
 ### Memory and garbage collection
 
@@ -247,6 +252,7 @@ Full entries: [src/driver/DECISIONS.md](src/driver/DECISIONS.md).
 ### COPY and LISTEN/NOTIFY
 
 - [COPY with backpressure both ways](src/driver/DECISIONS.md#copy-with-backpressure-both-ways)
+- [`copyRows` loops synchronously over sync rows](src/driver/DECISIONS.md#copyrows-loops-synchronously-over-sync-rows) (measured)
 - [`copyTo` chunks: everything received, one copy per read](src/driver/DECISIONS.md#copyto-chunks-everything-received-one-copy-per-read) (measured)
 - [Node stream adapters for COPY](src/driver/DECISIONS.md#node-stream-adapters-for-copy)
 - [A NOTIFY fast path and a channel-name cache](src/driver/DECISIONS.md#a-notify-fast-path-and-a-channel-name-cache) (measured)
@@ -260,6 +266,7 @@ Full entries: [src/driver/DECISIONS.md](src/driver/DECISIONS.md).
 - [A statement timeout is refused for statements that can't run in a transaction block](src/driver/DECISIONS.md#a-statement-timeout-is-refused-for-statements-that-cant-run-in-a-transaction-block)
 - [Drop unsent queries without contacting the server](src/driver/DECISIONS.md#drop-unsent-queries-without-contacting-the-server)
 - [Server-side statement timeouts, transaction-local and pipelined](src/driver/DECISIONS.md#server-side-statement-timeouts-transaction-local-and-pipelined)
+- [Two statements on a pool, where no transaction block can precede the query](src/driver/DECISIONS.md#two-statements-on-a-pool-where-no-transaction-block-can-precede-the-query) (measured)
 - [Every wait has a timeout](src/driver/DECISIONS.md#every-wait-has-a-timeout)
 
 ### Runtimes

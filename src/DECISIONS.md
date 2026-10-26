@@ -300,6 +300,20 @@ The driver suite on a 4-vCPU VM (client on 2 CPUs, PostgreSQL 18 on the other 2)
 
 **Code.** `resolveColumn`, `expressionBuilder` in [expression-builder.ts](expression-builder.ts); `shareColumn`, `identifier` in [compile.ts](compile.ts); [test/builder-caches.test.ts](../test/builder-caches.test.ts).
 
+### Joined scopes' expression builders made once
+
+**What it is.** The expression builder of a scope of several tables (after a join) is made once and kept, as a single table's is: a list per first table, compared table by table, at most 64 scopes per first table. It is frozen, like the single-table one.
+
+**Why.** Every callback after a join (each `on`, `where`, `select` and `nest`) asked for its scope's builder, and making one builds its function namespaces (`fn`, `json`, …) and its reference map: about 70% of the allocation of building a two-table query with a `nest`.
+
+**Alternatives.** Keep a scope's builder on the query builder: it is immutable and copied per chained call, and each copy would need it again after the next join. A key string per scope (the tables' names): aliased tables of the same name are different scopes, and the string costs a join per lookup.
+
+**Cost.** Up to 64 frozen builders per table (weakly held through it), past which a scope's builder is made per call as before: aliases made per query (`users.as(name)` with a new name each time) would otherwise grow the list without bound.
+
+**Measured.** `harness.ts`, Node 24, client pinned to one CPU, median of 5 interleaved runs: building a join with a `nest` 3.5 → 1.8 µs (allocation 23.6 → 7.3 KB), a join with three `where` callbacks and a computed selection 4.9 → 2.5 µs; the same join run on a pool, end to end, 4,958 → 5,732/s (CPU −17%). A single-table lookup unchanged.
+
+**Code.** `expressionBuilder`, `joinedBuilder` in [expression-builder.ts](expression-builder.ts).
+
 ### SQL rendered through a trie of its pieces
 
 **What it is.** The compiler doesn't concatenate a query's SQL: it walks a trie keyed by the pieces it writes (keywords, quoted names, a shared column's SQL, placeholders), and the node a query ends on holds its SQL, made once. A query of a shape rendered before gets the same string object. With it:
@@ -329,7 +343,7 @@ The driver suite on a 4-vCPU VM (client on 2 CPUs, PostgreSQL 18 on the other 2)
 - Shapes made at run time (literals, `in` lists of new lengths) add prefixes until it starts over.
 - The shared column lists must stay immutable: they are frozen, and their nodes were already shared.
 - `isDataStatement` relies on `compile` marking only select, insert, update and delete nodes. A copy of a compiled query (`{ ...query }`) is tested by the regular expression, as raw SQL is.
-- A rewrite of `rowsNode` with `Object.keys` measured 0.3 µs less per insert in-process, but put inserts at 1000 callers and 5 ms into a slower JIT mode in about half the runs (−5% throughput). It was reverted to `Object.entries`, resolving each column once.
+- A rewrite of `rowsNode` with `Object.keys` measured 0.3 µs less per insert in-process, but put inserts at 1000 callers and 5 ms into a slower JIT mode in about half the runs (−5% throughput). It was reverted to `Object.entries`, resolving each column once. A later rewrite, one pass over each row's `Object.keys` with no per-row arrays ([Rows built in one pass](#rows-built-in-one-pass)), measured level in that cell.
 
 **Measured.** The driver benchmark suite (#6), with the built package, `main` (`337fc4f`) against this change interleaved in one session, a fresh process per cell, median of 5 runs, a pool of 10. The driver suite on an 8-vCPU VM: client on CPUs 0–2, PostgreSQL 18 on 4–7, Node 24.22. `pool.query` runs the same statement written by hand (`pk`, `insert1`, `update`).
 
@@ -553,6 +567,20 @@ In one process (the sources run directly, 100 callers, 0 ms, one core), a lookup
 **Measured.** With binary arrays ([#19](https://github.com/shlokdesai33/quarry/pull/19)): bulk insert of 1k rows 514 → 674 queries/s, 10k rows 58 → 75 (Bun.sql: 611 and 63); through the builder, 1,000 rows × 8 columns 5.83 → 3.94 ms.
 
 **Code.** `renderInsert` in [compile.ts](compile.ts); [insert-query-builder.ts](insert-query-builder.ts).
+
+### Rows built in one pass
+
+**What it is.** `rowsNode`, which aligns `values([...])` and `setEach` rows on their columns, reads each row's `Object.keys` once and writes each cell straight into the row's cell array. A key is found at its own position when the row lists its keys in the same order as the columns found so far (the usual case), and through a `Map` otherwise; its column is resolved when it first appears. The node is unchanged: one value node per cell, which `renderUnnest` reads back into column arrays.
+
+**Why.** It was 80% of building a 100-row insert (28 µs and 116 KB, about 1.1 KB per row): `Object.entries` made a pair array per cell and an array per row, every row's cells started as `keys.map(() => undefined)`, and each cell searched the keys with `indexOf`.
+
+**Alternatives.** Column arrays filled directly for `unnest`, with no node per cell: it changes the node that the compiler, `setEach` and `toNode()` read, and the one-pass rewrite already reached the build time that was estimated for it. `Object.keys` with the same per-row arrays: what was reverted before ([SQL rendered through a trie of its pieces](#sql-rendered-through-a-trie-of-its-pieces)).
+
+**Cost.** Rows with keys in other orders take the `Map` path. A cell array is padded once all rows are read, so every row has every column (`undefined` for its `default`), as before.
+
+**Measured.** `harness.ts`, Node 24, client pinned to one CPU, median of 5 interleaved runs: building a 100-row insert 28.2 → 8.6 µs (116 → 48 KB), `setEach(100)` 51.5 → 34.5 µs; running a 100-row insert 3,938 → 4,415/s (CPU 89 → 55 µs), 1,000 rows 498 → 571/s (CPU 616 → 365 µs); a one-row insert level (32,053 → 32,327/s over 7 runs, built in 1.1 → 0.8 µs). The benchmark suite's builder inserts (pool 10, Toxiproxy, median of 5): 1000 callers at 5 ms 135,418 → 135,339/s, every run within 131–141k on both sides; at 0 ms 124k → 146k/s; other cells within noise.
+
+**Code.** `rowsNode` in [write-query.ts](write-query.ts).
 
 ### `unnest` casts without type modifiers
 
@@ -881,6 +909,8 @@ Before, throughput was capped at `max` lookups per round trip (10 per 6 ms at 5 
 - Before the query layer existed, the benchmark (about 100 comparisons and one `selectFrom` per table, 2-table scopes) checked 20 tables in about 0.67 s, 50 in 1.5 s, 100 in 3.1 s (9.1M instantiations, 210 MB): linear (early design review).
 - Row locking (#22): +0.2% instantiations at 100 tables, check time unchanged.
 - Everyday SQL (#32): on the shared type tests, instantiations went from 241k to 348k, almost all a **one-time** cost of checking `src` (109k → 215k); the **per-query** cost was unchanged (131k vs 133k).
+- `selectAll` and `returningAll` check that their columns don't repeat a key already selected, with a rest parameter (`UniqueColumns`). TypeScript evaluated it during inference against a placeholder table name, so its quadratic `RepeatedColumns` ran over every reference in scope, even with nothing selected yet: about 4,900 of a `selectAll` point lookup's 5,400 instantiations. With nothing selected (`[keyof O] extends [never]`), the rest parameter is now empty. On 50 `selectAll` lookups of 20-column tables, beyond the library's own 215k: 5,390 → 463 instantiations per lookup, check time 104 → 60 ms. The duplicate-key error stays for a `selectAll` after earlier selections (tested). Skipping only `RepeatedColumns` reached just 4,492.
+- `bench:types` generates a tsconfig with `types: ['node']` since [Node only](driver/DECISIONS.md#node-only): with `types: []`, `src/driver/protocol/text.ts` no longer checked (`Buffer`, `TextEncoder`).
 
 **Code.** [refs.ts](refs.ts), [operators.ts](operators.ts), [types.ts](types.ts), [row.ts](row.ts), [where-builder.ts](where-builder.ts); [bench/types](../bench/types/run.ts).
 

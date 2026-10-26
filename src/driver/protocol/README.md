@@ -243,7 +243,7 @@ for (let type = reader.nextType(); type >= 0; type = reader.nextType()) {
 
 ### Messages split across chunks
 
-If a message is incomplete at the end of a chunk, `#stash(needed)` copies **just its beginning** into a buffer of the message's full size (or 5 bytes, if even the length isn't complete), and releases the chunk. Later `push` calls fill that buffer (`#fill`) until it is complete (`#partReady`), and `nextType` returns it before reading on in the new chunk. So:
+If a message is incomplete at the end of a chunk, `#stash(needed)` copies **just its beginning** into a buffer of the message's full size (or 5 bytes, if even the length isn't complete), and releases the chunk. A DataRow of 64 KiB to 16 MiB goes into one buffer the reader keeps and reuses for the next (`#partBuffer`, grown by doubling up to 16 MiB): its values are copied out as it is decoded, so nothing keeps it. The connection calls `dropSpare()` when it has nothing in flight, so an idle connection holds none. Later `push` calls fill that buffer (`#fill`) until it is complete (`#partReady`), and `nextType` returns it before reading on in the new chunk. So:
 
 - only split messages are ever copied, and each byte at most once: a 100 MB row arriving in 64 KiB chunks is collected linearly, not by re-joining a growing buffer (quadratic);
 - a chunk is released as soon as it is consumed, so an idle connection holds no buffers.
@@ -260,7 +260,7 @@ Every length is checked: a message length below 4 or above `maxMessageSize` (def
 
 - Messages without fields (ParseComplete, BindComplete, CloseComplete, NoData, EmptyQueryResponse, PortalSuspended, CopyDone) and the three ReadyForQuery variants are **shared constant objects**: a query gets several of them, and they are never modified.
 - A DataRow message object (when not taken by the fast path) holds a `subarray` view of its body, not a copy.
-- **CommandComplete** tags repeat (`SELECT 1` again and again), so the last tag's bytes and string are kept: if the next tag has the same bytes, the same string is returned without decoding. The bytes are **copied** for the comparison, because a view would keep the whole chunk alive.
+- **CommandComplete** tags repeat (`SELECT 1` again and again; `BEGIN`, `INSERT 0 1`, `COMMIT` in turn in a transaction), so the last 8 tags' bytes and strings are kept: if the next tag has the same bytes as one of them, the same string is returned without decoding. The bytes are **copied** for the comparison, because a view would keep the whole chunk alive. `parseTag` in [../ops.ts](../ops.ts) keeps up to 64 parsed tags in a `Map`.
 - `Cursor` creates its `DataView` lazily: the frequent messages read integers by hand.
 - Counts (columns, parameters) are read as **unsigned** 16-bit, so up to 65,535 parameters fit.
 - BackendKeyData's key must be 4 to 256 bytes.
@@ -281,6 +281,7 @@ Why the protocol layer works this way. Each links to its full entry (what it is,
 - [Back-filled message lengths](../DECISIONS.md#back-filled-message-lengths): messages written once, front to back.
 - [The writer: reserve one byte per character, hand off big buffers](../DECISIONS.md#the-writer-reserve-one-byte-per-character-hand-off-big-buffers): no tripled or pinned buffers for large values.
 - [Zero-copy reads: messages decoded in place](../DECISIONS.md#zero-copy-reads-messages-decoded-in-place): read in place, copy only split messages.
+- [Large split DataRows reassembled in one reused buffer](../DECISIONS.md#large-split-datarows-reassembled-in-one-reused-buffer): no new buffer per large row, none kept while idle.
 - [DataRow fast path: no message objects for rows](../DECISIONS.md#datarow-fast-path-no-message-objects-for-rows): rows go straight to the decoder.
 - [Strict bounds checks on every read](../DECISIONS.md#strict-bounds-checks-on-every-read): a protocol error closes the connection instead of corrupting later results.
 - [Shared constant messages and repeated-string caches](../DECISIONS.md#shared-constant-messages-and-repeated-string-caches): the messages every query receives cost nothing.

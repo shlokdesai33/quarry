@@ -333,7 +333,7 @@ Client CPU per query on the churn workload fell from 11.4–13.6 to 7.2–7.5 µ
 
 ### Which types are binary and which stay text
 
-**What it is.** Results are read in binary for `bool`, `int2`, `int4`, `oid`, `int8` (as `bigint`), `float8`, `bytea`, `timestamptz`, pgvector's `vector`, and arrays of those, of text-like types and of json/jsonb. Everything else (numeric, uuid, date, time, text, enums, jsonb scalars, int8 as a string, float4) stays text ([CODECS.md](CODECS.md#the-built-in-codecs)).
+**What it is.** Results are read in binary for `bool`, `int2`, `int4`, `oid`, `int8` (as `bigint`), `float8`, `bytea`, `timestamptz`, `tstzrange`, pgvector's `vector`, and arrays of those, of text-like types and of json/jsonb. Everything else (numeric, uuid, date, daterange, time, text, enums, jsonb scalars, int8 as a string, float4) stays text ([CODECS.md](CODECS.md#the-built-in-codecs)).
 
 **Why.** Binary wins when the JavaScript value **isn't a string**: it skips building a string and then parsing it. It ties or loses when the value is returned as a string anyway, because JavaScript then has to build that string itself, which is slower than Node's one native UTF-8 slice.
 
@@ -355,11 +355,13 @@ Client CPU per query on the churn workload fell from 11.4–13.6 to 7.2–7.5 µ
 
 1-row queries show no difference at all (median −0.4 µs on a 46 µs query); binary matters from tens of rows up.
 
+**Ranges.** A `tstzrange` is two `Date`s, so it follows `timestamptz`: its binary format (a flags byte, then each finite bound as an Int32 length and the element's binary value) goes through `timestamptz`'s binary decoder, and gives the same `RangeValue` as the text. In text, both bounds are quoted (`["2024-01-01 00:00:00+00","…")`), and the parser built each one a character at a time; a quoted bound without escapes is now sliced. `daterange` stays text: its bounds are never quoted, it decodes to strings, and it cost a quarter of a `tstzrange` (327 ns). Measured on 100k-row reads of one range column (`harness.ts xtype-r`, Node 24, client pinned to one CPU, median of 5 interleaved runs): `tstzrange` 1.41 → 0.27 µs per value in binary (CPU −81%, allocation 1,966 → 454 B per value), 1.49 → 0.80 µs in text; `daterange` unchanged (within ±3%).
+
 **Alternatives.** All binary: breaks every type without a binary decoder (extensions, domains, custom codecs), and loses on string types. All text: leaves the large-result wins.
 
 **Cost.** `float4` stays text because binary would change visible values (`0.1` reads as `0.10000000149011612`); `vector` accepted that change (its values are float32 by nature, and the gain is 3×), applied on both paths so text and binary agree. Binary formats also don't depend on session settings (DateStyle, `bytea_output`), a robustness bonus.
 
-**Code.** [codecs.ts](codecs.ts) (`resultFormat` per codec, `readArraysInBinary`).
+**Code.** [codecs.ts](codecs.ts) (`resultFormat` per codec, `readArraysInBinary`); [binary.ts](binary.ts) `rangeDecoder`; [parsers.ts](parsers.ts) `parseRange`.
 
 ### Binary array parameters, with a per-array fallback
 
@@ -411,7 +413,7 @@ Client CPU per query on the churn workload fell from 11.4–13.6 to 7.2–7.5 µ
 
 ### Zero-copy reads: messages decoded in place
 
-**What it is.** The reader finds message boundaries inside the socket's chunks and gives the caller **offsets into the chunk**; only a message split across two chunks is copied, into a buffer of exactly its size. Consumed chunks are released ([protocol/README.md](protocol/README.md#the-reader)).
+**What it is.** The reader finds message boundaries inside the socket's chunks and gives the caller **offsets into the chunk**; only a message split across two chunks is copied, into a buffer of exactly its size (a large DataRow into [one reused buffer](#large-split-datarows-reassembled-in-one-reused-buffer)). Consumed chunks are released ([protocol/README.md](protocol/README.md#the-reader)).
 
 **Why.** Copying every message (or re-joining a chunk's tail with the next chunk) costs time and memory proportional to everything received, and made large rows quadratic. Before #20, the unread tail of nearly every 64 KB chunk was re-copied, and the last joined buffer stayed referenced while the connection was idle.
 
@@ -422,6 +424,20 @@ Client CPU per query on the churn workload fell from 11.4–13.6 to 7.2–7.5 µ
 **Measured.** Streaming 1M rows: peak RSS 217 → 151 MB; 100k-row fetch 482 → 466 MB; throughput unchanged or slightly better ([#20](https://github.com/shlokdesai33/quarry/pull/20)).
 
 **Code.** [protocol/reader.ts](protocol/reader.ts).
+
+### Large split DataRows reassembled in one reused buffer
+
+**What it is.** A DataRow of 64 KiB to 16 MiB that arrives split across socket chunks is copied into a buffer the reader keeps and reuses (grown by doubling, up to 16 MiB), instead of a new buffer of its size each time. The reader lets go of it when the connection has nothing in flight. Smaller rows, larger ones and other messages keep a buffer of their own.
+
+**Why.** Rows of large values (a 1 MB `bytea`, a big `jsonb` document) nearly always span chunks, so each one allocated and zeroed a buffer of its size, only to drop it once decoded. The decoder copies every value out (strings are new, `bytea` is copied), so nothing keeps the reassembly buffer, and the next split row can overwrite it.
+
+**Alternatives.** A growable read buffer for everything (see above: copies every message). An unbounded reused buffer: one 500 MB row would pin 500 MB for the connection's life. Keeping it while idle: an idle pool of 10 would hold up to 160 MiB.
+
+**Cost.** Up to 16 MiB per connection while it is reading large rows. CopyData stays in a buffer of its own, since `copyTo` hands it out as a view.
+
+**Measured.** 1 MB values (`harness.ts`, Node 24, client pinned to one CPU, median of 5 interleaved runs): `bytea` 165 → 192 reads/s (CPU −16%), `text` 144 → 162/s (−17%), `jsonb` 38 → 41/s (−7%); `fetch1k` unchanged.
+
+**Code.** [protocol/reader.ts](protocol/reader.ts) `#partBuffer`, `dropSpare`; [connection.ts](connection.ts) `#onData`.
 
 ### Strict bounds checks on every read
 
@@ -459,6 +475,20 @@ Client CPU per query on the churn workload fell from 11.4–13.6 to 7.2–7.5 µ
 
 **Code.** [rows.ts](rows.ts).
 
+### Decoder factories found by result shape, not by their source
+
+**What it is.** The compiled decoder factories are looked up by a short key of the result's shape (row mode, each column's decode kind, the names, and the nesting), checked before any source is generated. The source cache behind it stays, so two shapes with the same code still share one compiled function.
+
+**Why.** A prepared statement builds its decoder once; an unprepared one (`prepare: false`, or behind PgBouncer before 1.21) gets a new RowDescription every run, and finding its factory meant generating the whole decoder source and joining it, only to use it as the cache key. That was 58% of the 16 KB an unprepared point lookup allocated.
+
+**Alternatives.** Keep a decoder per statement text for unprepared runs: a RowDescription can change between runs (a `select *` after an `alter table`), so it would still have to be compared. Hash the source: still builds it.
+
+**Cost.** A second `Map` (bounded by the same 4 M characters of source) and a key string per unprepared run.
+
+**Measured.** An unprepared point lookup (`harness.ts pk-noprep`, Node 24, client pinned to one CPU, median of 5 interleaved runs): 18,334 → 21,916/s, CPU 26.7 → 18.3 µs, allocation 16.0 → 5.0 KB per query. Prepared lookups and 1,000-row fetches unchanged.
+
+**Code.** [rows.ts](rows.ts) `factoryOf`.
+
 ### Decode only the rows a caller keeps (`keepRows`)
 
 **What it is.** A query can say "keep only the first N rows" (`keepRows`); the op skips decoding every row after that, while the query still runs to completion and the row count still counts every row ([ARCHITECTURE.md](ARCHITECTURE.md#keeprows)).
@@ -473,13 +503,27 @@ Client CPU per query on the churn workload fell from 11.4–13.6 to 7.2–7.5 µ
 
 ### Shared constant messages and repeated-string caches
 
-**What it is.** Messages with no fields (ParseComplete, BindComplete, NoData, …) and the three ReadyForQuery variants are shared, never-modified objects; the last command tag (`SELECT 1`) is kept and reused when the next tag has the same bytes ([protocol/README.md](protocol/README.md#decoding)).
+**What it is.** Messages with no fields (ParseComplete, BindComplete, NoData, …) and the three ReadyForQuery variants are shared, never-modified objects. The last 8 command tags (`SELECT 1`, `BEGIN`, `INSERT 0 1`, …) are kept, and one is reused when the next tag has the same bytes; parsed tags (command and row count) are kept in a `Map` of up to 64 ([protocol/README.md](protocol/README.md#decoding)).
 
-**Why.** Every query receives several of these; allocating them is pure garbage.
+**Why.** Every query receives several of these; allocating them is pure garbage. With one cached tag, a transaction's `BEGIN`, `INSERT` and `COMMIT` replaced each other, so every tag was decoded, copied and parsed again.
 
-**Cost.** None visible; the tag bytes are copied, so the cache never keeps a read buffer alive.
+**Alternatives.** One entry (before): enough for a loop of one statement, thrashed by any transaction. A `Map` keyed by the tag's string for the reader: the string is what decoding the bytes would build.
 
-**Code.** [protocol/reader.ts](protocol/reader.ts), [ops.ts](ops.ts) `parseTag`.
+**Cost.** Eight byte comparisons at worst per tag; the tag bytes are copied, so the cache never keeps a read buffer alive. The parsed-tag `Map` is cleared once it holds 64 entries (row counts vary).
+
+**Measured.** `harness.ts`, Node 24, client pinned to one CPU, median of 5 interleaved runs: a one-insert transaction allocates 10.7 → 9.5 KB (−12%, CPU −3%), three statements in one 15.8 → 13.6 KB (−14%, CPU −6%); a point lookup unchanged.
+
+**Code.** [protocol/reader.ts](protocol/reader.ts) `commandTag`, [ops.ts](ops.ts) `parseTag`.
+
+### `Buffer` read from `node:buffer` once
+
+**What it is.** The protocol's text, binary and array-parameter code imports `Buffer` from `node:buffer` instead of reading the global per value.
+
+**Why.** `globalThis.Buffer` is an accessor in Node 24, so each read of the global, once per decoded string, went through a getter (`isBuffer` and the getter were about 5% of a fetch's client CPU). Since [Node only](#node-only), there is no runtime without `Buffer` to fall back for.
+
+**Measured.** `harness.ts`, Node 24, client pinned to one CPU, median of 5 interleaved runs: a 1,000-row fetch CPU −6% (2,557 → 2,664/s), through the builder −7%; 10 wide rows −6%.
+
+**Code.** [protocol/text.ts](protocol/text.ts), [binary.ts](binary.ts), [array-params.ts](array-params.ts).
 
 ## Memory and garbage collection
 
@@ -631,6 +675,8 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 - **Narrowing.** With W pipelined backends on C CPUs, each is off its CPU about 1 − C/W of the time, so W × (1 − stalled) estimates C. Above 25% stalled two epochs in a row, the width drops to that (not below 2 in one step). The connections to drop (stalled ones first) take no new queries and go idle once theirs finish; the others keep pipelining.
 - **Picking.** Among connections with room, the least loaded one that isn't stalled: a query sent to a stalled connection waits with it.
 - **Judged, because slow queries stall too.** A connection behind a 20 ms query also stalls, and there fewer connections would only queue more lookups behind it. A narrowing is kept only if stalls then fell by a quarter (or below 25%) and the mean latency (in flight plus queued, over the completion rate) didn't double; otherwise the next try waits four times as long (4 to 1024 epochs). It is undone at once if, once it settled, completions come at under three fifths of the rate before, overall and in each of the last four windows of 256 completions (a client pause, GC or the process descheduled, slows only one; judged on the overall rate alone, one pause in a narrowing's first ~1,000 completions undid it and held the pool at full width for 1,024 epochs): under CPU contention the CPUs stay busy whatever the width, so that only happens behind slow queries, and the next try waits the full 1024 epochs.
+- **Oversized pools: few queries per connection.** When the pool is far wider than its callers need (pool 50, 32 callers), each connection carries about one query, its backend wakes for it and sleeps again, and the server spends its CPUs switching between backends: completions slowed down, but nothing stalled, so the rule above never fired. While queries average under 4 in flight or queued per connection, and under 1 ms in the pool, the width is halved (not below 2), with no stall signal needed. Such a narrowing is kept if completions then come at least about as fast (time per completion within 3% of before) and queries don't spend a quarter longer in the pool; stalls may rise, since fewer connections each carry more. A growth from a width narrowed this way is undone if it slowed completions down.
+- **A stall narrowing that sped things up.** A narrowing for stalls is also kept when stalls stayed level but completions came faster, as long as stalls didn't rise by a quarter: a pool that stalls because it is too wide often stalls as much at half the width, yet completes more.
 - **Growing.** Below 5% stalled, with queries pipelined or queued at the width, +1; a growth that brings stalls back doubles the wait before the next; one that holds halves it.
 - **Not judged:** the epoch after a change, one in which the pool ran out of queries, and one in which a connection took queries for the first time. While a pool of 50 fills up, not every connection is busy, stalls read low (50–60% instead of 96%), and the first narrowing would aim at 20 connections instead of 2.
 
@@ -670,6 +716,19 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 - Mixed workload (10 connections; 100 lookup callers and 5 callers of 20 ms queries): 226–231k → 218–237k lookups/s, and the slow callers got 143–239 instead of 46–141 queries/s. With 5,000 lookup callers and 20 slow ones: 148–149k → 148–150k, the same p99.
 - Builder queries (through `pool.query` since #37) are client-bound on this VM (Node ~62k/s, Bun ~103k/s); they stay level, and the width doesn't engage while the server has room.
 - In about 1 run in 7 at pool 50 × 1000, the first narrowing is undone, and the pool stays wide for the rest of a 1-second run.
+
+**Measured: oversized pools.** Point lookups (`select * from bench_users where id = $1`) from 1–256 callers on pools of 10, 20 and 50, same VM, Node 24, ops/s late in a 12 s run, before → after the oversized-pool rule (in brackets, the pool's busy connections then):
+
+| Callers | Pool 10                     | Pool 20                     | Pool 50                     |
+| ------- | --------------------------- | --------------------------- | --------------------------- |
+| 1       | 37.9k → 37.4k               | 37.9k → 37.7k               | 37.7k → 37.6k               |
+| 8       | 111k (8) → **175k** (3)     | 114k (8) → **182k** (2)     | 119k (8) → **199k** (2)     |
+| 16      | 147k (10) → **243k** (2)    | 111k (16) → **240k** (2)    | 112k (16) → **238k** (2)    |
+| 32      | 188k (10) → **247k** (2)    | 145k (20) → **247k** (2)    | 115k (32) → **245k** (2)    |
+| 64      | 246k (2) → 244k (2)         | 181k (20) → **205k** (2)    | 175k (14) → **242k** (2)    |
+| 256     | 244k (2) → 250k (2)         | 247k (2) → 247k (3)         | 194k (18) → **244k** (3)    |
+
+Before, the stall rule narrowed pools only once callers outnumbered connections several times over, and pools of 20 and 50 stayed wide up to 64–256 callers at half the throughput. The mixed workload above (10 connections, 100 lookup callers and 5 callers of 20 ms queries) is unchanged: 249k lookups/s and 241 slow queries/s before, 256k and 241 after. A first version that kept any narrowing that sped completions up, whatever the stalls did, cut it to 106k and 148: there, narrowing starved the slow queries, so a narrowing that raises stalls by a quarter is undone, and the oversized-pool rule only tries queries that spend under 1 ms in the pool.
 
 **Code.** [pool.ts](pool.ts) `Width`, `#claimShared`, `#pickShared`, `#fillShared`, `#serveShared`, `#done`.
 
@@ -1073,6 +1132,16 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 
 **Code.** [ops.ts](ops.ts) `CopyFromOp`, `CopyToOp`.
 
+### `copyRows` loops synchronously over sync rows
+
+**What it is.** `copyRows` batches rows into 64 KiB chunks with a plain `for … of` when `rows` is a sync iterable (an array, a generator), and with `for await` only for an async one.
+
+**Why.** `for await` over a sync iterable awaits every row: a promise and a microtask turn per row, for nothing, on the bulk-load path. The chunks were already yielded from an async generator, so backpressure is unchanged.
+
+**Measured.** `copyRows` of 100k rows from an array (`harness.ts copy-in-100k`, Node 24, client pinned to one CPU, median of 5 interleaved runs): 76.5 → 59.6 ms of CPU per load (−22%), allocation −39%.
+
+**Code.** [types.ts](types.ts) `copyChunks`.
+
 ### `copyTo` chunks: everything received, one copy per read
 
 **What it is.** Each CopyData message (a row, in text format) stays a view of the read buffer until `next()` takes it; `next()` copies every message received by then into one chunk.
@@ -1209,6 +1278,20 @@ Builder point lookups (`selectFrom(users).where(id).select([3 columns]).expectOn
 Untimed lookups are unchanged (77,092, 79,339, 14,941 and 56,411/s before).
 
 **Code.** [connection.ts](connection.ts) `#queryWithTimeout`; [ops.ts](ops.ts) `STATEMENT_TIMEOUT`, `SyncGroupOp`, `CursorOp`; [../driver-executor.ts](../driver-executor.ts) `#shared`.
+
+### Two statements on a pool, where no transaction block can precede the query
+
+**What it is.** A timed `pool.query()` (and so a builder query or default batch with a `timeout`) goes out as two statements under one Sync, `set_config('statement_timeout', $1, true)` and the query, when the pool can be sure it runs outside a transaction block: the connection's last ReadyForQuery said idle, and everything queued or in flight on it is a plain statement that can't open a block (not `begin` or `start transaction`, read after comments; not a simple query, a cursor or COPY), and the timed query isn't one either. Their implicit transaction ends the setting at the Sync, so no restore is needed. Everywhere else (a connection's own queries, a transaction, a pool connection with a `begin` pipelined ahead, a timed `begin`) keeps the three-statement framing above.
+
+**Why.** The three-statement form costs a second statement, the saved setting and a `case` per timed query. On a pool's shared connections, the pool itself issues everything ahead, so it can tell what's queued. The status alone can't be trusted ([above](#a-statement-timeout-is-framed-under-the-querys-sync-whatever-the-transaction-status)): a `begin` pipelined ahead and not yet answered leaves the status idle, which is why every queued op has to be checked as well. A timed `begin` would keep its transaction-local setting for the block it opens, bounding the caller's later statements.
+
+**Alternatives.** The short form wherever the status is idle: the kind of bug #38 fixed. Behind another caller's unanswered `begin`, the setting would land inside that caller's transaction and last for the rest of it. The three statements everywhere (before): correct, slower. Choosing at the head of the queue: needs to wait for earlier answers.
+
+**Cost.** A scan of the connection's queue (at most its pipeline depth, usually a few ops) per timed query, and a regular expression per queued plain query's SQL, both only for timed queries. Tested directly and through PgBouncer in transaction mode: pipelined neighbours timed and untimed, a `begin` pipelined ahead (three statements, the caller's transaction unbounded), a timed `begin`, a failing query mid-pipeline and an invalid interval (each fails alone, nothing leaks), and transactions and plain connections (three statements).
+
+**Measured.** `harness.ts`, Node 24, client pinned to one CPU, median of 5 interleaved runs: a timed point lookup 26,108 → 29,065/s (CPU −6%, allocation −21%); 64 callers 99,693 → 136,231/s (p99 6.4 → 4.3 ms); builder lookups with a `timeout` from 100 callers 120,769 → 147,892/s (p99 6.7 → 4.3 ms). Untimed lookups from 64 callers unchanged.
+
+**Code.** [connection.ts](connection.ts) `#query`, `#queryWithTimeout`, `#outsideTransactionBlock`; [ops.ts](ops.ts) `STATEMENT_TIMEOUT_LOCAL`, `opensNoBlock`.
 
 ### Every wait has a timeout
 

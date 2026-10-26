@@ -491,6 +491,28 @@ describe.skipIf(noPg).each(targets)('statementTimeout %s', (_name, target) => {
 			]);
 		});
 
+		it('runs the same statement pipelined behind one whose interval is invalid', async () => {
+			await using pool = createPool({ ...target(), max: 1, pipeline: 10 });
+			const sql = 'select $1::int as x';
+			// its next run is the one that prepares it
+			await pool.query(sql, [0]);
+			const [invalid, again, timed] = await Promise.allSettled([
+				pool.query(sql, [1], { statementTimeout: 'soon' }),
+				pool.query(sql, [2]),
+				pool.query(sql, [3], { statementTimeout: '1s' }),
+			]);
+			expect(invalid?.status === 'rejected' && String(invalid.reason)).toMatch(
+				/statement_timeout/,
+			);
+			expect(again?.status === 'fulfilled' && again.value.rows).toEqual([
+				{ x: 2 },
+			]);
+			expect(timed?.status === 'fulfilled' && timed.value.rows).toEqual([
+				{ x: 3 },
+			]);
+			expect((await pool.query(sql, [4])).rows).toEqual([{ x: 4 }]);
+		});
+
 		it('keeps the three statements on a connection and in a transaction', async () => {
 			const net = recordingSockets();
 			await using pool = createPool({

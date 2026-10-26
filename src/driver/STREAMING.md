@@ -147,7 +147,7 @@ It resolves with the row count from `COPY n`.
 
 ### `copyRows(sql, rows)`
 
-The convenient form: `rows` is an iterable of value arrays, encoded like query parameters (`copyChunks` → `copyLine` in [types.ts](types.ts)): each value as its Postgres text (numbers, booleans `t`/`f`, `Date`s in UTC, byte arrays as `\x` hex, arrays as literals, objects as JSON), tab-separated, `\N` for NULL, with backslash, tab, newline and carriage return escaped; batched into chunks of about 64 KiB characters.
+The convenient form: `rows` is an iterable of value arrays, encoded like query parameters (`copyChunks` → `copyLine` in [types.ts](types.ts)): each value as its Postgres text (numbers, booleans `t`/`f`, `Date`s in UTC, byte arrays as `\x` hex, arrays as literals, objects as JSON), tab-separated, `\N` for NULL, with backslash, tab, newline and carriage return escaped; batched into chunks of about 64 KiB characters. A sync iterable (an array, a generator) is read with a plain loop, an async one with `for await`, which would otherwise cost a promise per row ([DECISIONS.md](DECISIONS.md#copyrows-loops-synchronously-over-sync-rows)).
 
 ```ts
 await conn.copyRows('copy users (id, name) from stdin', [

@@ -472,8 +472,21 @@ export class QueryOp extends Op {
 		const spec = specOf(this.#options, ctx);
 		this.#spec = spec;
 		const types = this.#paramTypes;
-		if (this.#options.prepare && ctx.preparable(this.#sql, types)) {
-			const statement = ctx.statement(this.#sql, types, ctx.named());
+		let statement =
+			this.#options.prepare && ctx.preparable(this.#sql, types)
+				? ctx.statement(this.#sql, types, ctx.named())
+				: undefined;
+		// its Parse, still unanswered, may yet be skipped (a group failing
+		// before it), and an op that can't be retried can't recover from that
+		if (
+			statement !== undefined &&
+			this.#retried &&
+			statement.name !== '' &&
+			!statement.unwritten &&
+			!statement.parsed
+		)
+			statement = undefined;
+		if (statement !== undefined) {
 			this.#statement = statement;
 			if (statement.name === '') {
 				this.#unnamed = true;
