@@ -19,6 +19,7 @@ function run(
 	ticks: number,
 	server: Server,
 	depth = 20,
+	waiting = 100,
 ): number[] {
 	const slots: { shared: number; lastDone: number }[] = Array.from(
 		{ length: max },
@@ -40,7 +41,7 @@ function run(
 		const slot = slots[server.pick(tick, active)]!;
 		width.demand();
 		clock.now += server.pace(active);
-		width.done(slot, depth * active - 1, 100, active, map);
+		width.done(slot, depth * active - 1, waiting, active, map);
 		limits.push(width.limit);
 	}
 	return limits;
@@ -162,6 +163,36 @@ describe('Width', () => {
 		expect(width.limit).toBeLessThanOrEqual(3);
 		const limits = run(width, clock, 10, 300_000, timeSliced(Infinity));
 		expect(limits.at(-1)).toBe(10);
+	});
+
+	it('narrows an oversized pool whose connections each carry a query or two, while completions come as fast', () => {
+		const clock = { now: 0 };
+		const width = new Width(50, () => clock.now);
+		// each backend woken for a query costs the server: the more connections, the slower
+		const wakeups: Server = {
+			pick: (tick, active) => tick % active,
+			pace: (active) => 0.001 * (1 + active / 10),
+		};
+		const limits = run(width, clock, 50, 150_000, wakeups, 1, 0);
+		expect(median(limits.slice(100_000))).toBeLessThanOrEqual(4);
+	});
+
+	it('keeps an oversized pool wide when fewer connections complete fewer queries, or queries are slow', () => {
+		for (const pace of [
+			// every connection is needed: the queries wait on something else
+			(active: number) => 0.04 / active,
+			// slow queries: the wake-ups don't matter, so it doesn't try
+			(active: number) => 1.5 * (1 + active / 10),
+		]) {
+			const clock = { now: 0 };
+			const width = new Width(20, () => clock.now);
+			const parallel: Server = { pick: (tick, active) => tick % active, pace };
+			const limits = run(width, clock, 20, 150_000, parallel, 1, 0);
+			const late = limits.slice(50_000);
+			expect(late.filter((limit) => limit === 20).length).toBeGreaterThan(
+				late.length * 0.9,
+			);
+		}
 	});
 
 	it('stays within 1 and max', () => {

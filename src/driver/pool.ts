@@ -225,6 +225,22 @@ const NARROWER_WORSE = 2;
  */
 const GROW_BACKOFF = 64;
 const NARROW_BACKOFF = 1024;
+/**
+ * Below this many queries in flight (or queued) per connection on
+ * average, each backend wakes for a query or two and sleeps again: the
+ * server spends more on switching between them than on the queries, and
+ * fewer connections, each carrying more, complete as fast or faster. A
+ * narrowing tried for that is kept only if completions come about as
+ * fast (time per completion at most `SPARSE_SLOWER` times what it was).
+ */
+const SPARSE_LOAD = 4;
+const SPARSE_SLOWER = 1.03;
+/** Nor if queries then spend this many times longer in the pool on average (as when they arrive at a steady rate). */
+const SPARSE_LATER = 1.25;
+/** Only tried while queries spend less than this long in the pool on average (ms): the wake-ups dominate short queries alone. */
+const SPARSE_LATENCY = 1;
+/** A narrowing for stalls that sped completions up is kept only if stalls rose less than this (times what they were). */
+const STALLS_ROSE = 1.25;
 
 /**
  * How many connections `query` spreads its queries across: up to `max`,
@@ -313,6 +329,13 @@ export class Width {
 	#trialStart = 0;
 	#trialTick = 0;
 	#trialPace = 0;
+	/** The narrowing being judged was tried for efficiency (`SPARSE_LOAD`), not for stalls. */
+	#sparse = false;
+	/** The width is below `max` because of a narrowing for efficiency: growths are judged by pace too. */
+	#narrowedSparse = false;
+	/** The width before a growth being judged, and the time per completion before it. */
+	#growFrom = 0;
+	#growPace = 0;
 	/** The last pace check (time and completion count), and how many in a row found completions slower. */
 	#checkTime = 0;
 	#checkTick = 0;
@@ -428,8 +451,9 @@ export class Width {
 	#adjust(shared: number): boolean {
 		const now = this.#now();
 		const elapsed = now - this.#started;
-		// Little's law: mean queries in the pool over the completion rate
-		const latency = (this.#load / WIDTH_EPOCH) * (elapsed / WIDTH_EPOCH);
+		// mean queries in flight or queued, and Little's law: that over the completion rate
+		const load = this.#load / WIDTH_EPOCH;
+		const latency = load * (elapsed / WIDTH_EPOCH);
 		const stalled = this.#gaps > 0 ? this.#stalled / this.#gaps : 0;
 		const demand = this.#demand;
 		if (this.#settling) {
@@ -446,14 +470,40 @@ export class Width {
 		this.#epoch(now);
 		const lastStalled = this.#lastStalled;
 		this.#lastStalled = stalled;
+		const pace = elapsed / WIDTH_EPOCH;
 		if (this.#from > 0) {
 			if (
-				stalled >= Math.max(STALLED_HIGH, this.#stalledBefore * 0.75) ||
-				latency > this.#before * NARROWER_WORSE
-			)
+				this.#sparse
+					? // tried for efficiency: kept if completions come as fast; stalls
+						// may rise (busier backends get time-sliced), which narrows further
+						pace > this.#trialPace * SPARSE_SLOWER ||
+						latency > this.#before * SPARSE_LATER
+					: latency > this.#before * NARROWER_WORSE ||
+						// stalls didn't fall, and completions didn't come faster with
+						// stalls level (behind slow queries, fewer connections stall more)
+						(stalled >= Math.max(STALLED_HIGH, this.#stalledBefore * 0.75) &&
+							(pace * SPARSE_SLOWER > this.#trialPace ||
+								stalled > this.#stalledBefore * STALLS_ROSE))
+			) {
+				this.#sparse = false;
 				return this.#revert(now);
+			}
 			this.#from = 0;
 			this.#narrowBackoff = Math.max(4, this.#narrowBackoff >> 1);
+			if (this.#sparse) {
+				this.#sparse = false;
+				this.#narrowedSparse = true;
+			}
+		}
+		if (this.#growFrom > 0) {
+			// a growth from a width narrowed for efficiency: undone if completions slowed
+			if (pace > this.#growPace * SPARSE_SLOWER) {
+				this.limit = this.#growFrom;
+				this.#growBackoff = Math.min(GROW_BACKOFF, this.#growBackoff * 2);
+				this.#growHoldoff = this.#growBackoff;
+				this.#probing = false;
+			}
+			this.#growFrom = 0;
 		}
 		if (stalled > STALLED_HIGH) {
 			if (this.#narrowHoldoff > 0) {
@@ -469,6 +519,7 @@ export class Width {
 			if (this.#probing)
 				this.#growBackoff = Math.min(GROW_BACKOFF, this.#growBackoff * 2);
 			this.#probing = false;
+			this.#narrowedSparse = false;
 			this.#growHoldoff = this.#growBackoff;
 			this.#from = this.limit;
 			this.#before = latency;
@@ -482,6 +533,28 @@ export class Width {
 			return false;
 		}
 		if (this.#narrowHoldoff > 0) this.#narrowHoldoff--;
+		const width = Math.min(this.limit, shared);
+		if (
+			this.#narrowHoldoff === 0 &&
+			width >= 4 &&
+			load > 0 &&
+			load < width * SPARSE_LOAD &&
+			latency < SPARSE_LATENCY
+		) {
+			// a few queries per connection: halved, kept if completions don't slow
+			this.#sparse = true;
+			this.#from = this.limit;
+			this.#before = latency;
+			this.#stalledBefore = stalled;
+			this.#trialStart = now;
+			this.#trialTick = this.#ticks;
+			this.#trialPace = pace;
+			this.#growHoldoff = this.#growBackoff;
+			this.#settling = true;
+			this.#epoch(now);
+			this.limit = Math.max(2, Math.ceil(width / 2));
+			return false;
+		}
 		if (this.#growHoldoff > 0) {
 			this.#growHoldoff--;
 			return false;
@@ -491,9 +564,14 @@ export class Width {
 		// the last try held: try again sooner
 		if (this.#probing) this.#growBackoff = Math.max(1, this.#growBackoff >> 1);
 		this.#probing = true;
+		if (this.#narrowedSparse) {
+			this.#growFrom = this.limit;
+			this.#growPace = pace;
+		}
 		this.#settling = true;
 		this.#epoch(now);
 		this.limit++;
+		if (this.limit >= this.#max) this.#narrowedSparse = false;
 		return true;
 	}
 }
