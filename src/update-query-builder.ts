@@ -34,6 +34,9 @@ import {
 import {
 	type ColumnKey,
 	columnOf,
+	eachIncrements,
+	type IncrementOf,
+	incremented,
 	rowsNode,
 	setNodes,
 	type SetValues,
@@ -110,13 +113,16 @@ export interface SetEachOptions<K extends string, A extends string> {
 
 /**
  * A row of a `setEach`: its `key` columns `K`, which match it to the
- * table's row, and any of the columns an update can set. A column a row
- * leaves out (or sets to `undefined`) keeps its value in that row; `null`
- * sets it to null.
+ * table's row, and any of the columns an update can set, a numeric one
+ * also to an `inc` / `dec` of the table's value by the row's amount. A
+ * column a row leaves out (or sets to `undefined`) keeps its value in that
+ * row; `null` sets it to null.
  */
 export type SetEachRow<T extends AnyTable, K extends ColumnKey<T>> = Prettify<
 	{ readonly [C in K]: NonNullable<Columns<T>[C]['$select']> } & {
-		readonly [C in Exclude<UpdateKey<T>, K>]?: Columns<T>[C]['$update'];
+		readonly [C in Exclude<UpdateKey<T>, K>]?:
+			| Columns<T>[C]['$update']
+			| IncrementOf<Columns<T>[C], NonNullable<Columns<T>[C]['$update']>>;
 	}
 >;
 
@@ -173,11 +179,13 @@ export class UpdateQueryBuilder<
 
 	/**
 	 * Columns to set, typed by their update types; read-only columns aren't
-	 * offered. A value can be an expression, over `setEach`'s rows too.
-	 * Adds to the columns set before, replacing a column set again.
+	 * offered. A value can be an expression, over `setEach`'s rows too, and
+	 * a numeric column can be changed relative to its value with `inc` /
+	 * `dec`. Adds to the columns set before, replacing a column set again.
 	 *
 	 * @example .set({ name: 'Ada' })
 	 * @example .set((eb) => ({ name: eb.fn.lower('users.name') }))
+	 * @example .set({ loginCount: inc(1), credits: dec('5') })
 	 */
 	set(
 		values: SetValues<T> | ((eb: ExpressionBuilder<R>) => SetValues<T>),
@@ -208,6 +216,7 @@ export class UpdateQueryBuilder<
 	 * @example .setEach([{ id: 1, name: 'Ada' }, { id: 2, email: null }], { key: 'id' })
 	 * @example .setEach(rows, { key: ['tenantId', 'slug'] }).expectRows(rows.length)
 	 * @example .setEach(rows, { key: 'id' }).set((eb) => ({ stock: eb.fn.coalesce('row.stock', 'products.stock') }))
+	 * @example .setEach([{ id: 1, balance: inc('5') }, { id: 2, balance: inc('7.50') }], { key: 'id' }) // per-row amounts
 	 */
 	setEach<const K extends ColumnKey<T>, const A extends string = 'row'>(
 		rows: readonly NoInfer<SetEachRow<T, K>>[],
@@ -224,6 +233,7 @@ export class UpdateQueryBuilder<
 			typeof options.key === 'string' ? [options.key] : options.key;
 		const given: readonly Readonly<Record<string, unknown>>[] = rows;
 		checkEachRows(table, given, keys, alias, this.#state.from !== undefined);
+		const changes = eachIncrements(table, given, keys);
 		const target = (name: string): ReferenceNode => ({
 			kind: 'reference',
 			table: table.name,
@@ -238,7 +248,7 @@ export class UpdateQueryBuilder<
 		// the key columns first, then the others in the order they appear
 		const values = rowsNode(
 			table,
-			given.map((each) =>
+			changes.rows.map((each) =>
 				Object.assign(
 					Object.fromEntries(keys.map((key) => [key, each[key]])),
 					each,
@@ -259,7 +269,18 @@ export class UpdateQueryBuilder<
 		);
 		values.columns.forEach((name, i) => {
 			if (keyNames.has(name)) return;
-			let value: OperationNode = row(name);
+			const increment = changes.increments.get(name);
+			// an inc / dec adds the row's amount to the table's value
+			const fromRow =
+				increment === undefined
+					? row(name)
+					: incremented(
+							target(name),
+							increment.operator,
+							row(name),
+							increment.coalesce,
+						);
+			let value: OperationNode = fromRow;
 			if (values.rows.some((cellsOf) => cellsOf[i] === undefined)) {
 				// a row that leaves the column out keeps its value
 				const flag = `set:${name}`;
@@ -275,7 +296,7 @@ export class UpdateQueryBuilder<
 				);
 				value = {
 					kind: 'case',
-					branches: [{ when: row(flag), result: row(name) }],
+					branches: [{ when: row(flag), result: fromRow }],
 					otherwise: target(name),
 				};
 			}
@@ -407,13 +428,38 @@ export class UpdateQueryBuilder<
 		return {
 			kind: 'update',
 			table: tableNode(table),
-			set,
+			// with rows of the same columns in scope, `set`'s own columns are qualified
+			set:
+				from === undefined
+					? set
+					: set.map(({ column, value }) => ({
+							column,
+							value: qualified(value, table.name),
+						})),
 			from,
 			where: where.toNode(),
 			allRows,
 			returning,
 			tag,
 		};
+	}
+}
+
+/** `node` with the update's own unqualified columns (an `inc`'s current value) qualified by `table`. */
+function qualified(node: OperationNode, table: string): OperationNode {
+	switch (node.kind) {
+		case 'column':
+			return { kind: 'reference', table, column: node.column };
+		case 'binary':
+			return {
+				...node,
+				left: qualified(node.left, table),
+				right: qualified(node.right, table),
+			};
+		case 'function':
+			return { ...node, args: node.args.map((arg) => qualified(arg, table)) };
+		default:
+			return node;
 	}
 }
 

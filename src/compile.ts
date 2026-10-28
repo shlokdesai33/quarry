@@ -606,6 +606,9 @@ function render(node: OperationNode, out: Output): void {
 		case 'reference':
 			renderReference(node, out);
 			return;
+		case 'column':
+			writeIdentifier(node.column, out);
+			return;
 		case 'value':
 			param(out, node.value, node.codec);
 			return;

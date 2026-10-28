@@ -7,6 +7,7 @@ import type { Codec } from './driver/codec.js';
  */
 export type OperationNode =
 	| ReferenceNode
+	| ColumnNode
 	| ValueNode
 	| ValueListNode
 	| LiteralNode
@@ -25,6 +26,15 @@ export type OperationNode =
 export type ReferenceNode = {
 	readonly kind: 'reference';
 	readonly table: string;
+	readonly column: string;
+};
+
+/**
+ * A column of the table an `update` writes, unqualified, e.g. `"views"` in
+ * `set "views" = "views" + $1`.
+ */
+export type ColumnNode = {
+	readonly kind: 'column';
 	readonly column: string;
 };
 

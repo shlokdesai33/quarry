@@ -31,6 +31,7 @@ import {
 import {
 	type ColumnKey,
 	columnOf,
+	type Current,
 	excluded,
 	type Excluded,
 	rowsNode,
@@ -293,9 +294,11 @@ export class OnConflictBuilder<T extends AnyTable, O, M extends 'values'> {
 
 	/**
 	 * `do update set ...`, from the proposed row as `excluded`, typed like
-	 * an update's `set`.
+	 * an update's `set`. An `inc` / `dec` changes the existing row's value,
+	 * e.g. by the proposed one.
 	 *
 	 * @example .onConflict('email').doUpdate((excluded) => ({ name: excluded.name }))
+	 * @example .onConflict('key').doUpdate((excluded) => ({ hits: inc(excluded.hits) }))
 	 */
 	doUpdate(
 		set: (
@@ -305,9 +308,19 @@ export class OnConflictBuilder<T extends AnyTable, O, M extends 'values'> {
 		options?: ConflictUpdateOptions<T>,
 	): InsertQueryBuilder<T, O, M> {
 		const { table } = this.#state;
+		const existing: Current = (column) => ({
+			kind: 'reference',
+			table: table.name,
+			column,
+		});
 		return this.#then({
 			kind: 'update',
-			set: setNodes(table, [], set(excluded(table), expressionBuilder(table))),
+			set: setNodes(
+				table,
+				[],
+				set(excluded(table), expressionBuilder(table)),
+				existing,
+			),
 			where: this.#updateWhere(options),
 		});
 	}

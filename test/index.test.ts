@@ -16,6 +16,8 @@ describe('the package entry point', () => {
 			'insertInto',
 			'update',
 			'deleteFrom',
+			'inc',
+			'dec',
 			'formatVerifyReport',
 			'defineConfig',
 			'compile',
