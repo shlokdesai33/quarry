@@ -1,3 +1,5 @@
+// a module binding: the global `Buffer` is an accessor, read on every use
+import { Buffer } from 'node:buffer';
 const decoder = new TextDecoder();
 
 /** The bytes as a Buffer sharing the same memory. */

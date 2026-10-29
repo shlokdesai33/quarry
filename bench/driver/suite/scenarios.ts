@@ -532,6 +532,21 @@ export const SCENARIOS: Scenario[] = [
 	},
 	{
 		kind: 'ops',
+		id: 'tx-insert-commit',
+		group: 'transactions',
+		title:
+			'transaction: begin; insert; commit, the insert marked as the last statement',
+		setup: truncateWrites,
+		needs: 'transactionCommitting',
+		op: (d, i) =>
+			d.transactionCommitting!(INSERT1, [
+				`txc${i}`,
+				1,
+				'2024-01-01 00:00:00+00',
+			]),
+	},
+	{
+		kind: 'ops',
 		id: 'savepoints',
 		group: 'transactions',
 		title: 'transaction with 5 savepoints (select 1 in each)',

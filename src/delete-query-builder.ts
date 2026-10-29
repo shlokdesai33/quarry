@@ -130,7 +130,9 @@ export class DeleteQueryBuilder<
 	 * @example .returningAll()
 	 */
 	returningAll(
-		..._unique: UniqueColumns<O, Ref<RefsOf<[T]>>>
+		..._unique: [keyof O] extends [never]
+			? []
+			: UniqueColumns<O, Ref<RefsOf<[T]>>>
 	): DeleteQueryBuilder<T, AddRow<O, RowOf<RefsOf<[T]>, Ref<RefsOf<[T]>>>>, M> {
 		return new DeleteQueryBuilder({
 			...this.#state,

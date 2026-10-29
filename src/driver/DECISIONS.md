@@ -27,6 +27,7 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
 - [Writing to the socket](#writing-to-the-socket)
   - [Coalesced writes: one write per microtask](#coalesced-writes-one-write-per-microtask)
   - [`TCP_NODELAY`](#tcp_nodelay)
+  - [`noDelay` in the connect options](#nodelay-in-the-connect-options)
   - [Backpressure: 64 KiB chunks, and queued ops stay unencoded](#backpressure-64-kib-chunks-and-queued-ops-stay-unencoded)
   - [Back-filled message lengths](#back-filled-message-lengths)
   - [Pipelining, with one Sync per query](#pipelining-with-one-sync-per-query)
@@ -37,6 +38,7 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
   - [Retry a stale statement once, unprepared](#retry-a-stale-statement-once-unprepared)
   - [Unnamed statements for pipelined queries behind PgBouncer](#unnamed-statements-for-pipelined-queries-behind-pgbouncer)
   - [Detect poolers at login rather than configure them](#detect-poolers-at-login-rather-than-configure-them)
+  - [Prepare on a SQL text's second run](#prepare-on-a-sql-texts-second-run)
 - [Codecs, types and formats](#codecs-types-and-formats)
   - [Codecs owned by the driver, chosen by the caller](#codecs-owned-by-the-driver-chosen-by-the-caller)
   - [Exact parameter OIDs, except for text-like types](#exact-parameter-oids-except-for-text-like-types)
@@ -48,24 +50,33 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
   - [`undefined` is refused, never sent as NULL](#undefined-is-refused-never-sent-as-null)
 - [Reading and decoding](#reading-and-decoding)
   - [Zero-copy reads: messages decoded in place](#zero-copy-reads-messages-decoded-in-place)
+  - [Large split DataRows reassembled in one reused buffer](#large-split-datarows-reassembled-in-one-reused-buffer)
   - [Strict bounds checks on every read](#strict-bounds-checks-on-every-read)
   - [DataRow fast path: no message objects for rows](#datarow-fast-path-no-message-objects-for-rows)
   - [Generated, monomorphic row decoders](#generated-monomorphic-row-decoders)
+  - [Decoder factories found by result shape, not by their source](#decoder-factories-found-by-result-shape-not-by-their-source)
   - [Text decoded with `Buffer#utf8Slice`](#text-decoded-with-bufferutf8slice)
   - [Nested objects built by the generated row decoder](#nested-objects-built-by-the-generated-row-decoder)
   - [Decode only the rows a caller keeps (`keepRows`)](#decode-only-the-rows-a-caller-keeps-keeprows)
   - [Shared constant messages and repeated-string caches](#shared-constant-messages-and-repeated-string-caches)
+  - [`Buffer` read from `node:buffer` once](#buffer-read-from-nodebuffer-once)
 - [Memory and garbage collection](#memory-and-garbage-collection)
   - [Allocation cuts for the small-query tail](#allocation-cuts-for-the-small-query-tail)
   - [The shared promise executor lets go of each query's resolvers](#the-shared-promise-executor-lets-go-of-each-querys-resolvers)
   - [One sweep timer for every idle connection](#one-sweep-timer-for-every-idle-connection)
   - [The writer: reserve one byte per character, hand off big buffers](#the-writer-reserve-one-byte-per-character-hand-off-big-buffers)
+  - [GC on million-row results: left to V8](#gc-on-million-row-results-left-to-v8)
 - [The pool](#the-pool)
   - [Pipelining onto busy connections, only once the pool is full](#pipelining-onto-busy-connections-only-once-the-pool-is-full)
   - [A FIFO of pipeline slots, with slot hand-off](#a-fifo-of-pipeline-slots-with-slot-hand-off)
   - [Draining a shared connection for exclusive callers](#draining-a-shared-connection-for-exclusive-callers)
   - [Adaptive pipeline depth, from 100 to 1000](#adaptive-pipeline-depth-from-100-to-1000)
   - [Adaptive width: no more pipelined backends than the server runs at once](#adaptive-width-no-more-pipelined-backends-than-the-server-runs-at-once)
+  - [The pool's hot path: no change from the clock reads or per-waiter timers](#the-pools-hot-path-no-change-from-the-clock-reads-or-per-waiter-timers)
+  - [`maxUses`](#maxuses)
+  - [Pool events and counters](#pool-events-and-counters)
+  - [Connect retry delay, opt-in and not escalating](#connect-retry-delay-opt-in-and-not-escalating)
+  - [Run a query again when the server ended the session before answering it](#run-a-query-again-when-the-server-ended-the-session-before-answering-it)
   - [`withShared`: several queries as one pipeline slot](#withshared-several-queries-as-one-pipeline-slot)
   - [Pool policies: LIFO idle, jittered lifetime, safe release, fail fast](#pool-policies-lifo-idle-jittered-lifetime-safe-release-fail-fast)
 - [Connecting](#connecting)
@@ -76,10 +87,13 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
   - [A TLS secure-context cache](#a-tls-secure-context-cache)
   - [`close()` with libpq semantics](#close-with-libpq-semantics)
   - [`verify-full` by default, and strict TLS and SCRAM checks](#verify-full-by-default-and-strict-tls-and-scram-checks)
-  - [Ask for protocol 3.2, accept 3.0, retry once](#ask-for-protocol-32-accept-30-retry-once)
+  - [Ask for protocol 3.2, accept 3.0, retry once, remember who refused](#ask-for-protocol-32-accept-30-retry-once-remember-who-refused)
+  - [A cap on SCRAM iterations, and the RSASSA-PSS hash read from the certificate](#a-cap-on-scram-iterations-and-the-rsassa-pss-hash-read-from-the-certificate)
 - [Transactions and batches](#transactions-and-batches)
   - [BEGIN shares the first statement's Sync](#begin-shares-the-first-statements-sync)
-  - [Deferred savepoint RELEASE](#deferred-savepoint-release)
+  - [Savepoints and RELEASE share the next statement's Sync](#savepoints-and-release-share-the-next-statements-sync)
+  - [A swallowed error resurfaces as itself](#a-swallowed-error-resurfaces-as-itself)
+  - [COMMIT pipelined behind a transaction's last statement](#commit-pipelined-behind-a-transactions-last-statement)
   - [Detect a COMMIT that rolled back](#detect-a-commit-that-rolled-back)
   - [`afterCommit` callbacks that can't change the outcome](#aftercommit-callbacks-that-cant-change-the-outcome)
   - [`db.batch` framing: one write, with COMMIT pipelined unless results are checked](#dbbatch-framing-one-write-with-commit-pipelined-unless-results-are-checked)
@@ -87,7 +101,7 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
   - [Settings with `set_config(…, true)`](#settings-with-set_config-true)
 - [Cursors and streams](#cursors-and-streams)
   - [Exclusive ops for anything that keeps talking](#exclusive-ops-for-anything-that-keeps-talking)
-  - [Streams: strict pull](#streams-strict-pull)
+  - [Streams: strict pull, read-ahead opt-in](#streams-strict-pull-read-ahead-opt-in)
   - [Cursors: describe first for binary from the first run](#cursors-describe-first-for-binary-from-the-first-run)
   - [Cursors inside a transaction use a named portal](#cursors-inside-a-transaction-use-a-named-portal)
   - [Aborting a suspended cursor closes it instead of cancelling](#aborting-a-suspended-cursor-closes-it-instead-of-cancelling)
@@ -95,15 +109,21 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
   - [A statement timeout bounds the whole stream](#a-statement-timeout-bounds-the-whole-stream)
 - [COPY and LISTEN/NOTIFY](#copy-and-listennotify)
   - [COPY with backpressure both ways](#copy-with-backpressure-both-ways)
+  - [`copyRows` loops synchronously over sync rows](#copyrows-loops-synchronously-over-sync-rows)
+  - [`copyTo` chunks: everything received, one copy per read](#copyto-chunks-everything-received-one-copy-per-read)
+  - [Node stream adapters for COPY](#node-stream-adapters-for-copy)
   - [A NOTIFY fast path and a channel-name cache](#a-notify-fast-path-and-a-channel-name-cache)
   - [`notify` with `pg_notify($1, $2)`](#notify-with-pg_notify1-2)
   - [A dedicated, self-healing LISTEN connection, re-subscribing in one round trip](#a-dedicated-self-healing-listen-connection-re-subscribing-in-one-round-trip)
 - [Cancellation and timeouts](#cancellation-and-timeouts)
   - [Cancel only the query at the head, and hold back later writes](#cancel-only-the-query-at-the-head-and-hold-back-later-writes)
+  - [Stop repeating a cancel once the server answered the query](#stop-repeating-a-cancel-once-the-server-answered-the-query)
+  - [A statement timeout is refused for statements that can't run in a transaction block](#a-statement-timeout-is-refused-for-statements-that-cant-run-in-a-transaction-block)
   - [Drop unsent queries without contacting the server](#drop-unsent-queries-without-contacting-the-server)
   - [Server-side statement timeouts, transaction-local and pipelined](#server-side-statement-timeouts-transaction-local-and-pipelined)
   - [A statement timeout framed by the transaction status](#a-statement-timeout-framed-by-the-transaction-status) (superseded)
   - [A statement timeout is framed under the query's Sync, whatever the transaction status](#a-statement-timeout-is-framed-under-the-querys-sync-whatever-the-transaction-status)
+  - [Two statements on a pool, where no transaction block can precede the query](#two-statements-on-a-pool-where-no-transaction-block-can-precede-the-query)
   - [Every wait has a timeout](#every-wait-has-a-timeout)
 - [Observability](#observability)
   - [OpenTelemetry spans through a structural tracer, without parameters](#opentelemetry-spans-through-a-structural-tracer-without-parameters)
@@ -115,6 +135,9 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
 - [Errors and safety](#errors-and-safety)
   - [Errors carry everything and leak nothing](#errors-carry-everything-and-leak-nothing)
   - [Typed error classes per SQLSTATE](#typed-error-classes-per-sqlstate)
+  - [Secrets hidden from a configuration's enumerable properties](#secrets-hidden-from-a-configurations-enumerable-properties)
+  - [Only a `Uint8Array` is sent as bytes](#only-a-uint8array-is-sent-as-bytes)
+  - [Spans for cursors, COPY TO and transactions](#spans-for-cursors-copy-to-and-transactions)
   - [A decode failure fails one query, not the connection](#a-decode-failure-fails-one-query-not-the-connection)
 
 ## Architecture
@@ -196,6 +219,18 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
 **Why.** The driver already merges writes itself; Nagle would only add latency to every small query, notably during TLS handshakes.
 
 **Alternatives.** Leave it on (postgres.js does). Measured on loopback for postgres.js: no throughput difference (there's always a response to carry the acknowledgement), but it matters on real networks and in handshakes.
+
+**Code.** [node-socket.ts](node-socket.ts) `nodeSockets.connect`.
+
+### `noDelay` in the connect options
+
+**What it is.** TCP connections pass `noDelay: true` (and the keepalive settings) to `net.connect`/`tls.connect` instead of calling `setNoDelay` once connected.
+
+**Why.** With direct TLS (`sslnegotiation=direct`) the handshake runs inside `tls.connect`, before the old `setNoDelay` call: its small writes waited on Nagle's algorithm. Set in the options, `TCP_NODELAY` covers the socket from its first byte.
+
+**Alternatives.** `setNoDelay(true)` after `connect`/`secureConnect` (what the driver did; pg calls it before connecting).
+
+**Cost.** None.
 
 **Code.** [node-socket.ts](node-socket.ts) `nodeSockets.connect`.
 
@@ -331,6 +366,34 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
 
 **Code.** [capabilities.ts](capabilities.ts).
 
+### Prepare on a SQL text's second run
+
+**What it is.** A SQL text runs as an unnamed statement until the server has parsed it `prepareThreshold − 1` times on the connection (default threshold 2: unnamed once, prepared on its second run). Until then its cache entry is unnamed and holds only the columns its runs described. When the cache is full, the least recently used **unnamed** entry is evicted first, so SQL run once never pushes a prepared statement out ([ARCHITECTURE.md](ARCHITECTURE.md#the-prepared-statement-cache)).
+
+**Why.** Preparing on first use gave every one-off SQL text (inlined literals, migrations, ad-hoc reports) a server-side statement, a slot in the 100-entry cache and, once evicted, a Close; and it pushed hot statements out, which then paid Parse, Describe and a text run again. A working set above the cache size churned the same way on every query.
+
+**Why a run counts once it was parsed.** A sighting counted at write time could prepare a statement in the middle of a pipeline that repeats it (a statement timeout's set and restore are the same SQL in one group): its named Parse would then sit behind a statement that may fail, which makes the server skip the Parse while groups pipelined behind have already bound its name. Counted at its ParseComplete, the run that prepares it is written after an answer, like any new SQL. (Counting only runs that succeeded left a statement that always fails at run time, the `error` scenario, unprepared for good: −7.5% on it.)
+
+**Why the run that prepares reads text.** Its columns were described by the unnamed runs, but the schema may have changed since; asking for binary from them would fail that run with `DecodeError` if a column's new type has no binary decoder (the cost already accepted behind PgBouncer, not on direct connections). So a repeated statement reads binary from its third run instead of its second.
+
+**Why 2 is the default.** It is the only threshold that wins on every workload measured (below): one-off SQL stops costing server-side statements and evictions, a working set larger than the cache stops churning, and repeated statements pay one extra parse per connection. The price is on large results read on fresh connections (a repeated statement's second run reads text), which a long-lived pool pays once per statement and connection; 1 keeps that run binary for code that only runs a few statements, many times, on short-lived connections.
+
+**Alternatives.** Threshold 1 (prepare on first use: the old behaviour). Higher thresholds (pgjdbc and Npgsql use 5): measured below, 3 and 5 lose on churn because statements stay unnamed and re-planned for longer. Counting sightings in a separate map: a second structure to bound and evict from, where the unnamed cache entry already exists.
+
+**Cost.** A repeated statement is parsed and planned once more (its first run), and reads text on its first two runs instead of one. That shows on large results read on a fresh connection: the benchmark suite's equal-work cell (a fresh pool, then three 1M-row fetches) went from 412 to 535 ms per fetch on average, because its first measured fetch now reads text; small queries don't notice (point lookups, inserts, updates, the error path, 1k-row fetches: all within noise). `prepareThreshold: 1` restores the old behaviour.
+
+**Measured.** Pool of 10, 50 callers, PostgreSQL on 2 CPUs and the client on the other 2, 3 s per run, two runs each (ops/s):
+
+| Workload                                         | 1               | **2**           | 3               | 5               |
+| ------------------------------------------------ | --------------- | --------------- | --------------- | --------------- |
+| 20 hot lookups, 1 query in 5 is SQL never seen   | 161,629–164,607 | 172,111–196,915 | 169,319–171,828 | 169,320–172,259 |
+| 20 hot lookups only                              | 248,772–263,208 | 264,529–266,852 | 249,040–261,425 | 261,707–265,890 |
+| 150 distinct statements in rotation (cache: 100) | 79,423–94,035   | 134,066–139,793 | 120,038–121,064 | 77,180–90,377   |
+
+Client CPU per query on the churn workload fell from 11.4–13.6 to 7.2–7.5 µs.
+
+**Code.** [connection.ts](connection.ts) `#statement`; [ops.ts](ops.ts) `QueryOp.write`, `handle` (`seen`); [config.ts](config.ts) `prepareThreshold`.
+
 ## Codecs, types and formats
 
 ### Codecs owned by the driver, chosen by the caller
@@ -378,7 +441,7 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
 
 ### Which types are binary and which stay text
 
-**What it is.** Results are read in binary for `bool`, `int2`, `int4`, `oid`, `int8` (as `bigint`), `float8`, `bytea`, `timestamptz`, pgvector's `vector`, and arrays of those, of text-like types and of json/jsonb. Everything else (numeric, uuid, date, time, text, enums, jsonb scalars, int8 as a string, float4) stays text ([CODECS.md](CODECS.md#the-built-in-codecs)).
+**What it is.** Results are read in binary for `bool`, `int2`, `int4`, `oid`, `int8` (as `bigint`), `float8`, `bytea`, `timestamptz`, `tstzrange`, pgvector's `vector`, and arrays of those, of text-like types and of json/jsonb. Everything else (numeric, uuid, date, daterange, time, text, enums, jsonb scalars, int8 as a string, float4) stays text ([CODECS.md](CODECS.md#the-built-in-codecs)).
 
 **Why.** Binary wins when the JavaScript value **isn't a string**: it skips building a string and then parsing it. When the value is returned as a string anyway, the gain is small or negative, because JavaScript then has to build that string itself instead of one native UTF-8 slice (uuid: 92 → 99 ns). numeric and int8 as a string decode about a fifth faster in binary on Node, but were 2–3× slower on Bun, a target when #19 measured them (dropped since by [Node only](#node-only)), so they stayed text.
 
@@ -400,11 +463,13 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
 
 1-row queries show no difference at all (median −0.4 µs on a 46 µs query); binary matters from tens of rows up.
 
+**Ranges.** A `tstzrange` is two `Date`s, so it follows `timestamptz`: its binary format (a flags byte, then each finite bound as an Int32 length and the element's binary value) goes through `timestamptz`'s binary decoder, and gives the same `RangeValue` as the text. In text, both bounds are quoted (`["2024-01-01 00:00:00+00","…")`), and the parser built each one a character at a time; a quoted bound without escapes is now sliced. `daterange` stays text: its bounds are never quoted, it decodes to strings, and it cost a quarter of a `tstzrange` (327 ns). Measured on 100k-row reads of one range column (`harness.ts xtype-r`, Node 24, client pinned to one CPU, median of 5 interleaved runs): `tstzrange` 1.41 → 0.27 µs per value in binary (CPU −81%, allocation 1,966 → 454 B per value), 1.49 → 0.80 µs in text; `daterange` unchanged (within ±3%).
+
 **Alternatives.** All binary: breaks every type without a binary decoder (extensions, domains, custom codecs), and loses on string types. All text: leaves the large-result wins.
 
 **Cost.** `float4` stays text because binary would change visible values (`0.1` reads as `0.10000000149011612`); `vector` accepted that change (its values are float32 by nature, and the gain is 3×), applied on both paths so text and binary agree. Binary formats also don't depend on session settings (DateStyle, `bytea_output`), a robustness bonus.
 
-**Code.** [codecs.ts](codecs.ts) (`resultFormat` per codec, `readArraysInBinary`).
+**Code.** [codecs.ts](codecs.ts) (`resultFormat` per codec, `readArraysInBinary`); [binary.ts](binary.ts) `rangeDecoder`; [parsers.ts](parsers.ts) `parseRange`.
 
 ### Binary array parameters, with a per-array fallback
 
@@ -456,7 +521,7 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
 
 ### Zero-copy reads: messages decoded in place
 
-**What it is.** The reader finds message boundaries inside the socket's chunks and gives the caller **offsets into the chunk**; only a message split across two chunks is copied, into a buffer of exactly its size. Consumed chunks are released ([protocol/README.md](protocol/README.md#the-reader)).
+**What it is.** The reader finds message boundaries inside the socket's chunks and gives the caller **offsets into the chunk**; only a message split across two chunks is copied, into a buffer of exactly its size (a large DataRow into [one reused buffer](#large-split-datarows-reassembled-in-one-reused-buffer)). Consumed chunks are released ([protocol/README.md](protocol/README.md#the-reader)).
 
 **Why.** Copying every message (or re-joining a chunk's tail with the next chunk) costs time and memory proportional to everything received, and made large rows quadratic. Before #20, the unread tail of nearly every 64 KB chunk was re-copied, and the last joined buffer stayed referenced while the connection was idle.
 
@@ -467,6 +532,20 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
 **Measured.** Streaming 1M rows: peak RSS 217 → 151 MB; 100k-row fetch 482 → 466 MB; throughput unchanged or slightly better ([#20](https://github.com/shlokdesai33/quarry/pull/20)).
 
 **Code.** [protocol/reader.ts](protocol/reader.ts).
+
+### Large split DataRows reassembled in one reused buffer
+
+**What it is.** A DataRow of 64 KiB to 16 MiB that arrives split across socket chunks is copied into a buffer the reader keeps and reuses (grown by doubling, up to 16 MiB), instead of a new buffer of its size each time. The reader lets go of it when the connection has nothing in flight. Smaller rows, larger ones and other messages keep a buffer of their own.
+
+**Why.** Rows of large values (a 1 MB `bytea`, a big `jsonb` document) nearly always span chunks, so each one allocated and zeroed a buffer of its size, only to drop it once decoded. The decoder copies every value out (strings are new, `bytea` is copied), so nothing keeps the reassembly buffer, and the next split row can overwrite it.
+
+**Alternatives.** A growable read buffer for everything (see above: copies every message). An unbounded reused buffer: one 500 MB row would pin 500 MB for the connection's life. Keeping it while idle: an idle pool of 10 would hold up to 160 MiB.
+
+**Cost.** Up to 16 MiB per connection while it is reading large rows. CopyData stays in a buffer of its own, since `copyTo` hands it out as a view.
+
+**Measured.** 1 MB values (`harness.ts`, Node 24, client pinned to one CPU, median of 5 interleaved runs): `bytea` 165 → 192 reads/s (CPU −16%), `text` 144 → 162/s (−17%), `jsonb` 38 → 41/s (−7%); `fetch1k` unchanged.
+
+**Code.** [protocol/reader.ts](protocol/reader.ts) `#partBuffer`, `dropSpare`; [connection.ts](connection.ts) `#onData`.
 
 ### Strict bounds checks on every read
 
@@ -503,6 +582,20 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
 **Measured.** Decoder microbenchmark: 6 columns 323–394 ns per row (before: 1,068), 100 columns 3.8–4.0 µs (before: 8.3); 1M-row fetch 500 → 458 ms; 100k rows 42.5 → 37.3 ms ([#21](https://github.com/shlokdesai33/quarry/pull/21)).
 
 **Code.** [rows.ts](rows.ts).
+
+### Decoder factories found by result shape, not by their source
+
+**What it is.** The compiled decoder factories are looked up by a short key of the result's shape (row mode, each column's decode kind, the names, and the nesting), checked before any source is generated. The source cache behind it stays, so two shapes with the same code still share one compiled function.
+
+**Why.** A prepared statement builds its decoder once; an unprepared one (`prepare: false`, or behind PgBouncer before 1.21) gets a new RowDescription every run, and finding its factory meant generating the whole decoder source and joining it, only to use it as the cache key. That was 58% of the 16 KB an unprepared point lookup allocated.
+
+**Alternatives.** Keep a decoder per statement text for unprepared runs: a RowDescription can change between runs (a `select *` after an `alter table`), so it would still have to be compared. Hash the source: still builds it.
+
+**Cost.** A second `Map` (bounded by the same 4 M characters of source) and a key string per unprepared run.
+
+**Measured.** An unprepared point lookup (`harness.ts pk-noprep`, Node 24, client pinned to one CPU, median of 5 interleaved runs): 18,334 → 21,916/s, CPU 26.7 → 18.3 µs, allocation 16.0 → 5.0 KB per query. Prepared lookups and 1,000-row fetches unchanged.
+
+**Code.** [rows.ts](rows.ts) `factoryOf`.
 
 ### Text decoded with `Buffer#utf8Slice`
 
@@ -544,13 +637,27 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
 
 ### Shared constant messages and repeated-string caches
 
-**What it is.** Messages with no fields (ParseComplete, BindComplete, NoData, …) and the three ReadyForQuery variants are shared, never-modified objects; the last command tag (`SELECT 1`) is kept and reused when the next tag has the same bytes ([protocol/README.md](protocol/README.md#decoding)).
+**What it is.** Messages with no fields (ParseComplete, BindComplete, NoData, …) and the three ReadyForQuery variants are shared, never-modified objects. The last 8 command tags (`SELECT 1`, `BEGIN`, `INSERT 0 1`, …) are kept, and one is reused when the next tag has the same bytes; parsed tags (command and row count) are kept in a `Map` of up to 64 ([protocol/README.md](protocol/README.md#decoding)).
 
-**Why.** Every query receives several of these; allocating them is pure garbage.
+**Why.** Every query receives several of these; allocating them is pure garbage. With one cached tag, a transaction's `BEGIN`, `INSERT` and `COMMIT` replaced each other, so every tag was decoded, copied and parsed again.
 
-**Cost.** None visible; the tag bytes are copied, so the cache never keeps a read buffer alive.
+**Alternatives.** One entry (before): enough for a loop of one statement, thrashed by any transaction. A `Map` keyed by the tag's string for the reader: the string is what decoding the bytes would build.
 
-**Code.** [protocol/reader.ts](protocol/reader.ts), [ops.ts](ops.ts) `parseTag`.
+**Cost.** Eight byte comparisons at worst per tag; the tag bytes are copied, so the cache never keeps a read buffer alive. The parsed-tag `Map` is cleared once it holds 64 entries (row counts vary).
+
+**Measured.** `harness.ts`, Node 24, client pinned to one CPU, median of 5 interleaved runs: a one-insert transaction allocates 10.7 → 9.5 KB (−12%, CPU −3%), three statements in one 15.8 → 13.6 KB (−14%, CPU −6%); a point lookup unchanged.
+
+**Code.** [protocol/reader.ts](protocol/reader.ts) `commandTag`, [ops.ts](ops.ts) `parseTag`.
+
+### `Buffer` read from `node:buffer` once
+
+**What it is.** The protocol's text, binary and array-parameter code imports `Buffer` from `node:buffer` instead of reading the global per value.
+
+**Why.** `globalThis.Buffer` is an accessor in Node 24, so each read of the global, once per decoded string, went through a getter (`isBuffer` and the getter were about 5% of a fetch's client CPU). Since [Node only](#node-only), there is no runtime without `Buffer` to fall back for.
+
+**Measured.** `harness.ts`, Node 24, client pinned to one CPU, median of 5 interleaved runs: a 1,000-row fetch CPU −6% (2,557 → 2,664/s), through the builder −7%; 10 wide rows −6%.
+
+**Code.** [protocol/text.ts](protocol/text.ts), [binary.ts](binary.ts), [array-params.ts](array-params.ts).
 
 ## Memory and garbage collection
 
@@ -614,6 +721,18 @@ Most measurements come from benchmark runs described in the linked PRs, usually 
 **Measured.** A 64 MB text parameter: 256 MB of write buffer kept afterwards → 0 ([#20](https://github.com/shlokdesai33/quarry/pull/20)). A Bind with 300 short parameters: 28 → 17 µs on Node, 20 → 11 µs on Bun ([#19](https://github.com/shlokdesai33/quarry/pull/19)).
 
 **Code.** [protocol/writer.ts](protocol/writer.ts).
+
+### GC on million-row results: left to V8
+
+**What it is.** Fetching 1M rows into one result spends about a quarter of its time in garbage collection, and the driver does nothing more about it.
+
+**Why.** Measured on a 1M-row fetch (`bench_users`, pg-compatible decoding, Node 24, client on 2 CPUs): 430–441 ms per fetch, of which 105–118 ms GC, nearly all of it **scavenges** (about 6 per fetch, ~18 ms each; 0.4 mark-compacts). Every row allocates about six objects that all stay alive (the row, two strings, a `Date`, a boxed float, its slot in the rows array), and a scavenge copies everything alive in the young generation, so each one moves the rows built since the last. The rows array, the one thing the driver could size up front, was tried in [#45](https://github.com/shlokdesai33/quarry/pull/45) (≤2%).
+
+**Alternatives.** A larger young generation (`--max-semi-space-size`) or `--minor-ms` cut it, but they are deployment flags, not library choices. Decoding rows lazily, or returning columns instead of row objects, would change what a result is. One string per row sliced into columns keeps the same object count. Allocation-site pretenuring applies to object literals, not to strings, `Date`s or numbers, which are most of the objects.
+
+**Cost.** 1M-row results keep their GC share; `cursor()`/`stream()` is the tool for results that size (1M rows streamed spend 3–4× less GC).
+
+**Code.** [rows.ts](rows.ts), [ops.ts](ops.ts) `QueryOp.dataRow`.
 
 ## The pool
 
@@ -704,6 +823,8 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 - **Narrowing.** With W pipelined backends on C CPUs, each is off its CPU about 1 − C/W of the time, so W × (1 − stalled) estimates C. Above 25% stalled two epochs in a row, the width drops to that (not below 2 in one step). The connections to drop (stalled ones first) take no new queries and go idle once theirs finish; the others keep pipelining.
 - **Picking.** Among connections with room, the least loaded one that isn't stalled: a query sent to a stalled connection waits with it.
 - **Judged, because slow queries stall too.** A connection behind a 20 ms query also stalls, and there fewer connections would only queue more lookups behind it. A narrowing is kept only if stalls then fell by a quarter (or below 25%) and the mean latency (in flight plus queued, over the completion rate) didn't double; otherwise the next try waits four times as long (4 to 1024 epochs). It is undone at once if, once it settled, completions come at under three fifths of the rate before, overall and in each of the last four windows of 256 completions (a client pause, GC or the process descheduled, slows only one; judged on the overall rate alone, one pause in a narrowing's first ~1,000 completions undid it and held the pool at full width for 1,024 epochs): under CPU contention the CPUs stay busy whatever the width, so that only happens behind slow queries, and the next try waits the full 1024 epochs.
+- **Oversized pools: few queries per connection.** When the pool is far wider than its callers need (pool 50, 32 callers), each connection carries about one query, its backend wakes for it and sleeps again, and the server spends its CPUs switching between backends: completions slowed down, but nothing stalled, so the rule above never fired. While queries average under 4 in flight or queued per connection, and under 1 ms in the pool, the width is halved (not below 2), with no stall signal needed. Such a narrowing is kept if completions then come at least about as fast (time per completion within 3% of before) and queries don't spend a quarter longer in the pool; stalls may rise, since fewer connections each carry more. A growth from a width narrowed this way is undone if it slowed completions down.
+- **A stall narrowing that sped things up.** A narrowing for stalls is also kept when stalls stayed level but completions came faster, as long as stalls didn't rise by a quarter: a pool that stalls because it is too wide often stalls as much at half the width, yet completes more.
 - **Growing.** Below 5% stalled, with queries pipelined or queued at the width, +1; a growth that brings stalls back doubles the wait before the next; one that holds halves it.
 - **Not judged:** the epoch after a change, one in which the pool ran out of queries, and one in which a connection took queries for the first time. While a pool of 50 fills up, not every connection is busy, stalls read low (50–60% instead of 96%), and the first narrowing would aim at 20 connections instead of 2.
 
@@ -744,7 +865,88 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 - Builder queries (through `pool.query` since #37) are client-bound on this VM (Node ~62k/s, Bun ~103k/s); they stay level, and the width doesn't engage while the server has room.
 - In about 1 run in 7 at pool 50 × 1000, the first narrowing is undone, and the pool stays wide for the rest of a 1-second run.
 
+**Measured: oversized pools.** Point lookups (`select * from bench_users where id = $1`) from 1–256 callers on pools of 10, 20 and 50, same VM, Node 24, ops/s late in a 12 s run, before → after the oversized-pool rule (in brackets, the pool's busy connections then):
+
+| Callers | Pool 10                  | Pool 20                  | Pool 50                  |
+| ------- | ------------------------ | ------------------------ | ------------------------ |
+| 1       | 37.9k → 37.4k            | 37.9k → 37.7k            | 37.7k → 37.6k            |
+| 8       | 111k (8) → **175k** (3)  | 114k (8) → **182k** (2)  | 119k (8) → **199k** (2)  |
+| 16      | 147k (10) → **243k** (2) | 111k (16) → **240k** (2) | 112k (16) → **238k** (2) |
+| 32      | 188k (10) → **247k** (2) | 145k (20) → **247k** (2) | 115k (32) → **245k** (2) |
+| 64      | 246k (2) → 244k (2)      | 181k (20) → **205k** (2) | 175k (14) → **242k** (2) |
+| 256     | 244k (2) → 250k (2)      | 247k (2) → 247k (3)      | 194k (18) → **244k** (3) |
+
+Before, the stall rule narrowed pools only once callers outnumbered connections several times over, and pools of 20 and 50 stayed wide up to 64–256 callers at half the throughput. The mixed workload above (10 connections, 100 lookup callers and 5 callers of 20 ms queries) is unchanged: 249k lookups/s and 241 slow queries/s before, 256k and 241 after. A first version that kept any narrowing that sped completions up, whatever the stalls did, cut it to 106k and 148: there, narrowing starved the slow queries, so a narrowing that raises stalls by a quarter is undone, and the oversized-pool rule only tries queries that spend under 1 ms in the pool.
+
 **Code.** [pool.ts](pool.ts) `Width`, `#claimShared`, `#pickShared`, `#fillShared`, `#serveShared`, `#done`.
+
+### The pool's hot path: no change from the clock reads or per-waiter timers
+
+**What it is.** `#pickShared` still checks each candidate's lifetime with `Date.now()`, and each waiting caller still has its own `acquireTimeout` timer. Both were changed and measured, and the changes were dropped.
+
+**Why.** The implementation comparison put `#pickShared` and its expiry check at about 4.6% of client CPU at 10 connections × 100 callers, and a timer per waiting query looked avoidable. Two changes were built: a flag set by one timer per connection when its lifetime ends (so picking, taking and releasing read no clock), and one `acquireTimeout` timer for every waiter (each wait queue is in deadline order, so only its head needs a timer). Neither showed in the measurements below, so the simpler code stays.
+
+**Alternatives.** A clock cached per tick (still a read per tick, and a stale value to reason about).
+
+**Cost.** None beyond what was there. The single waiter timer also had a trap: it fires on libuv's millisecond clock, up to a millisecond before a `performance.now()` deadline, and when it re-armed instead of failing a waiter, a connect timeout of the same length won the race and changed which error the caller saw (pg-pool's test suite caught it).
+
+**Measured.** Node 24, PostgreSQL on 2 CPUs, the benchmark suite's concurrency sweep (point lookups, pools of 1, 5, 10 and 50 × 1–1000 callers, 5 runs each): every cell within run-to-run noise, client CPU per lookup 4.2–4.5 µs either way at 10 connections. Client-bound (the client on one CPU, 500 callers, pool 10, 5 alternating runs): 3.85–4.07 µs per lookup on `main`, 3.86–4.16 µs with both changes.
+
+**Code.** [pool.ts](pool.ts) `#expired`, `#pickShared`, `#wait`.
+
+### `maxUses`
+
+**What it is.** `maxUses: n` replaces a connection once it has served `n` queries and borrowers: it takes no new work, and closes when its last query ends. Below `min`, it is replaced at once.
+
+**Why.** To spread load again after a failover or a pooler change (long-lived connections stay where they first landed), and to bound per-session server memory (plan caches, `work_mem` leftovers) by work done rather than time.
+
+**Alternatives.** `maxLifetime` alone (bounds time, not work). pg-pool counts checkouts only; a pipelined pool's unit of work is a query, so both count.
+
+**Cost.** A counter per claim.
+
+**Code.** [pool.ts](pool.ts) `#use`.
+
+### Pool events and counters
+
+**What it is.** `pool.onEvent(listener)` reports `open`, `openFailed`, `close` (with a reason: `idle`, `lifetime`, `maxUses`, `discarded`, `transaction`, `lost`, `end`), `waitTimeout` and `waitRefused`; `pool.metrics` counts the same since the pool was created, plus callers that had to wait. `pool.stats` stays the point-in-time view.
+
+**Why.** Operating a pool needs to see churn (connections closed as `lost` point at the network or the server), saturation (waits, timeouts, refusals) and failed connects, without wrapping the pool.
+
+**Why this shape.** Two views, as metrics systems want them: counters that only grow (`metrics`, read on a scrape interval and turned into rates), and events for logs and alerts (`onEvent`), each carrying what a log line needs (the connection, the error, the reason). `stats` stays the gauge view. Events are lifecycle-only, so subscribing costs nothing per query; one listener method with a `type` field (like `onNotice`) rather than a method per event keeps the API to one name, returns its own unsubscribe, and can't crash the process the way an unhandled `'error'` event can.
+
+**Alternatives.** An `EventEmitter` (an `'error'` event without a listener crashes the process, pg-pool's trap). Per-query events (a cost on every query; `onTiming` and telemetry already cover queries).
+
+**Cost.** Integer increments on lifecycle paths; nothing per query. A throwing listener is reported in a microtask, as other listeners are.
+
+**Code.** [pool.ts](pool.ts) `onEvent`, `metrics`, `#emit`.
+
+### Connect retry delay, opt-in and not escalating
+
+**What it is.** With `connectRetryDelay: ms`, a failed connection attempt holds the next one back for about `ms` (±50% jitter, per pool); a success clears it. The delay doesn't grow with consecutive failures. A failed attempt still rejects one waiting caller; the others keep waiting (up to `acquireTimeout`), and `min` connections are opened again after the delay.
+
+**Why.** Without it, every waiting caller triggers its own attempt the moment the previous one fails: a recovering server, or one refusing connections (`57P03` while starting), gets a burst of handshakes. A fixed delay bounds that load and still recovers within one delay of the server coming back.
+
+**Alternatives.** postgres.js's shared, escalating backoff turned 0.5–2 s outages into 4–14 s stalls (measured in the comparison). Default-on: the default keeps failing fast during an outage, which callers with their own retry logic expect.
+
+**Cost.** Callers wait up to one delay longer after a failure.
+
+**Code.** [pool.ts](pool.ts) `#failedOpen`, `#holdingBack`.
+
+### Run a query again when the server ended the session before answering it
+
+**What it is.** When the server ends a pooled connection's session (`57P01` administrator or shutdown, `57P02` crash, `57P03` starting or stopping, `57P05` `idle_session_timeout`) and its FATAL is the **first** message after a query was written, the query is run once more, on another connection, from the next turn of the event loop. So are queued queries the connection never wrote. Only `pool.query` does this, never a transaction's statements; a second failure is reported.
+
+**Why.** All three drivers measured failed the query issued right after the server killed an idle connection, before the client had read the close. The query provably never ran: the server answers in order and flushes everything it produced before a FATAL, so had it read the query's Parse or Bind (let alone committed at its Sync), a ParseComplete or BindComplete would have come first.
+
+**Why not a socket closed with no FATAL.** The server may have run and committed the query and then died before flushing its answer; there is no proof it didn't run, so it is reported.
+
+**Why stricter than the recommendation.** The comparison suggested also retrying a query whose socket closed while the connection looked idle. A rerun must never run a write twice, and only a FATAL that came first proves the server didn't run the query; an idle connection closing under a written query proves nothing about what the server did before dying. Such a query fails with `ConnectionError`, as before, and the caller decides.
+
+**Alternatives.** Retry on any connection error (can run a write twice). No retry (the old behaviour).
+
+**Cost.** A field per query to keep its options for a rerun. The rerun waits for the next turn of the event loop, so connections the server ended at the same time (a restart) have read their FATAL too and aren't picked.
+
+**Code.** [connection.ts](connection.ts) `TERMINATED`, `#dispatch`, `#fail`; [pool.ts](pool.ts) `#rerun`.
 
 ### `withShared`: several queries as one pipeline slot
 
@@ -858,15 +1060,29 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 
 **Code.** [config.ts](config.ts) `resolveConfig`; [connect.ts](connect.ts) `requestSsl`; [auth/scram.ts](auth/scram.ts).
 
-### Ask for protocol 3.2, accept 3.0, retry once
+### Ask for protocol 3.2, accept 3.0, retry once, remember who refused
 
-**What it is.** The startup message asks for protocol 3.2 (PostgreSQL 18's, with cancel keys up to 256 bytes); a server or pooler that negotiates down to 3.0 is accepted; one that rejects 3.2 with an error gets one reconnect asking for 3.0 ([auth/README.md](auth/README.md#protocol-version-negotiation)).
+**What it is.** The startup message asks for protocol 3.2 (PostgreSQL 18's, with cancel keys up to 256 bytes); a server or pooler that negotiates down to 3.0 is accepted; one that rejects 3.2 with an error gets one reconnect asking for 3.0, and its host is remembered for an hour, so later connections ask it for 3.0 straight away ([auth/README.md](auth/README.md#protocol-version-negotiation)).
 
-**Why.** Long cancel keys make guessing a key to cancel someone else's query infeasible, and asking costs nothing; but some poolers don't negotiate correctly.
+**Why.** Long cancel keys make guessing a key to cancel someone else's query infeasible, and asking costs nothing; but some poolers don't negotiate correctly, and without the memory every connection to them paid two handshakes.
 
-**Cost.** One extra connection attempt against those poolers.
+**Alternatives.** Remember for the pool's life (a pooler upgraded meanwhile would never be asked again). Forget (two handshakes per connection).
 
-**Code.** [connect.ts](connect.ts) `rejectsProtocol32`; [connection.ts](connection.ts) `#negotiated`.
+**Cost.** One extra connection attempt per host per hour against those poolers.
+
+**Code.** [connect.ts](connect.ts) `rejectsProtocol32`, `rejectsNewest`; [connection.ts](connection.ts) `#negotiated`.
+
+### A cap on SCRAM iterations, and the RSASSA-PSS hash read from the certificate
+
+**What it is.** A server asking for more PBKDF2 iterations than `scramMaxIterations` (default 1,000,000; PostgreSQL's default is 4096) is refused. For channel binding, a certificate signed with RSASSA-PSS has its hash read from the signature's parameters (SHA-1, which tls-server-end-point replaces with SHA-256, when absent) instead of assumed to be SHA-256.
+
+**Why.** The iteration count comes from the server: a hostile or misconfigured one could keep the client hashing for minutes per connection. The binding must hash the certificate with the hash its signature uses, or a SHA-384 PSS certificate fails SCRAM-SHA-256-PLUS.
+
+**Alternatives.** pg caps at 100,000, which breaks hardened roles; no cap (the old behaviour).
+
+**Cost.** A role hashed with more than a million iterations needs a higher cap.
+
+**Code.** [auth/scram.ts](auth/scram.ts) `maxIterations`, `pssHash`.
 
 ## Transactions and batches
 
@@ -884,17 +1100,45 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 
 **Code.** [transaction.ts](transaction.ts) `Session.#begin`; [ops.ts](ops.ts) `SyncGroupOp`.
 
-### Deferred savepoint RELEASE
+### Savepoints and RELEASE share the next statement's Sync
 
-**What it is.** When a savepoint's callback succeeds, `release savepoint` is sent without waiting for its answer; the next statement of the transaction (or COMMIT) reports its error if it failed. On error, `rollback to` and `release` are sent together.
+**What it is.** `savepoint` (and a savepoint's settings) aren't sent when `tx.transaction(fn)` starts: they wait for `fn`'s first statement and go out with it, under its Sync. `release savepoint` waits the same way for the statement after the savepoint (or COMMIT). A savepoint in which `fn` runs no statement sends nothing ([TRANSACTIONS.md](TRANSACTIONS.md#savepoints)).
 
-**Why.** Each savepoint cost a round trip just to be released.
+**Why.** Each savepoint cost one round trip to open and, before #18, one to release. Under one Sync with the statement, a failed `savepoint` (or `release`) makes the server skip the statement, which rejects with that error: nothing runs outside the savepoint, and the error surfaces where the work is.
 
-**Cost.** A failing release surfaces at the next statement, as its own error (`3B001`), rather than where the savepoint ended. If the callback swallowed a database error, the release is awaited as before.
+**Alternatives.** Await `savepoint` (one round trip per savepoint: the old way). Send it with its own Sync without waiting (pipelines too, but a statement could then run after a failed `savepoint`, in the outer scope). Defer only RELEASE (#18: 17 → 11 round trips for 5 savepoints).
 
-**Measured.** 5 savepoints with `select 1` each: 17 → 11 round trips (12 from this alone; BEGIN sharing takes one more); direct 2,441 → 3,316/s; at 5 ms RTT 10.0 → 15.6/s (postgres.js 14.1) ([#18](https://github.com/shlokdesai33/quarry/pull/18)).
+**Cost.** Statements that need a Sync of their own (with a `signal`, `timeout` or `onTiming`, a cursor, COPY) send the queued statements first, unanswered; the next statement then reports their error.
 
-**Code.** [transaction.ts](transaction.ts) `Session.sendDeferred`, `Transaction.transaction`.
+**Measured.** A transaction with 5 savepoints and a `select 1` in each: 11 → 6 round trips (the comparison counted 17 before #18, postgres.js 12). In the benchmark suite (Node 24, PostgreSQL on 2 CPUs of a 4-vCPU VM, 5 runs, medians): 3,650 → 5,456 transactions/s (+49%), client CPU per transaction 195 → 116 µs.
+
+**Code.** [transaction.ts](transaction.ts) `Session.queue`, `#group`, `#sendPrefix`, `Transaction.transaction`.
+
+### A swallowed error resurfaces as itself
+
+**What it is.** The connection records the error that failed its transaction (the first statement whose ReadyForQuery reported `E`). A savepoint whose callback caught a database error and carried on fails with that error, and so does one whose callback threw "current transaction is aborted" (25P02); the outermost transaction does the same, and a COMMIT answered ROLLBACK throws `TransactionRolledBack` with that error as its `cause`.
+
+**Why.** After the first error, every statement fails with 25P02, which says nothing about what went wrong; code that caught the first error (a "try the insert, ignore a duplicate" pattern) saw only 25P02 from the savepoint.
+
+**Alternatives.** postgres.js tracks the first error per scope on the client; reading it from the ReadyForQuery transition needs no tracking per statement.
+
+**Cost.** One field per connection, set on the transition.
+
+**Code.** [connection.ts](connection.ts) `transactionError`; [transaction.ts](transaction.ts) `firstError`.
+
+### COMMIT pipelined behind a transaction's last statement
+
+**What it is.** `tx.queryAndCommit(sql, params)` (quarry's `executeAndCommit()` inside `db.transaction`) sends COMMIT right behind the statement, under a Sync of its own, without waiting: with BEGIN sharing the statement's Sync, a one-statement transaction is one round trip. The transaction then takes no more statements. If the statement fails, COMMIT answers ROLLBACK and the transaction rolls back; if BEGIN failed, the statement was skipped and COMMIT, outside a transaction, does nothing ([TRANSACTIONS.md](TRANSACTIONS.md#commit-behind-the-last-statement)).
+
+**Why.** `db.batch({ transaction: true })` already sends a fixed list of statements as one round trip; a callback transaction paid a round trip more for its COMMIT, the largest cost of a short transaction on a network.
+
+**Alternatives.** Detect the last statement automatically (impossible: the callback may issue more). Make COMMIT share the statement's Sync (a failed statement would leave the transaction open for a rollback round trip). An option on `query` (`commit: true`, the first version): a method whose name says it commits keeps "this ends the transaction" visible where it happens, as quarry names its methods for what they do.
+
+**Cost.** Once the statement succeeded, nothing the callback does after it can roll the transaction back: an error thrown afterwards is reported, but the transaction committed (its `afterCommit` callbacks run). So the builder refuses it with an `expect…` shape (its check would run after COMMIT) and in a savepoint.
+
+**Measured.** begin; insert; commit: 2 → 1 round trips. In the benchmark suite (same setup), `tx-insert-commit` (one insert run with `queryAndCommit`): 18,335 → 27,016 transactions/s (+47%), p99 94 → 67 µs, client CPU 33.0 → 23.7 µs; the unmarked `tx-insert` is unchanged (18,123 → 18,007/s).
+
+**Code.** [transaction.ts](transaction.ts) `Session.commitWith`, `Transaction.queryAndCommit`, `Transaction.run`; [../driver-executor.ts](../driver-executor.ts) `execute`.
 
 ### Detect a COMMIT that rolled back
 
@@ -966,17 +1210,17 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 
 **Code.** [ops.ts](ops.ts) `CursorOp`, `CopyFromOp`, `CopyToOp` (`exclusive`).
 
-### Streams: strict pull
+### Streams: strict pull, read-ahead opt-in
 
-**What it is.** A cursor fetches a batch only when the consumer asks for the next one; nothing is read ahead ([STREAMING.md](STREAMING.md#strict-pull)).
+**What it is.** A cursor fetches a batch only when the consumer asks for the next one; nothing is read ahead ([STREAMING.md](STREAMING.md#strict-pull)). With `readAhead: true` (outside a transaction), it fetches the next batch as soon as one is handed out: at most one batch ahead.
 
-**Why.** "Bounded memory however large the result" is the point of streaming; with read-ahead, a slow consumer holds two batches and the server does work the consumer may never take (a `break` after the first batch).
+**Why.** "Bounded memory however large the result" is the point of streaming; with read-ahead, a slow consumer holds two batches and the server does work the consumer may never take (a `break` after the first batch). But a consumer that spends time on each batch then also waits a round trip per batch, which read-ahead overlaps with its work.
 
-**Alternatives.** Read one batch ahead (what the cursor did before #34; pg-query-stream reads ahead too).
+**Alternatives.** Read ahead by default (what the cursor did before #34; pg-query-stream reads ahead too). Read ahead inside transactions too: a prefetch queued ahead of the loop's own queries would delay each of them by a batch.
 
-**Cost.** The consumer waits one round trip per batch; over a WAN with tiny batches, that dominates. A larger `batchSize` trades memory for round trips.
+**Cost.** Strict pull: the consumer waits one round trip per batch; over a WAN with tiny batches, that dominates. Read-ahead: one more batch in memory.
 
-**Measured.** 5M rows (`int4, text, timestamptz`), batch 1000: 2,494 → 1,480 ms (2.0M → 3.4M rows/s), peak heap growth 55 → 27 MB, RSS growth 107 → 50 MB (this includes the next two entries; [#34](https://github.com/shlokdesai33/quarry/pull/34)). Batch 100: 3.0 s and 13 MB; 10,000: 1.5 s and 102 MB.
+**Measured.** 5M rows (`int4, text, timestamptz`), batch 1000: 2,494 → 1,480 ms (2.0M → 3.4M rows/s), peak heap growth 55 → 27 MB, RSS growth 107 → 50 MB (this includes the next two entries; [#34](https://github.com/shlokdesai33/quarry/pull/34)). Batch 100: 3.0 s and 13 MB; 10,000: 1.5 s and 102 MB. Read-ahead, benchmark suite (Node 24, 5 runs): 200k rows to a consumer taking 2 ms per 1000-row batch, 555 ms per stream with strict pull against 438 ms with `readAhead` (−21%); 1M rows to a fast consumer, 317 against 315 ms (no change: the consumer never waits).
 
 **Code.** [ops.ts](ops.ts) `CursorOp.#pump`.
 
@@ -1038,13 +1282,49 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 
 ### COPY with backpressure both ways
 
-**What it is.** `copyFrom` waits for the socket to drain every 64 KiB before reading more from its source; `copyTo` pauses the socket once more than 1 MiB is queued unread and resumes below half ([STREAMING.md](STREAMING.md#copy)).
+**What it is.** `copyFrom` waits for the socket to drain every 64 KiB before reading more from its source; `copyTo` pauses the socket once more than 1 MiB is queued unread and resumes once a chunk is taken ([STREAMING.md](STREAMING.md#copy)).
 
 **Why.** A fast source or a fast server can't fill memory faster than the other side takes it.
 
 **Alternatives.** pg needs the separate `pg-copy-streams` package; postgres.js lets a query pipeline behind COPY FROM.
 
 **Code.** [ops.ts](ops.ts) `CopyFromOp`, `CopyToOp`.
+
+### `copyRows` loops synchronously over sync rows
+
+**What it is.** `copyRows` batches rows into 64 KiB chunks with a plain `for … of` when `rows` is a sync iterable (an array, a generator), and with `for await` only for an async one.
+
+**Why.** `for await` over a sync iterable awaits every row: a promise and a microtask turn per row, for nothing, on the bulk-load path. The chunks were already yielded from an async generator, so backpressure is unchanged.
+
+**Measured.** `copyRows` of 100k rows from an array (`harness.ts copy-in-100k`, Node 24, client pinned to one CPU, median of 5 interleaved runs): 76.5 → 59.6 ms of CPU per load (−22%), allocation −39%.
+
+**Code.** [types.ts](types.ts) `copyChunks`.
+
+### `copyTo` chunks: everything received, one copy per read
+
+**What it is.** Each CopyData message (a row, in text format) stays a view of the read buffer until `next()` takes it; `next()` copies every message received by then into one chunk.
+
+**Why.** `copyTo` yielded one row per chunk: a promise, an iteration and an allocation per row. A consumer now gets as many rows as arrived while it worked.
+
+**Alternatives.** Copy each row on arrival and concatenate later (two copies). Hand out views (they would keep 64 KiB read buffers alive).
+
+**Cost.** Up to the 1 MiB high-water mark in one chunk.
+
+**Measured.** `COPY bench_users TO STDOUT` (1M rows, 83 MB) to a consumer counting bytes, Node 24, client on 2 CPUs, median of 5 copies, 3 alternating runs each: 310–319 → 292–294 ms per copy, client CPU 316–321 → 190–193 ms (−40%), 1,000,000 → about 20,000 chunks.
+
+**Code.** [ops.ts](ops.ts) `CopyToOp`.
+
+### Node stream adapters for COPY
+
+**What it is.** `createCopyFromStream(sql)` returns a Node `Writable` that is a `COPY … FROM STDIN` (it finishes once the server confirmed the COPY, with `rowCount` set; destroying it, or a failing source in a `pipeline`, fails the COPY with CopyFail), and `createCopyToStream(sql)` a `Readable` of a `COPY … TO STDOUT` (destroying it stops the COPY). On a pool, each holds a connection of its own until it ends.
+
+**Why.** `pipeline(createReadStream(file), …)` is how Node code moves bytes; the async-iterable API needed glue for it.
+
+**Alternatives.** Leave it to `Readable.from` (covers COPY TO, not COPY FROM's writable side).
+
+**Cost.** A small adapter; each write's callback waits until the COPY has taken the chunk, so the stream inherits the socket's backpressure.
+
+**Code.** [copy-streams.ts](copy-streams.ts).
 
 ### A NOTIFY fast path and a channel-name cache
 
@@ -1068,11 +1348,11 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 
 ### A dedicated, self-healing LISTEN connection, re-subscribing in one round trip
 
-**What it is.** `pool.listen` uses one dedicated connection outside `max`; if it drops, it reconnects with backoff (100 ms doubling to 5 s) and re-subscribes every channel with the `listen` statements pipelined in one round trip.
+**What it is.** `pool.listen` uses one dedicated connection outside `max`; if it drops, it reconnects with jittered backoff (100 ms doubling to 5 s, × 0.5–1.5) and re-subscribes every channel with the `listen` statements pipelined in one round trip. A subscription's `onGap` callback is called once it listens again, with when the connection dropped and when it was back.
 
-**Why.** `LISTEN` is session state; on a pooled connection it would be lost or delivered to the wrong borrower. Re-subscribing one channel per round trip made reconnects slow with many channels.
+**Why.** `LISTEN` is session state; on a pooled connection it would be lost or delivered to the wrong borrower. Re-subscribing one channel per round trip made reconnects slow with many channels. Jitter keeps the listeners of many processes from reconnecting in step after a restart. Postgres doesn't queue notifications for a session that isn't there, so code that must not miss one needs to know when to re-read what it would have said.
 
-**Cost.** Notifications sent while the connection is down are lost (Postgres doesn't queue them).
+**Cost.** Notifications sent while the connection is down are lost; `onGap` says when.
 
 **Code.** [pool.ts](pool.ts) `Listener`.
 
@@ -1089,6 +1369,30 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 **Cost.** Pipelined queries behind a canceled one wait for it to finish.
 
 **Code.** [connection.ts](connection.ts) `#abort`, `#cancelAtHead`.
+
+### Stop repeating a cancel once the server answered the query
+
+**What it is.** The cancel request for a query is repeated with backoff while the query has received no message; once any message for it has arrived, the cancel sent then is the last.
+
+**Why.** The server drops a cancel that arrives while it is still reading the query, hence the repeats. Once it answered part of the query (ParseComplete, BindComplete, a row), it has read all of it, so a cancel sent then lands on it, or after it finished, where a repeat would hit the next query pipelined behind it: the residual race the comparison found.
+
+**Alternatives.** Repeat until the query ends (the old way). Send one cancel (dropped when the query was just written).
+
+**Cost.** A long query that produces no output before ending (`pg_sleep`) still gets the repeats.
+
+**Code.** [connection.ts](connection.ts) `#cancelAtHead`; [ops.ts](ops.ts) `Op.answered`.
+
+### A statement timeout is refused for statements that can't run in a transaction block
+
+**What it is.** `statementTimeout` on `vacuum`, `create index concurrently`, `drop index concurrently`, `reindex … concurrently`, `reindex database|system`, `create|drop database`, `alter system`, `create|drop tablespace`, a bare `cluster`, `discard all`, `commit|rollback prepared` and subscription commands fails at once with a `DriverError` that says why, before anything is sent.
+
+**Why.** The timeout is set and restored around its query under one Sync, an implicit transaction block, where PostgreSQL refuses those statements with an error about transaction blocks that says nothing about the timeout.
+
+**Alternatives.** Send it and let the server refuse (the old way). Run such statements with a session-level `SET` (would leak the setting to the next borrower behind a pooler).
+
+**Cost.** A regular expression test on queries with a `statementTimeout`; a client-side `timeout` still works for them.
+
+**Code.** [connection.ts](connection.ts) `TRANSACTION_REFUSED`.
 
 ### Drop unsent queries without contacting the server
 
@@ -1128,7 +1432,7 @@ A pipelined connection always has input waiting, so its backend never sleeps. Wi
 
 **Alternatives.** Route timed queries to exclusive use (`acquire`, what [#37](https://github.com/shlokdesai33/quarry/pull/37) did in quarry's executor until #38): it fixes the pool, not a connection pipelined by its owner (a `begin` and a timed query issued together), and costs each timed query a whole connection. Choose the framing when the query reaches the head of the queue: the status is still unknown while earlier queries are in flight, so it would have to wait for them, a round trip per timed query. `begin`/`set_config`/query/`commit` under one Sync: right outside a transaction, but inside one its `commit` would end the caller's transaction. Two statements for the set and the restore: once the query fails, the server skips the restore's Parse, while groups pipelined behind have already bound its name; one statement keeps its only Parse first in the group. Sending them unprepared avoids that too, but parsing them for every query cut timed throughput to about half of `main`'s.
 
-**Cost.** A custom placeholder setting, `quarry.statement_timeout`, exists in the session once a timed query ran (transaction-local, so `current_setting('quarry.statement_timeout', true)` is empty afterwards; not listed in `pg_settings`; harmless behind a pooler). A stale statement in a timed group isn't retried, since the statements after it were skipped (nor was it before, inside `begin … commit`). `vacuum` and `create index concurrently` with a timeout are refused as before ("cannot run inside a transaction block"). Relies on `statement_timeout` being re-armed for each Execute of a pipeline (PostgreSQL 13+). The group is all or nothing on the client: a query that can't be encoded sends none of it. The set and the restore declare the same parameter type, so they share one cached statement (keyed by SQL, types compared). On a pool, a timed query frees its slot at its ReadyForQuery, through the group's `onDone`, and counts as one completion for the adaptive width; it no longer makes its connection report a transaction mid-flight.
+**Cost.** A custom placeholder setting, `quarry.statement_timeout`, exists in the session once a timed query ran (transaction-local, so `current_setting('quarry.statement_timeout', true)` is empty afterwards; not listed in `pg_settings`; harmless behind a pooler). A stale statement in a timed group isn't retried, since the statements after it were skipped (nor was it before, inside `begin … commit`). So a statement in a group never binds a cached statement whose Parse is still unanswered: that Parse may be in a group that fails before it (an invalid interval makes the server skip the query, and its Parse with it), and the bind would fail with `26000`, where a plain query is retried. It is parsed again unnamed for that run instead, once per statement in the window before its ParseComplete; no change measured (timed lookups from 64 callers 185,166 → 185,484/s; an A/A control on that cell moved 9.5%). `vacuum` and `create index concurrently` with a timeout are refused as before ("cannot run inside a transaction block"). Relies on `statement_timeout` being re-armed for each Execute of a pipeline (PostgreSQL 13+). The group is all or nothing on the client: a query that can't be encoded sends none of it. The set and the restore declare the same parameter type, so they share one cached statement (keyed by SQL, types compared). On a pool, a timed query frees its slot at its ReadyForQuery, through the group's `onDone`, and counts as one completion for the adaptive width; it no longer makes its connection report a transaction mid-flight.
 
 **Measured.** `pool.query('select $1::int')` from 200 callers on 4 connections, Node 24, PostgreSQL 18 on the same 4-core VM, median of 3 interleaved 2 s runs: every query timed 152,466 → 218,568/s (+43%); 1 in 10 timed 460,449 → 534,603/s (+16%; a timed query no longer makes its connection report a transaction, which stopped the pool pipelining onto it); untimed 551,240 → 546,982/s (unchanged path, within noise). At a simulated 5 ms round trip all three are bound by the callers (31,700–35,300/s either way). One Sync per timed query instead of four.
 
@@ -1144,6 +1448,20 @@ Builder point lookups (`selectFrom(users).where(id).select([3 columns]).expectOn
 Untimed lookups are unchanged (77,092, 79,339, 14,941 and 56,411/s before).
 
 **Code.** [connection.ts](connection.ts) `#queryWithTimeout`; [ops.ts](ops.ts) `STATEMENT_TIMEOUT`, `SyncGroupOp`, `CursorOp`; [../driver-executor.ts](../driver-executor.ts) `#shared`.
+
+### Two statements on a pool, where no transaction block can precede the query
+
+**What it is.** A timed `pool.query()` (and so a builder query or default batch with a `timeout`) goes out as two statements under one Sync, `set_config('statement_timeout', $1, true)` and the query, when the pool can be sure it runs outside a transaction block: the connection's last ReadyForQuery said idle, and everything queued or in flight on it is a plain statement that can't open a block (not `begin` or `start transaction`, read after comments; not a simple query, a cursor or COPY), and the timed query isn't one either. Their implicit transaction ends the setting at the Sync, so no restore is needed. Everywhere else (a connection's own queries, a transaction, a pool connection with a `begin` pipelined ahead, a timed `begin`) keeps the three-statement framing above.
+
+**Why.** The three-statement form costs a second statement, the saved setting and a `case` per timed query. On a pool's shared connections, the pool itself issues everything ahead, so it can tell what's queued. The status alone can't be trusted ([above](#a-statement-timeout-is-framed-under-the-querys-sync-whatever-the-transaction-status)): a `begin` pipelined ahead and not yet answered leaves the status idle, which is why every queued op has to be checked as well. A timed `begin` would keep its transaction-local setting for the block it opens, bounding the caller's later statements.
+
+**Alternatives.** The short form wherever the status is idle: the kind of bug #38 fixed. Behind another caller's unanswered `begin`, the setting would land inside that caller's transaction and last for the rest of it. The three statements everywhere (before): correct, slower. Choosing at the head of the queue: needs to wait for earlier answers.
+
+**Cost.** A scan of the connection's queue (at most its pipeline depth, usually a few ops) per timed query, and a regular expression per queued plain query's SQL, both only for timed queries. Tested directly and through PgBouncer in transaction mode: pipelined neighbours timed and untimed, a `begin` pipelined ahead (three statements, the caller's transaction unbounded), a timed `begin`, a failing query mid-pipeline and an invalid interval (each fails alone, nothing leaks, and the same statement pipelined behind an invalid interval runs, timed or not), and transactions and plain connections (three statements).
+
+**Measured.** `harness.ts`, Node 24, client pinned to one CPU, median of 5 interleaved runs: a timed point lookup 26,108 → 29,065/s (CPU −6%, allocation −21%); 64 callers 99,693 → 136,231/s (p99 6.4 → 4.3 ms); builder lookups with a `timeout` from 100 callers 120,769 → 147,892/s (p99 6.7 → 4.3 ms). Untimed lookups from 64 callers unchanged.
+
+**Code.** [connection.ts](connection.ts) `#query`, `#queryWithTimeout`, `#outsideTransactionBlock`; [ops.ts](ops.ts) `STATEMENT_TIMEOUT_LOCAL`, `opensNoBlock`.
 
 ### Every wait has a timeout
 
@@ -1248,11 +1566,39 @@ The interface itself stays: the config's `socket` option takes a custom factory 
 
 ### Typed error classes per SQLSTATE
 
-**What it is.** Common SQLSTATEs have their own subclasses (`UniqueViolation`, `SerializationFailure`, `QueryCanceled` with a `reason`, …), `isRetryable` and `isFatal`, and `IntegrityConstraintViolation.columns` parsed from the error.
+**What it is.** Common SQLSTATEs have their own subclasses (`UniqueViolation`, `SerializationFailure`, `QueryCanceled` with a `reason`, …), each with its own `name`, plus `isRetryable` and `isFatal`, and `IntegrityConstraintViolation.columns` parsed from the error.
 
-**Why.** `catch (e) { if (e instanceof UniqueViolation) … }` is clearer and safer than comparing code strings everywhere.
+**Why.** `catch (e) { if (e instanceof UniqueViolation) … }` is clearer and safer than comparing code strings everywhere, and a log line or stack trace that starts `UniqueViolation:` says what happened where `PostgresError:` didn't.
 
 **Code.** [errors.ts](errors.ts) `postgresError`.
+
+### Secrets hidden from a configuration's enumerable properties
+
+**What it is.** A resolved configuration's `password`, `ssl.key` and `ssl.passphrase` are non-enumerable.
+
+**Why.** Configurations get logged and serialized (`console.log(pool)`-style debugging, error reporters walking objects); `JSON.stringify` and most loggers skip non-enumerable properties, while code reading them by name still can.
+
+**Code.** [config.ts](config.ts) `hideSecrets`.
+
+### Only a `Uint8Array` is sent as bytes
+
+**What it is.** A `Uint8Array` (or `Buffer`) parameter is sent in binary as bytea; any other typed array or `DataView` is refused with a message saying how to convert it.
+
+**Why.** A `Float32Array` or `Int16Array` went out as its raw, platform-endian bytes: almost never what a column of numbers (a vector, an `int2[]`) wants, and silently wrong.
+
+**Why refuse rather than convert.** There are two plausible meanings (the numbers, for an array or vector column; the raw bytes, for bytea), and the driver can't tell which without the column's type. Guessing the numbers silently changes what a `bytea` receives; guessing the bytes is what happened before. The error names both conversions (`Array.from(value)`, `new Uint8Array(value.buffer, …)`), so the fix is one call.
+
+**Alternatives.** Encode other typed arrays as arrays of numbers (a guess at the column's type).
+
+**Code.** [types.ts](types.ts) `notBytes`.
+
+### Spans for cursors, COPY TO and transactions
+
+**What it is.** With `telemetry`, a cursor (and so a stream) and a `copyTo` are each one span, from the first batch asked for to the end, with the rows read; a transaction is a `TRANSACTION` span around its statements' spans.
+
+**Why.** A stream's time and a transaction's total time weren't visible: only their statements were.
+
+**Code.** [connection.ts](connection.ts) `#observeIteration`, `transaction`; [telemetry.ts](telemetry.ts).
 
 ### A decode failure fails one query, not the connection
 

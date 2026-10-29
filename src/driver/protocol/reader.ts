@@ -19,6 +19,10 @@ const DEFAULT_MAX_MESSAGE_SIZE = 0x40000000;
  * stay linear. Consumed chunks are released, not kept while the connection
  * is idle.
  */
+/** Split DataRows from this size up reuse one buffer (smaller ones are cheap to allocate), up to `MAX_SPARE`. */
+const MIN_SPARE = 65_536;
+const MAX_SPARE = 16 * 1024 * 1024;
+
 export class Reader {
 	/** The chunk being read, from `#pos`. Empty while a split message is collected. */
 	#buf: Uint8Array = EMPTY;
@@ -30,6 +34,13 @@ export class Reader {
 	#needed = 0;
 	/** Whether `#part` holds a whole message, returned before the rest of `#buf`. */
 	#partReady = false;
+	/**
+	 * The buffer split DataRows are put back together in, reused: a row is
+	 * decoded, its values copied out, before the next message is read.
+	 * Dropped when the connection goes idle (`dropSpare`), so it holds
+	 * memory only while queries run.
+	 */
+	#spare: Uint8Array = EMPTY;
 	readonly #maxMessageSize: number;
 
 	constructor(maxMessageSize = DEFAULT_MAX_MESSAGE_SIZE) {
@@ -83,7 +94,7 @@ export class Reader {
 	#sizePart(): void {
 		const part = this.#part;
 		const length = this.#length(part, 0);
-		const whole = allocate(length + 1);
+		const whole = this.#partBuffer(part[0] ?? 0, length + 1);
 		whole.set(part.subarray(0, 5));
 		this.#part = whole;
 		this.#needed = length + 1;
@@ -106,11 +117,31 @@ export class Reader {
 	/** Moves the incomplete message at the end of the chunk into a buffer of its own, `needed` bytes long (5 if its length is unknown). */
 	#stash(needed: number): void {
 		const tail = this.#buf.subarray(this.#pos);
-		this.#part = allocate(needed);
+		this.#part = this.#partBuffer(tail[0] ?? 0, needed);
 		this.#part.set(tail);
 		this.#partLength = tail.length;
 		this.#needed = needed;
 		this.#release();
+	}
+
+	/**
+	 * Room for a split message of `size` bytes: in the spare buffer for a
+	 * DataRow from `MIN_SPARE` to `MAX_SPARE` bytes, otherwise its own. Other
+	 * messages keep their own: CopyData is handed out as a view.
+	 */
+	#partBuffer(type: number, size: number): Uint8Array {
+		if (type !== 0x44 || size < MIN_SPARE || size > MAX_SPARE)
+			return allocate(size);
+		if (this.#spare.length < size)
+			this.#spare = allocate(
+				Math.min(MAX_SPARE, Math.max(size, this.#spare.length * 2)),
+			);
+		return this.#spare.subarray(0, size);
+	}
+
+	/** Lets go of the reassembly buffer: the connection has nothing in flight. */
+	dropSpare(): void {
+		this.#spare = EMPTY;
 	}
 
 	#release(): void {
@@ -289,23 +320,31 @@ function readyForQuery(bytes: Uint8Array, start: number, end: number) {
 	}
 }
 
-/** The latest command tag: queries mostly repeat it, so its string is reused rather than decoded again. */
-let lastTagBytes = EMPTY;
-let lastTag = '';
+/**
+ * The last 8 command tags' bytes and strings: queries mostly repeat a few
+ * (a transaction alternates BEGIN, its statements and COMMIT), so their
+ * strings are reused rather than decoded again.
+ */
+const TAG_CACHE = 8;
+const tagBytes: Uint8Array[] = [];
+const tagStrings: string[] = [];
+let tagNext = 0;
 
 function commandTag(bytes: Uint8Array, start: number, end: number): string {
 	const nul = nulAt(bytes, start, end);
 	const length = nul - start;
-	const known = lastTagBytes;
-	if (known.length === length) {
+	for (let k = 0; k < tagBytes.length; k++) {
+		const known = tagBytes[k];
+		if (known === undefined || known.length !== length) continue;
 		let i = 0;
 		while (i < length && known[i] === bytes[start + i]) i++;
-		if (i === length) return lastTag;
+		if (i === length) return tagStrings[k] ?? '';
 	}
 	const tag = utf8(bytes, start, nul);
-	// a copy: a view would keep the whole read buffer alive
-	lastTagBytes = new Uint8Array(bytes.subarray(start, nul));
-	lastTag = tag;
+	// a copy: a view would keep the read buffer alive
+	tagBytes[tagNext] = new Uint8Array(bytes.subarray(start, nul));
+	tagStrings[tagNext] = tag;
+	tagNext = (tagNext + 1) % TAG_CACHE;
 	return tag;
 }
 

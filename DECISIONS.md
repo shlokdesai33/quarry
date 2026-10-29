@@ -22,7 +22,7 @@ The ones that shape everything else, with their biggest measured effect:
 | [Binary only after describe](src/driver/DECISIONS.md#binary-only-after-describe)                                         | never guess column types: safe against schema drift                    | first-run binary was 2× faster at 10k rows, and dropped for safety                          |
 | [Generated row decoders](src/driver/DECISIONS.md#generated-monomorphic-row-decoders)                                     | one compiled function per statement's columns                          | 6 columns: 1,068 → 323–394 ns per row                                                       |
 | [Allocation cuts](src/driver/DECISIONS.md#allocation-cuts-for-the-small-query-tail)                                      | a small query's garbage cut from ~5.0 KB to ~2.2 KB                    | `select 1` p99.9 368 → 264 µs                                                               |
-| [Streams: strict pull](src/driver/DECISIONS.md#streams-strict-pull)                                                      | fetch a batch only when the consumer asks                              | 5M rows 2,494 → 1,480 ms, peak heap 55 → 27 MB (with binary first run)                      |
+| [Streams: strict pull](src/driver/DECISIONS.md#streams-strict-pull-read-ahead-opt-in)                                    | fetch a batch only when the consumer asks                              | 5M rows 2,494 → 1,480 ms, peak heap 55 → 27 MB (with binary first run)                      |
 | [Types follow PostgreSQL](src/DECISIONS.md#types-follow-postgresql-not-javascript)                                       | "it type-checks" means "Postgres accepts it"                           |                                                                                             |
 | [No implicit LIMIT in result shapes](src/DECISIONS.md#no-implicit-limit-in-result-shapes)                                | the SQL you see is what runs, whatever the shape                       |                                                                                             |
 | [Lazy shapes and `db.batch`](src/DECISIONS.md#lazy-result-shapes-and-execute-as-the-one-way-to-run)                      | queries are values, so many can go in one round trip                   | a transfer at 5 ms RTT: 22.8 → 5.86 ms                                                      |
@@ -62,13 +62,16 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 - [A write's `execute()` with `returning` resolves to the rows](src/DECISIONS.md#a-writes-execute-with-returning-resolves-to-the-rows)
 - [`db.batch`: two modes with names](src/DECISIONS.md#dbbatch-two-modes-with-names)
 - [`stream()`: only for every-row reads, run by iterating it](src/DECISIONS.md#stream-only-for-every-row-reads-run-by-iterating-it)
+- [`executeAndCommit()` for a transaction's last statement](src/DECISIONS.md#executeandcommit-for-a-transactions-last-statement)
 
 ### Compiling to SQL
 
 - [A node tree, and one compiler](src/DECISIONS.md#a-node-tree-and-one-compiler)
 - [References resolved before compiling](src/DECISIONS.md#references-resolved-before-compiling)
 - [Columns resolved and quoted once per table](src/DECISIONS.md#columns-resolved-and-quoted-once-per-table) (measured)
+- [Joined scopes' expression builders made once](src/DECISIONS.md#joined-scopes-expression-builders-made-once) (measured)
 - [SQL rendered through a trie of its pieces](src/DECISIONS.md#sql-rendered-through-a-trie-of-its-pieces) (measured)
+- [The builder's remaining per-query cost: profiled, nothing cut](src/DECISIONS.md#the-builders-remaining-per-query-cost-profiled-nothing-cut) (measured)
 - [Every identifier quoted](src/DECISIONS.md#every-identifier-quoted)
 - [Parameters everywhere, literals only where Postgres refuses a parameter](src/DECISIONS.md#parameters-everywhere-literals-only-where-postgres-refuses-a-parameter)
 - [Parameters numbered in text order; `in` takes a list, or one array as `= any($1)`](src/DECISIONS.md#parameters-numbered-in-text-order-in-takes-a-list-or-one-array-as--any1)
@@ -94,6 +97,7 @@ Full entries: [src/DECISIONS.md](src/DECISIONS.md).
 ### Bulk writes
 
 - [Many rows through `unnest`, one array per column](src/DECISIONS.md#many-rows-through-unnest-one-array-per-column) (measured)
+- [Rows built in one pass](src/DECISIONS.md#rows-built-in-one-pass) (measured)
 - [`unnest` casts without type modifiers](src/DECISIONS.md#unnest-casts-without-type-modifiers)
 - [`setEach`: one method for the source, the assignments and the key match](src/DECISIONS.md#seteach-one-method-for-the-source-the-assignments-and-the-key-match) (measured)
 - [Rows that set different columns: flag columns and `case`](src/DECISIONS.md#rows-that-set-different-columns-flag-columns-and-case)
@@ -160,6 +164,7 @@ Full entries: [src/driver/DECISIONS.md](src/driver/DECISIONS.md).
 
 - [Coalesced writes: one write per microtask](src/driver/DECISIONS.md#coalesced-writes-one-write-per-microtask) (measured)
 - [`TCP_NODELAY`](src/driver/DECISIONS.md#tcp_nodelay)
+- [`noDelay` in the connect options](src/driver/DECISIONS.md#nodelay-in-the-connect-options)
 - [Backpressure: 64 KiB chunks, and queued ops stay unencoded](src/driver/DECISIONS.md#backpressure-64-kib-chunks-and-queued-ops-stay-unencoded) (measured)
 - [Back-filled message lengths](src/driver/DECISIONS.md#back-filled-message-lengths)
 - [Pipelining, with one Sync per query](src/driver/DECISIONS.md#pipelining-with-one-sync-per-query) (measured)
@@ -172,13 +177,14 @@ Full entries: [src/driver/DECISIONS.md](src/driver/DECISIONS.md).
 - [Retry a stale statement once, unprepared](src/driver/DECISIONS.md#retry-a-stale-statement-once-unprepared)
 - [Unnamed statements for pipelined queries behind PgBouncer](src/driver/DECISIONS.md#unnamed-statements-for-pipelined-queries-behind-pgbouncer) (measured)
 - [Detect poolers at login rather than configure them](src/driver/DECISIONS.md#detect-poolers-at-login-rather-than-configure-them)
+- [Prepare on a SQL text's second run](src/driver/DECISIONS.md#prepare-on-a-sql-texts-second-run) (measured)
 
 ### Codecs, types and formats
 
 - [Codecs owned by the driver, chosen by the caller](src/driver/DECISIONS.md#codecs-owned-by-the-driver-chosen-by-the-caller) (measured)
 - [Exact parameter OIDs, except for text-like types](src/driver/DECISIONS.md#exact-parameter-oids-except-for-text-like-types)
 - [Binary only after describe](src/driver/DECISIONS.md#binary-only-after-describe)
-- [Which types are binary and which stay text](src/driver/DECISIONS.md#which-types-are-binary-and-which-stay-text)
+- [Which types are binary and which stay text](src/driver/DECISIONS.md#which-types-are-binary-and-which-stay-text) (measured)
 - [Binary array parameters, with a per-array fallback](src/driver/DECISIONS.md#binary-array-parameters-with-a-per-array-fallback) (measured)
 - [Arrays of text read as one latin1 string](src/driver/DECISIONS.md#arrays-of-text-read-as-one-latin1-string) (measured)
 - [Named types resolved once per pool through the catalog](src/driver/DECISIONS.md#named-types-resolved-once-per-pool-through-the-catalog)
@@ -187,13 +193,16 @@ Full entries: [src/driver/DECISIONS.md](src/driver/DECISIONS.md).
 ### Reading and decoding
 
 - [Zero-copy reads: messages decoded in place](src/driver/DECISIONS.md#zero-copy-reads-messages-decoded-in-place) (measured)
+- [Large split DataRows reassembled in one reused buffer](src/driver/DECISIONS.md#large-split-datarows-reassembled-in-one-reused-buffer) (measured)
 - [Strict bounds checks on every read](src/driver/DECISIONS.md#strict-bounds-checks-on-every-read)
 - [DataRow fast path: no message objects for rows](src/driver/DECISIONS.md#datarow-fast-path-no-message-objects-for-rows)
 - [Generated, monomorphic row decoders](src/driver/DECISIONS.md#generated-monomorphic-row-decoders) (measured)
+- [Decoder factories found by result shape, not by their source](src/driver/DECISIONS.md#decoder-factories-found-by-result-shape-not-by-their-source) (measured)
 - [Text decoded with `Buffer#utf8Slice`](src/driver/DECISIONS.md#text-decoded-with-bufferutf8slice) (measured)
 - [Nested objects built by the generated row decoder](src/driver/DECISIONS.md#nested-objects-built-by-the-generated-row-decoder)
 - [Decode only the rows a caller keeps (`keepRows`)](src/driver/DECISIONS.md#decode-only-the-rows-a-caller-keeps-keeprows)
-- [Shared constant messages and repeated-string caches](src/driver/DECISIONS.md#shared-constant-messages-and-repeated-string-caches)
+- [Shared constant messages and repeated-string caches](src/driver/DECISIONS.md#shared-constant-messages-and-repeated-string-caches) (measured)
+- [`Buffer` read from `node:buffer` once](src/driver/DECISIONS.md#buffer-read-from-nodebuffer-once) (measured)
 
 ### Memory and garbage collection
 
@@ -201,6 +210,7 @@ Full entries: [src/driver/DECISIONS.md](src/driver/DECISIONS.md).
 - [The shared promise executor lets go of each query's resolvers](src/driver/DECISIONS.md#the-shared-promise-executor-lets-go-of-each-querys-resolvers) (measured)
 - [One sweep timer for every idle connection](src/driver/DECISIONS.md#one-sweep-timer-for-every-idle-connection)
 - [The writer: reserve one byte per character, hand off big buffers](src/driver/DECISIONS.md#the-writer-reserve-one-byte-per-character-hand-off-big-buffers) (measured)
+- [GC on million-row results: left to V8](src/driver/DECISIONS.md#gc-on-million-row-results-left-to-v8) (measured)
 
 ### The pool
 
@@ -211,6 +221,11 @@ Full entries: [src/driver/DECISIONS.md](src/driver/DECISIONS.md).
 - [Adaptive width: no more pipelined backends than the server runs at once](src/driver/DECISIONS.md#adaptive-width-no-more-pipelined-backends-than-the-server-runs-at-once) (measured)
 - [`withShared`: several queries as one pipeline slot](src/driver/DECISIONS.md#withshared-several-queries-as-one-pipeline-slot)
 - [Pool policies: LIFO idle, jittered lifetime, safe release, fail fast](src/driver/DECISIONS.md#pool-policies-lifo-idle-jittered-lifetime-safe-release-fail-fast)
+- [The pool's hot path: no change from the clock reads or per-waiter timers](src/driver/DECISIONS.md#the-pools-hot-path-no-change-from-the-clock-reads-or-per-waiter-timers) (measured)
+- [`maxUses`](src/driver/DECISIONS.md#maxuses)
+- [Pool events and counters](src/driver/DECISIONS.md#pool-events-and-counters)
+- [Connect retry delay, opt-in and not escalating](src/driver/DECISIONS.md#connect-retry-delay-opt-in-and-not-escalating)
+- [Run a query again when the server ended the session before answering it](src/driver/DECISIONS.md#run-a-query-again-when-the-server-ended-the-session-before-answering-it)
 
 ### Connecting
 
@@ -221,12 +236,15 @@ Full entries: [src/driver/DECISIONS.md](src/driver/DECISIONS.md).
 - [A TLS secure-context cache](src/driver/DECISIONS.md#a-tls-secure-context-cache)
 - [`close()` with libpq semantics](src/driver/DECISIONS.md#close-with-libpq-semantics) (measured)
 - [`verify-full` by default, and strict TLS and SCRAM checks](src/driver/DECISIONS.md#verify-full-by-default-and-strict-tls-and-scram-checks)
-- [Ask for protocol 3.2, accept 3.0, retry once](src/driver/DECISIONS.md#ask-for-protocol-32-accept-30-retry-once)
+- [Ask for protocol 3.2, accept 3.0, retry once, remember who refused](src/driver/DECISIONS.md#ask-for-protocol-32-accept-30-retry-once-remember-who-refused)
+- [A cap on SCRAM iterations, and the RSASSA-PSS hash read from the certificate](src/driver/DECISIONS.md#a-cap-on-scram-iterations-and-the-rsassa-pss-hash-read-from-the-certificate)
 
 ### Transactions and batches
 
 - [BEGIN shares the first statement's Sync](src/driver/DECISIONS.md#begin-shares-the-first-statements-sync) (measured)
-- [Deferred savepoint RELEASE](src/driver/DECISIONS.md#deferred-savepoint-release) (measured)
+- [Savepoints and RELEASE share the next statement's Sync](src/driver/DECISIONS.md#savepoints-and-release-share-the-next-statements-sync) (measured)
+- [A swallowed error resurfaces as itself](src/driver/DECISIONS.md#a-swallowed-error-resurfaces-as-itself)
+- [COMMIT pipelined behind a transaction's last statement](src/driver/DECISIONS.md#commit-pipelined-behind-a-transactions-last-statement) (measured)
 - [Detect a COMMIT that rolled back](src/driver/DECISIONS.md#detect-a-commit-that-rolled-back)
 - [`afterCommit` callbacks that can't change the outcome](src/driver/DECISIONS.md#aftercommit-callbacks-that-cant-change-the-outcome)
 - [`db.batch` framing: one write, with COMMIT pipelined unless results are checked](src/driver/DECISIONS.md#dbbatch-framing-one-write-with-commit-pipelined-unless-results-are-checked)
@@ -236,7 +254,7 @@ Full entries: [src/driver/DECISIONS.md](src/driver/DECISIONS.md).
 ### Cursors and streams
 
 - [Exclusive ops for anything that keeps talking](src/driver/DECISIONS.md#exclusive-ops-for-anything-that-keeps-talking)
-- [Streams: strict pull](src/driver/DECISIONS.md#streams-strict-pull) (measured)
+- [Streams: strict pull, read-ahead opt-in](src/driver/DECISIONS.md#streams-strict-pull-read-ahead-opt-in) (measured)
 - [Cursors: describe first for binary from the first run](src/driver/DECISIONS.md#cursors-describe-first-for-binary-from-the-first-run)
 - [Cursors inside a transaction use a named portal](src/driver/DECISIONS.md#cursors-inside-a-transaction-use-a-named-portal)
 - [Aborting a suspended cursor closes it instead of cancelling](src/driver/DECISIONS.md#aborting-a-suspended-cursor-closes-it-instead-of-cancelling)
@@ -246,6 +264,9 @@ Full entries: [src/driver/DECISIONS.md](src/driver/DECISIONS.md).
 ### COPY and LISTEN/NOTIFY
 
 - [COPY with backpressure both ways](src/driver/DECISIONS.md#copy-with-backpressure-both-ways)
+- [`copyRows` loops synchronously over sync rows](src/driver/DECISIONS.md#copyrows-loops-synchronously-over-sync-rows) (measured)
+- [`copyTo` chunks: everything received, one copy per read](src/driver/DECISIONS.md#copyto-chunks-everything-received-one-copy-per-read) (measured)
+- [Node stream adapters for COPY](src/driver/DECISIONS.md#node-stream-adapters-for-copy)
 - [A NOTIFY fast path and a channel-name cache](src/driver/DECISIONS.md#a-notify-fast-path-and-a-channel-name-cache) (measured)
 - [`notify` with `pg_notify($1, $2)`](src/driver/DECISIONS.md#notify-with-pg_notify1-2)
 - [A dedicated, self-healing LISTEN connection, re-subscribing in one round trip](src/driver/DECISIONS.md#a-dedicated-self-healing-listen-connection-re-subscribing-in-one-round-trip)
@@ -253,10 +274,13 @@ Full entries: [src/driver/DECISIONS.md](src/driver/DECISIONS.md).
 ### Cancellation and timeouts
 
 - [Cancel only the query at the head, and hold back later writes](src/driver/DECISIONS.md#cancel-only-the-query-at-the-head-and-hold-back-later-writes)
+- [Stop repeating a cancel once the server answered the query](src/driver/DECISIONS.md#stop-repeating-a-cancel-once-the-server-answered-the-query)
+- [A statement timeout is refused for statements that can't run in a transaction block](src/driver/DECISIONS.md#a-statement-timeout-is-refused-for-statements-that-cant-run-in-a-transaction-block)
 - [Drop unsent queries without contacting the server](src/driver/DECISIONS.md#drop-unsent-queries-without-contacting-the-server)
 - [Server-side statement timeouts, transaction-local and pipelined](src/driver/DECISIONS.md#server-side-statement-timeouts-transaction-local-and-pipelined)
 - [A statement timeout framed by the transaction status](src/driver/DECISIONS.md#a-statement-timeout-framed-by-the-transaction-status) (superseded by A statement timeout is framed under the query's Sync, whatever the transaction status)
 - [A statement timeout is framed under the query's Sync, whatever the transaction status](src/driver/DECISIONS.md#a-statement-timeout-is-framed-under-the-querys-sync-whatever-the-transaction-status) (measured)
+- [Two statements on a pool, where no transaction block can precede the query](src/driver/DECISIONS.md#two-statements-on-a-pool-where-no-transaction-block-can-precede-the-query) (measured)
 - [Every wait has a timeout](src/driver/DECISIONS.md#every-wait-has-a-timeout)
 
 ### Observability
@@ -274,4 +298,7 @@ Full entries: [src/driver/DECISIONS.md](src/driver/DECISIONS.md).
 
 - [Errors carry everything and leak nothing](src/driver/DECISIONS.md#errors-carry-everything-and-leak-nothing)
 - [Typed error classes per SQLSTATE](src/driver/DECISIONS.md#typed-error-classes-per-sqlstate)
+- [Secrets hidden from a configuration's enumerable properties](src/driver/DECISIONS.md#secrets-hidden-from-a-configurations-enumerable-properties)
+- [Only a `Uint8Array` is sent as bytes](src/driver/DECISIONS.md#only-a-uint8array-is-sent-as-bytes)
+- [Spans for cursors, COPY TO and transactions](src/driver/DECISIONS.md#spans-for-cursors-copy-to-and-transactions)
 - [A decode failure fails one query, not the connection](src/driver/DECISIONS.md#a-decode-failure-fails-one-query-not-the-connection)

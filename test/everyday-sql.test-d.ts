@@ -399,4 +399,12 @@ describe('returningAll', () => {
 				.$output,
 		).toEqualTypeOf<{ id: number; authorId: number; title: string }>();
 	});
+
+	it('refuses a column already returned', () => {
+		const insert = insertInto(posts).values({ authorId: 1, title: 'x' });
+		// @ts-expect-error `title` is already returned
+		insert.returning(['posts.title']).returningAll();
+		// @ts-expect-error twice
+		insert.returningAll().returningAll();
+	});
 });

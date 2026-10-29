@@ -85,6 +85,7 @@ export class Pool extends EventEmitter {
 			min: o.min,
 			idleTimeout: o.idleTimeoutMillis,
 			maxLifetime: o.maxLifetimeSeconds * 1000,
+			maxUses: o.maxUses,
 			acquireTimeout: o.connectionTimeoutMillis ?? 0,
 			onConnect: async (connection) => {
 				const { client } = this.#wrap(connection);

@@ -226,11 +226,8 @@ export function textOf(value: unknown): string {
 			return value ? 't' : 'f';
 		case 'object':
 			if (value instanceof Date) return formatTimestamp(value);
-			if (ArrayBuffer.isView(value)) {
-				return hexDigits(
-					new Uint8Array(value.buffer, value.byteOffset, value.byteLength),
-				);
-			}
+			if (value instanceof Uint8Array) return hexDigits(value);
+			if (ArrayBuffer.isView(value)) throw notBytes(value);
 			return JSON.stringify(value);
 		default:
 			throw new DriverError(`Cannot send a ${typeof value} as a parameter`);
@@ -273,11 +270,20 @@ export function encodeDefined(value: unknown): WireValue {
 	if (value === null || value === undefined) return null;
 	if (typeof value === 'string') return value;
 	if (value instanceof Uint8Array) return value;
-	if (ArrayBuffer.isView(value)) {
-		return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-	}
 	if (Array.isArray(value)) return arrayLiteral(value);
 	return textOf(value);
+}
+
+/**
+ * Why a typed array other than `Uint8Array` (or a `DataView`) isn't sent:
+ * its raw bytes depend on the platform's byte order and are rarely what a
+ * column of numbers wants.
+ */
+export function notBytes(value: ArrayBufferView): DriverError {
+	const kind = value.constructor.name;
+	return new DriverError(
+		`A ${kind} parameter is not sent: only a Uint8Array (or Buffer) is sent as bytes. Pass Array.from(value) for its numbers, or new Uint8Array(value.buffer, value.byteOffset, value.byteLength) for its raw bytes`,
+	);
 }
 
 /**
@@ -332,11 +338,22 @@ export async function* copyChunks(
 	size = 65536,
 ): AsyncGenerator<string, void, undefined> {
 	let chunk = '';
-	for await (const row of rows) {
-		chunk += copyLine(row);
-		if (chunk.length >= size) {
-			yield chunk;
-			chunk = '';
+	if (Symbol.asyncIterator in rows) {
+		for await (const row of rows) {
+			chunk += copyLine(row);
+			if (chunk.length >= size) {
+				yield chunk;
+				chunk = '';
+			}
+		}
+	} else {
+		// synchronously: `for await` over a sync iterable costs a promise per row
+		for (const row of rows) {
+			chunk += copyLine(row);
+			if (chunk.length >= size) {
+				yield chunk;
+				chunk = '';
+			}
 		}
 	}
 	if (chunk !== '') yield chunk;

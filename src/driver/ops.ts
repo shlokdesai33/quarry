@@ -9,6 +9,7 @@ import {
 	postgresError,
 } from './errors.js';
 import * as fe from './protocol/frontend.js';
+import { allocate } from './protocol/text.js';
 import type { WireValue } from './protocol/frontend.js';
 import type { BackendMessage, Field } from './protocol/messages.js';
 import type { Writer } from './protocol/writer.js';
@@ -24,6 +25,7 @@ import {
 	type ResultSpec,
 } from './results.js';
 import type { NestedObject, RowDecoder, RowMode } from './rows.js';
+import type { QueryOptions } from './connection.js';
 
 /**
  * With $1, sets `statement_timeout` to it until the transaction ends,
@@ -35,6 +37,22 @@ import type { NestedObject, RowDecoder, RowMode } from './rows.js';
  * where nothing can make the server skip it: groups pipelined behind
  * bind its name before it is answered. Its parameter is text (OID 25).
  */
+/**
+ * A statement that opens a transaction block, by its first word (after
+ * comments): the only ones that leave one open behind their Sync.
+ */
+const BEGINS = /^(?:\s|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*(?:begin|start)\b/i;
+
+export const opensTransactionBlock = (sql: string): boolean => BEGINS.test(sql);
+
+/**
+ * Sets `statement_timeout` to $1 until the transaction ends: with its
+ * query under one Sync, outside a transaction block, the implicit
+ * transaction ends it at the Sync. Its parameter is text (OID 25).
+ */
+export const STATEMENT_TIMEOUT_LOCAL =
+	"select set_config('statement_timeout', $1, true)";
+
 export const STATEMENT_TIMEOUT =
 	"select case when $1::text is null then set_config('statement_timeout', current_setting('quarry.statement_timeout'), true) else set_config('quarry.statement_timeout', current_setting('statement_timeout'), true) || set_config('statement_timeout', $1, true) end";
 
@@ -49,6 +67,8 @@ export interface Statement {
 	readonly types: readonly number[];
 	/** When the statement was last looked up, on the connection's counter: the cache evicts the lowest. */
 	used: number;
+	/** How often its SQL was parsed unnamed (ParseComplete), towards the connection's `prepareThreshold`. */
+	seen: number;
 	/** Created, and its Parse not yet written: the operation that finds it so writes it. */
 	unwritten: boolean;
 	/** Set once ParseComplete arrives. */
@@ -75,8 +95,9 @@ export interface OpContext {
 	readonly specs: { readonly binary: ResultSpec; readonly text: ResultSpec };
 	/**
 	 * The cached statement for this SQL, created if new (`unwritten` until
-	 * its Parse is written). A `named` one is created with a name, to be
-	 * parsed; an unnamed entry is then replaced.
+	 * its Parse is written). With `named`, one run often enough
+	 * (`prepareThreshold`) has a name, to be parsed, replacing its unnamed
+	 * entry; until then, and without `named`, it is unnamed (name '').
 	 */
 	statement(sql: string, types: readonly number[], named: boolean): Statement;
 	/**
@@ -127,6 +148,8 @@ export interface OpTiming {
 export abstract class Op {
 	written = false;
 	done = false;
+	/** Set once a message for it arrived: the server read all of it and is running it. */
+	answered = false;
 	/**
 	 * Whether later operations must wait until this one completes (it keeps
 	 * talking after being written); read once it is written.
@@ -189,6 +212,16 @@ export abstract class Op {
 		return 0;
 	}
 
+	/** The server's error for it, once one arrived. */
+	get failure(): Error | undefined {
+		return undefined;
+	}
+
+	/** Whether it surely leaves no transaction block open behind it (see `opensNoBlock`). */
+	get opensNoBlock(): boolean {
+		return false;
+	}
+
 	abstract write(ctx: OpContext): void;
 	/** Handles one message; true when the operation is complete. */
 	abstract handle(msg: BackendMessage, ctx: OpContext): boolean;
@@ -214,26 +247,31 @@ interface ParsedTag {
 	readonly rowCount: number | null;
 }
 
-/** The latest tag parsed: a connection mostly sees the same few tags in a row. */
-let lastTag = '';
-let lastParsed: ParsedTag = { command: '', rowCount: null };
+/**
+ * Tags parsed lately: a transaction alternates BEGIN, its statements and
+ * COMMIT, which a cache of the last tag alone would parse every time.
+ */
+const parsedTags = new Map<string, ParsedTag>();
 
 export function parseTag(tag: string): ParsedTag {
-	if (tag === lastTag) return lastParsed;
+	let parsed = parsedTags.get(tag);
+	if (parsed !== undefined) return parsed;
 	const space = tag.lastIndexOf(' ');
 	let digits = space > 0 && space < tag.length - 1;
 	for (let i = space + 1; digits && i < tag.length; i++) {
 		const code = tag.charCodeAt(i);
 		digits = code >= 0x30 && code <= 0x39;
 	}
-	lastParsed = digits
+	parsed = digits
 		? {
 				command: tag.slice(0, tag.indexOf(' ')),
 				rowCount: Number(tag.slice(space + 1)),
 			}
 		: { command: tag, rowCount: null };
-	lastTag = tag;
-	return lastParsed;
+	// row counts make many distinct tags: start over rather than grow
+	if (parsedTags.size >= 64) parsedTags.clear();
+	parsedTags.set(tag, parsed);
+	return parsed;
 }
 
 export interface QueryOpOptions {
@@ -342,6 +380,11 @@ export class QueryOp extends Op {
 	readonly #options: QueryOpOptions;
 	readonly #resolve: (result: QueryResult<unknown>) => void;
 	readonly #reject: (error: Error) => void;
+	/**
+	 * The query's options as given, when it may run again on another
+	 * connection if it provably never ran on its own (see `Connection.rerun`).
+	 */
+	rerunOptions: QueryOptions | null | undefined;
 	#spec: ResultSpec | undefined;
 	/** The formats asked for before the columns were known; undefined when they came from a plan. */
 	#requested: readonly number[] | 0 | undefined;
@@ -390,9 +433,36 @@ export class QueryOp extends Op {
 		return this.#options.prepare ? 1 : 0;
 	}
 
+	get sql(): string {
+		return this.#sql;
+	}
+
+	get params(): readonly unknown[] {
+		return this.#params;
+	}
+
+	/** Settles with what `run` settles with instead: the query never ran here. */
+	redirect(
+		run: (
+			resolve: (result: QueryResult<unknown>) => void,
+			reject: (error: Error) => void,
+		) => void,
+	): void {
+		this.settle();
+		run(this.#resolve, this.#reject);
+	}
+
 	/** The server's error for this statement, once it arrived. */
 	get error(): PostgresError | undefined {
 		return this.#error;
+	}
+
+	override get failure(): Error | undefined {
+		return this.#error;
+	}
+
+	override get opensNoBlock(): boolean {
+		return !opensTransactionBlock(this.#sql);
 	}
 
 	/** Writes the statement; without `sync` it ends with the next one's Sync (see `SyncGroupOp`). */
@@ -401,11 +471,23 @@ export class QueryOp extends Op {
 		const spec = specOf(this.#options, ctx);
 		this.#spec = spec;
 		const types = this.#paramTypes;
-		if (this.#options.prepare && ctx.preparable(this.#sql, types)) {
-			const named = ctx.named();
-			const statement = ctx.statement(this.#sql, types, named);
+		let statement =
+			this.#options.prepare && ctx.preparable(this.#sql, types)
+				? ctx.statement(this.#sql, types, ctx.named())
+				: undefined;
+		// its Parse, still unanswered, may yet be skipped (a group failing
+		// before it), and an op that can't be retried can't recover from that
+		if (
+			statement !== undefined &&
+			this.#retried &&
+			statement.name !== '' &&
+			!statement.unwritten &&
+			!statement.parsed
+		)
+			statement = undefined;
+		if (statement !== undefined) {
 			this.#statement = statement;
-			if (!named) {
+			if (statement.name === '') {
 				this.#unnamed = true;
 				// binary only for columns already described
 				let formats: readonly number[] | 0 = 0;
@@ -520,8 +602,10 @@ export class QueryOp extends Op {
 			case 'DataRow':
 				return !this.dataRow(msg.payload, 0, msg.payload.length);
 			case 'ParseComplete':
-				if (this.#statement && this.#createdStatement)
-					this.#statement.parsed = true;
+				if (this.#statement === undefined) return false;
+				if (this.#createdStatement) this.#statement.parsed = true;
+				// its SQL parsed, run unnamed: one more run towards preparing it
+				else if (this.#unnamed) this.#statement.seen++;
 				return false;
 			case 'BindComplete': {
 				// an unnamed one's columns come next, from the portal's description
@@ -730,6 +814,15 @@ export class SyncGroupOp extends Op {
 		let count = 0;
 		for (const op of this.#ops) count += op.prepares;
 		return count;
+	}
+
+	override get failure(): Error | undefined {
+		return this.#failed ? this.#ops[this.#current]?.error : undefined;
+	}
+
+	override get opensNoBlock(): boolean {
+		for (const op of this.#ops) if (!op.opensNoBlock) return false;
+		return true;
 	}
 
 	write(ctx: OpContext): void {
@@ -1011,6 +1104,8 @@ export class CursorOp extends Op {
 	readonly #batchSize: number;
 	readonly #portal: string;
 	readonly #held: boolean;
+	/** Fetch the next batch as soon as one is handed out, rather than when it is asked for. */
+	readonly #readAhead: boolean;
 	/** The `statement_timeout` for the portal, as an interval. */
 	readonly #statementTimeout: string | undefined;
 	/** The setting statement is unanswered: its answers come before the portal's. */
@@ -1063,6 +1158,7 @@ export class CursorOp extends Op {
 		portal: string,
 		held: boolean,
 		statementTimeout?: string,
+		readAhead = false,
 	) {
 		super();
 		this.#sql = sql;
@@ -1073,6 +1169,7 @@ export class CursorOp extends Op {
 		this.#batchSize = batchSize;
 		this.#portal = portal;
 		this.#held = held;
+		this.#readAhead = readAhead && !held;
 		this.#statementTimeout = held ? undefined : statementTimeout;
 		this.exclusive = true;
 	}
@@ -1124,11 +1221,10 @@ export class CursorOp extends Op {
 			this.#describe(w);
 			return;
 		}
-		const named = ctx.named();
-		const statement = ctx.statement(this.#sql, types, named);
+		const statement = ctx.statement(this.#sql, types, ctx.named());
 		this.#statement = statement;
-		if (!named) {
-			// behind a pooler that rewrites named statements: parsed unnamed, with the cached columns
+		if (statement.name === '') {
+			// not prepared (yet), or behind a pooler that rewrites named statements: parsed unnamed, with the cached columns
 			fe.parse(w, '', this.#sql, types);
 			if (statement.fields === undefined) this.#describe(w);
 			else this.#bind(w, statement.fields, true);
@@ -1301,8 +1397,23 @@ export class CursorOp extends Op {
 		this.#sync(closePortal);
 	}
 
-	/** Hands batches to waiting consumers, fetching one when they wait for it. */
+	/**
+	 * Hands batches to waiting consumers, fetching one when they wait for
+	 * it, or with `readAhead`, as soon as none is left unread.
+	 */
 	#pump(): void {
+		this.#handOut();
+		if (
+			this.#readAhead &&
+			this.#unread.length === 0 &&
+			this.#phase === 'suspended' &&
+			!this.#discarding &&
+			!this.#finished
+		)
+			this.#fetch();
+	}
+
+	#handOut(): void {
 		while (this.#waiters.length > 0) {
 			const batch = this.#unread.shift();
 			// oxlint-disable-next-line typescript/no-non-null-assertion -- the loop checks there is one
@@ -1381,6 +1492,7 @@ export class CursorOp extends Op {
 			case 'ParseComplete':
 				if (this.#setting || this.#restoring) return false;
 				if (this.#statement && this.#created) this.#statement.parsed = true;
+				else if (this.#statement?.name === '') this.#statement.seen++;
 				return false;
 			case 'ParameterDescription':
 			case 'BindComplete':
@@ -1741,7 +1853,13 @@ export class CopyFromOp extends Op {
 	}
 }
 
-/** COPY … TO STDOUT, read as chunks with backpressure. */
+/**
+ * COPY … TO STDOUT, read as chunks with backpressure. Each CopyData (a
+ * row, in text format) is kept as a view of the read buffer until `next`
+ * takes it, and `next` copies every one received by then into one chunk:
+ * one allocation per read rather than per row, and no view keeps a read
+ * buffer alive.
+ */
 export class CopyToOp extends Op {
 	override readonly exclusive = true;
 	readonly #sql: string;
@@ -1749,6 +1867,8 @@ export class CopyToOp extends Op {
 	#ctx: OpContext | undefined;
 	readonly #chunks: Uint8Array[] = [];
 	#buffered = 0;
+	/** Rows copied, from the command tag. */
+	rowCount = 0;
 	#paused = false;
 	#waiter: Waiter<Uint8Array | undefined> | undefined;
 	#error: Error | undefined;
@@ -1775,11 +1895,19 @@ export class CopyToOp extends Op {
 	#pump(): void {
 		const waiter = this.#waiter;
 		if (waiter === undefined) return;
-		const chunk = this.#chunks.shift();
-		if (chunk !== undefined) {
+		const chunks = this.#chunks;
+		if (chunks.length > 0) {
 			this.#waiter = undefined;
-			this.#buffered -= chunk.length;
-			if (this.#paused && this.#buffered < this.#highWaterMark / 2) {
+			// a copy: the views are of the read buffer (Buffer#slice would be a view too)
+			const chunk = allocate(this.#buffered);
+			let at = 0;
+			for (const part of chunks) {
+				chunk.set(part, at);
+				at += part.length;
+			}
+			chunks.length = 0;
+			this.#buffered = 0;
+			if (this.#paused) {
 				this.#paused = false;
 				this.#ctx?.resume();
 			}
@@ -1797,7 +1925,7 @@ export class CopyToOp extends Op {
 			case 'CopyDone':
 				return false;
 			case 'CopyData': {
-				const chunk = msg.data.slice();
+				const chunk = msg.data;
 				this.#chunks.push(chunk);
 				this.#buffered += chunk.length;
 				if (!this.#paused && this.#buffered >= this.#highWaterMark) {
@@ -1808,6 +1936,7 @@ export class CopyToOp extends Op {
 				return false;
 			}
 			case 'CommandComplete':
+				this.rowCount = parseTag(msg.tag).rowCount ?? 0;
 				return false;
 			case 'CopyInResponse': {
 				const w = ctx.writer;

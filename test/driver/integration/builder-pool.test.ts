@@ -119,7 +119,8 @@ describe.skipIf(noPg)('builder queries on a pool', () => {
 				.takeFirst()
 				.execute();
 		await Promise.all([lookup(db, 1).execute(), first()]);
-		// described by their first run: binary from now on
+		await Promise.all([lookup(db, 1).execute(), first()]);
+		// prepared and described by their second run: binary from now on
 		binary = 0;
 		net.reset();
 		const controller = new AbortController();

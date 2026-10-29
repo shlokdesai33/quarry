@@ -546,7 +546,9 @@ export class SelectQueryBuilder<
 	 */
 	selectAll<N extends T[number]['name']>(
 		table: N,
-		..._unique: UniqueColumns<O, TableRefs<RefsOf<T>, N>>
+		..._unique: [keyof O] extends [never]
+			? []
+			: UniqueColumns<O, TableRefs<RefsOf<T>, N>>
 	): SelectQueryBuilder<
 		T,
 		AddRow<O, RowOf<RefsOf<T>, TableRefs<RefsOf<T>, N>>>,
@@ -946,6 +948,11 @@ export class SelectQueryBuilder<
 	/** Runs the query and returns every row. */
 	execute(options?: RunOptions): Promise<O[]> {
 		return this.toQuery().execute(options);
+	}
+
+	/** Runs the query as its transaction's last statement and commits; see `Query.executeAndCommit`. */
+	executeAndCommit(options?: RunOptions): Promise<O[]> {
+		return this.toQuery().executeAndCommit(options);
 	}
 
 	/** The SQL and parameters `execute()` sends. */

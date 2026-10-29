@@ -65,6 +65,51 @@ describe.skipIf(noPg)('OpenTelemetry spans', () => {
 		expect(JSON.stringify(spans)).not.toContain('secret-param');
 	});
 
+	it('reports a cursor, COPY TO and a transaction as one span each', async () => {
+		const { tracer, spans } = recordingTracer();
+		await using conn = await open({ telemetry: { tracer } });
+		let batches = 0;
+		for await (const _ of conn.cursor('select generate_series(1, 5) as n', [], {
+			batchSize: 2,
+		}))
+			batches++;
+		expect(batches).toBe(3);
+		const chunks: Uint8Array[] = [];
+		for await (const chunk of conn.copyTo(
+			'copy (select generate_series(1, 4)) to stdout',
+		))
+			chunks.push(chunk);
+		await conn.transaction(async (tx) => {
+			await tx.query('select 1');
+		});
+		await rejection(
+			conn.transaction((tx) => tx.query('select 1/0')),
+			PostgresError,
+		);
+		const db = cluster().database;
+		expect(
+			spans.map((span) => [
+				span.name,
+				span.attributes['db.response.returned_rows'],
+				span.status?.code,
+				span.ended,
+			]),
+		).toEqual([
+			[`SELECT ${db}`, 5, undefined, true],
+			[`COPY ${db}`, 4, undefined, true],
+			[`TRANSACTION ${db}`, undefined, undefined, true],
+			[`BEGIN ${db}`, undefined, undefined, true],
+			[`SELECT ${db}`, 1, undefined, true],
+			[`COMMIT ${db}`, undefined, undefined, true],
+			[`TRANSACTION ${db}`, undefined, 2, true],
+			[`BEGIN ${db}`, undefined, undefined, true],
+			[`SELECT ${db}`, undefined, 2, true],
+			[`ROLLBACK ${db}`, undefined, undefined, true],
+		]);
+		expect(spans[2]?.attributes['db.query.text']).toBeUndefined();
+		expect(spans[2]?.attributes['db.operation.name']).toBe('TRANSACTION');
+	});
+
 	it('marks failures with the SQLSTATE and the exception', async () => {
 		const { tracer, spans } = recordingTracer();
 		await using conn = await open({ telemetry: { tracer, queryText: false } });

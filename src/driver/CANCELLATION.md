@@ -66,6 +66,8 @@ Both call `#abort(op, reason)`:
 
 A query that was never sent can't have done anything, so it fails with `AbortError` and the connection is unaffected. A sent one is canceled on the server, unless the op can stop without the server's help (`interrupt` returns true: a cursor between batches, [below](#cursors)).
 
+**`timeout` counts from when the query is queued on its connection**, not from when it is written: the wait behind queries pipelined ahead of it on that connection counts, as the caller waits. A pool's wait for a connection or a pipeline slot comes before that and is bounded by `acquireTimeout`; quarry's `execute({ timeout })` is a server-side `statementTimeout`, which counts only the server's work on the statement.
+
 ## The cancel request
 
 `connection.cancel()` calls the `cancel` function `connect.ts` gave the connection at open time: `sendCancel(config, host, plan, pid, key)`.
@@ -97,11 +99,13 @@ sequenceDiagram
     Note over C: B failed (QueryCanceled 'abort'), canceling cleared → write C
 ```
 
-**Repeated, with backoff.** The server drops a cancel that arrives while it is still reading the query's messages (before it starts executing). So `#cancelAtHead` sends the cancel, and while the op is still running and at the head, sends it again after 50, 100, 200, 400 and 800 ms (at most 6 attempts). The timers are `unref`'d and cleared when the op settles.
+**Repeated, with backoff, until the server answered.** The server drops a cancel that arrives while it is still reading the query's messages (before it starts executing). So `#cancelAtHead` sends the cancel, and while the op is still running, at the head, and **has received no message**, sends it again after 50, 100, 200, 400 and 800 ms (at most 6 attempts). Once any message for the op has arrived (`op.answered`: ParseComplete, BindComplete, a row), the server has read all of it, so the cancel sent then is the last: a repeat sent after the query finished would hit a query pipelined behind it. The timers are `unref`'d and cleared when the op settles.
 
 If another aborted op is waiting further back, `#canceling` moves to it when the first settles, keeping later writes held back until it too is done.
 
 In a `SyncGroupOp` (several statements under one Sync), a cancel applies to the group: `canceledBy` is passed to the statement currently running, which is the one the server interrupts; the rest are skipped by the server as after any error.
+
+**Statements that can't run in a transaction block** (`vacuum`, `create index concurrently`, `create database`, `alter system`, …) are refused with a `statementTimeout` before anything is sent: the timeout's set and restore put the statement in an implicit transaction block, where the server refuses them with an error that says nothing about the timeout. A client-side `timeout` still works for them.
 
 ## Cursors
 
@@ -149,9 +153,18 @@ With a value, it keeps the current `statement_timeout` in a custom setting, `qua
 
 PostgreSQL re-arms `statement_timeout` for each Execute, from the value current when the statement starts, so the query, and only the query, runs under the new value.
 
-The query's result is returned, or its error is thrown. If `S` fails (an invalid interval, such as `'soon'`), the server skips the query, which rejects with that error. A query that can't be sent (an `undefined` parameter) fails before any of the group is written, so `S` is never sent alone, which inside a transaction would have left the setting on its later statements. Both uses of `S` declare their parameter as `text` (OID 25), so the statement cache finds one statement for them, keyed by its SQL, and the connection prepares it once. Over a pool the group is one operation: it frees its pipeline slot at its ReadyForQuery, before the caller's callbacks, as any query does, so the adaptive depth and [width](POOL.md#adaptive-width) count it as one completion. `signal` and `timeout` cancel the group, which hits the statement running ([above](#why-later-writes-are-held-back)); `onTiming` times the whole group.
+The query's result is returned, or its error is thrown. If `S` fails (an invalid interval, such as `'soon'`), the server skips the query, which rejects with that error, and skips its Parse if the group was preparing it. A statement in a group therefore never binds a cached statement whose Parse is still unanswered; it parses its SQL again, unnamed, for that run (`QueryOp.write`), since a group can't be retried statement by statement. A query that can't be sent (an `undefined` parameter) fails before any of the group is written, so `S` is never sent alone, which inside a transaction would have left the setting on its later statements. Both uses of `S` declare their parameter as `text` (OID 25), so the statement cache finds one statement for them, keyed by its SQL, and the connection prepares it once. Over a pool the group is one operation: it frees its pipeline slot at its ReadyForQuery, before the caller's callbacks, as any query does, so the adaptive depth and [width](POOL.md#adaptive-width) count it as one completion. `signal` and `timeout` cancel the group, which hits the statement running ([above](#why-later-writes-are-held-back)); `onTiming` times the whole group.
 
 Numbers are milliseconds (`'2000ms'`); strings are any Postgres interval (`'2s'`, `'500ms'`).
+
+<a id="two-statements-on-a-pool"></a>
+**Two statements on a pool.** A pool's `query()` on a shared connection sends two statements instead, when nothing can have opened a transaction block ahead of it:
+
+```
+C> set_config('statement_timeout', $1, true)  <query>  Sync
+```
+
+Their implicit transaction ends the setting at the Sync, so there is nothing to restore. `#outsideTransactionBlock` decides it when the query is queued: the last ReadyForQuery said idle (`I`), and every op queued or in flight on the connection says `opensNoBlock`, which a plain statement does unless its SQL starts with `begin` or `start` (after comments), and a group does when all its statements do; a simple query, a cursor or COPY never does. The timed query mustn't be a `begin` either, or its setting would last for the block it opens. Anything else (a connection's own `query`, a `Transaction`, a pool connection with a `begin` pipelined ahead) keeps the three statements. Only the pool takes this path because it issued everything on its shared connections itself; the status alone isn't enough, as the next paragraph explains.
 
 **Why one Sync group, independent of the transaction status.** The connection's transaction status is the one in the **last ReadyForQuery received**: it says how the last answered query left the connection, not how the queries still queued or in flight ahead of this one will leave it. Until #38 the framing was chosen from it (`begin`/`set_config`/query/`commit` with four Syncs when idle; set, query, then an asynchronous restore when in a transaction: [the superseded decision](DECISIONS.md#a-statement-timeout-framed-by-the-transaction-status)). On a pipelined connection, a pool's shared connection included, that was wrong three ways:
 
@@ -206,8 +219,11 @@ Why cancellation works this way. Each links to its full entry (what it is, why, 
 - [Aborting a suspended cursor closes it instead of cancelling](DECISIONS.md#aborting-a-suspended-cursor-closes-it-instead-of-cancelling): between batches there is nothing to cancel.
 - [Server-side statement timeouts, transaction-local and pipelined](DECISIONS.md#server-side-statement-timeouts-transaction-local-and-pipelined): the server enforces them even if the client is stuck.
 - [A statement timeout is framed under the query's Sync, whatever the transaction status](DECISIONS.md#a-statement-timeout-is-framed-under-the-querys-sync-whatever-the-transaction-status): it bounds its own query alone, whatever else is pipelined.
+- [Two statements on a pool, where no transaction block can precede the query](DECISIONS.md#two-statements-on-a-pool-where-no-transaction-block-can-precede-the-query): no restore where the pool knows nothing ahead of the query can open a block.
 - [A statement timeout bounds the whole stream](DECISIONS.md#a-statement-timeout-bounds-the-whole-stream): for cursors.
 - [Every wait has a timeout](DECISIONS.md#every-wait-has-a-timeout): nothing waits forever by default.
+- [Stop repeating a cancel once the server answered the query](DECISIONS.md#stop-repeating-a-cancel-once-the-server-answered-the-query): closes the race with a query pipelined behind.
+- [A statement timeout is refused for statements that can't run in a transaction block](DECISIONS.md#a-statement-timeout-is-refused-for-statements-that-cant-run-in-a-transaction-block): a clear error instead of the server's.
 
 ## Glossary
 

@@ -114,6 +114,37 @@ describe('insertInto', () => {
 		});
 	});
 
+	it('aligns rows whose keys come in other orders, or are left undefined', () => {
+		const at = new Date('2024-01-01T00:00:00.000Z');
+		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- the undefined a plain JS caller can pass
+		const missing = undefined as never;
+		const { values } = insertInto(users)
+			.values([
+				{ name: 'Ada', email: 'ada@example.com', createdAt: missing },
+				{ createdAt: at, email: 'alan@example.com', name: missing },
+				{ email: 'grace@example.com', name: missing, createdAt: at },
+			])
+			.toNode();
+		expect(values?.columns).toEqual(['name', 'email', 'created_at']);
+		expect(values?.rows).toStrictEqual([
+			[
+				value('Ada', codecs.text),
+				value('ada@example.com', codecs.text),
+				undefined,
+			],
+			[
+				undefined,
+				value('alan@example.com', codecs.text),
+				value(at, codecs.timestamptz),
+			],
+			[
+				undefined,
+				value('grace@example.com', codecs.text),
+				value(at, codecs.timestamptz),
+			],
+		]);
+	});
+
 	it('records the returning list and tag', () => {
 		const node = insertInto(users)
 			.values({ email: 'ada@example.com', name: null })

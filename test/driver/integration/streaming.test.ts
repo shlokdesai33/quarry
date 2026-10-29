@@ -264,6 +264,49 @@ describe.skipIf(noPg)('cursors', () => {
 		await iterator.return?.();
 	});
 
+	it('with readAhead, fetches the next batch as soon as one is handed out', async () => {
+		const net = roundTripSockets();
+		await using c = await open({ socket: net.factory });
+		const iterator = iterate(
+			c.cursor('select generate_series(1, 25) as n', [], {
+				batchSize: 10,
+				readAhead: true,
+			}),
+		);
+		expect((await iterator.next()).value).toHaveLength(10);
+		await sleep(30);
+		// the second batch arrived meanwhile: it is handed over before any I/O
+		const second = iterator.next();
+		expect(
+			await Promise.race([
+				second.then(() => 'ready'),
+				new Promise((resolve) => setImmediate(() => resolve('waited'))),
+			]),
+		).toBe('ready');
+		expect((await second).value).toHaveLength(10);
+		const rest = [];
+		for (
+			let r = await iterator.next();
+			r.done !== true;
+			r = await iterator.next()
+		)
+			rest.push(...r.value);
+		expect(rest).toEqual([21, 22, 23, 24, 25].map((n) => ({ n })));
+		// one batch ahead at most
+		const early = iterate(
+			c.cursor('select generate_series(1, 100) as n', [], {
+				batchSize: 10,
+				readAhead: true,
+			}),
+		);
+		await early.next();
+		const writes = net.writes();
+		await sleep(30);
+		expect(net.writes()).toBe(writes);
+		await early.return?.();
+		expect((await c.query('select 1 as x')).rows).toEqual([{ x: 1 }]);
+	});
+
 	it('runs other queries of the transaction between its batches', async () => {
 		await using c = await open();
 		const rows = await c.transaction(async (tx) => {

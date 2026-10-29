@@ -2,6 +2,7 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 import { statementNames } from '../../src/driver/capabilities.js';
 import { connect } from '../../src/driver/connect.js';
+import { createPool } from '../../src/driver/pool.js';
 import {
 	ConnectionError,
 	PostgresError,
@@ -97,6 +98,10 @@ describe('protocol negotiation with older servers and poolers', () => {
 		await using conn = await connect(options(port));
 		expect(versions).toEqual([196610, 196608]);
 		expect(conn.protocol).toBe('3.0');
+		// the host is remembered: the next connection asks for 3.0 at once
+		await using again = await connect(options(port));
+		expect(versions).toEqual([196610, 196608, 196608]);
+		expect(again.protocol).toBe('3.0');
 	});
 
 	it('does not retry when the failure is not about the protocol', async () => {
@@ -205,6 +210,125 @@ describe('a misbehaving server', () => {
 		await expect(connect({ ...options(port), ssl: 'require' })).rejects.toThrow(
 			/does not support TLS/,
 		);
+	});
+});
+
+describe('a connection the server ended while it was idle', () => {
+	/**
+	 * A server whose first connection ends its session as a query arrives,
+	 * with `fatal` (or by closing without one); later connections answer
+	 * every query. Counts the connections.
+	 */
+	async function endingServer(fatal: string | undefined) {
+		const state = { connections: 0 };
+		const port = await fakeServer((socket, _version, send) => {
+			const n = ++state.connections;
+			socket.on('data', (data: Buffer) => {
+				if (n === 1) {
+					if (fatal !== undefined)
+						send({
+							type: 'ErrorResponse',
+							fields: { S: 'FATAL', V: 'FATAL', C: fatal, M: 'terminating' },
+						});
+					socket.end();
+					return;
+				}
+				for (
+					let i = 0;
+					i + 5 <= data.length;
+					i += 1 + data.readInt32BE(i + 1)
+				) {
+					const type = String.fromCharCode(data[i] ?? 0);
+					if (type === 'P') send({ type: 'ParseComplete' });
+					else if (type === 'B') send({ type: 'BindComplete' });
+					else if (type === 'D') send({ type: 'NoData' });
+					else if (type === 'E')
+						send({ type: 'CommandComplete', tag: 'SELECT 0' });
+					else if (type === 'S') send({ type: 'ReadyForQuery', status: 'I' });
+				}
+			});
+			send(...ready);
+		});
+		return { state, port };
+	}
+
+	it('runs a pool query again on a new connection when the session ended before answering it', async () => {
+		for (const code of ['57P01', '57P02', '57P03', '57P05']) {
+			// oxlint-disable-next-line no-await-in-loop
+			const { state, port } = await endingServer(code);
+			// oxlint-disable-next-line no-await-in-loop -- disposed at the end of each pass
+			await using pool = createPool({ ...options(port), max: 1 });
+			// oxlint-disable-next-line no-await-in-loop
+			const result = await pool.query('select 1');
+			expect(result.command).toBe('SELECT');
+			expect(state.connections).toBe(2);
+			expect(pool.metrics).toMatchObject({ opened: 2, closed: 1 });
+		}
+	});
+
+	it('does not run a query again when the connection closed without saying the server ended it', async () => {
+		const { state, port } = await endingServer(undefined);
+		await using pool = createPool({ ...options(port), max: 1 });
+		await expect(pool.query('select 1')).rejects.toBeInstanceOf(
+			ConnectionError,
+		);
+		expect(state.connections).toBe(1);
+	});
+
+	it('reports the server’s error on a plain connection, which has nowhere else to run it', async () => {
+		const { port } = await endingServer('57P01');
+		await using conn = await connect(options(port));
+		const error = await conn.query('select 1').catch((e: unknown) => e);
+		expect(error).toBeInstanceOf(PostgresError);
+		expect(error).toMatchObject({ code: '57P01' });
+	});
+});
+
+describe('cancel requests', () => {
+	const CANCEL_CODE = 80877102;
+
+	/** A server that runs queries forever, answering their first messages when `answer`; counts cancel requests. */
+	async function slowServer(answer: boolean) {
+		const state = { cancels: 0, client: undefined as Socket | undefined };
+		const port = await fakeServer((socket, version, send) => {
+			if (version === CANCEL_CODE) {
+				state.cancels++;
+				socket.end();
+				return;
+			}
+			state.client = socket;
+			socket.on('data', () => {
+				if (answer) send({ type: 'ParseComplete' }, { type: 'BindComplete' });
+			});
+			send(...ready);
+		});
+		return { state, port };
+	}
+
+	const aborted = async (port: number) => {
+		const conn = await connect(options(port));
+		const controller = new AbortController();
+		const query = conn.query('select pg_sleep(60)', [], {
+			prepare: false,
+			signal: controller.signal,
+		});
+		query.catch(() => {});
+		await new Promise((r) => setTimeout(r, 30));
+		controller.abort();
+		await new Promise((r) => setTimeout(r, 400));
+		conn.destroy();
+	};
+
+	it('stops repeating the cancel once the server answered part of the query', async () => {
+		const { state, port } = await slowServer(true);
+		await aborted(port);
+		expect(state.cancels).toBe(1);
+	});
+
+	it('repeats the cancel while the server has answered nothing of the query', async () => {
+		const { state, port } = await slowServer(false);
+		await aborted(port);
+		expect(state.cancels).toBeGreaterThanOrEqual(3);
 	});
 });
 
@@ -508,8 +632,9 @@ describe('statement names behind a pooler', () => {
 			maxPreparedStatements: 200,
 		});
 		expect(statementNames(capabilities.pgbouncer)).toBe('rewritten');
-		expect(parsed).toEqual(['q1', '', '', '']);
-		expect(bound).toEqual(['q1', '', '', '', 'q1']);
+		// unnamed on its first run, then pipelined; named once alone again
+		expect(parsed).toEqual(['', '', '', '', 'q1']);
+		expect(bound).toEqual(['', '', '', '', 'q1']);
 	});
 
 	it('names no statement when PgBouncer in transaction mode keeps none', async () => {
@@ -529,8 +654,9 @@ describe('statement names behind a pooler', () => {
 			const { port, parsed, bound } = await pooler(parameters);
 			// oxlint-disable-next-line no-await-in-loop
 			await run(port, preparePipelined);
-			expect(parsed).toEqual(['q1']);
-			expect(bound).toEqual(['q1', 'q1', 'q1', 'q1', 'q1']);
+			// unnamed on its first run, prepared on its second
+			expect(parsed).toEqual(['', 'q1']);
+			expect(bound).toEqual(['', 'q1', 'q1', 'q1', 'q1']);
 		}
 	});
 
@@ -538,7 +664,44 @@ describe('statement names behind a pooler', () => {
 		const { port, parsed, bound } = await pooler({});
 		const capabilities = await run(port, false);
 		expect(capabilities.pgbouncer).toBeUndefined();
-		expect(parsed).toEqual(['q1', '', '', '']);
-		expect(bound).toEqual(['q1', '', '', '', 'q1']);
+		expect(parsed).toEqual(['', '', '', '', 'q1']);
+		expect(bound).toEqual(['', '', '', '', 'q1']);
 	});
+
+	it('prepares SQL on its prepareThreshold-th successful run', async () => {
+		for (const [threshold, names] of [
+			[1, ['q1']],
+			[3, ['', '', 'q1']],
+		] as const) {
+			// oxlint-disable-next-line no-await-in-loop
+			const { port, parsed } = await pooler({});
+			// oxlint-disable-next-line no-await-in-loop
+			await using conn = await connect({
+				...options(port),
+				prepareThreshold: threshold,
+			});
+			for (let i = 0; i < 4; i++)
+				// oxlint-disable-next-line no-await-in-loop
+				await conn.query('insert into t values ($1)', [i]);
+			expect(parsed).toEqual(names);
+		}
+	});
+
+	/* oxlint-disable no-await-in-loop -- one query after another */
+	it('keeps prepared statements cached when SQL run once fills the cache', async () => {
+		const { port, parsed, bound } = await pooler({});
+		await using conn = await connect({
+			...options(port),
+			statementCacheSize: 4,
+		});
+		const hot = ['a', 'b'].map((t) => `insert into ${t} values ($1)`);
+		for (const sql of [...hot, ...hot]) await conn.query(sql, [1]);
+		for (let i = 0; i < 20; i++)
+			await conn.query(`insert into once${i} values ($1)`, [1]);
+		for (const sql of hot) await conn.query(sql, [1]);
+		// the hot statements were prepared once, and are still bound by name
+		expect(parsed.filter((name) => name !== '')).toEqual(['q1', 'q2']);
+		expect(bound.slice(-2)).toEqual(['q1', 'q2']);
+	});
+	/* oxlint-enable no-await-in-loop */
 });

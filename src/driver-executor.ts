@@ -323,9 +323,25 @@ export class DriverExecutor implements TransactionExecutor {
 		let acquired = start;
 		let timing: OpTiming | undefined;
 		try {
-			const pool = this.#shared(query);
+			const source = this.#source;
+			const pool = options.andCommit === true ? undefined : this.#shared(query);
 			let result: QueryResult<unknown>;
-			if (pool !== undefined) {
+			if (options.andCommit === true) {
+				if (!(source instanceof Transaction))
+					throw new DriverError(
+						'executeAndCommit() commits a transaction: run it inside db.transaction',
+					);
+				if (observe) acquired = performance.now();
+				result = await source.queryAndCommit<unknown>(
+					query.sql,
+					query.params,
+					this.#queryOptions(
+						options,
+						observe ? (t) => (timing = t) : undefined,
+						query,
+					),
+				);
+			} else if (pool !== undefined) {
 				if (!this.#ready) await this.#prepare(pool);
 				// the pool picks the connection: the time before the query
 				// reached it is the wait for a connection or a pipeline slot
@@ -432,6 +448,7 @@ export class DriverExecutor implements TransactionExecutor {
 				...(options.batchSize === undefined
 					? {}
 					: { batchSize: options.batchSize }),
+				...(options.readAhead === true ? { readAhead: true } : {}),
 			};
 			for await (const batch of runner.cursor<unknown>(
 				query.sql,

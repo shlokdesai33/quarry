@@ -45,22 +45,28 @@ export interface SpanTarget {
 	readonly port: number;
 }
 
+/** A span in progress; `finish` ends it with the row count or the error. */
+export interface QuerySpan {
+	finish(
+		result: { rowCount?: number | null | undefined } | undefined,
+		error?: unknown,
+	): void;
+}
+
 /**
  * Starts a client span for a query, following OpenTelemetry's database
- * conventions. `finish` ends it with the row count or the error.
+ * conventions: named by `tag`, or by the operation (the SQL's first
+ * keyword, or `name`: `TRANSACTION`, whose span has no SQL text) and the
+ * database.
  */
 export function startQuerySpan(
 	telemetry: TelemetryOptions,
 	target: SpanTarget,
 	sql: string,
 	tag: string | undefined,
-): {
-	finish(
-		result: { rowCount?: number | null | undefined } | undefined,
-		error?: unknown,
-	): void;
-} {
-	const op = operation(sql);
+	name?: string,
+): QuerySpan {
+	const op = name ?? operation(sql);
 	const attributes: Record<string, string | number | boolean> = {
 		'db.system.name': 'postgresql',
 		'db.namespace': target.database,
@@ -68,7 +74,8 @@ export function startQuerySpan(
 		'server.address': target.host,
 	};
 	if (!target.host.startsWith('/')) attributes['server.port'] = target.port;
-	if (telemetry.queryText !== false) attributes['db.query.text'] = sql;
+	if (telemetry.queryText !== false && sql !== '')
+		attributes['db.query.text'] = sql;
 	if (tag !== undefined) attributes['db.query.summary'] = tag;
 	const span = telemetry.tracer.startSpan(tag ?? `${op} ${target.database}`, {
 		kind: SPAN_KIND_CLIENT,

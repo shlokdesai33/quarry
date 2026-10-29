@@ -203,6 +203,11 @@ export class SqlQuery<R> {
 		return this.toQuery().execute(options);
 	}
 
+	/** Runs the statement as its transaction's last and commits; see `Query.executeAndCommit`. */
+	executeAndCommit(options?: RunOptions): Promise<SqlResult<R>> {
+		return this.toQuery().executeAndCommit(options);
+	}
+
 	/** The query `execute()` runs, for `db.batch`. */
 	toQuery(): Query<SqlResult<R>> {
 		return this.#shaped({

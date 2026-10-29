@@ -173,27 +173,42 @@ export function rowsNode(
 	rows: readonly object[],
 	strategy: RowsNode['strategy'],
 ): RowsNode {
-	const entries = rows.map((row) => Object.entries(row));
 	const keys: string[] = [];
-	for (const list of entries) {
-		for (const [key, value] of list) {
-			if (value !== undefined && !keys.includes(key)) keys.push(key);
-		}
-	}
-	const resolved = keys.map((key) => columnOf(table, key));
-	return {
-		columns: resolved.map(({ name }) => name),
-		types: resolved.map(({ column }) => castType(column._quarry.dataType)),
-		codecs: resolved.map(({ column }) => column._quarry.dataType.codec),
-		rows: entries.map((list) => {
-			const cells: (OperationNode | undefined)[] = keys.map(() => undefined);
-			for (const [key, value] of list) {
-				if (value === undefined) continue;
-				const i = keys.indexOf(key);
-				cells[i] = valueNode(resolved[i]!.column, value);
+	const index = new Map<string, number>();
+	const columns: AnyColumn[] = [];
+	const names: string[] = [];
+	const cellRows: (OperationNode | undefined)[][] = [];
+	for (const row of rows) {
+		const cells: (OperationNode | undefined)[] = [];
+		for (let i = 0; i < keys.length; i++) cells.push(undefined);
+		// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- a row is a record of columns
+		const record = row as Record<string, unknown>;
+		const own = Object.keys(row);
+		for (let j = 0; j < own.length; j++) {
+			const key = own[j]!;
+			// read once each, as Object.entries reads them
+			const value = record[key];
+			if (value === undefined) continue;
+			let i = keys[j] === key ? j : index.get(key);
+			if (i === undefined) {
+				i = keys.length;
+				const { column, name } = columnOf(table, key);
+				keys.push(key);
+				index.set(key, i);
+				columns.push(column);
+				names.push(name);
 			}
-			return cells;
-		}),
+			cells[i] = valueNode(columns[i]!, value);
+		}
+		cellRows.push(cells);
+	}
+	for (const cells of cellRows)
+		while (cells.length < keys.length) cells.push(undefined);
+	return {
+		columns: names,
+		types: columns.map((column) => castType(column._quarry.dataType)),
+		codecs: columns.map((column) => column._quarry.dataType.codec),
+		rows: cellRows,
 		strategy,
 	};
 }
@@ -481,6 +496,16 @@ export abstract class WriteQueryBuilder<O, M extends string> {
 		options?: RunOptions,
 	): Promise<WriteOutput<O>> {
 		return writeOutput<O>(this.#executor, this.toNode()).execute(options);
+	}
+
+	/** Runs the query as its transaction's last statement and commits; see `Query.executeAndCommit`. */
+	executeAndCommit(
+		this: WriteQueryBuilder<O, never>,
+		options?: RunOptions,
+	): Promise<WriteOutput<O>> {
+		return writeOutput<O>(this.#executor, this.toNode()).executeAndCommit(
+			options,
+		);
 	}
 
 	/** The SQL and parameters `execute()` sends. */

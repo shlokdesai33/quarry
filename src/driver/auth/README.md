@@ -172,7 +172,7 @@ Verification itself is done by the runtime's TLS (`rejectUnauthorized: verifyCha
 The driver asks for the **newest** version in `config.protocol` (3.2 by default) and accepts anything down to the minimum (3.0):
 
 - A server or pooler that speaks only an older 3.x answers the StartupMessage with **NegotiateProtocolVersion** (newest minor it supports, and the names of `_pq_.` options it didn't recognise). `Connection.#negotiated` checks it isn't below `min_protocol_version` (`EPROTOCOL` otherwise) and continues at that version.
-- Some poolers instead **reject** 3.2 with an error mentioning "protocol" (`rejectsProtocol32` recognises a few SQLSTATEs). `connectHost` then retries the same plan once asking for the minimum version.
+- Some poolers instead **reject** 3.2 with an error mentioning "protocol" (`rejectsProtocol32` recognises a few SQLSTATEs). `connectHost` then retries the same plan once asking for the minimum version, and remembers the host (`host:port`) for an hour: connections to it in that time ask for the minimum straight away, instead of paying two handshakes each.
 - `protocol: '3.0'` (exact) or `maxProtocolVersion` force a version.
 
 What changes with the version is the length of the cancel key (`BackendKeyData`: 4 bytes in 3.0, up to 256 in 3.2) and therefore of `CancelRequest`. `connection.protocol` and `capabilities.protocol` report what was agreed.
@@ -253,7 +253,7 @@ The server, knowing `StoredKey`, recomputes `HMAC(StoredKey, AuthMessage)`, XORs
 The checks in `final` and `verify`:
 
 - the server nonce must **start with** the client nonce and be longer;
-- the salt must be present and the iteration count a positive integer;
+- the salt must be present and the iteration count a positive integer, at most `scramMaxIterations` (default 1,000,000): a server can't keep the client hashing for minutes;
 - `AuthenticationOk` without a verified server signature is refused (`#startup`): a server that skips the final step hasn't proven anything.
 
 ### SASLprep
@@ -274,7 +274,7 @@ Postgres implements `tls-server-end-point` (RFC 5929): the binding data is a has
 `Connection.#scram`:
 
 1. If the connection is encrypted, the server offered `-PLUS`, and `channelBinding` isn't `disable`, read the server certificate (DER bytes, `socket.peerCertificate()`) and compute the binding (`serverEndPoint(der)`).
-2. `serverEndPoint` parses just enough of the certificate's DER structure (`derHeader`) to find its **signature algorithm**, maps it to the hash RFC 5929 prescribes (SHA-256 for MD5/SHA-1/SHA-256 signatures, SHA-384, SHA-512; RSASSA-PSS assumed SHA-256), and hashes the whole certificate. An algorithm without a defined hash (Ed25519) gives no binding.
+2. `serverEndPoint` parses just enough of the certificate's DER structure (`derHeader`) to find its **signature algorithm**, maps it to the hash RFC 5929 prescribes (SHA-256 for MD5/SHA-1/SHA-256 signatures, SHA-384, SHA-512; for RSASSA-PSS, the hash named in the signature's parameters, `pssHash`), and hashes the whole certificate. An algorithm without a defined hash (Ed25519) gives no binding.
 3. The GS2 header becomes `p=tls-server-end-point,,` and the `c=` attribute carries the header plus the hash.
 4. If binding was possible but the server didn't offer `-PLUS`, the header is `y,,`: the server, which does support it, then knows something stripped `-PLUS` from its offer (a **downgrade attack**) and fails the authentication.
 
@@ -334,7 +334,7 @@ Why connecting works this way. Each links to its full entry (what it is, why, th
 - [SCRAM with `node:crypto`, and a derived-key cache](../DECISIONS.md#scram-with-nodecrypto-and-a-derived-key-cache): pools open quickly without weakening anything.
 - [A TLS secure-context cache](../DECISIONS.md#a-tls-secure-context-cache): the CA is parsed once, not per connection.
 - [Lazy `node:tls`, `getBuiltinModule`, and preloading](../DECISIONS.md#lazy-nodetls-getbuiltinmodule-and-preloading): work overlapped with network waits: faster cold connects.
-- [Ask for protocol 3.2, accept 3.0, retry once](../DECISIONS.md#ask-for-protocol-32-accept-30-retry-once): stronger cancel keys where available, compatibility with every pooler.
+- [Ask for protocol 3.2, accept 3.0, retry once, remember who refused](../DECISIONS.md#ask-for-protocol-32-accept-30-retry-once-remember-who-refused): stronger cancel keys where available, compatibility with every pooler.
 - [PostgreSQL 18 or later only](../DECISIONS.md#postgresql-18-or-later-only): with a clear error on older servers.
 - [`close()` with libpq semantics](../DECISIONS.md#close-with-libpq-semantics): no waiting for the backend to exit.
 

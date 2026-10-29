@@ -23,7 +23,10 @@ export interface ReadOptions {
 }
 
 /** What an executor is asked to do besides the query itself. */
-export interface ExecuteOptions extends RunOptions, ReadOptions {}
+export interface ExecuteOptions extends RunOptions, ReadOptions {
+	/** Inside a transaction: the transaction's last statement, with COMMIT sent right behind it. */
+	readonly andCommit?: boolean | undefined;
+}
 
 /** A query of a batch, and how its rows are returned. */
 export interface BatchQuery extends ReadOptions {
@@ -38,6 +41,13 @@ export interface BatchQuery extends ReadOptions {
 export interface StreamOptions extends RunOptions {
 	/** Rows fetched per round trip (default 1000), each batch once the rows before it are taken. */
 	readonly batchSize?: number | undefined;
+	/**
+	 * Fetch the next batch as soon as the loop starts on one, instead of
+	 * once it has taken every row: a slow loop then doesn't wait a round
+	 * trip per batch, for one more batch in memory (default false). Outside
+	 * a transaction only.
+	 */
+	readonly readAhead?: boolean | undefined;
 }
 
 /** The outcome of one statement. */

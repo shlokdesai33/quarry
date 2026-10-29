@@ -477,12 +477,14 @@ Why the compiler works this way. Each links to its full entry (what it is, why, 
 - [References resolved before compiling](DECISIONS.md#references-resolved-before-compiling): `compile` needs no schema and can't get a name wrong.
 - [Every identifier quoted](DECISIONS.md#every-identifier-quoted): no reserved-word list, and case is preserved.
 - [Columns resolved and quoted once per table](DECISIONS.md#columns-resolved-and-quoted-once-per-table): shared, immutable column nodes whose SQL is rendered once.
+- [Joined scopes' expression builders made once](DECISIONS.md#joined-scopes-expression-builders-made-once): a callback after a join reuses its scope's builder.
 - [SQL rendered through a trie of its pieces](DECISIONS.md#sql-rendered-through-a-trie-of-its-pieces): a query of a shape rendered before gets the same SQL string, so the driver's statement cache finds it by identity.
 - [Parameters everywhere, literals only where Postgres refuses a parameter](DECISIONS.md#parameters-everywhere-literals-only-where-postgres-refuses-a-parameter): injection-safe and cache-friendly, with checked exceptions.
 - [Parameters numbered in text order; `in` takes a list, or one array as `= any($1)`](DECISIONS.md#parameters-numbered-in-text-order-in-takes-a-list-or-one-array-as--any1): identical queries give identical SQL, so the statement cache gets hits.
 - [Every operation operand bracketed](DECISIONS.md#every-operation-operand-bracketed): no precedence table to get wrong.
 - [Codecs as getters on the compiled query](DECISIONS.md#codecs-as-getters-on-the-compiled-query): compiled queries print and compare as `{ sql, params }`.
 - [Many rows through `unnest`, one array per column](DECISIONS.md#many-rows-through-unnest-one-array-per-column): constant SQL text and parameter count whatever the number of rows.
+- [Rows built in one pass](DECISIONS.md#rows-built-in-one-pass): a multi-row insert's cells written straight from each row's keys.
 - [`unnest` casts without type modifiers](DECISIONS.md#unnest-casts-without-type-modifiers): a too-long value is rejected, not truncated.
 - [`setEach`: one method for the source, the assignments and the key match](DECISIONS.md#seteach-one-method-for-the-source-the-assignments-and-the-key-match): rendered with ordinary set and where nodes.
 - [The driver owns the codecs; the builder only chooses them](DECISIONS.md#the-driver-owns-the-codecs-the-builder-only-chooses-them): values are not encoded here.

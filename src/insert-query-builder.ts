@@ -193,7 +193,9 @@ export class InsertQueryBuilder<
 	 * @example .returningAll()
 	 */
 	returningAll(
-		..._unique: UniqueColumns<O, Ref<RefsOf<[T]>>>
+		..._unique: [keyof O] extends [never]
+			? []
+			: UniqueColumns<O, Ref<RefsOf<[T]>>>
 	): InsertQueryBuilder<T, AddRow<O, RowOf<RefsOf<[T]>, Ref<RefsOf<[T]>>>>, M> {
 		return new InsertQueryBuilder({
 			...this.#state,

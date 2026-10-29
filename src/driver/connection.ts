@@ -26,6 +26,12 @@ import {
 	ProtocolError,
 	postgresError,
 } from './errors.js';
+import type { Readable } from 'node:stream';
+import {
+	copyFromStream,
+	copyToStream,
+	type CopyFromStream,
+} from './copy-streams.js';
 import { CursorIterator, type CursorHost } from './cursor.js';
 import { toNotice, type Notice, type Notification } from './notice.js';
 import {
@@ -37,6 +43,8 @@ import {
 	QueryOp,
 	SimpleQueryOp,
 	STATEMENT_TIMEOUT,
+	STATEMENT_TIMEOUT_LOCAL,
+	opensTransactionBlock,
 	SyncGroupOp,
 	closedError,
 	type Description,
@@ -60,7 +68,7 @@ import {
 	type RowMode,
 } from './rows.js';
 import type { DriverSocket } from './socket.js';
-import { startQuerySpan } from './telemetry.js';
+import { startQuerySpan, type QuerySpan } from './telemetry.js';
 import { Transaction, type TransactionOptions } from './transaction.js';
 import type { Codec } from './codec.js';
 import {
@@ -87,7 +95,10 @@ export interface QueryOptions {
 	 * connection's: a registry (`createCodecRegistry`), or a list.
 	 */
 	readonly codecs?: CodecRegistry | readonly Codec[];
-	/** Use a cached named prepared statement (default: the connection's `prepare` option). */
+	/**
+	 * Use a cached named prepared statement, once the SQL has run
+	 * `prepareThreshold` times (default: the connection's `prepare` option).
+	 */
 	readonly prepare?: boolean;
 	/**
 	 * The codec of each parameter, by position (as `typed` gives one): the
@@ -111,7 +122,13 @@ export interface QueryOptions {
 	readonly paramTypes?: readonly number[];
 	/** Cancels the query when aborted. A query not yet sent is dropped without contacting the server. */
 	readonly signal?: AbortSignal;
-	/** Cancels the query after this many milliseconds, from the client. */
+	/**
+	 * Cancels the query after this many milliseconds, from the client. The
+	 * time counts from when the query is queued on its connection, so it
+	 * includes the wait behind queries pipelined ahead of it there, not only
+	 * the server's work. A pool's wait for a connection or a pipeline slot
+	 * comes before, bounded by `acquireTimeout`.
+	 */
 	readonly timeout?: number;
 	/**
 	 * A server-side `statement_timeout` for this query only (milliseconds,
@@ -166,6 +183,13 @@ export interface GroupStatement {
 export interface CursorOptions extends Omit<QueryOptions, 'keepRows'> {
 	/** Rows fetched per round trip (default 1000), each batch once the one before is taken. */
 	readonly batchSize?: number;
+	/**
+	 * Fetch the next batch as soon as one is handed out, instead of when it
+	 * is asked for: a slow consumer then doesn't wait a round trip per
+	 * batch, for one more batch in memory (default false). Outside a
+	 * transaction only; inside one, other queries run between batches.
+	 */
+	readonly readAhead?: boolean;
 }
 
 /** What a connection needs to know about how it was opened. */
@@ -222,6 +246,8 @@ export class Connection implements AsyncDisposable {
 	/** Which cached statements are written named: every one, those written alone, or none (see `OpContext.named`). */
 	#naming: 'always' | 'alone' | 'never' = 'always';
 	#status: 'I' | 'T' | 'E' = 'I';
+	/** The error that failed the open transaction; kept until a transaction or savepoint rollback runs again. */
+	#transactionError: Error | undefined;
 	#closed = false;
 	#ending = false;
 	#closing: Promise<void> | undefined;
@@ -249,6 +275,21 @@ export class Connection implements AsyncDisposable {
 	#resolveClosed: () => void = () => {};
 	/** When the connection was opened (ms since epoch). */
 	readonly createdAt = Date.now();
+	/**
+	 * @internal Runs again, elsewhere, a query of `queryThen` that provably
+	 * never ran here: the connection failed before it was written, or the
+	 * server's first answer after it was written ended the session
+	 * (`TERMINATED`). Set by a pool.
+	 */
+	rerun:
+		| ((
+				sql: string,
+				params: readonly unknown[],
+				options: QueryOptions | undefined,
+				resolve: (result: QueryResult<unknown>) => void,
+				reject: (error: Error) => void,
+		  ) => void)
+		| undefined;
 	readonly #ctx: OpContext;
 	#defaultOptions: QueryOpOptions | undefined;
 	readonly #flushTask = () => this.#flush();
@@ -378,6 +419,16 @@ export class Connection implements AsyncDisposable {
 			: this.#status === 'T'
 				? 'transaction'
 				: 'failed';
+	}
+
+	/**
+	 * The error of the statement that failed the transaction, once one
+	 * did: later statements fail with "current transaction is aborted"
+	 * (25P02), and this says why. Kept until the transaction ends and
+	 * another starts, or a rollback to a savepoint recovers it.
+	 */
+	get transactionError(): Error | undefined {
+		return this.#transactionError;
 	}
 
 	/** Whether the connection is closed or closing. */
@@ -627,11 +678,13 @@ export class Connection implements AsyncDisposable {
 			);
 		}
 		const password = await this.#password();
-		return new ScramClient(
+		const client = new ScramClient(
 			password,
 			binding,
 			encrypted && mode !== 'disable' && !plusOffered,
 		);
+		client.maxIterations = this.#config.scramMaxIterations;
+		return client;
 	}
 
 	// --- incoming ----------------------------------------------------------
@@ -644,8 +697,13 @@ export class Connection implements AsyncDisposable {
 				if (type === 0x44 && !this.#starting) {
 					// rows go straight from the buffer to the operation's decoder
 					const op = this.#queue.at(0);
-					if (op?.written && op.dataRow(reader.bytes, reader.start, reader.end))
+					if (
+						op?.written &&
+						op.dataRow(reader.bytes, reader.start, reader.end)
+					) {
+						op.answered = true;
 						continue;
+					}
 				} else if (type === 0x41) {
 					this.#notify(
 						decodeNotification(
@@ -719,7 +777,17 @@ export class Connection implements AsyncDisposable {
 			msg.type === 'ErrorResponse' &&
 			(msg.fields['V'] === 'FATAL' || msg.fields['V'] === 'PANIC')
 		) {
-			this.#fatal = postgresError(msg.fields);
+			const fatal = postgresError(msg.fields);
+			this.#fatal = fatal;
+			const head = this.#queue.at(0);
+			if (
+				TERMINATED.has(fatal.code) &&
+				(head === undefined || !head.written || !head.answered)
+			) {
+				// sent before the server answered anything written: it ran none of it
+				this.#fail(fatal, true);
+				return;
+			}
 		}
 		const op = this.#queue.at(0);
 		if (op === undefined || !op.written) {
@@ -730,7 +798,13 @@ export class Connection implements AsyncDisposable {
 			}
 			throw new ProtocolError(`Unexpected ${msg.type} with no query in flight`);
 		}
-		if (msg.type === 'ReadyForQuery') this.#status = msg.status;
+		if (msg.type === 'ReadyForQuery') {
+			if (msg.status === 'T') this.#transactionError = undefined;
+			else if (msg.status === 'E' && this.#status !== 'E')
+				this.#transactionError = op.failure;
+			this.#status = msg.status;
+		}
+		op.answered = true;
 		if (!op.handle(msg, this.#ctx)) return;
 		this.#queue.shift();
 		this.#written--;
@@ -749,8 +823,11 @@ export class Connection implements AsyncDisposable {
 		}
 		this.#cancelAtHead();
 		if (unblocked || this.#written < this.#queue.length) this.#schedule();
-		if (this.#queue.length === 0 && this.#idleWaiters.length > 0)
-			for (const resolve of this.#idleWaiters.splice(0)) resolve();
+		if (this.#queue.length === 0) {
+			this.#reader.dropSpare();
+			if (this.#idleWaiters.length > 0)
+				for (const resolve of this.#idleWaiters.splice(0)) resolve();
+		}
 		this.#finished(op);
 	}
 
@@ -824,6 +901,17 @@ export class Connection implements AsyncDisposable {
 	 * compared: a SQL string used again keeps its hash, where a key built
 	 * per query (types and SQL) would be hashed in full every time. The same
 	 * SQL with other types is keyed by both.
+	 *
+	 * With `named`, SQL is prepared on its `prepareThreshold`th run: before
+	 * that its entry is unnamed, keeping only the columns its runs
+	 * described, so SQL run once never takes a server-side statement or
+	 * pushes a prepared one out. A run counts once the server parsed it
+	 * (ParseComplete), so a statement isn't prepared in the middle of a
+	 * pipeline that repeats it, behind a statement that may fail and make
+	 * the server skip its Parse.
+	 * It is prepared like new SQL (described, its results in text that
+	 * run): its columns may have changed since. When the cache is full, the
+	 * least recently used unnamed entry goes first.
 	 */
 	#statement(sql: string, types: readonly number[], named: boolean): Statement {
 		let key = sql;
@@ -836,24 +924,28 @@ export class Connection implements AsyncDisposable {
 				existing = found;
 			}
 		}
+		const threshold = this.#config.prepareThreshold;
 		if (existing !== undefined) {
-			if (!named || existing.name !== '') {
-				// a use stamp instead of moving the entry to the Map's end: deleting
-				// and re-adding a key on every hit makes the Map rehash, garbage
-				// that adds up to GC pauses on small queries
-				existing.used = ++this.#statementUses;
+			// a use stamp instead of moving the entry to the Map's end: deleting
+			// and re-adding a key on every hit makes the Map rehash, garbage
+			// that adds up to GC pauses on small queries
+			existing.used = ++this.#statementUses;
+			if (!named || existing.name !== '' || existing.seen + 1 < threshold)
 				return existing;
-			}
-			// an unnamed entry, replaced by a named statement
+			// run often enough: replaced by a named statement
 			this.#statements.delete(key);
 		}
 		const statement: Statement = {
-			name: named ? `q${++this.#statementCount}` : '',
+			name:
+				named && (existing !== undefined || threshold <= 1)
+					? `q${++this.#statementCount}`
+					: '',
 			key,
 			sql,
 			// a copy: `paramTypes` is the caller's array
 			types: [...types],
 			used: ++this.#statementUses,
+			seen: existing?.seen ?? 0,
 			unwritten: true,
 			parsed: false,
 			fields: undefined,
@@ -862,13 +954,21 @@ export class Connection implements AsyncDisposable {
 		};
 		if (this.#statements.size >= this.#config.statementCacheSize) {
 			let oldest: Statement | undefined;
-			for (const candidate of this.#statements.values())
+			let oldestUnnamed: Statement | undefined;
+			for (const candidate of this.#statements.values()) {
 				if (oldest === undefined || candidate.used < oldest.used)
 					oldest = candidate;
-			if (oldest !== undefined) {
-				this.#statements.delete(oldest.key);
+				if (
+					candidate.name === '' &&
+					(oldestUnnamed === undefined || candidate.used < oldestUnnamed.used)
+				)
+					oldestUnnamed = candidate;
+			}
+			const evicted = oldestUnnamed ?? oldest;
+			if (evicted !== undefined) {
+				this.#statements.delete(evicted.key);
 				// written before the new statement's Parse; the op ignores the CloseComplete
-				if (oldest.name !== '') fe.close(this.#writer, 'S', oldest.name);
+				if (evicted.name !== '') fe.close(this.#writer, 'S', evicted.name);
 			}
 		}
 		this.#statements.set(key, statement);
@@ -948,11 +1048,15 @@ export class Connection implements AsyncDisposable {
 			return;
 		this.#cancelSent = op;
 		// the server drops a cancel that arrives while it is still reading the
-		// query's messages, so it is repeated, with backoff, until the query ends
+		// query's messages, so it is repeated, with backoff, until the query
+		// ends; once the server answered part of it, it has read all of it, so
+		// the cancel sent then is the last: one sent after the query finished
+		// would hit a query pipelined behind it
 		const send = (attempt: number) => {
 			if (op.done || this.#closed || this.#queue.at(0) !== op) return;
+			const last = op.answered;
 			this.cancel().catch(() => {});
-			if (attempt >= 5) return;
+			if (last || attempt >= 5) return;
 			const timer = setTimeout(() => send(attempt + 1), 50 * 2 ** attempt);
 			if (typeof timer === 'object' && 'unref' in timer) timer.unref();
 			op.onSettle(() => clearTimeout(timer));
@@ -1101,10 +1205,16 @@ export class Connection implements AsyncDisposable {
 		params: readonly unknown[] | undefined,
 		options: QueryOptions | undefined,
 		onDone: () => void,
+		rerunnable = false,
 	): Promise<QueryResult<R>> {
 		if (this.#config.telemetry === undefined && !this.#config.captureStack)
-			return this.#query<R>(sql, params ?? [], options, onDone);
-		const result = this.query<R>(sql, params, options);
+			return this.#query<R>(sql, params ?? [], options, onDone, rerunnable);
+		const result = this.#observe(
+			sql,
+			options?.tag,
+			() => this.#query<R>(sql, params ?? [], options, undefined, rerunnable),
+			(r) => r.rowCount,
+		);
 		result.then(onDone, onDone);
 		return result;
 	}
@@ -1148,14 +1258,24 @@ export class Connection implements AsyncDisposable {
 		params: readonly unknown[],
 		options: QueryOptions | undefined,
 		onDone?: () => void,
+		rerunnable = false,
 	): Promise<QueryResult<R>> {
 		if (options?.statementTimeout !== undefined) {
+			const refused = outsideTransactionOnly(sql);
+			if (refused !== undefined) {
+				onDone?.();
+				return Promise.reject(refused);
+			}
 			return this.#queryWithTimeout<R>(
 				sql,
 				params,
 				options,
 				options.statementTimeout,
 				onDone,
+				// a timed begin would keep a local setting for the block it opens
+				rerunnable &&
+					!opensTransactionBlock(sql) &&
+					this.#outsideTransactionBlock(),
 			);
 		}
 		// one shared executor: one closing over this query would cost a
@@ -1180,6 +1300,8 @@ export class Connection implements AsyncDisposable {
 			);
 			op.onTiming = options?.onTiming;
 			op.onDone = onDone;
+			// `null`: no options, but rerunnable
+			if (rerunnable) op.rerunOptions = options ?? null;
 			this.#enqueue(op, options?.signal, options?.timeout);
 			if (!this.#config.catalog.loaded) this.#loadTypesAfter(params, options);
 		} catch (error) {
@@ -1305,12 +1427,31 @@ export class Connection implements AsyncDisposable {
 		options: QueryOptions,
 		statementTimeout: number | string,
 		onDone: (() => void) | undefined,
+		outsideBlock: boolean,
 	): Promise<QueryResult<R>> {
 		const { statementTimeout: _, signal, timeout, onTiming, ...rest } = options;
 		const interval =
 			typeof statementTimeout === 'number'
 				? `${statementTimeout}ms`
 				: statementTimeout;
+		if (outsideBlock) {
+			// the implicit transaction of the Sync ends the setting: no restore
+			const [set, query] = this.#queryGroup(
+				[
+					{
+						sql: STATEMENT_TIMEOUT_LOCAL,
+						params: [interval],
+						options: STATEMENT_TIMEOUT_OPTIONS,
+					},
+					{ sql, params, options: rest },
+				],
+				signal,
+				{ timeout, onTiming, onDone, whole: true },
+			);
+			set?.catch(() => {});
+			if (query === undefined) throw new ConnectionError('Query did not run');
+			return asResult<R>(await query);
+		}
 		const [set, query, restore] = this.#queryGroup(
 			[
 				{
@@ -1341,6 +1482,20 @@ export class Connection implements AsyncDisposable {
 	}
 
 	/**
+	 * Whether a query written now surely runs outside a transaction block:
+	 * the last answer left the connection idle, and nothing queued ahead of
+	 * it can open one (a `begin` or `start transaction`, or anything sent
+	 * otherwise than as plain statements). Then a timed query's setting can
+	 * be ended by the implicit transaction of its Sync, with no restore.
+	 */
+	#outsideTransactionBlock(): boolean {
+		if (this.#status !== 'I') return false;
+		for (let i = 0; i < this.#queue.length; i++)
+			if (this.#queue.at(i)?.opensNoBlock !== true) return false;
+		return true;
+	}
+
+	/**
 	 * Runs `fn` in a transaction: committed when it resolves, rolled back
 	 * when it throws. Serialization failures and deadlocks can be retried,
 	 * and settings applied with bound parameters.
@@ -1349,7 +1504,81 @@ export class Connection implements AsyncDisposable {
 		fn: (tx: Transaction) => Promise<T>,
 		options?: TransactionOptions,
 	): Promise<T> {
-		return Transaction.run(this, fn, options);
+		const span = this.#span('', undefined, 'TRANSACTION');
+		if (span === undefined) return Transaction.run(this, fn, options);
+		return Transaction.run(this, fn, options).then(
+			(result) => {
+				span.finish(undefined);
+				return result;
+			},
+			(error: unknown) => {
+				span.finish(undefined, error);
+				throw error;
+			},
+		);
+	}
+
+	/** A span for an operation, when telemetry is on. */
+	#span(
+		sql: string,
+		tag: string | undefined,
+		name?: string,
+	): QuerySpan | undefined {
+		const telemetry = this.#config.telemetry;
+		return telemetry === undefined
+			? undefined
+			: startQuerySpan(
+					telemetry,
+					{ database: this.#config.database, ...this.#info.host },
+					sql,
+					tag,
+					name,
+				);
+	}
+
+	/** Reports an iteration (a cursor's batches, COPY's chunks) as one span, from its first `next` to its end. */
+	#observeIteration<T>(
+		sql: string,
+		tag: string | undefined,
+		iterable: AsyncIterable<T>,
+		rows: (value: T) => number,
+		rowCount?: () => number,
+	): AsyncIterable<T> {
+		if (this.#config.telemetry === undefined) return iterable;
+		return {
+			[Symbol.asyncIterator]: () => {
+				const iterator = iterable[Symbol.asyncIterator]();
+				let span: QuerySpan | undefined;
+				let count = 0;
+				const end = (error?: unknown) => {
+					span?.finish(
+						{ rowCount: rowCount === undefined ? count : rowCount() },
+						error,
+					);
+					span = undefined;
+				};
+				return {
+					next: async () => {
+						span ??= this.#span(sql, tag);
+						try {
+							const result = await iterator.next();
+							if (result.done === true) end();
+							else count += rows(result.value);
+							return result;
+						} catch (error) {
+							end(error);
+							throw error;
+						}
+					},
+					return: async () => {
+						end();
+						return (
+							(await iterator.return?.()) ?? { done: true, value: undefined }
+						);
+					},
+				};
+			},
+		};
 	}
 
 	/**
@@ -1463,6 +1692,7 @@ export class Connection implements AsyncDisposable {
 					portal,
 					held,
 					statementTimeout,
+					options?.readAhead,
 				);
 				if (!this.#config.catalog.loaded) this.#loadTypesAfter(params, options);
 				return op;
@@ -1471,7 +1701,12 @@ export class Connection implements AsyncDisposable {
 		const iterate = (): AsyncIterator<R[]> =>
 			// oxlint-disable-next-line typescript/no-unsafe-type-assertion -- rows are typed by the caller, as in `asRows`
 			new CursorIterator(this.#cursors(), request) as AsyncIterator<R[]>;
-		return { [Symbol.asyncIterator]: iterate };
+		return this.#observeIteration(
+			sql,
+			options?.tag,
+			{ [Symbol.asyncIterator]: iterate },
+			(batch) => batch.length,
+		);
 	}
 
 	#cursors(): CursorHost {
@@ -1548,10 +1783,13 @@ export class Connection implements AsyncDisposable {
 		return this.copyFrom(sql, copyChunks(rows), options);
 	}
 
-	/** Runs `COPY … TO STDOUT`, yielding the data in chunks, with backpressure. */
+	/**
+	 * Runs `COPY … TO STDOUT`, yielding the data in chunks, with
+	 * backpressure: each chunk holds what arrived since the last.
+	 */
 	copyTo(
 		sql: string,
-		options?: Pick<QueryOptions, 'signal' | 'timeout'> & {
+		options?: Pick<QueryOptions, 'signal' | 'timeout' | 'tag'> & {
 			highWaterMark?: number;
 		},
 	): AsyncIterable<Uint8Array> {
@@ -1563,6 +1801,23 @@ export class Connection implements AsyncDisposable {
 				}),
 			};
 		}
+		let rowCount = 0;
+		return this.#observeIteration(
+			sql,
+			options?.tag,
+			this.#copyTo(sql, options, (n) => (rowCount = n)),
+			() => 0,
+			() => rowCount,
+		);
+	}
+
+	#copyTo(
+		sql: string,
+		options:
+			| (Pick<QueryOptions, 'signal' | 'timeout'> & { highWaterMark?: number })
+			| undefined,
+		onRowCount: (rowCount: number) => void,
+	): AsyncIterable<Uint8Array> {
 		return {
 			[Symbol.asyncIterator]: () => {
 				const op = new CopyToOp(sql, options?.highWaterMark ?? 1 << 20);
@@ -1574,9 +1829,9 @@ export class Connection implements AsyncDisposable {
 							this.#enqueue(op, options?.signal, options?.timeout);
 						}
 						const chunk = await op.next();
-						return chunk === undefined
-							? { done: true, value: undefined }
-							: { done: false, value: chunk };
+						if (chunk !== undefined) return { done: false, value: chunk };
+						onRowCount(op.rowCount);
+						return { done: true, value: undefined };
 					},
 					return: async (): Promise<IteratorResult<Uint8Array>> => {
 						if (started && !op.done) {
@@ -1592,6 +1847,29 @@ export class Connection implements AsyncDisposable {
 				};
 			},
 		};
+	}
+
+	/**
+	 * `copyFrom` as a Node `Writable`, to pipe a file or another stream into
+	 * `COPY … FROM STDIN`. It finishes once the server confirmed the COPY,
+	 * with `rowCount` set; destroying it fails the COPY.
+	 *
+	 * @example
+	 * await pipeline(createReadStream('users.csv'), conn.createCopyFromStream('copy users from stdin (format csv)'));
+	 */
+	createCopyFromStream(
+		sql: string,
+		options?: Pick<QueryOptions, 'signal' | 'timeout' | 'tag'>,
+	): CopyFromStream {
+		return copyFromStream((source) => this.copyFrom(sql, source, options));
+	}
+
+	/** `copyTo` as a Node `Readable`; destroying it stops the COPY. */
+	createCopyToStream(
+		sql: string,
+		options?: Pick<QueryOptions, 'signal' | 'timeout' | 'tag'>,
+	): Readable {
+		return copyToStream(this.copyTo(sql, options));
 	}
 
 	/**
@@ -1737,7 +2015,12 @@ export class Connection implements AsyncDisposable {
 		);
 	}
 
-	#fail(error: Error): void {
+	/**
+	 * Closes the connection, failing what is queued with `error`. With
+	 * `terminated`, the server ended the session before answering anything
+	 * written: none of it ran.
+	 */
+	#fail(error: Error, terminated = false): void {
 		if (this.#closed) return;
 		this.#closed = true;
 		this.#failure = error;
@@ -1745,7 +2028,20 @@ export class Connection implements AsyncDisposable {
 		this.#startupError?.(error);
 		const ops = this.#queue.drain();
 		this.#written = 0;
-		for (const op of ops) op.fail(error);
+		const rerun = this.rerun;
+		for (const op of ops) {
+			if (
+				rerun !== undefined &&
+				op instanceof QueryOp &&
+				op.rerunOptions !== undefined &&
+				(terminated || !op.written)
+			) {
+				const options = op.rerunOptions ?? undefined;
+				op.redirect((resolve, reject) =>
+					rerun(op.sql, op.params, options, resolve, reject),
+				);
+			} else op.fail(error);
+		}
 		for (const resolve of this.#idleWaiters.splice(0)) resolve();
 		for (const resolve of this.#drainWaiters.splice(0)) resolve();
 		this.#resolveClosed();
@@ -1770,6 +2066,19 @@ function naming(
 }
 
 const noop = () => {};
+
+/**
+ * SQLSTATEs of a server ending the session on its own: an administrator
+ * (`pg_terminate_backend`) or a shutdown, another backend's crash, a server
+ * starting or stopping, `idle_session_timeout`.
+ */
+const TERMINATED: ReadonlySet<string> = new Set([
+	'57P01',
+	'57P02',
+	'57P03',
+	'57P05',
+]);
+
 /**
  * The resolving functions of the promise `capture` just executed for. Reset
  * as soon as they're read: a resolving function keeps its promise, and so
@@ -1814,6 +2123,23 @@ function invalidSql(sql: unknown): DriverError | undefined {
 			`The SQL text contains a NUL byte (at character ${nul + 1}), which PostgreSQL does not accept`,
 		);
 	return undefined;
+}
+
+/**
+ * Statements PostgreSQL refuses inside a transaction block, by their first
+ * words (after comments): a `statementTimeout` frames its query in one.
+ */
+const TRANSACTION_REFUSED =
+	/^(?:\s|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*(vacuum|create\s+database|drop\s+database|alter\s+system|create\s+tablespace|drop\s+tablespace|(?:create\s+(?:unique\s+)?|drop\s+)index\s+concurrently|reindex\s+(?:\([^)]*\)\s*)?(?:system|database)|reindex\b[^;]*?\bconcurrently|cluster\s*(?:\([^)]*\)\s*)?(?:;|$)|discard\s+all|(?:commit|rollback)\s+prepared|(?:create|drop)\s+subscription|alter\s+subscription\s+\S+\s+(?:refresh|enable|disable)|alter\s+database\s+\S+\s+set\s+tablespace)\b/i;
+
+/** Why `sql` can't take a `statementTimeout`, if it can't. */
+function outsideTransactionOnly(sql: string): DriverError | undefined {
+	const match = TRANSACTION_REFUSED.exec(sql);
+	if (match === null) return undefined;
+	const statement = (match[1] ?? '').replace(/\s+/g, ' ').toLowerCase();
+	return new DriverError(
+		`A statementTimeout can't bound ${statement}: it runs only outside a transaction block, and the timeout is set and restored in one around its query. Use a client-side timeout, or set statement_timeout on the session first`,
+	);
 }
 
 export function quoteIdentifier(name: string): string {

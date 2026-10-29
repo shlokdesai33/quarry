@@ -183,6 +183,8 @@ export default function Postgres(a?: any, b?: any): any {
 				: 0,
 			acquireTimeout: 0,
 			prepare: options.prepare,
+			// postgres.js prepares a statement on its first use
+			prepareThreshold: 1,
 			keepAlive: !!options.keep_alive,
 			keepAliveInitialDelay: options.keep_alive
 				? options.keep_alive * 1000

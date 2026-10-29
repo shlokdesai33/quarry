@@ -33,11 +33,14 @@ The driver's decisions are in [driver/DECISIONS.md](driver/DECISIONS.md), which 
   - [A write's `execute()` with `returning` resolves to the rows](#a-writes-execute-with-returning-resolves-to-the-rows)
   - [`db.batch`: two modes with names](#dbbatch-two-modes-with-names)
   - [`stream()`: only for every-row reads, run by iterating it](#stream-only-for-every-row-reads-run-by-iterating-it)
+  - [`executeAndCommit()` for a transaction's last statement](#executeandcommit-for-a-transactions-last-statement)
 - [Compiling to SQL](#compiling-to-sql)
   - [A node tree, and one compiler](#a-node-tree-and-one-compiler)
   - [References resolved before compiling](#references-resolved-before-compiling)
   - [Columns resolved and quoted once per table](#columns-resolved-and-quoted-once-per-table)
+  - [Joined scopes' expression builders made once](#joined-scopes-expression-builders-made-once)
   - [SQL rendered through a trie of its pieces](#sql-rendered-through-a-trie-of-its-pieces)
+  - [The builder's remaining per-query cost: profiled, nothing cut](#the-builders-remaining-per-query-cost-profiled-nothing-cut)
   - [Every identifier quoted](#every-identifier-quoted)
   - [Parameters everywhere, literals only where Postgres refuses a parameter](#parameters-everywhere-literals-only-where-postgres-refuses-a-parameter)
   - [Parameters numbered in text order; `in` takes a list, or one array as `= any($1)`](#parameters-numbered-in-text-order-in-takes-a-list-or-one-array-as--any1)
@@ -59,6 +62,7 @@ The driver's decisions are in [driver/DECISIONS.md](driver/DECISIONS.md), which 
   - [Raw SQL only through the `sql` template tag](#raw-sql-only-through-the-sql-template-tag)
 - [Bulk writes](#bulk-writes)
   - [Many rows through `unnest`, one array per column](#many-rows-through-unnest-one-array-per-column)
+  - [Rows built in one pass](#rows-built-in-one-pass)
   - [`unnest` casts without type modifiers](#unnest-casts-without-type-modifiers)
   - [`setEach`: one method for the source, the assignments and the key match](#seteach-one-method-for-the-source-the-assignments-and-the-key-match)
   - [Rows that set different columns: flag columns and `case`](#rows-that-set-different-columns-flag-columns-and-case)
@@ -324,9 +328,25 @@ The driver's decisions are in [driver/DECISIONS.md](driver/DECISIONS.md), which 
 
 **Alternatives.** An async generator (slower per row: [driver/DECISIONS.md](driver/DECISIONS.md#rowstream-a-hand-written-iterator-instead-of-an-async-generator)). Inside a transaction, a `timeout` that saves and restores `statement_timeout` around the stream: the refusal's message points to `tx.setLocal('statement_timeout', …)` instead, which bounds every statement after it in the transaction.
 
-**Cost.** Over a pool, a stream holds one connection from its first batch until it ends (released on `break`, `return`, a throw or an abort).
+**Cost.** Over a pool, a stream holds one connection from its first batch until it ends (released on `break`, `return`, a throw or an abort). A slow loop waits a round trip per batch, unless `readAhead: true` fetches one batch ahead ([driver/DECISIONS.md](driver/DECISIONS.md#streams-strict-pull-read-ahead-opt-in)).
 
 **Code.** `stream` in [select-query-builder.ts](select-query-builder.ts); [driver-executor.ts](driver-executor.ts) `stream`; the driver's [row-stream.ts](driver/row-stream.ts).
+
+### `executeAndCommit()` for a transaction's last statement
+
+**What it is.** Inside `db.transaction`, `executeAndCommit()` runs a query as the transaction's last statement: the driver sends COMMIT right behind it (`Transaction.queryAndCommit`), so a callback whose only statement this is runs in one round trip ([driver/DECISIONS.md](driver/DECISIONS.md#commit-pipelined-behind-a-transactions-last-statement)). It throws outside a transaction, in a savepoint, and for an `expect…` shape.
+
+**Why.** `db.batch({ transaction: true })` reaches one round trip for statements known up front; a callback transaction, which can branch on results, paid one more for COMMIT.
+
+**Why a method named for what it does.** Only the caller knows which statement is the last, so it has to say so; a method whose name says it also commits makes that visible where it happens, where an `execute({ commit: true })` flag reads like any other option. It sits beside `execute()` on queries, select builders, write builders and `db.sql`, and takes the same `signal` and `timeout`.
+
+**Why refused with `expect…` shapes.** A shape checks the rows after they arrive, which would be after COMMIT was sent: a `NoRowError` could no longer roll anything back, so the combination throws rather than mislead (a batch with `verify` makes COMMIT wait for the check instead).
+
+**Alternatives.** An option on `execute` (the first version: `execute({ commit: true })`). Detecting the last statement: the callback may always issue another.
+
+**Cost.** Once the statement succeeded, an error thrown later in the callback no longer rolls the transaction back.
+
+**Code.** [query.ts](query.ts) `executeAndCommit`; [driver-executor.ts](driver-executor.ts) `execute`.
 
 ## Compiling to SQL
 
@@ -391,6 +411,20 @@ The driver suite on a 4-vCPU VM (client on 2 CPUs, PostgreSQL 18 on the other 2)
 
 **Code.** `resolveColumn`, `expressionBuilder` in [expression-builder.ts](expression-builder.ts); `shareColumn`, `identifier` in [compile.ts](compile.ts); [test/builder-caches.test.ts](../test/builder-caches.test.ts).
 
+### Joined scopes' expression builders made once
+
+**What it is.** The expression builder of a scope of several tables (after a join) is made once and kept, as a single table's is: a list per first table, compared table by table, at most 64 scopes per first table. It is frozen, like the single-table one.
+
+**Why.** Every callback after a join (each `on`, `where`, `select` and `nest`) asked for its scope's builder, and making one builds its function namespaces (`fn`, `json`, …) and its reference map: about 70% of the allocation of building a two-table query with a `nest`.
+
+**Alternatives.** Keep a scope's builder on the query builder: it is immutable and copied per chained call, and each copy would need it again after the next join. A key string per scope (the tables' names): aliased tables of the same name are different scopes, and the string costs a join per lookup.
+
+**Cost.** Up to 64 frozen builders per table (weakly held through it), past which a scope's builder is made per call as before: aliases made per query (`users.as(name)` with a new name each time) would otherwise grow the list without bound.
+
+**Measured.** `harness.ts`, Node 24, client pinned to one CPU, median of 5 interleaved runs: building a join with a `nest` 3.5 → 1.8 µs (allocation 23.6 → 7.3 KB), a join with three `where` callbacks and a computed selection 4.9 → 2.5 µs; the same join run on a pool, end to end, 4,958 → 5,732/s (CPU −17%). A single-table lookup unchanged.
+
+**Code.** `expressionBuilder`, `joinedBuilder` in [expression-builder.ts](expression-builder.ts).
+
 ### SQL rendered through a trie of its pieces
 
 **What it is.** The compiler doesn't concatenate a query's SQL: it walks a trie keyed by the pieces it writes (keywords, quoted names, a shared column's SQL, placeholders), and the node a query ends on holds its SQL, made once. A query of a shape rendered before gets the same string object. With it:
@@ -420,7 +454,7 @@ The driver suite on a 4-vCPU VM (client on 2 CPUs, PostgreSQL 18 on the other 2)
 - Shapes made at run time (literals, `in` lists of new lengths) add prefixes until it starts over.
 - The shared column lists must stay immutable: they are frozen, and their nodes were already shared.
 - `isDataStatement` relies on `compile` marking only select, insert, update and delete nodes. A copy of a compiled query (`{ ...query }`) is tested by the regular expression, as raw SQL is.
-- A rewrite of `rowsNode` with `Object.keys` measured 0.3 µs less per insert in-process, but put inserts at 1000 callers and 5 ms into a slower JIT mode in about half the runs (−5% throughput). It was reverted to `Object.entries`, resolving each column once.
+- A rewrite of `rowsNode` with `Object.keys` measured 0.3 µs less per insert in-process, but put inserts at 1000 callers and 5 ms into a slower JIT mode in about half the runs (−5% throughput). It was reverted to `Object.entries`, resolving each column once. A later rewrite, one pass over each row's `Object.keys` with no per-row arrays ([Rows built in one pass](#rows-built-in-one-pass)), measured level in that cell.
 
 **Measured.** The driver benchmark suite (#6), with the built package, `main` (`337fc4f`) against this change interleaved in one session, a fresh process per cell, median of 5 runs, a pool of 10. The driver suite on an 8-vCPU VM: client on CPUs 0–2, PostgreSQL 18 on 4–7, Node 24.22. `pool.query` runs the same statement written by hand (`pk`, `insert1`, `update`).
 
@@ -450,6 +484,16 @@ At 0 ms with 100 or 1000 callers, point lookups go from 39% to 64–65% of the d
 In one process (the sources run directly, 100 callers, 0 ms, one core), a lookup went from 6.3 to 3.2–3.4 µs (`pool.query`: 2.3). Build and compile with a mock executor went 1.69 → 0.5 µs, and compile alone 270 → 130 ns. The executor and the driver add nothing over `pool.query` for the same SQL and options. What is left is the builder chain itself (about 0.5 µs: four immutable builders, the where node, the shape and `Query`), its async `execute` layers, and their garbage.
 
 **Code.** `Prefix`, `write`, `sharedList`, `isDataStatement` in [compile.ts](compile.ts); `allSelections` in [expression-builder.ts](expression-builder.ts); `changesSession` in [driver-executor.ts](driver-executor.ts); the shapes in [shape.ts](shape.ts); [test/builder-caches.test.ts](../test/builder-caches.test.ts).
+
+### The builder's remaining per-query cost: profiled, nothing cut
+
+**What it is.** After #43, a profile of builder point lookups (500 callers, pool 10) puts the builder's own code at about 14% of the client's CPU, spread over three parts, none of which a change could remove without giving something up: building the query's objects (`selectFrom`, `where`, `selectAll`, the shape: ~4%), rendering it into the SQL trie (`compile`: 5.6%, though the select list is already rendered once per table), and the two `async` frames between `execute()` and the driver (~4%, with their share of microtask work).
+
+**Why nothing was cut.** The `async` frames are what lets the call-site stack reach the caller's code ([below](#errors-carry-the-query-hidden-and-the-code-awaiting-it)); a cache of the rendered prefix up to `where` would save a few trie steps (~1–2%), under the run-to-run noise of the benchmark; a cache of whole compiled queries needs a key that costs a walk of the new nodes ([above](#sql-rendered-through-a-trie-of-its-pieces)).
+
+**Measured.** The profile: 500 callers on a pool of 10, Node 24, client on 2 CPUs and PostgreSQL on the other 2 (builder files 13.9% of samples, `compile` 5.6% inclusive, `render` and `renderSelect` 3.5–3.7%). In the benchmark suite's builder phase on that machine, builder lookups ran at 184–211k/s against the driver's 168–221k (100–1000 callers, 0 ms), within noise of each other because the server is the bottleneck there; the report's 0.85 µs gap came from the 8-vCPU machine, where the client is.
+
+**Code.** [compile.ts](compile.ts), [query.ts](query.ts), [driver-executor.ts](driver-executor.ts).
 
 ### Every identifier quoted
 
@@ -665,6 +709,20 @@ In one process (the sources run directly, 100 callers, 0 ms, one core), a lookup
 **Measured.** With binary arrays ([#19](https://github.com/shlokdesai33/quarry/pull/19)): bulk insert of 1k rows 514 → 674 queries/s, 10k rows 58 → 75; through the builder, 1,000 rows × 8 columns 5.83 → 3.94 ms.
 
 **Code.** `renderInsert` in [compile.ts](compile.ts); [insert-query-builder.ts](insert-query-builder.ts).
+
+### Rows built in one pass
+
+**What it is.** `rowsNode`, which aligns `values([...])` and `setEach` rows on their columns, reads each row's `Object.keys` once and writes each cell straight into the row's cell array. A key is found at its own position when the row lists its keys in the same order as the columns found so far (the usual case), and through a `Map` otherwise; its column is resolved when it first appears. The node is unchanged: one value node per cell, which `renderUnnest` reads back into column arrays.
+
+**Why.** It was 80% of building a 100-row insert (28 µs and 116 KB, about 1.1 KB per row): `Object.entries` made a pair array per cell and an array per row, every row's cells started as `keys.map(() => undefined)`, and each cell searched the keys with `indexOf`.
+
+**Alternatives.** Column arrays filled directly for `unnest`, with no node per cell: it changes the node that the compiler, `setEach` and `toNode()` read, and the one-pass rewrite already reached the build time that was estimated for it. `Object.keys` with the same per-row arrays: what was reverted before ([SQL rendered through a trie of its pieces](#sql-rendered-through-a-trie-of-its-pieces)).
+
+**Cost.** Rows with keys in other orders take the `Map` path. A cell array is padded once all rows are read, so every row has every column (`undefined` for its `default`), as before.
+
+**Measured.** `harness.ts`, Node 24, client pinned to one CPU, median of 5 interleaved runs: building a 100-row insert 28.2 → 8.6 µs (116 → 48 KB), `setEach(100)` 51.5 → 34.5 µs; running a 100-row insert 3,938 → 4,415/s (CPU 89 → 55 µs), 1,000 rows 498 → 571/s (CPU 616 → 365 µs); a one-row insert level (32,053 → 32,327/s over 7 runs, built in 1.1 → 0.8 µs). The benchmark suite's builder inserts (pool 10, Toxiproxy, median of 5): 1000 callers at 5 ms 135,418 → 135,339/s, every run within 131–141k on both sides; at 0 ms 124k → 146k/s; other cells within noise.
+
+**Code.** `rowsNode` in [write-query.ts](write-query.ts).
 
 ### `unnest` casts without type modifiers
 
@@ -1023,6 +1081,8 @@ Before, throughput was capped at `max` lookups per round trip (10 per 6 ms at 5 
 - Before the query layer existed, the benchmark (about 100 comparisons and one `selectFrom` per table, 2-table scopes) checked 20 tables in about 0.67 s, 50 in 1.5 s, 100 in 3.1 s (9.1M instantiations, 210 MB): linear (early design review).
 - Row locking (#22): +0.2% instantiations at 100 tables, check time unchanged.
 - Everyday SQL (#32): on the shared type tests, instantiations went from 241k to 348k, almost all a **one-time** cost of checking `src` (109k → 215k); the **per-query** cost was unchanged (131k vs 133k).
+- `selectAll` and `returningAll` check that their columns don't repeat a key already selected, with a rest parameter (`UniqueColumns`). TypeScript evaluated it during inference against a placeholder table name, so its quadratic `RepeatedColumns` ran over every reference in scope, even with nothing selected yet: about 4,900 of a `selectAll` point lookup's 5,400 instantiations. With nothing selected (`[keyof O] extends [never]`), the rest parameter is now empty. On 50 `selectAll` lookups of 20-column tables, beyond the library's own 215k: 5,390 → 463 instantiations per lookup, check time 104 → 60 ms. The duplicate-key error stays for a `selectAll` after earlier selections (tested). Skipping only `RepeatedColumns` reached just 4,492.
+- `bench:types` generates a tsconfig with `types: ['node']` since [Node only](driver/DECISIONS.md#node-only): with `types: []`, `src/driver/protocol/text.ts` no longer checked (`Buffer`, `TextEncoder`).
 
 **Code.** [refs.ts](refs.ts), [operators.ts](operators.ts), [types.ts](types.ts), [row.ts](row.ts), [where-builder.ts](where-builder.ts); [bench/types](../bench/types/run.ts).
 

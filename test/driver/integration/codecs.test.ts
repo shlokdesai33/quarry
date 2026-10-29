@@ -182,6 +182,20 @@ const CASES: readonly (readonly [string, Codec, string, readonly Case[]])[] = [
 			],
 			[{ empty: false, lower: null, upper: null, bounds: '()' }],
 			[{ empty: true }],
+			[
+				{
+					empty: false,
+					lower: new Date(Date.UTC(2024, 0, 1, 12, 30, 15, 250)),
+					upper: null,
+					bounds: '(]',
+				},
+				{
+					empty: false,
+					lower: new Date(Date.UTC(2024, 0, 1, 12, 30, 15, 250)),
+					upper: null,
+					bounds: '()',
+				},
+			],
 		],
 	],
 ];
@@ -345,6 +359,29 @@ describe.skipIf(noPg)('built-in codecs', () => {
 		]);
 	});
 
+	it('reads infinite timestamp bounds the same in text and binary', async () => {
+		const read = (codec: Codec, binary: boolean) =>
+			c.query("select tstzrange('-infinity', 'infinity', '[]') as v", [], {
+				resultCodecs: [codec],
+				binary,
+			});
+		const expected = {
+			empty: false,
+			lower: new Date(-8.64e15),
+			upper: new Date(8.64e15),
+			bounds: '[]',
+		};
+		for (const [codec, binary] of [
+			[codecs.tstzrange, false],
+			[inBinary(codecs.tstzrange), true],
+		] as const) {
+			await read(codec, binary);
+			const result = await read(codec, binary);
+			expect(result.rows).toEqual([{ v: expected }]);
+			expect(result.fields[0]?.format).toBe(binary ? 1 : 0);
+		}
+	});
+
 	it('tests a range against a single point', async () => {
 		const range = {
 			empty: false,
@@ -395,14 +432,20 @@ describe.skipIf(noPg)('result codecs', () => {
 					a: [1, 2],
 				},
 			]);
+			// prepared, and described, by its second run
 			const second = await c.query(SQL, [], {
 				resultCodecs: expected,
 				prepare,
 			});
-			expect(second.fields.map((f) => f.format)).toEqual(
+			expect(second.fields.map((f) => f.format)).toEqual([0, 0, 0, 0]);
+			const third = await c.query(SQL, [], {
+				resultCodecs: expected,
+				prepare,
+			});
+			expect(third.fields.map((f) => f.format)).toEqual(
 				prepare ? [1, 1, 0, 1] : [0, 0, 0, 0],
 			);
-			expect(second.rows).toEqual(first.rows);
+			expect([second.rows, third.rows]).toEqual([first.rows, first.rows]);
 		}
 	});
 
@@ -535,6 +578,7 @@ describe.skipIf(noPg)('types looked up by name', () => {
 			pool.query('select m, ms, n from feelings', [], {
 				resultCodecs: [mood, arrayOf(mood), posint],
 			});
+		await feelings();
 		await feelings();
 		const read = await feelings();
 		expect(read.rows).toEqual([{ m: 'happy', ms: ['happy', 'sad'], n: 3 }]);

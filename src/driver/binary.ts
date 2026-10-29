@@ -1,4 +1,6 @@
+import { Buffer } from 'node:buffer';
 import { DriverError } from './errors.js';
+import type { RangeValue } from './parsers.js';
 import { utf8 } from './protocol/text.js';
 
 /** Decodes one binary-format value, `bytes[start, end)`. */
@@ -138,6 +140,52 @@ export const vector = (b: Uint8Array, s: number, e: number): number[] => {
 	for (let i = 0; i < dim; i++) out.push(view.getFloat32(i * 4));
 	return out;
 };
+
+const invalidRange = (): DriverError =>
+	new DriverError('Invalid range binary value');
+
+const RANGE_EMPTY = 0x01;
+const RANGE_LB_INC = 0x02;
+const RANGE_UB_INC = 0x04;
+const RANGE_LB_INF = 0x08;
+const RANGE_UB_INF = 0x10;
+const RANGE_BOUNDS = ['()', '[)', '(]', '[]'] as const;
+
+/**
+ * A range's binary format: a flags byte, then each finite bound as an Int32
+ * length and the element's binary value. The same `RangeValue` as
+ * `parseRange` reads from the text.
+ */
+export function rangeDecoder<T>(
+	element: (bytes: Uint8Array, start: number, end: number) => T,
+): (bytes: Uint8Array, start: number, end: number) => RangeValue<T> {
+	return (b, s, e) => {
+		const flags = b[s] ?? 0;
+		if (flags & RANGE_EMPTY) return { empty: true };
+		let pos = s + 1;
+		const bound = (): T => {
+			if (pos + 4 > e) throw invalidRange();
+			const length = int32(b, pos);
+			const next = pos + 4 + length;
+			if (length < 0 || next > e) throw invalidRange();
+			const value = element(b, pos + 4, next);
+			pos = next;
+			return value;
+		};
+		const lower = flags & RANGE_LB_INF ? null : bound();
+		const upper = flags & RANGE_UB_INF ? null : bound();
+		if (pos !== e) throw invalidRange();
+		return {
+			empty: false,
+			lower,
+			upper,
+			bounds:
+				RANGE_BOUNDS[
+					(flags & RANGE_LB_INC ? 1 : 0) | (flags & RANGE_UB_INC ? 2 : 0)
+				] ?? '()',
+		};
+	};
+}
 
 const invalidArray = (): DriverError =>
 	new DriverError('Invalid array binary value');

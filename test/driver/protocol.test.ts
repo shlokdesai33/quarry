@@ -528,6 +528,12 @@ describe('utf8', () => {
 const row = (value: string) =>
 	encodeBackend({ type: 'DataRow', payload: dataRowPayload([value]) });
 
+const copyData = (fill: number) =>
+	encodeBackend({
+		type: 'CopyData',
+		data: new Uint8Array(100_000).fill(fill),
+	});
+
 describe('buffer memory', () => {
 	it('copies only a message split across chunks, and reads the rest in place', () => {
 		const [a, b, c] = [row('first'), row('second'), row('third')];
@@ -558,6 +564,49 @@ describe('buffer memory', () => {
 		reader.next();
 		if (split?.type === 'DataRow')
 			expect(textValues(split.payload)).toEqual(['second']);
+	});
+
+	it('puts large split DataRows back together in one reused buffer, never CopyData, and lets it go when idle', () => {
+		const big = (fill: string) => row(fill.repeat(100_000));
+		const reader = new Reader();
+		const read = (message: Uint8Array) => {
+			const half = message.length >> 1;
+			reader.push(new Uint8Array(message.subarray(0, half)));
+			expect(reader.nextType()).toBe(-1);
+			reader.push(new Uint8Array(message.subarray(half)));
+			const type = reader.nextType();
+			return {
+				type,
+				bytes: reader.bytes,
+				start: reader.start,
+				end: reader.end,
+			};
+		};
+		const a = read(big('a'));
+		expect(a.type).toBe(0x44);
+		// decoded before the next message is read
+		expect(textValues(a.bytes.subarray(a.start, a.end))).toEqual([
+			'a'.repeat(100_000),
+		]);
+		const b = read(big('b'));
+		expect(b.bytes.buffer).toBe(a.bytes.buffer);
+		expect(textValues(b.bytes.subarray(b.start, b.end))).toEqual([
+			'b'.repeat(100_000),
+		]);
+		// CopyData is handed out as a view, so it gets a buffer of its own
+		const c1 = read(copyData(1));
+		const c2 = read(copyData(2));
+		expect(c1.bytes.buffer).not.toBe(b.bytes.buffer);
+		expect(c1.bytes.buffer).not.toBe(c2.bytes.buffer);
+		expect(c1.bytes[c1.start]).toBe(1);
+		reader.dropSpare();
+		const d = read(big('d'));
+		expect(d.bytes.buffer).not.toBe(b.bytes.buffer);
+		// a row larger than the bound gets a buffer of its own
+		const huge = read(row('h'.repeat(17 * 1024 * 1024)));
+		const after = read(big('e'));
+		expect(after.bytes.buffer).toBe(d.bytes.buffer);
+		expect(huge.bytes.buffer).not.toBe(d.bytes.buffer);
 	});
 
 	it('splits a header across chunks, byte by byte', () => {

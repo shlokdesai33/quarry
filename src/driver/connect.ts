@@ -297,6 +297,22 @@ function rejectsProtocol32(error: unknown): boolean {
 	return error instanceof ConnectionError && /protocol/i.test(error.message);
 }
 
+/**
+ * Hosts (`host:port`) that rejected the newest protocol version outright,
+ * until when to keep asking them for the oldest: a pooler upgraded since
+ * gets asked again after that.
+ */
+const rejectsNewest = new Map<string, number>();
+const REJECTION_MEMORY = 3_600_000;
+
+function rejectedNewest(key: string): boolean {
+	const until = rejectsNewest.get(key);
+	if (until === undefined) return false;
+	if (Date.now() < until) return true;
+	rejectsNewest.delete(key);
+	return false;
+}
+
 async function connectHost(
 	config: ResolvedConfig,
 	host: HostTarget,
@@ -313,11 +329,16 @@ async function connectHost(
 					? ['tls-optional', 'plain']
 					: [config.ssl.negotiation === 'direct' ? 'direct' : 'tls'];
 	// ask for the newest version; retry with the oldest accepted one when a
-	// pooler rejects the request outright instead of negotiating
-	const versions = [
-		config.protocol.max,
-		...(config.protocol.min < config.protocol.max ? [config.protocol.min] : []),
-	].map(fe.protocolVersion);
+	// pooler rejects the request outright instead of negotiating, and ask a
+	// host that did that for the oldest one from then on
+	const key = describeHost(host);
+	const versions = (
+		config.protocol.min < config.protocol.max
+			? rejectedNewest(key)
+				? [config.protocol.min]
+				: [config.protocol.max, config.protocol.min]
+			: [config.protocol.max]
+	).map(fe.protocolVersion);
 
 	const state: Attempt = { socket: undefined };
 	const run = async (): Promise<Connection> => {
@@ -335,7 +356,10 @@ async function connectHost(
 					);
 				} catch (error) {
 					lastError = error;
-					if (v + 1 < versions.length && rejectsProtocol32(error)) continue;
+					if (v + 1 < versions.length && rejectsProtocol32(error)) {
+						rejectsNewest.set(key, Date.now() + REJECTION_MEMORY);
+						continue;
+					}
 					break;
 				}
 			}

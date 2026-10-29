@@ -203,6 +203,8 @@ export class ScramClient {
 	readonly #nonce: string;
 	readonly #firstBare: string;
 	#expectedServerSignature: Uint8Array | undefined;
+	/** The most PBKDF2 iterations the server may ask for. */
+	maxIterations = Number.POSITIVE_INFINITY;
 
 	/**
 	 * @param binding channel binding data when using -PLUS.
@@ -254,6 +256,12 @@ export class ScramClient {
 			throw new ConnectionError('SCRAM: the server sent no salt');
 		if (!Number.isInteger(iterations) || iterations < 1) {
 			throw new ConnectionError('SCRAM: invalid iteration count');
+		}
+		if (iterations > this.maxIterations) {
+			throw new ConnectionError(
+				`SCRAM: the server asked for ${iterations} PBKDF2 iterations, more than scramMaxIterations (${this.maxIterations})`,
+				{ code: 'EAUTHMETHOD' },
+			);
 		}
 		const header = utf8Encode(this.#gs2Header);
 		const cbind = this.#binding
@@ -307,8 +315,18 @@ const SIGNATURE_HASHES: Readonly<
 	'2a8648ce3d040302': 'SHA-256', // ecdsa-with-SHA256
 	'2a8648ce3d040303': 'SHA-384', // ecdsa-with-SHA384
 	'2a8648ce3d040304': 'SHA-512', // ecdsa-with-SHA512
-	'2a864886f70d01010a': 'SHA-256', // RSASSA-PSS (hash in parameters; SHA-256 is by far the most common)
 };
+
+const RSASSA_PSS = '2a864886f70d01010a';
+
+// hash algorithm OIDs in RSASSA-PSS parameters (RFC 4055)
+const PSS_HASHES: Readonly<Record<string, 'SHA-256' | 'SHA-384' | 'SHA-512'>> =
+	{
+		'2b0e03021a': 'SHA-256', // id-sha1
+		'608648016503040201': 'SHA-256', // id-sha256
+		'608648016503040202': 'SHA-384', // id-sha384
+		'608648016503040203': 'SHA-512', // id-sha512
+	};
 
 /** Reads a DER tag-length header at `at`: the content's start and length. */
 function derHeader(
@@ -326,6 +344,33 @@ function derHeader(
 	return { start: pos, length };
 }
 
+const hex = (bytes: Uint8Array): string => {
+	let out = '';
+	for (const byte of bytes) out += byte.toString(16).padStart(2, '0');
+	return out;
+};
+
+/**
+ * The hash of RSASSA-PSS parameters (`RSASSA-PSS-params`, RFC 4055): the
+ * `[0] hashAlgorithm` field, SHA-1 when absent (which tls-server-end-point
+ * replaces with SHA-256).
+ */
+function pssHash(
+	der: Uint8Array,
+	start: number,
+	end: number,
+): 'SHA-256' | 'SHA-384' | 'SHA-512' | undefined {
+	if (start >= end || der[start] !== 0x30) return 'SHA-256';
+	const params = derHeader(der, start);
+	const first = params.start;
+	if (first >= params.start + params.length || der[first] !== 0xa0)
+		return 'SHA-256';
+	const tagged = derHeader(der, first);
+	const algorithm = derHeader(der, tagged.start);
+	const oid = derHeader(der, algorithm.start);
+	return PSS_HASHES[hex(der.subarray(oid.start, oid.start + oid.length))];
+}
+
 /**
  * The `tls-server-end-point` channel binding for a DER certificate, or
  * undefined when its signature algorithm has no defined hash (e.g. Ed25519).
@@ -337,10 +382,11 @@ export async function serverEndPoint(
 	const tbs = derHeader(der, cert.start);
 	const algorithm = derHeader(der, tbs.start + tbs.length);
 	const oid = derHeader(der, algorithm.start);
-	let key = '';
-	for (const byte of der.subarray(oid.start, oid.start + oid.length))
-		key += byte.toString(16).padStart(2, '0');
-	const hash = SIGNATURE_HASHES[key];
+	const key = hex(der.subarray(oid.start, oid.start + oid.length));
+	const hash =
+		key === RSASSA_PSS
+			? pssHash(der, oid.start + oid.length, algorithm.start + algorithm.length)
+			: SIGNATURE_HASHES[key];
 	if (hash === undefined) return undefined;
 	const data = await scramCrypto().digest(hash, der);
 	return { type: 'tls-server-end-point', data };

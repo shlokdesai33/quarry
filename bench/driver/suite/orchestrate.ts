@@ -153,7 +153,11 @@ function matrix(phase: string): Cell[] {
 			push({ ...c, driver: 'quarry-candidate' });
 			if (c.phase === 'main' && s?.kind === 'ops' && s.memOps !== undefined)
 				push({ ...c, driver: 'quarry-candidate', memOps: s.memOps });
+			if (s?.group === 'streaming' && s.kind === 'ops')
+				push({ ...c, driver: 'quarry-candidate-readahead' });
 		}
+		if (CANDIDATE && c.driver === 'quarry-db')
+			push({ ...c, driver: 'quarry-db-candidate' });
 	};
 	const runtime = 'node';
 	if (phase === 'main' || phase === 'verify') {

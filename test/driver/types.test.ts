@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
+import { int4, rangeDecoder } from '../../src/driver/binary.js';
 import { parseRange, parseTimestamptz } from '../../src/driver/parsers.js';
 import { encodeParams as encode } from '../../src/driver/params.js';
+import { codecs } from '../../src/driver/codecs.js';
 import {
 	DriverError,
+	postgresError,
 	UndefinedParameterError,
 } from '../../src/driver/errors.js';
 import { parseTag } from '../../src/driver/ops.js';
@@ -11,10 +14,13 @@ import {
 	copyLine,
 	encodeParam,
 	formatTimestamp,
+	arrayOids,
 	parseArray,
 	parseBytea,
 } from '../../src/driver/types.js';
 import { prng } from './helpers/backend.js';
+
+const rangeBytes = (...b: number[]) => Uint8Array.from(b);
 
 describe('parseArray and arrayLiteral', () => {
 	it('parses Postgres array output', () => {
@@ -88,6 +94,8 @@ describe('parseArray and arrayLiteral', () => {
 const encodeParams = (sql: string, params: readonly unknown[]) =>
 	encode(sql, params, undefined, undefined);
 
+const fields = (code: string) => ({ C: code, M: 'm', S: 'ERROR' });
+
 describe('parameters', () => {
 	it('encodes JavaScript values as Postgres input', () => {
 		expect(encodeParam(null)).toBeNull();
@@ -105,8 +113,39 @@ describe('parameters', () => {
 			'{"1",NULL,"a\\"b",{"t"}}',
 		);
 		expect(encodeParam([new Uint8Array([1, 255])])).toBe('{"\\\\x01ff"}');
-		expect(encodeParam(new Uint16Array([1]))).toEqual(new Uint8Array([1, 0]));
 		expect(() => encodeParam(() => 1)).toThrow(/function/);
+	});
+
+	it('sends only a Uint8Array as bytes, refusing other typed arrays and DataViews', () => {
+		const bytes = Buffer.from([1, 2]);
+		expect(encodeParam(bytes)).toBe(bytes);
+		for (const view of [
+			new Uint16Array([1]),
+			new Float32Array([0.5]),
+			new DataView(new ArrayBuffer(2)),
+		]) {
+			expect(() => encodeParam(view)).toThrow(
+				new RegExp(`A ${view.constructor.name} parameter is not sent`),
+			);
+			expect(() => encodeParam([view])).toThrow(/is not sent/);
+			expect(() =>
+				encode('select $1', [[view]], undefined, [arrayOids.bytea]),
+			).toThrow(/is not sent/);
+			expect(() =>
+				encode('select $1', [view], [codecs.bytea], undefined),
+			).toThrow(/is not sent/);
+		}
+	});
+
+	it('gives each error class its own name', () => {
+		expect(postgresError(fields('23505')).name).toBe('UniqueViolation');
+		expect(postgresError(fields('23999')).name).toBe(
+			'IntegrityConstraintViolation',
+		);
+		expect(postgresError(fields('57014')).name).toBe('QueryCanceled');
+		expect(postgresError(fields('40001')).name).toBe('SerializationFailure');
+		expect(postgresError(fields('XX000')).name).toBe('PostgresError');
+		expect(String(postgresError(fields('42P01')))).toBe('UndefinedTable: m');
 	});
 
 	it('refuses undefined parameters and array elements, naming the position', () => {
@@ -225,7 +264,39 @@ describe('quarry parsers', () => {
 			upper: 'x',
 			bounds: '(]',
 		});
+		expect(parseRange('["a b","c\\"d"]', String)).toEqual({
+			empty: false,
+			lower: 'a b',
+			upper: 'c"d',
+			bounds: '[]',
+		});
+		expect(parseRange('["x""y","z"]', String)).toEqual({
+			empty: false,
+			lower: 'x"y',
+			upper: 'z',
+			bounds: '[]',
+		});
 		expect(() => parseRange('1,2', String)).toThrow();
+	});
+
+	it('decodes the binary range format as the text', () => {
+		const decode = rangeDecoder(int4);
+		expect(decode(rangeBytes(0x01), 0, 1)).toEqual({ empty: true });
+		expect(
+			decode(
+				rangeBytes(0x02, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 5),
+				0,
+				17,
+			),
+		).toEqual(parseRange('[1,5)', Number));
+		expect(decode(rangeBytes(0x18), 0, 1)).toEqual(parseRange('(,)', Number));
+		expect(decode(rangeBytes(0x0c, 0, 0, 0, 4, 0, 0, 0, 9), 0, 9)).toEqual(
+			parseRange('(,9]', Number),
+		);
+		expect(() => decode(rangeBytes(0x02, 0, 0, 0, 4, 0), 0, 6)).toThrow(
+			DriverError,
+		);
+		expect(() => decode(rangeBytes(0x18, 0), 0, 2)).toThrow(DriverError);
 	});
 });
 

@@ -281,7 +281,9 @@ describe.skipIf(!pg?.bouncerPort)('PgBouncer in transaction mode', () => {
 					'1:',
 					'2:',
 					'3:',
-					// alone under its Sync but for BEGIN: named once, then bound
+					// alone under its Sync but for BEGIN: unnamed on its first
+					// run, named on its second
+					'4:',
 					'4:named',
 				]);
 			});

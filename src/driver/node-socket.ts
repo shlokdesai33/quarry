@@ -214,10 +214,18 @@ class NodeSocket implements DriverSocket {
 export const nodeSockets: SocketFactory = {
 	async connect(options: SocketConnectOptions): Promise<DriverSocket> {
 		const { target } = options;
-		const base =
+		// NODELAY from the first byte: a direct TLS handshake's small writes
+		// would otherwise wait on Nagle's algorithm
+		const base: Net.NetConnectOpts =
 			target.kind === 'unix'
 				? { path: target.path }
-				: { host: target.host, port: target.port };
+				: {
+						host: target.host,
+						port: target.port,
+						noDelay: true,
+						keepAlive: options.keepAlive,
+						keepAliveInitialDelay: options.keepAliveInitialDelay,
+					};
 		let open: () => Net.Socket;
 		let secure: Tls.TLSSocket | undefined;
 		if (options.tls === undefined) {
@@ -251,12 +259,6 @@ export const nodeSockets: SocketFactory = {
 				resolve(s);
 			});
 		});
-		if (target.kind === 'tcp') {
-			socket.setNoDelay(true);
-			if (options.keepAlive) {
-				socket.setKeepAlive(true, options.keepAliveInitialDelay);
-			}
-		}
 		return new NodeSocket(socket, secure);
 	},
 };
