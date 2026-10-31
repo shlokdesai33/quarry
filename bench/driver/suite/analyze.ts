@@ -206,6 +206,7 @@ const LABEL: Record<string, string> = {
 	'quarry-candidate': 'quarry (candidate)',
 	'quarry-db': 'quarry builder',
 	'quarry-lossless': 'quarry (lossless)',
+	'quarry-readahead': 'quarry (readAhead)',
 	'quarry-noprep': 'quarry (prepare: false)',
 	'quarry-nopipe': 'quarry (pipeline: false)',
 	pg: 'pg',
@@ -924,6 +925,39 @@ for (const runtime of RUNTIMES) {
 			),
 		);
 	}
+	// stream read-ahead (one batch fetched ahead) vs the strict default
+	if (driversIn('main', runtime).includes('quarry-readahead')) {
+		const stream1m = SCENARIOS.find((x) => x.id === 'stream1m');
+		const memOps = stream1m?.kind === 'ops' ? stream1m.memOps : undefined;
+		out.push(
+			table(
+				`${RT[runtime]}: quarry streams, strict backpressure vs \`readAhead: true\``,
+				'Scenario',
+				[
+					...['stream1m', 'stream-slow'].map((x) => ({
+						label: `${title(x)} (p50)`,
+						pick: mainPick(runtime, x, 'p50'),
+					})),
+					...(memOps === undefined
+						? []
+						: [
+								{
+									label: `${title('stream1m')} × ${memOps}: peak RSS (MB) at equal work`,
+									pick: (d: string) =>
+										metric('rssPeakMB')(
+											get('main', runtime, d, 'stream1m', { memOps }),
+										),
+									fmt: (v: number) => fmtNum(v, 0),
+								},
+							]),
+				],
+				['quarry', 'quarry-readahead'],
+				fmtTime,
+				true,
+				true,
+			),
+		);
+	}
 	if (driversIn('main', runtime).includes('neon-default')) {
 		out.push(
 			table(
@@ -1146,6 +1180,12 @@ summary['rtt'] = {};
 			10,
 			undefined,
 			'transaction (begin; insert; commit), sequential',
+		],
+		[
+			'tx-insert-commit',
+			10,
+			undefined,
+			'transaction with the insert marked last (queryAndCommit), sequential',
 		],
 		['insert1-c50', 10, undefined, 'insert, 50 concurrent, pool 10'],
 		['connect-plain-trust', 10, undefined, 'connect + select 1 + close'],

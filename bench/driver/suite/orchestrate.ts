@@ -100,6 +100,9 @@ const VARIANTS: Record<string, readonly string[]> = {
 	'postgres.js-noprep': PREPARE_SET,
 	'pg-native-named': PREPARE_SET,
 	'neon-default': ['select1', 'pk', 'fetch1k', 'insert1', 'tx-insert'],
+	'quarry-readahead': SCENARIOS.filter(
+		(s) => s.group === 'streaming' && s.kind === 'ops',
+	).map((s) => s.id),
 };
 
 interface Cell {
@@ -249,6 +252,18 @@ function matrix(phase: string): Cell[] {
 						...(concurrency ? { concurrency } : {}),
 						durationMs: rtt >= 5 ? 2000 : 1000,
 					});
+		// the insert marked as the transaction's last statement: quarry only
+		for (const rtt of [0, 1, 5, 20])
+			add({
+				phase,
+				runtime,
+				driver: 'quarry',
+				scenario: 'tx-insert-commit',
+				via: 'toxiproxy',
+				rtt,
+				max: 10,
+				durationMs: rtt >= 5 ? 2000 : 1000,
+			});
 	}
 	if (phase === 'bouncer') {
 		const drivers = [

@@ -87,6 +87,12 @@ out.append(table("Point lookups/s on Node, by pool size / callers", [(f"{m} / {c
 for s, mx, c, name in [("pk", 10, 50, "50 callers, pool 10"), ("pk", 1, 100, "100 callers, pool 1"), ("pk", 1, 500, "500 callers, pool 1"), ("tx-insert", 10, None, "begin; insert; commit"), ("savepoints", 10, None, "5 savepoints"), ("connect-plain-trust", 10, None, "connect + select 1 + close")]:
     metric = "throughput" if c else "p50"
     out.append(table(f"RTT, {name} ({'ops/s' if c else 'median latency'})", [(f"{x} ms", x) for x in [0, 1, 5, 20]], RTT_D, lambda x, d, s=s, mx=mx, c=c, metric=metric: val(get("rtt", "node", d, s, via="toxiproxy", mx=mx, conc=c, rtt=x), metric), r if c else t, not c, head="RTT"))
+if any(c["scenario"] == "tx-insert-commit" and c["phase"] == "rtt" for c in S["cells"]):
+    tx = [("begin; insert; commit", "tx-insert"), ("insert marked last (`queryAndCommit`)", "tx-insert-commit")]
+    out.append(table("RTT, quarry transactions (median latency)", [(f"{x} ms", x) for x in [0, 1, 5, 20]], tx, lambda x, k: val(get("rtt", "node", "quarry", k[1], via="toxiproxy", rtt=x), "p50"), t, True, head="RTT", label=lambda k: k[0], bold=False))
+if any(c["driver"] == "quarry-readahead" for c in S["cells"]):
+    rows = [("stream 1M rows (p50)", ("stream1m", "p50", None)), ("slow consumer, 200k rows (p50)", ("stream-slow", "p50", None))]
+    out.append(table("quarry streams: strict backpressure vs `readAhead: true`", rows, ["quarry", "quarry-readahead"], lambda k, d: val(get("main", "node", d, k[0]), k[1]), t, True))
 out.append(table("quarry, 1 connection, 100 callers: ops/s by `pipeline` (RTT 0 / 5 ms)", [(str(p) if p else "adaptive (default)", p) for p in [1, 2, 4, 8, 16, 32, 64, 100, None]], [0, 5], lambda p, rtt: val(get("pipeline", "node", "quarry", "pk", via="toxiproxy", mx=1, conc=100, pipe=p, rtt=rtt), "throughput"), r, False, head="pipeline", label=lambda d: f"RTT {d} ms", bold=False))
 batch = [s for s, v in S["scenarios"].items() if v["group"] == "batches"]
 if batch:

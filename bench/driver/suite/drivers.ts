@@ -138,6 +138,11 @@ export const DRIVERS: Record<
 				process.env['QUARRY_DIST_CANDIDATE'],
 			),
 	},
+	'quarry-readahead': {
+		describe:
+			'quarry (like-for-like decoding) with `readAhead: true` on streams: the next batch is fetched while the consumer handles the current one.',
+		make: (o) => quarry(o, { decode: 'compat', readAhead: true }),
+	},
 	'quarry-lossless': {
 		describe:
 			'quarry/driver with its standalone lossless defaults: int8 as bigint, timestamptz/date as text (no Date construction).',
