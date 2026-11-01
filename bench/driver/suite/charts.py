@@ -387,9 +387,13 @@ if len(sys.argv) > 4:
                 continue
             cells = [c.strip().replace("*", "").split("±")[0].strip().replace(",", "") for c in line.strip().strip("|").split("|")]
             pool = re.match(r"Node 24: pool size (\d+), point lookups/s by concurrency", title)
+            tail = re.match(r"Node 24: pool size (\d+), p99 latency by concurrency", title)
             try:
                 if pool:
                     rows[("conc", int(pool.group(1)), int(cells[0]), None, None)] = float(cells[1])
+                elif tail:
+                    value, unit = cells[1].split()
+                    rows[("p99", "node", int(tail.group(1)), int(cells[0]))] = float(value) / (1000 if unit == "µs" else 1)
                 elif title.startswith("quarry, one connection, 100 concurrent point lookups"):
                     rows[("pipeline", 1, 100, int(cells[0]), 0)] = float(cells[1])
                     rows[("pipeline", 1, 100, int(cells[0]), 5)] = float(cells[2])
