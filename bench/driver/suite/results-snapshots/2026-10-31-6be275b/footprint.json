@@ -1,0 +1,90 @@
+{
+	"install": {
+		"quarry (whole package: query builder + driver + src)": {
+			"bytes": 4479874,
+			"packages": 1
+		},
+		"pg": {
+			"bytes": 475143,
+			"packages": 14
+		},
+		"pg + pg-native (libpq addon, built)": {
+			"bytes": 1410284,
+			"packages": 19
+		},
+		"postgres.js": {
+			"bytes": 300263,
+			"packages": 1
+		},
+		"@neondatabase/serverless (+ ws on Node)": {
+			"bytes": 596319,
+			"packages": 2
+		}
+	},
+	"bundle": {
+		"quarry/driver": {
+			"bytes": 136085,
+			"gzip": 45767
+		},
+		"pg": {
+			"bytes": 86405,
+			"gzip": 26881
+		},
+		"postgres.js": {
+			"bytes": 38035,
+			"gzip": 14692
+		},
+		"@neondatabase/serverless": {
+			"bytes": 146288,
+			"gzip": 47425
+		},
+		"pg-native": {
+			"note": "native addon (libpq .node + libpq.so): not bundleable"
+		}
+	},
+	"cold": {
+		"node/none": {
+			"importMs": 0.002088999999998009,
+			"firstQueryMs": 0.008309999999994488,
+			"sinceStartMs": 41.207314,
+			"wallMs": 49.843511999999464,
+			"reps": 15
+		},
+		"node/quarry": {
+			"importMs": 9.38778,
+			"firstQueryMs": 11.301393000000004,
+			"sinceStartMs": 63.215857,
+			"wallMs": 69.60251400000016,
+			"reps": 15
+		},
+		"node/pg": {
+			"importMs": 22.122953000000003,
+			"firstQueryMs": 7.176206000000008,
+			"sinceStartMs": 72.2544,
+			"wallMs": 78.61854800000037,
+			"reps": 15
+		},
+		"node/pg-native": {
+			"importMs": 22.072000999999993,
+			"firstQueryMs": 8.599608000000003,
+			"sinceStartMs": 73.326461,
+			"wallMs": 80.82966600000145,
+			"reps": 15
+		},
+		"node/postgres.js": {
+			"importMs": 14.30379,
+			"firstQueryMs": 9.664701,
+			"sinceStartMs": 67.476703,
+			"wallMs": 76.03887000000032,
+			"reps": 15
+		},
+		"node/neon": {
+			"importMs": 24.210749,
+			"firstQueryMs": 11.791325999999998,
+			"sinceStartMs": 79.299353,
+			"wallMs": 85.37355900000148,
+			"reps": 15
+		}
+	},
+	"driverDistBytes": 2346
+}
