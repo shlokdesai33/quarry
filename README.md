@@ -823,75 +823,79 @@ const pool = createPool({
 
 ## Benchmarks
 
-`quarry/driver` against `pg` (unnamed and named statements), `pg-native` and postgres.js, at commit `b02e93f`: PostgreSQL 18.6 on an 8-vCPU VM (client, server and proxies on separate pinned cores), Node 24.22. Each cell ran 5 times in a fresh process in a shuffled order; figures are medians of the runs. quarry decodes like `pg` here (int8 and numeric as strings, timestamptz as `Date`), and every result-equality check across clients passed.
+`quarry/driver` against `pg` (unnamed and named statements), `pg-native` and postgres.js, at commit `6be275b`: PostgreSQL 18.6 on an 8-vCPU VM (client, server and proxies on separate pinned cores), Node 24.22. Each cell ran 5 times in a fresh process in a shuffled order; figures are medians of the runs. quarry decodes like `pg` here (int8 and numeric as strings, timestamptz as `Date`), and every result-equality check across clients passed.
 
 **Single queries, Node 24 (median latency)**
 
-| Scenario                     |      quarry |      pg | pg (named) | pg-native | postgres.js |
-| ---------------------------- | ----------: | ------: | ---------: | --------: | ----------: |
-| `select 1`                   | **21.4 µs** | 26.2 µs |    26.2 µs |   31.5 µs |     28.2 µs |
-| Point lookup by primary key  | **26.4 µs** | 46.1 µs |    34.5 µs |   50.0 µs |     32.6 µs |
-| Range scan, 100 rows         | **88.1 µs** |  188 µs |     182 µs |    198 µs |      154 µs |
-| Fetch 1,000 rows (6 columns) |  **311 µs** | 1.34 ms |    1.30 ms |   1.62 ms |      918 µs |
-| Insert one row               | **25.8 µs** | 38.7 µs |    30.1 µs |   43.9 µs |     33.4 µs |
-| `begin; insert; commit`      | **50.7 µs** | 80.9 µs |    71.9 µs |   98.2 µs |     87.0 µs |
-| A failing query              | **33.7 µs** | 2.27 ms |    2.32 ms |   4.69 ms |     53.2 µs |
+| Scenario                      |      quarry |      pg | pg (named) | pg-native | postgres.js |
+| ----------------------------- | ----------: | ------: | ---------: | --------: | ----------: |
+| `select 1`                    | **21.3 µs** | 26.0 µs |    26.4 µs |   31.3 µs |     28.7 µs |
+| Point lookup by primary key   | **26.4 µs** | 46.0 µs |    35.2 µs |   49.6 µs |     32.4 µs |
+| Range scan, 100 rows          | **86.0 µs** |  187 µs |     183 µs |    197 µs |      157 µs |
+| Fetch 1,000 rows (6 columns)  |  **293 µs** | 1.33 ms |    1.30 ms |   1.65 ms |      923 µs |
+| Insert one row                | **26.0 µs** | 38.6 µs |    30.1 µs |   44.1 µs |     33.3 µs |
+| `begin; insert; commit`       | **50.8 µs** | 81.1 µs |    71.6 µs |   98.7 µs |     86.3 µs |
+| Transaction with 5 savepoints |  **161 µs** |  375 µs |     380 µs |    460 µs |      327 µs |
+| A failing query               | **33.7 µs** | 2.23 ms |    2.29 ms |   4.71 ms |     54.2 µs |
 
 **Large results, Node 24 (mean time per fetch)**
 
 | Scenario                                       |      quarry |       pg | pg-native | postgres.js |
 | ---------------------------------------------- | ----------: | -------: | --------: | ----------: |
-| Fetch 100,000 rows                             | **26.1 ms** |   118 ms |    144 ms |     94.9 ms |
-| Fetch 1,000,000 rows                           |  **412 ms** | 1,295 ms |  1,549 ms |    1,038 ms |
-| Stream 1,000,000 rows (cursor)                 |  **313 ms** | 1,241 ms |       n/a |    1,037 ms |
-| Wide rows: 1,000 × 100 columns                 | **3.81 ms** | 14.08 ms |  21.30 ms |    16.30 ms |
-| Arrays: 1,000 rows of `int4[100]` + `text[20]` | **3.34 ms** | 23.18 ms |  25.81 ms |     8.94 ms |
-| 10 × 1 MB `bytea`                              | **4.46 ms** | 17.41 ms |  32.35 ms |    15.65 ms |
+| Fetch 100,000 rows                             | **27.4 ms** |   119 ms |    147 ms |     94.3 ms |
+| Fetch 1,000,000 rows                           |  **393 ms** | 1,278 ms |  1,538 ms |    1,016 ms |
+| Stream 1,000,000 rows (cursor)                 |  **304 ms** | 1,248 ms |       n/a |    1,059 ms |
+| Wide rows: 1,000 × 100 columns                 | **3.42 ms** |  14.2 ms |   21.4 ms |     17.0 ms |
+| Arrays: 1,000 rows of `int4[100]` + `text[20]` | **3.33 ms** |  23.6 ms |   27.0 ms |     10.0 ms |
+| 10 × 1 MB `bytea`                              | **4.14 ms** |  18.3 ms |   32.6 ms |     15.4 ms |
 
-At equal work (the same operations for every client), fetching 1,000,000 rows three times peaks at 736 MB RSS, against 818 MB for postgres.js and 1,370 MB for `pg`.
+At equal work (the same operations for every client), fetching 1,000,000 rows three times peaks at 751 MB RSS, against 815 MB for postgres.js and 1,369 MB for `pg`. A stream with `readAhead: true` fetches the next batch while the consumer works: 200,000 rows to a consumer that takes 2 ms per 1,000-row batch arrive in 432 ms, against 549 ms with the default strict backpressure.
 
 **Concurrency, Node 24 (point lookups/s)**
 
 | Pool / callers |      quarry | quarry, `pipeline: false` |     pg | postgres.js |
 | -------------- | ----------: | ------------------------: | -----: | ----------: |
-| 1 / 1,000      | **122,758** |                    35,982 | 21,364 |     114,461 |
-| 10 / 100       | **457,747** |                   104,724 | 61,672 |      42,225 |
-| 10 / 500       | **484,255** |                   106,031 | 66,931 |     133,382 |
-| 10 / 1,000     | **450,898** |                   106,463 | 64,926 |     148,456 |
-| 50 / 1,000     | **412,088** |                    91,893 | 63,310 |      43,299 |
+| 1 / 1,000      | **124,461** |                    36,468 | 21,255 |     114,900 |
+| 10 / 100       | **426,611** |                    95,231 | 60,776 |      42,858 |
+| 10 / 500       | **472,987** |                    87,386 | 62,398 |     133,266 |
+| 10 / 1,000     | **404,250** |                    90,459 | 62,110 |     154,099 |
+| 50 / 100       | **326,772** |                    90,958 | 59,910 |      41,799 |
+| 50 / 1,000     | **379,237** |                    91,956 | 60,124 |      43,962 |
 
-With 10 connections and 500 callers, the p99 is 5.0 ms, against 10.6 ms for postgres.js and 12.0 ms for `pg`.
+With 10 connections and 500 callers, the p99 is 4.9 ms, against 10.9 ms for postgres.js and 11.4 ms for `pg`.
 
 **Network latency, Node 24 (simulated round-trip time)**
 
-| Scenario                                         | RTT   |       quarry |       pg | postgres.js |
-| ------------------------------------------------ | ----- | -----------: | -------: | ----------: |
-| `begin; insert; commit` (latency)                | 5 ms  | **11.75 ms** | 17.53 ms |    17.59 ms |
-|                                                  | 20 ms | **41.75 ms** | 62.67 ms |    62.66 ms |
-| Point lookups, 50 callers, pool 10 (ops/s)       | 5 ms  |    **8,286** |    1,652 |       7,033 |
-|                                                  | 20 ms |    **2,359** |      473 |       2,004 |
-| Point lookups, 500 callers, 1 connection (ops/s) | 5 ms  |   **88,941** |      169 |       7,958 |
-|                                                  | 20 ms |   **23,550** |     47.8 |       2,333 |
+| Scenario                                             | RTT   |      quarry |      pg | postgres.js |
+| ---------------------------------------------------- | ----- | ----------: | ------: | ----------: |
+| `begin; insert; commit` (latency)                    | 5 ms  | **11.7 ms** | 17.5 ms |     17.5 ms |
+|                                                      | 20 ms | **41.7 ms** | 62.6 ms |     62.6 ms |
+| The same, insert run with `queryAndCommit` (latency) | 5 ms  | **5.91 ms** |     n/a |         n/a |
+|                                                      | 20 ms | **21.0 ms** |     n/a |         n/a |
+| Point lookups, 50 callers, pool 10 (ops/s)           | 5 ms  |   **8,318** |   1,654 |       6,848 |
+|                                                      | 20 ms |   **2,367** |     475 |       1,891 |
+| Point lookups, 500 callers, 1 connection (ops/s)     | 5 ms  |  **88,515** |     169 |       8,002 |
+|                                                      | 20 ms |  **23,295** |    47.8 |       2,343 |
 
-A transaction takes two round trips (`BEGIN` travels with the first statement), one when its last statement runs with `executeAndCommit()`, and `db.batch` with `{ transaction: true }` takes one: three statements in a transaction at 5 ms RTT run at 166 ops/s with `db.batch`, against 57 with `Promise.all` and 43 one after another.
+A transaction takes two round trips (`BEGIN` travels with the first statement), and one when its last statement runs with `executeAndCommit()` (`queryAndCommit()` in the driver). `db.batch` with `{ transaction: true }` also takes one: three statements in a transaction at 5 ms RTT run at 167 ops/s with `db.batch`, against 56 with `Promise.all` and 42 one after another.
 
-Through the query builder (`database()`, pool 10), lookups run at 270–312k ops/s with 100–1,000 callers and no added latency, 71–79% of the driver alone. At 5 ms RTT with 1,000 callers, lookups, inserts and updates run at 160–168k ops/s, within 3% of the driver, about 2.2× postgres.js (73–75k) and 100× `pg` (1.6k).
+Through the query builder (`database()`, pool 10), lookups run at 237–326k ops/s with 100–1,000 callers and no added latency, 63–79% of the driver alone. At 5 ms RTT with 1,000 callers, lookups, inserts and updates run at 155–167k ops/s, within 3% of the driver, about 2.2× postgres.js (73–75k) and 100× `pg` (1.6k).
 
 **Through PgBouncer 1.26, transaction mode, Node 24 (ops/s)**
 
-| Scenario                  |      quarry |     pg | pg (named) | postgres.js |
-| ------------------------- | ----------: | -----: | ---------: | ----------: |
-| Point lookups, 50 callers | **105,379** | 67,721 |     61,029 |      40,138 |
-| Fetch 1,000 rows          |   **2,674** |    726 |        739 |         808 |
-| `begin; insert; commit`   |   **9,332** |  6,307 |      5,638 |       5,638 |
+| Scenario                  |     quarry |     pg | pg (named) | postgres.js |
+| ------------------------- | ---------: | -----: | ---------: | ----------: |
+| Point lookups, 50 callers | **91,592** | 68,913 |     65,261 |      39,811 |
+| Fetch 1,000 rows          |  **2,790** |    736 |        751 |         886 |
+| `begin; insert; commit`   |  **9,431** |  6,536 |      6,946 |       6,031 |
 
 **Connecting, Node 24 (connect + `select 1` + close)**
 
 | Authentication           |      quarry |      pg | postgres.js |
 | ------------------------ | ----------: | ------: | ----------: |
-| trust, no TLS            | **2.29 ms** | 3.88 ms |     6.76 ms |
-| SCRAM, no TLS            | **2.59 ms** | 5.22 ms |     7.74 ms |
-| SCRAM, TLS `verify-full` | **5.19 ms** | 6.59 ms |     53.3 ms |
+| trust, no TLS            | **2.26 ms** | 3.97 ms |     6.67 ms |
+| SCRAM, no TLS            | **2.58 ms** | 5.21 ms |     7.82 ms |
+| SCRAM, TLS `verify-full` | **5.25 ms** | 6.62 ms |     53.0 ms |
 
 `pnpm bench:driver` runs a quick comparison against `pg` and postgres.js. The full suite behind these numbers (setup, orchestration, analysis and charts) is in `bench/driver/suite`.
 
